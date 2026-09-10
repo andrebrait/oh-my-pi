@@ -346,6 +346,7 @@ import {
 	isUserQueuedMessage,
 	queueChipText,
 	toRestoredQueuedMessage,
+	VIDEO_ATTACHMENT_TYPE,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
 import {
@@ -1248,6 +1249,10 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.agent.setQueuedMessageGrouping(
+			(previous, next) =>
+				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
+		);
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
@@ -6067,7 +6072,7 @@ export class AgentSession {
 			if (!sourcePath) continue;
 			notices.push({
 				role: "custom",
-				customType: "video-attachment",
+				customType: VIDEO_ATTACHMENT_TYPE,
 				content: prompt.render(videoAttachmentPrompt, { index: String(index + 1), path: sourcePath }),
 				display: false,
 				attribution: "user",
@@ -7491,6 +7496,9 @@ export class AgentSession {
 		const remaining = followUp.slice();
 		const promoted = remaining.splice(start, index - start + 1);
 		const message = promoted[promoted.length - 1];
+		// Plain user turns opt into model-side emphasis. Collab prompts are already
+		// recognized by customType in wrapSteeringForModel; other custom types keep
+		// their existing rendering semantics. Queue membership controls interruption.
 		if (message.role === "user") message.steering = true;
 		// Await-free removal and insertion preserves the original payload and companion
 		// order. replaceQueues also wakes the agent's in-flight steering watchers.
