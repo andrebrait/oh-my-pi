@@ -266,4 +266,48 @@ describe("dispatchRpcSkillPrompt", () => {
 
 		await removeWithRetries(dir);
 	});
+
+	test("preserves transformed input images when building the skill message", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
+		const skillPath = path.join(dir, "SKILL.md");
+		await Bun.write(skillPath, "---\nname: reviewer\ndescription: Review code\n---\n\nReview the attachment.\n");
+		let message: Pick<CustomMessage, "content"> | undefined;
+		const image = { type: "image" as const, mimeType: "image/png", data: "aW1hZ2U=" };
+		try {
+			await dispatchRpcSkillPrompt({
+				id: "skill-images",
+				session: {
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "reviewer",
+							description: "Review code",
+							filePath: skillPath,
+							baseDir: dir,
+							source: "project",
+						},
+					],
+					async promptCustomMessage(nextMessage) {
+						message = nextMessage;
+						return true;
+					},
+				},
+				message: "/skill:reviewer check the screenshot",
+				images: [image],
+				streamingBehavior: "followUp",
+				output: () => {},
+				onError: error => {
+					throw error;
+				},
+				extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
+			});
+			await settleUntil(() => message !== undefined);
+			expect(message?.content).toEqual([
+				{ type: "text", text: expect.stringContaining("check the screenshot") },
+				image,
+			]);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
 });

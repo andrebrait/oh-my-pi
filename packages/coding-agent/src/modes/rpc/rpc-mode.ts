@@ -11,6 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
@@ -157,12 +158,13 @@ export async function runRpcSkillCommand(
 	invocation: RpcSkillInvocation,
 	streamingBehavior: "steer" | "followUp" = "steer",
 	prebuilt?: BuiltSkillPromptMessage,
+	images?: ImageContent[],
 ): Promise<boolean> {
 	const built = prebuilt ?? (await buildSkillPromptMessage(invocation.skill, invocation.args, "user"));
 	return session.promptCustomMessage(
 		{
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
-			content: built.message,
+			content: images?.length ? [{ type: "text", text: built.message }, ...images] : built.message,
 			display: true,
 			details: built.details,
 			attribution: "user",
@@ -183,10 +185,12 @@ export async function dispatchRpcSkillPrompt(input: {
 	id: string | undefined;
 	session: RpcSkillCommandSession;
 	message: string;
+	images?: ImageContent[];
 	streamingBehavior: "steer" | "followUp" | undefined;
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+	inputObservation?: RpcExtensionUserMessageObservation;
 }): Promise<RpcSkillCommandResult | null> {
 	const invocation = resolveRpcSkillInvocation(input.session, input.message);
 	if (!invocation) return null;
@@ -198,10 +202,12 @@ export async function dispatchRpcSkillPrompt(input: {
 	const built = await buildSkillPromptMessage(invocation.skill, invocation.args, "user");
 	watchAndReportLocalOnlyPromptResult({
 		id: input.id,
-		startPrompt: () => runRpcSkillCommand(input.session, invocation, input.streamingBehavior ?? "steer", built),
+		startPrompt: () =>
+			runRpcSkillCommand(input.session, invocation, input.streamingBehavior ?? "steer", built, input.images),
 		output: input.output,
 		onError: input.onError,
 		extensionUserMessageTracker: input.extensionUserMessageTracker,
+		inputObservation: input.inputObservation,
 	});
 	return { agentInvoked: true };
 }
@@ -241,6 +247,11 @@ export function reportLocalOnlyPromptResult(input: {
 type RpcExtensionUserMessageScope = {
 	hasAgentMessageTask: boolean;
 	pendingAgentMessageTasks: Set<Promise<void>>;
+};
+
+type RpcExtensionUserMessageObservation = {
+	hasAgentMessageTask: () => boolean;
+	waitForAgentMessageTasks: () => Promise<void>;
 };
 
 /**
@@ -316,15 +327,25 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+	inputObservation?: RpcExtensionUserMessageObservation;
 }): void {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
+	const inputObservation = input.inputObservation;
 	reportLocalOnlyPromptResult({
 		id: input.id,
 		prompt: trackedPrompt.prompt,
 		output: input.output,
 		onError: input.onError,
-		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
-		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
+		hasExtensionAgentMessageTask: () =>
+			trackedPrompt.hasAgentMessageTask() || input.inputObservation?.hasAgentMessageTask() === true,
+		waitForExtensionAgentMessageTasks: inputObservation
+			? async () => {
+					await Promise.all([
+						trackedPrompt.waitForAgentMessageTasks(),
+						inputObservation.waitForAgentMessageTasks(),
+					]);
+				}
+			: trackedPrompt.waitForAgentMessageTasks,
 	});
 }
 
@@ -1103,6 +1124,40 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		let inputObservation: RpcExtensionUserMessageObservation | undefined;
+		const runner = session.extensionRunner;
+		if (
+			runner?.hasHandlers("input") &&
+			(command.type === "prompt" ||
+				command.type === "steer" ||
+				command.type === "follow_up" ||
+				command.type === "abort_and_prompt")
+		) {
+			const inputCommand = command;
+			const observedInput = extensionUserMessageTracker.watchPrompt(() =>
+				runner.emitInput(inputCommand.message, inputCommand.images, "rpc"),
+			);
+			inputObservation = observedInput;
+			const result = await observedInput.prompt;
+			if (result.handled) {
+				if (command.type === "prompt") {
+					reportLocalOnlyPromptResult({
+						id,
+						prompt: Promise.resolve(false),
+						output,
+						onError: promptError => output(error(id, "prompt", promptError.message)),
+						hasExtensionAgentMessageTask: observedInput.hasAgentMessageTask,
+						waitForExtensionAgentMessageTasks: observedInput.waitForAgentMessageTasks,
+					});
+				}
+				return success(id, command.type);
+			}
+			command = {
+				...command,
+				message: result.text ?? command.message,
+				images: result.images ?? command.images,
+			};
+		}
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1120,10 +1175,12 @@ export async function runRpcMode(
 					id,
 					session,
 					message: command.message,
+					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					output,
 					onError: promptError => output(error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
+					inputObservation,
 				});
 				if (skillResult) {
 					return success(id, "prompt", skillResult);
@@ -1152,6 +1209,7 @@ export async function runRpcMode(
 							output,
 							onError: promptError => output(error(id, "prompt", promptError.message)),
 							extensionUserMessageTracker,
+							inputObservation,
 						});
 						return success(id, "prompt");
 					}
@@ -1159,6 +1217,17 @@ export async function runRpcMode(
 					// `/retry`) schedule an agent turn whose events stream after
 					// this response. Report that so the host does not finalize the
 					// request as non-agent work while the agent is running.
+					if (!builtinResult.agentInvoked && inputObservation) {
+						reportLocalOnlyPromptResult({
+							id,
+							prompt: Promise.resolve(false),
+							output,
+							onError: promptError => output(error(id, "prompt", promptError.message)),
+							hasExtensionAgentMessageTask: inputObservation.hasAgentMessageTask,
+							waitForExtensionAgentMessageTasks: inputObservation.waitForAgentMessageTasks,
+						});
+						return success(id, "prompt");
+					}
 					return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
 				}
 
@@ -1175,6 +1244,7 @@ export async function runRpcMode(
 					output,
 					onError: promptError => output(error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
+					inputObservation,
 				});
 				return success(id, "prompt");
 			}
