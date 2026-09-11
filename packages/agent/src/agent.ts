@@ -1214,7 +1214,42 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	async continue(signal?: AbortSignal) {
+	/**
+	 * Prepare only the delivery unit that opens a queued run. Keep it queued until
+	 * preparation succeeds so cancellation or a failing hook cannot lose input.
+	 */
+	async #dequeueRunMessages(
+		mode: "steer" | "followUp",
+		signal: AbortSignal | undefined,
+		prepare?: (messages: readonly AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
+	): Promise<AgentMessage[]> {
+		if (!prepare) {
+			return mode === "steer"
+				? this.#dequeueSteeringMessagesAfterHooks(signal)
+				: this.#dequeueFollowUpMessagesAfterHooks(signal);
+		}
+		const getQueue = () => (mode === "steer" ? this.#steeringQueue : this.#followUpQueue);
+		if (signal?.aborted || getQueue().length === 0) return [];
+		await this.#runBeforeQueuedMessageDequeueHooks(signal);
+		signal?.throwIfAborted();
+		const selected = this.#dequeueMessages(getQueue(), mode === "steer" ? this.#steeringMode : this.#followUpMode);
+		if (selected.length === 0) return [];
+		const prepared = await prepare(selected, signal);
+		signal?.throwIfAborted();
+		const current = getQueue();
+		if (selected.some((message, index) => current[index] !== message)) {
+			throw new DOMException("Queued input changed during run preparation", "AbortError");
+		}
+		if (mode === "steer") this.#steeringQueue = current.slice(selected.length);
+		else this.#followUpQueue = current.slice(selected.length);
+		return prepared;
+	}
+
+	async continue(
+		signal?: AbortSignal,
+		/** Runs only when queued messages open a new run, never on in-run delivery or tool resumption. */
+		prepareQueuedRun?: (messages: readonly AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
+	) {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1231,48 +1266,25 @@ export class Agent {
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal);
 			const messages = this.#state.messages;
-			if (messages.length === 0) {
-				// An empty transcript has nothing to resume, but a queued steer/follow-up
-				// must still be delivered as the opening turn — mirroring the assistant-tail
-				// branch below. Throwing here leaves the message undeliverable, and idle-drain
-				// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
-				// microtask because hasQueuedMessages() never clears, spinning an unbounded
-				// allocation loop until OOM (issue #6344).
-				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
-				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
-					return;
-				}
-				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
-				if (queuedFollowUp.length > 0) {
-					await this.#runLoop(queuedFollowUp, undefined, signal, true);
-					return;
-				}
-				throw new Error("No messages to continue from");
+			const last = messages[messages.length - 1];
+			// Resume unpaired tool calls before injecting any queued directive.
+			if (last?.role === "assistant" && unpairedToolCallTail(messages)) {
+				await this.#runLoop(undefined, undefined, signal, true);
+				return;
 			}
-			if (messages[messages.length - 1].role === "assistant") {
-				// A tail with unpaired runnable tool calls resumes by re-executing
-				// them (see `unpairedToolCallTail` in agent-loop). This must win over
-				// queued-message delivery: injecting a message between the tool_use
-				// blocks and their results would break the provider's pairing
-				// invariant. Queued messages drain inside the resumed loop instead.
-				if (unpairedToolCallTail(messages)) {
-					await this.#runLoop(undefined, undefined, signal, true);
-					return;
-				}
-				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
-				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
-					return;
-				}
-
-				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
+			// A steer opens the run even after a non-conversational transcript tail.
+			const queuedSteering = await this.#dequeueRunMessages("steer", dequeueSignal, prepareQueuedRun);
+			if (queuedSteering.length > 0) {
+				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+				return;
+			}
+			if (!last || last.role === "assistant") {
+				const queuedFollowUp = await this.#dequeueRunMessages("followUp", dequeueSignal, prepareQueuedRun);
 				if (queuedFollowUp.length > 0) {
 					await this.#runLoop(queuedFollowUp, undefined, signal, true);
 					return;
 				}
-
-				throw new Error("Cannot continue from message role: assistant");
+				throw new Error(!last ? "No messages to continue from" : "Cannot continue from message role: assistant");
 			}
 
 			await this.#runLoop(undefined, undefined, signal, true);
