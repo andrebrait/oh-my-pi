@@ -129,6 +129,7 @@ export type RpcSkillCommandResult = { agentInvoked: true };
 
 export interface RpcSkillInvocation extends SkillPromptInput {
 	skill: Skill;
+	queueChipText: string;
 }
 
 /**
@@ -142,7 +143,7 @@ export function resolveRpcSkillInvocation(session: RpcSkillCommandSession, text:
 	if (!parsed) return null;
 	const skill = session.skills.find(candidate => candidate.name === parsed.name);
 	if (!skill) return null;
-	return { skill, args: parsed.args, prompt: parsed.prompt };
+	return { skill, args: parsed.args, prompt: parsed.prompt, queueChipText: text };
 }
 
 /**
@@ -167,7 +168,7 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior },
+		{ streamingBehavior, queueChipText: invocation.queueChipText },
 	);
 }
 
