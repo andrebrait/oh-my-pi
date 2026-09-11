@@ -26,6 +26,9 @@ function createContext(opts: { pendingImages: ImageContent[]; pendingImageLinks?
 		getText() {
 			return editorText;
 		},
+		getExpandedText() {
+			return editorText;
+		},
 		setCollapsedText(text: string) {
 			editorText = text;
 		},
@@ -103,4 +106,46 @@ describe("InputController focused submit restore-on-error", () => {
 		expect(ctx.editor.pendingImageLinks).toEqual([undefined]);
 		expect(ctx.editor.imageLinks).toEqual([undefined]);
 	});
+
+	for (const key of ["Enter", "Ctrl+Enter"] as const) {
+		it(`${key} intercepts focused input with the target runner and restores transformed failures`, async () => {
+			const { ctx, editor, prompt } = createContext({ pendingImages: [] });
+			const mainInput = vi.fn();
+			const focusedInput = vi.fn(async () => ({ text: "transformed normal mode" }));
+			Object.assign(ctx.session, { extensionRunner: { hasHandlers: () => true, emitInput: mainInput } });
+			Object.assign(ctx.viewSession, { extensionRunner: { hasHandlers: () => true, emitInput: focusedInput } });
+			editor.setText("normal mode");
+			const controller = new InputController(ctx);
+			controller.setupEditorSubmitHandler();
+			if (key === "Enter") await ctx.editor.onSubmit?.(editor.getText());
+			else await controller.handleFollowUp();
+
+			expect(mainInput).not.toHaveBeenCalled();
+			expect(focusedInput).toHaveBeenCalledTimes(1);
+			expect(focusedInput).toHaveBeenCalledWith("normal mode", undefined, "interactive");
+			expect(prompt).toHaveBeenCalledWith("transformed normal mode", {
+				streamingBehavior: key === "Enter" ? "steer" : "followUp",
+				images: undefined,
+			});
+			expect(editor.getText()).toBe("transformed normal mode");
+		});
+
+		it(`${key} lets the focused input hook consume commands before the chat-only gate`, async () => {
+			const { ctx, editor, prompt } = createContext({ pendingImages: [] });
+			const focusedInput = vi.fn(async () => ({ handled: true }));
+			const showStatus = vi.fn();
+			Object.assign(ctx.viewSession, { extensionRunner: { hasHandlers: () => true, emitInput: focusedInput } });
+			ctx.showStatus = showStatus;
+			editor.setText("/help");
+			const controller = new InputController(ctx);
+			controller.setupEditorSubmitHandler();
+			if (key === "Enter") await ctx.editor.onSubmit?.(editor.getText());
+			else await controller.handleFollowUp();
+
+			expect(focusedInput).toHaveBeenCalledTimes(1);
+			expect(prompt).not.toHaveBeenCalled();
+			expect(showStatus).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe("");
+		});
+	}
 });

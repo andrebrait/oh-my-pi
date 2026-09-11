@@ -318,6 +318,70 @@ describe("Agent", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("keeps queued input when new-run preparation fails or is aborted", async () => {
+		const mock = createMockModel({ responses: [{ content: ["delivered"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const directive = createUserMessage("preserve me");
+		agent.steer(directive);
+		await expect(
+			agent.continue(undefined, async () => {
+				throw new Error("policy unavailable");
+			}),
+		).rejects.toThrow("policy unavailable");
+		expect(agent.peekSteeringQueue()).toEqual([directive]);
+
+		const controller = new AbortController();
+		await expect(
+			agent.continue(controller.signal, async messages => {
+				controller.abort(new DOMException("cancelled", "AbortError"));
+				return [...messages];
+			}),
+		).rejects.toThrow("cancelled");
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.peekSteeringQueue()).toHaveLength(1);
+		await agent.continue();
+		expect(agent.peekSteeringQueue()).toHaveLength(0);
+		expect(mock.calls[0].context.messages).toContainEqual(directive);
+	});
+
+	it("prepares only the opening queue unit and retains arrivals during preparation", async () => {
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.setSteeringMode("one-at-a-time");
+		const first = createUserMessage("first directive");
+		const second = createUserMessage("arrived during preparation");
+		agent.steer(first);
+		let starts = 0;
+		await agent.continue(undefined, async messages => {
+			starts++;
+			expect(messages).toEqual([first]);
+			agent.steer(second);
+			agent.setSystemPrompt(["prepared policy"]);
+			return [...messages];
+		});
+		expect(starts).toBe(1);
+		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls[0].context.systemPrompt).toEqual(["prepared policy"]);
+		expect(mock.calls[0].context.messages).toContainEqual(first);
+		expect(mock.calls[0].context.messages).not.toContainEqual(second);
+		expect(mock.calls[1].context.messages).toContainEqual(second);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("does not resurrect input removed during new-run preparation", async () => {
+		const mock = createMockModel({ responses: [] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.followUp(createUserMessage("withdrawn directive"));
+		await expect(
+			agent.continue(undefined, async messages => {
+				agent.popLastFollowUp();
+				return [...messages];
+			}),
+		).rejects.toThrow("Queued input changed");
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("continue() leaves queued messages owned when its signal is already aborted", async () => {
 		const agent = new Agent();
 		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
