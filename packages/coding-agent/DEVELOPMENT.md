@@ -26,6 +26,35 @@ Never invoke `tsc`/`npx tsc` directly — `bun run check` is the typecheck gate.
 changing the React tool renderers under `collab-web/src/tool-render/`, rebuild them
 with `bun run gen:tool-views`.
 
+## Downstream integration builds
+
+In the `andrebrait/oh-my-pi` fork, `origin/integration` is the canonical source for
+builds with all downstream patches applied. Keep upstream PR branches separate;
+cherry-pick their reviewed changes onto `integration`. The dedicated local worktree
+is `/root/git/.oh-my-pi_worktrees/integration`.
+
+Refresh the branch by fetching `origin` and `upstream`, fast-forwarding to
+`origin/integration`, creating a uniquely named backup branch, and rebasing onto
+`upstream/main`. Preserve every downstream behavior when resolving conflicts; drop
+a patch only after confirming upstream provides its complete behavior. Compare the
+replayed stack with the backup and rerun verification. Push additions normally;
+after a rebase, use `--force-with-lease=refs/heads/integration:<previous-remote-sha>`
+with the exact remote SHA captured before rebasing.
+
+Build from a clean, detached worktree at the full SHA of `origin/integration`, never
+from a feature branch or an uncommitted source patch. From the repository root, run
+`bun install --frozen-lockfile`, `bun check`, and the tests covering the downstream
+patches. Build with `bun --cwd=packages/coding-agent run build`, then run
+`packages/coding-agent/dist/omp --smoke-test`.
+
+Record the branch, full commit SHA, upstream base, verification results, and binary
+checksum with each release. Keep the previous release for rollback. Updating this
+branch does not itself authorize deployment or restarting a running service.
+
+The initial stack includes queued-message promotion, atomic companion delivery,
+and preserved RPC skill invocation identity from
+[PR #11618](https://github.com/can1357/oh-my-pi/pull/11618).
+
 ## Boot flow
 
 ```text
