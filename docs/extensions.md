@@ -302,6 +302,21 @@ Cancelable pre-events:
 - `turn_start` / `turn_end`
 - `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached message snapshot, so use `tool_result` or `context` when an extension needs to change provider context
 
+Interactive Enter/Ctrl+Enter and RPC `prompt`, `steer`, `follow_up`, and
+`abort_and_prompt` emit `input` once at submission, before command interpretation
+or queueing. Handlers may replace text/images or return `{ handled: true }`.
+Focused editor submissions use the focused session's handlers. Queue delivery
+and synthetic continuation directives do not replay external input events;
+extension `sendUserMessage` remains a raw-message API, not command invocation.
+
+When queued user messages open a new agent run, `before_agent_start` prepares
+their system prompt and companion messages before the provider request. Its
+prompt/images describe the user messages in the opening delivery unit; grouped
+hidden companions retain their delivery order.
+Delivery into an already-running loop, synthetic-only queued continuations, and
+retry/tool resumption do not trigger this additional preparation. Queue ownership
+is retained if preparation fails or is cancelled.
+
 ### Tool lifecycle
 
 - `tool_call` (pre-exec, may block, or revise the tool's execution `input`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike)

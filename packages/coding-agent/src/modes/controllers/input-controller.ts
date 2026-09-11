@@ -711,6 +711,30 @@ export class InputController {
 		return compacted.text.trim();
 	}
 
+	/** Intercept external editor input once, before commands or queues consume it. */
+	async #interceptEditorInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		imageLinks: (string | undefined)[] | undefined,
+		session = this.ctx.session,
+	): Promise<{ text: string; images?: ImageContent[]; imageLinks?: (string | undefined)[] } | undefined> {
+		const runner = session.extensionRunner;
+		if (runner?.hasHandlers("input")) {
+			const result = await runner.emitInput(text, images, "interactive");
+			if (result?.handled) {
+				this.ctx.editor.clearDraft();
+				return undefined;
+			}
+			if (result?.text !== undefined) text = result.text.trim();
+			if (result?.images !== undefined) {
+				images = result.images;
+				const manager = this.ctx.sessionManager;
+				imageLinks = await materializeImageReferenceLinks(images, manager.putBlob.bind(manager));
+			}
+		}
+		return { text, images, imageLinks };
+	}
+
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			text = this.#compactDraftImages(text.trim());
@@ -739,6 +763,15 @@ export class InputController {
 
 			if (!text && !hasPendingImages) return;
 
+			let inputImages = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+			let inputImageLinks =
+				this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
+			const submittedImages = inputImages;
+
+			const input = await this.#interceptEditorInput(text, inputImages, inputImageLinks);
+			if (!input) return;
+			({ text, images: inputImages, imageLinks: inputImageLinks } = input);
+			const hasInputImages = (inputImages?.length ?? 0) > 0;
 			// Continue shortcuts: "." or "c" resume the agent with a hidden agent-authored
 			// developer directive (no visible user message) instead of an empty turn, so the
 			// model continues the prior intent rather than second-guessing the interrupt.
@@ -756,31 +789,6 @@ export class InputController {
 				return;
 			}
 
-			const runner = this.ctx.session.extensionRunner;
-			let inputImages = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
-			let inputImageLinks =
-				this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
-			let hasInputImages = (inputImages?.length ?? 0) > 0;
-			const submittedImages = inputImages;
-
-			if (runner?.hasHandlers("input")) {
-				const result = await runner.emitInput(text, inputImages, "interactive");
-				if (result?.handled) {
-					this.ctx.editor.clearDraft();
-					return;
-				}
-				if (result?.text !== undefined) {
-					text = result.text.trim();
-				}
-				if (result?.images !== undefined) {
-					inputImages = result.images;
-					inputImageLinks = await materializeImageReferenceLinks(
-						inputImages,
-						this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager),
-					);
-				}
-				hasInputImages = (inputImages?.length ?? 0) > 0;
-			}
 			const submittedMode = parseSlashCommand(text)?.name;
 			const draftDetached =
 				submittedMode === "plan" ||
@@ -1099,8 +1107,8 @@ export class InputController {
 	/** Submit editor text to the focused subagent session (chat-only focus policy). */
 	async #submitToFocusedSession(text: string, streamingBehavior: "steer" | "followUp"): Promise<void> {
 		const target = this.ctx.viewSession;
-		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
-		const imageLinks =
+		let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+		let imageLinks =
 			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
 		if (!text && !images) {
 			if (target.isStreaming && target.queuedMessageCount > 0) {
@@ -1111,6 +1119,10 @@ export class InputController {
 			}
 			return;
 		}
+		const input = await this.#interceptEditorInput(text, images, imageLinks, target);
+		if (!input) return;
+		({ text, images, imageLinks } = input);
+		if (!text && !images?.length) return;
 		if (text && (text.startsWith("/") || text.startsWith("!") || parsePythonCommandInput(text))) {
 			this.ctx.showStatus("Commands run in the main session — press ←← to return first");
 			return; // editor text not cleared: Editor does not auto-clear on submit
@@ -1469,8 +1481,8 @@ export class InputController {
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
 		let text = this.#compactDraftImages(this.ctx.editor.getExpandedText().trim());
-		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
-		const imageLinks =
+		let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+		let imageLinks =
 			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
 		if (!text && !images) return;
 
@@ -1479,6 +1491,10 @@ export class InputController {
 			await this.#submitToFocusedSession(text, "followUp");
 			return;
 		}
+		const input = await this.#interceptEditorInput(text, images, imageLinks);
+		if (!input) return;
+		({ text, images, imageLinks } = input);
+		if (!text && !images?.length) return;
 
 		// Compaction first: while compacting, free text gets queued via
 		// `queueCompactionMessage`, and `/skill:*` rides the same queue so a
@@ -1486,7 +1502,6 @@ export class InputController {
 		// `promptCustomMessage`. The compaction-resume path re-parses the
 		// queued text into a user-attributed skill invocation before delivery.
 		if (this.ctx.session.isCompacting) {
-			const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 			this.ctx.queueCompactionMessage(text, "followUp", images);
 			return;
 		}

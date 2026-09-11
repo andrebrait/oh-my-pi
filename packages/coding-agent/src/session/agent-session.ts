@@ -3749,7 +3749,7 @@ export class AgentSession {
 			}
 			for (;;) {
 				try {
-					await this.agent.continue(signal);
+					await this.agent.continue(signal, (messages, runSignal) => this.#prepareQueuedRun(messages, runSignal));
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -6377,6 +6377,71 @@ export class AgentSession {
 		});
 	}
 
+	async #prepareQueuedRun(queued: readonly AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
+		const messages = [...queued];
+		const userMessages = queued.filter((message): message is Extract<AgentMessage, { role: "user" | "custom" }> =>
+			isUserQueuedMessage(message),
+		);
+		// Synthetic continuations retain the current run policy.
+		if (userMessages.length === 0) return messages;
+		const generation = this.#promptGeneration;
+		await this.#memory.transition;
+		signal?.throwIfAborted();
+		const text = userMessages.map(message => this.#getCustomMessageTextContent(message)).join("\n\n");
+		const images = userMessages.flatMap(message =>
+			typeof message.content === "string"
+				? []
+				: message.content.filter((content): content is ImageContent => content.type === "image"),
+		);
+		await this.#prepareAgentStart(userMessages[0], text, images.length > 0 ? images : undefined, messages);
+		signal?.throwIfAborted();
+		if (this.#isDisposed || this.#promptGeneration !== generation) {
+			throw new DOMException("Session changed during queued run preparation", "AbortError");
+		}
+		return messages;
+	}
+
+	async #prepareAgentStart(
+		message: AgentMessage,
+		text: string,
+		images: ImageContent[] | undefined,
+		messages: AgentMessage[],
+	): Promise<boolean> {
+		const systemPrompt = await this.#buildSystemPromptForAgentStart(text);
+		const result = await this.#extensionRunner?.emitBeforeAgentStart(text, images, systemPrompt);
+		if (result?.messages) {
+			const promptAttribution = "attribution" in message ? message.attribution : undefined;
+			for (const msg of result.messages) {
+				const normalized = normalizeCustomMessagePayload(msg);
+				const hasExplicitAttribution =
+					msg !== null &&
+					typeof msg === "object" &&
+					!Array.isArray(msg) &&
+					(msg.attribution === "user" || msg.attribution === "agent");
+				messages.push(
+					await this.#normalizeAgentMessageImages({
+						role: "custom",
+						customType: normalized.customType,
+						content: normalized.content,
+						display: normalized.display,
+						details: normalized.details,
+						attribution: hasExplicitAttribution
+							? normalized.attribution
+							: (promptAttribution ?? (message.role === "user" ? "user" : "agent")),
+						timestamp: Date.now(),
+					}),
+				);
+			}
+		}
+		if (result?.systemPrompt !== undefined) {
+			this.#tools.setTurnSystemPromptOverride(result.systemPrompt);
+			return false;
+		}
+		this.#tools.clearTurnSystemPromptOverride();
+		this.agent.setSystemPrompt(systemPrompt);
+		return true;
+	}
+
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
@@ -6499,53 +6564,12 @@ export class AgentSession {
 			const disposingBeforeTransition = this.#isDisposed;
 			await this.#memory.transition;
 			if ((this.#isDisposed && !disposingBeforeTransition) || this.#promptGeneration !== generation) return false;
-			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-
-			let baseXdevCatalogDelivered = true;
-			// Emit before_agent_start extension event
-			if (this.#extensionRunner) {
-				const result = await this.#extensionRunner.emitBeforeAgentStart(
-					expandedText,
-					options?.images,
-					beforeAgentStartSystemPrompt,
-				);
-				if (result?.messages) {
-					const promptAttribution: "user" | "agent" | undefined =
-						"attribution" in message ? message.attribution : undefined;
-					for (const msg of result.messages) {
-						const normalized = normalizeCustomMessagePayload(msg);
-						const hasExplicitAttribution =
-							msg !== null &&
-							typeof msg === "object" &&
-							!Array.isArray(msg) &&
-							(msg.attribution === "user" || msg.attribution === "agent");
-						messages.push(
-							await this.#normalizeAgentMessageImages({
-								role: "custom",
-								customType: normalized.customType,
-								content: normalized.content,
-								display: normalized.display,
-								details: normalized.details,
-								attribution: hasExplicitAttribution
-									? normalized.attribution
-									: (promptAttribution ?? (message.role === "user" ? "user" : "agent")),
-								timestamp: Date.now(),
-							}),
-						);
-					}
-				}
-
-				if (result?.systemPrompt !== undefined) {
-					baseXdevCatalogDelivered = false;
-					this.#tools.setTurnSystemPromptOverride(result.systemPrompt);
-				} else {
-					this.#tools.clearTurnSystemPromptOverride();
-					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-				}
-			} else {
-				this.#tools.clearTurnSystemPromptOverride();
-				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-			}
+			const baseXdevCatalogDelivered = await this.#prepareAgentStart(
+				message,
+				expandedText,
+				options?.images,
+				messages,
+			);
 
 			// Bail out if a newer abort/prompt cycle has started since we began setup
 			if (this.#promptGeneration !== generation) {
@@ -6985,12 +7009,8 @@ export class AgentSession {
 	#canAutoContinueForFollowUp(): boolean {
 		if (this.isStreaming) return false;
 		if (this.isRetrying) return false;
-		// A queued steer resumes from ANY tail: Agent.continue() runs #runLoop(undefined),
-		// whose initial steering poll injects the steer before the first provider call, so the
-		// request tail becomes the steer (valid) regardless of any injected custom / bashExecution
-		// / pythonExecution record a user interrupt left as the literal transcript tail. This is
-		// why a queued user steer stranded behind a preserved advisor card (or a flushed IRC aside
-		// / eval execution record) still resumes — no tail-role enumeration needed.
+		// Agent.continue() can open a queued steer run from any transcript tail;
+		// unpaired tool calls still resume before queued-message delivery.
 		if (this.agent.peekSteeringQueue().length > 0) return true;
 		// Follow-up-only auto-resume stays suppressed while a deliberate user interrupt is in effect
 		// (#advisorAutoResumeSuppressed, cleared on the next user prompt): the user stopped, so their

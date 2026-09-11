@@ -4,6 +4,8 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -19,10 +21,24 @@ const agent = new Agent({
 	initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
 	streamFn: mock.stream,
 });
+const sessionManager = SessionManager.inMemory(process.cwd());
+const settings = Settings.isolated({ "compaction.enabled": false });
+const extensionPath = process.env.OMP_RPC_INPUT_EXTENSION;
+const loaded = await loadExtensions(extensionPath ? [extensionPath] : [], process.cwd());
+const extensionRunner = new ExtensionRunner(
+	loaded.extensions,
+	loaded.runtime,
+	process.cwd(),
+	sessionManager,
+	modelRegistry,
+	undefined,
+	settings,
+);
 const session = new AgentSession({
 	agent,
-	sessionManager: SessionManager.inMemory(process.cwd()),
-	settings: Settings.isolated({ "compaction.enabled": false }),
+	sessionManager,
+	settings,
+	extensionRunner,
 	modelRegistry,
 });
 await runRpcMode(session);
