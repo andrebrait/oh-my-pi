@@ -271,11 +271,15 @@ Remove the first matching user-authored message from the selected pending queue:
 
 `message` matches the queue-chip text or its prompt-template expansion. Removal also drops that message's attachments and contiguous hidden user companions, preserving other messages and the other queue. Repeating a successful request can remove another occurrence of duplicate text.
 
+Companions and their prompt are enqueued and dequeued as a complete group, including in `one-at-a-time` mode. Once that group leaves the pending queue for delivery, a removal request cannot report success after only part of its context has been emitted.
+
 Agent-authored entries never match, including internal handoffs with `role: "user"` and `attribution: "agent"`. Pending originals remain cancellable during queued-message preparation; preparation and delivery in the unselected queue continue unchanged.
 
 The check and removal are synchronous: `data.removed: false` means no matching user message is pending in that queue at dispatch time. Already-delivered messages and inputs still being preprocessed cannot be cancelled by this command. It does not resend input, abort a turn, or change promotion or interruption behavior. Non-string `message` values and missing or invalid `queue` values produce an error response.
 
 Clients must hide the chip or restore its draft only after `removed: true`. Older runtimes reject this command; clients must not fall back to aborting or resending queued messages. The TypeScript client exposes `removeQueuedMessage(message, queue): Promise<{ removed: boolean }>`.
+
+The official Python client exposes `remove_queued_message(message, queue) -> RemoveQueuedMessageResult`; inspect its `.removed` boolean rather than the result object's truthiness.
 
 ### `get_state` payload
 

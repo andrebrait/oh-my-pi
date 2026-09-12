@@ -547,9 +547,11 @@
 
 - Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Added `remove_queued_message` to RPC and `removeQueuedMessage()` to the session and TypeScript client APIs to cancel a pending user-authored steering or follow-up message without resending, aborting, or restarting preparation in the other queue ([#3](https://github.com/andrebrait/oh-my-pi/pull/3) by [@andrebrait](https://github.com/andrebrait)).
+- Added typed queued-message removal to the official Python RPC client, including validated success and refusal results ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
+- Cancelling a concurrently queued prompt now preserves the other prompt's hidden keyword context instead of removing it with the cancelled message ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 - Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
