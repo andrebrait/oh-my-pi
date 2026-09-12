@@ -337,6 +337,12 @@ RPC input handlers may await extension UI responses without blocking the stdin
 reader. See [RPC completion and ordering](./rpc.md#promptqueue-concurrency-and-ordering),
 including local-only completion for consumed `abort_and_prompt` replacements.
 
+Ctrl+Enter detaches the submitted draft before awaiting native handlers, so
+another submission cannot reuse it and ordinary later typing remains a new draft.
+Handled/empty input consumes only the detached submission. Dispatch failures
+restore its text and attachments alongside any newer draft. This does not make
+the established interactive input-handler chain cancellable by Esc.
+
 #### Delivery policy preparation
 
 `before_agent_start` prepares policy for an ordinary prompt and for each steering or follow-up batch containing user work when that batch is actually dequeued. It is not an enqueue notification: a live batch can fire it without another `agent_start`. Queue peeks, retries, tool-only iterations, and synthetic-only queued continuations do not fire it. Explicit synthetic prompts retain their ordinary prompt lifecycle.
