@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 
 interface StubEditor {
 	setText: (text: string) => void;
@@ -232,5 +233,106 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		});
 		expect(ctx.editor.pendingImages).toEqual([]);
 		expect(ctx.editor.pendingImageLinks).toEqual([]);
+	});
+
+	for (const key of ["Enter", "Ctrl+Enter"] as const) {
+		const submit = async (controller: InputController, editor: StubEditor) => {
+			if (key === "Ctrl+Enter") await controller.handleFollowUp();
+			else {
+				controller.setupEditorSubmitHandler();
+				await editor.onSubmit?.(editor.getText());
+			}
+		};
+
+		it(`${key} transforms text and images once before interpreting a builtin command`, async () => {
+			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+			const { ctx, editor, emitInput, prompt, handleGoalModeCommand } = createContext({
+				isStreaming: true,
+				pendingImages: [],
+				input: async text => ({ text: `/goal set ${text} [Image #1]`, images: [image] }),
+			});
+			editor.setText("normal mode");
+			await submit(new InputController(ctx), editor);
+
+			expect(emitInput).toHaveBeenCalledTimes(1);
+			expect(emitInput).toHaveBeenCalledWith("normal mode", undefined, "interactive");
+			expect(handleGoalModeCommand).toHaveBeenCalledWith("set normal mode [Image #1]", {
+				images: [image],
+				imageLinks: ["blob://transformed.png"],
+			});
+			expect(prompt).not.toHaveBeenCalled();
+		});
+
+		it(`${key} consumes handled input before slash dispatch or compaction queueing`, async () => {
+			const { ctx, editor, emitInput, prompt, handleGoalModeCommand, queueCompactionMessage } = createContext({
+				isStreaming: true,
+				pendingImages: [],
+				input: async () => ({ handled: true }),
+			});
+			Object.assign(ctx.session, { isCompacting: true });
+			editor.setText("/goal set stop ponytail");
+			await submit(new InputController(ctx), editor);
+
+			expect(emitInput).toHaveBeenCalledTimes(1);
+			expect(handleGoalModeCommand).not.toHaveBeenCalled();
+			expect(queueCompactionMessage).not.toHaveBeenCalled();
+			expect(prompt).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe("");
+		});
+
+		it(`${key} queues transformed input rather than the original draft during compaction`, async () => {
+			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+			const { ctx, editor, emitInput } = createContext({
+				isStreaming: true,
+				pendingImages: [],
+				input: async text => ({ text: `transformed ${text}`, images: [image] }),
+			});
+			const helpers = new UiHelpers(ctx);
+			ctx.showStatus = vi.fn();
+			ctx.queueCompactionMessage = (text, mode, images, options) =>
+				helpers.queueCompactionMessage(text, mode, images, options);
+			Object.assign(ctx.session, { isCompacting: true });
+			editor.setText("stop ponytail");
+			await submit(new InputController(ctx), editor);
+
+			expect(emitInput).toHaveBeenCalledTimes(1);
+			expect(ctx.compactionQueuedMessages).toEqual([
+				{ text: "transformed stop ponytail", mode: key === "Enter" ? "steer" : "followUp", images: [image] },
+			]);
+		});
+	}
+
+	it("restores transformed follow-up text and image links after dispatch rejects", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+		const { ctx, editor, prompt, emitInput } = createContext({
+			isStreaming: true,
+			pendingImages: [],
+			input: async () => ({ text: "transformed [Image #1]", images: [image] }),
+		});
+		prompt.mockRejectedValueOnce(new Error("queue rejected"));
+		editor.setText("stop ponytail");
+		await new InputController(ctx).handleFollowUp();
+
+		expect(emitInput).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("transformed [Image #1]");
+		expect(editor.pendingImages).toEqual([image]);
+		expect(editor.pendingImageLinks).toEqual(["blob://transformed.png"]);
+	});
+
+	it("keeps typed continue shortcuts on the synthetic path without external input interception", async () => {
+		const { ctx, editor, emitInput } = createContext({
+			isStreaming: false,
+			pendingImages: [],
+			input: async () => ({}),
+		});
+		const onInput = vi.fn();
+		ctx.onInputCallback = onInput;
+		editor.setText(".");
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.(".");
+
+		expect(emitInput).not.toHaveBeenCalled();
+		expect(onInput).toHaveBeenCalledWith(expect.objectContaining({ synthetic: true, userInitiated: true }));
 	});
 });
