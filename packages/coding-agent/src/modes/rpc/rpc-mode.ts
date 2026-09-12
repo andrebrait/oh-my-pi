@@ -1263,6 +1263,18 @@ export async function runRpcMode(
 				return success(id, "promote_queued_message", { promoted: session.promoteQueuedMessage(command.message) });
 			}
 
+			case "remove_queued_message": {
+				if (typeof command.message !== "string") {
+					return error(id, "remove_queued_message", "message must be a string");
+				}
+				if (command.queue !== "steering" && command.queue !== "followUp") {
+					return error(id, "remove_queued_message", 'queue must be "steering" or "followUp"');
+				}
+				return success(id, "remove_queued_message", {
+					removed: session.removeQueuedMessage(command.message, command.queue),
+				});
+			}
+
 			case "abort": {
 				await abortUserInput().completion;
 				return success(id, "abort");

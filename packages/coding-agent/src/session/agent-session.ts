@@ -7599,6 +7599,35 @@ export class AgentSession {
 	}
 
 	/**
+	 * Remove the first matching user message and its hidden companions from one queue.
+	 * Matches queue-chip text or its prompt-template expansion. A missing or already
+	 * delivered target changes nothing; repeated calls may remove further duplicates.
+	 */
+	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
+		const steering = this.agent.peekSteeringQueue();
+		const followUp = this.agent.peekFollowUpQueue();
+		const selected = queue === "steering" ? steering : followUp;
+		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		const index = selected.findIndex(message => {
+			if (!isUserQueuedMessage(message)) return false;
+			const chipText = queueChipText(message);
+			return chipText === text || chipText === expandedText;
+		});
+		if (index < 0) return false;
+
+		let start = index;
+		while (start > 0 && isHiddenUserCompanion(selected[start - 1])) start--;
+		const remaining = selected.slice();
+		remaining.splice(start, index - start + 1);
+		this.agent.replaceQueues(
+			queue === "steering" ? remaining : steering.slice(),
+			queue === "followUp" ? remaining : followUp.slice(),
+		);
+		this.#reconcileQueuedMessageDrain();
+		return true;
+	}
+
+	/**
 	 * Pop the last queued message (steering first, then follow-up).
 	 * Used by dequeue keybinding to restore messages to editor one at a time.
 	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).

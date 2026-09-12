@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 
-describe("RPC queued-message promotion", () => {
+describe("RPC queued-message management", () => {
 	let client: RpcClient;
 	let directory: string;
 
@@ -48,6 +48,43 @@ describe("RPC queued-message promotion", () => {
 		const messages = await client.getMessages();
 		expect(messages.filter(message => message.role === "user").map(message => message.content)).toEqual([
 			[{ type: "text", text: "queued request" }],
+		]);
+	}, 30_000);
+
+	test("validates removal and delivers only the surviving queued request", async () => {
+		await client.start();
+		await client.followUp("cancel this");
+		await client.followUp("keep this");
+		await expect(client.removeQueuedMessage(null as unknown as string, "followUp")).rejects.toMatchObject({
+			command: "remove_queued_message",
+		});
+		await expect(
+			client.removeQueuedMessage("cancel this", "steer" as unknown as "steering"),
+		).rejects.toMatchObject({ command: "remove_queued_message" });
+		expect(await client.removeQueuedMessage("cancel this", "steering")).toEqual({ removed: false });
+		expect(await client.removeQueuedMessage("absent", "followUp")).toEqual({ removed: false });
+		expect((await client.getState()).queuedMessageCount).toBe(2);
+
+		expect(await client.removeQueuedMessage("cancel this", "followUp")).toEqual({ removed: true });
+		expect(await client.removeQueuedMessage("cancel this", "followUp")).toEqual({ removed: false });
+		expect((await client.getState()).queuedMessageCount).toBe(1);
+
+		const idle = Promise.withResolvers<void>();
+		const unsubscribe = client.onEvent(event => {
+			if (event.type === "agent_end") idle.resolve();
+		});
+		try {
+			expect(await client.promoteQueuedMessage("keep this")).toEqual({ promoted: true });
+			await withTimeout(idle.promise, 10_000, "Surviving RPC message did not finish");
+		} finally {
+			unsubscribe();
+		}
+
+		expect(await client.removeQueuedMessage("keep this", "steering")).toEqual({ removed: false });
+		expect((await client.getState()).queuedMessageCount).toBe(0);
+		const messages = await client.getMessages();
+		expect(messages.filter(message => message.role === "user").map(message => message.content)).toEqual([
+			[{ type: "text", text: "keep this" }],
 		]);
 	}, 30_000);
 });

@@ -114,6 +114,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "steer", message: string, images?: ImageContent[] }`
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "promote_queued_message", message: string }`
+- `{ id?, type: "remove_queued_message", message: string, queue: "steering" | "followUp" }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "new_session", parentSession?: string }`
@@ -255,6 +256,21 @@ In `one-at-a-time` mode, a user prompt and its contiguous hidden companions are 
 `data.promoted: false` means no matching user follow-up remains queued (for example, it was already delivered). Non-string `message` values produce an error response. Existing steering, follow-up, and interrupt modes still apply; promotion does not abort the model stream or guarantee cancellation of running tools.
 
 Clients should update their queue display only after `promoted: true`, accounting for message delivery that can race with the acknowledgement. Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate.
+
+### `remove_queued_message` payload
+
+Remove the first matching user-authored message from the selected pending queue:
+
+```json
+{"id":"req_3","type":"remove_queued_message","message":"Use the existing parser","queue":"steering"}
+{"id":"req_3","type":"response","command":"remove_queued_message","success":true,"data":{"removed":true}}
+```
+
+`message` matches the queue-chip text or its prompt-template expansion. Removal also drops that message's attachments and contiguous hidden user companions, preserving other messages and the other queue. Repeating a successful request can remove another occurrence of duplicate text.
+
+The check and removal are synchronous: `data.removed: false` means no matching user message is pending in that queue at dispatch time. Already-delivered messages and inputs still being preprocessed cannot be cancelled by this command. It does not resend input, abort a turn, or change promotion or interruption behavior. Non-string `message` values and missing or invalid `queue` values produce an error response.
+
+Clients must hide the chip or restore its draft only after `removed: true`. Older runtimes reject this command; clients must not fall back to aborting or resending queued messages. The TypeScript client exposes `removeQueuedMessage(message, queue): Promise<{ removed: boolean }>`.
 
 ### `get_state` payload
 
