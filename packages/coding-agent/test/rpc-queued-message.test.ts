@@ -58,9 +58,9 @@ describe("RPC queued-message management", () => {
 		await expect(client.removeQueuedMessage(null as unknown as string, "followUp")).rejects.toMatchObject({
 			command: "remove_queued_message",
 		});
-		await expect(
-			client.removeQueuedMessage("cancel this", "steer" as unknown as "steering"),
-		).rejects.toMatchObject({ command: "remove_queued_message" });
+		await expect(client.removeQueuedMessage("cancel this", "steer" as unknown as "steering")).rejects.toMatchObject({
+			command: "remove_queued_message",
+		});
 		expect(await client.removeQueuedMessage("cancel this", "steering")).toEqual({ removed: false });
 		expect(await client.removeQueuedMessage("absent", "followUp")).toEqual({ removed: false });
 		expect((await client.getState()).queuedMessageCount).toBe(2);

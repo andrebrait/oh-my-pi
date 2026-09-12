@@ -426,6 +426,12 @@ describe("AgentSession queued steer delivery", () => {
 					display: true,
 					timestamp: 1,
 				};
+				const internalUser: AgentMessage = {
+					role: "user",
+					content: "duplicate",
+					attribution: "agent",
+					timestamp: 1,
+				};
 				const companion: AgentMessage = {
 					role: "custom",
 					customType: "image-attachment-description",
@@ -438,23 +444,86 @@ describe("AgentSession queued steer delivery", () => {
 				const first: AgentMessage = { role: "user", content: "duplicate", timestamp: 3 };
 				const keptCompanion: AgentMessage = { ...companion, timestamp: 4 };
 				const duplicate: AgentMessage = { ...first, timestamp: 5 };
-				const selected = [internal, keyword, companion, first, keptCompanion, duplicate];
-				const other = [{ ...companion, timestamp: 6 }, { ...first, timestamp: 7 }];
+				const selected = [internal, internalUser, keyword, companion, first, keptCompanion, duplicate];
+				const other = [
+					{ ...companion, timestamp: 6 },
+					{ ...first, timestamp: 7 },
+				];
 				session.agent.replaceQueues(
 					queue === "steering" ? selected : other,
 					queue === "followUp" ? selected : other,
 				);
 
 				expect(session.removeQueuedMessage("duplicate", queue)).toBe(true);
-				const remaining = [internal, keptCompanion, duplicate];
+				const remaining = [internal, internalUser, keptCompanion, duplicate];
 				expect(session.agent.peekSteeringQueue()).toEqual(queue === "steering" ? remaining : other);
 				expect(session.agent.peekFollowUpQueue()).toEqual(queue === "followUp" ? remaining : other);
 				expect(session.removeQueuedMessage("hidden", queue)).toBe(false);
 				expect(session.removeQueuedMessage("absent", queue)).toBe(false);
 				expect(session.removeQueuedMessage("duplicate", queue)).toBe(true);
 				expect(session.removeQueuedMessage("duplicate", queue)).toBe(false);
-				expect(session.agent.peekSteeringQueue()).toEqual(queue === "steering" ? [internal] : other);
-				expect(session.agent.peekFollowUpQueue()).toEqual(queue === "followUp" ? [internal] : other);
+				expect(session.agent.peekSteeringQueue()).toEqual(queue === "steering" ? [internal, internalUser] : other);
+				expect(session.agent.peekFollowUpQueue()).toEqual(queue === "followUp" ? [internal, internalUser] : other);
+				expect(session.getQueuedMessages()[queue]).toEqual([]);
+			});
+
+			it(`preserves the other queue's claimed delivery when removing from ${queue}`, async () => {
+				const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["continued"] }]);
+				const kept: AgentMessage = { role: "user", content: "keep claimed", timestamp: 1 };
+				const cancelled: AgentMessage = { role: "user", content: "cancel unrelated", timestamp: 2 };
+				const prepared: AgentMessage = { role: "user", content: "prepared context", timestamp: 3 };
+				const started = Promise.withResolvers<AbortSignal>();
+				const release = Promise.withResolvers<void>();
+				let preparations = 0;
+				let endedBeforeDelivery = false;
+				session.agent.prepareQueuedMessages = async (_messages, signal) => {
+					preparations++;
+					started.resolve(signal);
+					await release.promise;
+					return { commit: () => [prepared] };
+				};
+				const unsubscribe = session.subscribe(event => {
+					if (event.type !== "turn_end") return;
+					unsubscribe();
+					if (queue === "followUp") session.agent.steer(kept);
+					else session.agent.followUp(kept);
+				});
+				const unsubscribeEnd = session.subscribe(event => {
+					if (event.type === "agent_end" && !session.messages.includes(kept)) endedBeforeDelivery = true;
+				});
+
+				const running = session.prompt("start");
+				try {
+					const signal = await withTimeout(started.promise, 5_000, "queued preparation did not start");
+					// Follow-up preparation starts only after steering was polled, so enqueue
+					// the unrelated steer after the claim exists to exercise the reverse path.
+					if (queue === "steering") session.agent.steer(cancelled);
+					else session.agent.followUp(cancelled);
+					expect(session.removeQueuedMessage("cancel unrelated", queue)).toBe(true);
+					expect(signal.aborted).toBe(false);
+				} finally {
+					release.resolve();
+					await running;
+					await session.waitForIdle();
+					unsubscribe();
+					unsubscribeEnd();
+				}
+
+				expect(preparations).toBe(1);
+				expect(endedBeforeDelivery).toBe(false);
+				expect(mock.calls).toHaveLength(2);
+				expect(
+					mock.calls[1].context.messages.flatMap(message => {
+						if (message.role !== "user") return [];
+						return typeof message.content === "string"
+							? [message.content]
+							: message.content.filter(part => part.type === "text").map(part => part.text);
+					}),
+				).toEqual(["start", "keep claimed", "prepared context"]);
+				expect(
+					session.messages.filter(message => message === kept || message === prepared || message === cancelled),
+				).toEqual([kept, prepared]);
+				expect(session.agent.hasQueuedMessages()).toBe(false);
 			});
 		}
 
