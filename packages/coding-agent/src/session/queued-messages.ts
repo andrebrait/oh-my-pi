@@ -58,7 +58,7 @@ export function isTerminalTextAssistantAnswer(message: AgentMessage | undefined)
 
 /** Whether queued content was authored by the user and can be restored to the editor. */
 export function isUserQueuedMessage(message: AgentMessage): boolean {
-	if (message.role === "user") return true;
+	if (message.role === "user") return message.attribution !== "agent";
 	return message.role === "custom" && message.attribution === "user" && message.display !== false;
 }
 
