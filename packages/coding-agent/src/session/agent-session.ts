@@ -7334,7 +7334,7 @@ export class AgentSession {
 		// but not the non-interrupting aside path above.
 		if (this.#isDisposed || this.#promptGeneration !== generation) return false;
 		this.#allowQueuedMessageDrainRetry();
-		// Publish every companion and its user record together, without yielding.
+		// Publish the complete group without yielding: removal owns contiguous companions.
 		if (mode === "followUp") {
 			for (const notice of prependMessages) this.agent.followUp(notice);
 			for (const notice of videoAttachmentNotices) this.agent.followUp(notice);
@@ -7963,13 +7963,18 @@ export class AgentSession {
 		});
 		if (index < 0) return false;
 
-		let start = index;
-		while (start > 0 && isHiddenUserCompanion(selected[start - 1])) start--;
-		const remaining = selected.slice();
-		remaining.splice(start, index - start + 1);
-		this.agent.replaceQueue(queue, remaining);
+		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
 		this.#reconcileQueuedMessageDrain();
 		return true;
+	}
+
+	/** Companions are inserted contiguously before their user; preserve every other group. */
+	#withoutQueuedUserMessage(queue: readonly AgentMessage[], userIndex: number): AgentMessage[] {
+		let start = userIndex;
+		while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
+		const remaining = queue.slice();
+		remaining.splice(start, userIndex - start + 1);
+		return remaining;
 	}
 
 	/**
@@ -7986,27 +7991,17 @@ export class AgentSession {
 			}
 			return -1;
 		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
-		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
-			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
-			const next = queue.slice();
-			next.splice(start, userIndex - start + 1);
-			return next;
-		};
 		const fromSteer = lastUserIndex(steering);
 		if (fromSteer >= 0) {
 			const removed = steering[fromSteer];
-			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
+			this.agent.replaceQueues(this.#withoutQueuedUserMessage(steering, fromSteer), followUp.slice());
 			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
-			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
+			this.agent.replaceQueues(steering.slice(), this.#withoutQueuedUserMessage(followUp, fromFollowUp));
 			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}

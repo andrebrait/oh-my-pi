@@ -388,7 +388,119 @@ describe("AgentSession queued steer delivery", () => {
 		expect(session.agent.peekSteeringQueue()).toEqual([]);
 	});
 
+	it("delivers an RPC skill through the default steering queue with its invocation intact", async () => {
+		const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["skill response"] }]);
+		const skillPath = path.join(tempDir, "SKILL.md");
+		await Bun.write(skillPath, "---\nname: reviewer\ndescription: Review code\n---\n\nReview the supplied code.\n");
+		const invocation = "/skill:reviewer  focus on risks\nand correctness";
+		let queued: { steering: readonly string[]; followUp: readonly string[] } | undefined;
+		let injected = false;
+		session.agent.setOnBeforeYield(async () => {
+			if (injected) return;
+			injected = true;
+			await tryRunRpcSkillCommand(
+				{
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "reviewer",
+							description: "Review code",
+							filePath: skillPath,
+							baseDir: tempDir,
+							source: "project",
+						},
+					],
+					promptCustomMessage: session.promptCustomMessage.bind(session),
+				},
+				invocation,
+			);
+			queued = session.getQueuedMessages();
+		});
+
+		await session.prompt("start");
+		await session.waitForIdle();
+
+		expect(queued).toEqual({ steering: [invocation], followUp: [] });
+		const delivered = session.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "skill-prompt",
+		);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0].content).toContain("focus on risks\nand correctness");
+		expect(mock.calls).toHaveLength(2);
+		expect(JSON.stringify(mock.calls[1].context.messages)).toContain("Review the supplied code.");
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+	});
+
 	describe("removeQueuedMessage", () => {
+		for (const kind of ["prompt", "skill"] as const) {
+			it(`keeps concurrent ${kind} companions owned through cancellation and delivery`, async () => {
+				const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["kept B"] }]);
+				const queue = kind === "prompt" ? "steering" : "followUp";
+				const streamingBehavior = kind === "prompt" ? "steer" : "followUp";
+				const chip = (name: string) =>
+					kind === "prompt" ? `ultrathink ${name}` : `/skill:reviewer ultrathink ${name}`;
+				const submit = (name: string) =>
+					kind === "prompt"
+						? session.prompt(chip(name), { streamingBehavior })
+						: session.promptCustomMessage(
+								{
+									customType: "skill-prompt",
+									content: `Expanded review context for ${name}`,
+									display: true,
+									attribution: "user",
+									details: { name: "reviewer", args: `ultrathink ${name}` },
+								},
+								{ streamingBehavior, queueChipText: chip(name) },
+							);
+				let queued: readonly AgentMessage[] = [];
+				let remaining: readonly AgentMessage[] = [];
+				let removed = false;
+				let injected = false;
+				session.agent.setOnBeforeYield(async () => {
+					if (injected) return;
+					injected = true;
+					// Hold the running turn while both real submissions cross their async
+					// preprocessing from the same barrier, without serializing either call.
+					const release = Promise.withResolvers<void>();
+					const first = release.promise.then(() => submit("cancel A"));
+					const second = release.promise.then(() => submit("keep B"));
+					release.resolve();
+					await Promise.all([first, second]);
+					queued = [
+						...(queue === "steering" ? session.agent.peekSteeringQueue() : session.agent.peekFollowUpQueue()),
+					];
+					removed = session.removeQueuedMessage(chip("cancel A"), queue);
+					remaining = [
+						...(queue === "steering" ? session.agent.peekSteeringQueue() : session.agent.peekFollowUpQueue()),
+					];
+				});
+
+				await session.prompt("start");
+				await session.waitForIdle();
+
+				const userRole = kind === "prompt" ? "user" : "skill-prompt";
+				expect(queued.map(message => (message.role === "custom" ? message.customType : message.role))).toEqual([
+					"ultrathink-notice",
+					userRole,
+					"ultrathink-notice",
+					userRole,
+				]);
+				expect(removed).toBe(true);
+				expect(remaining).toEqual(queued.slice(2));
+				const notices = session.messages.filter(
+					(message): message is CustomMessage =>
+						message.role === "custom" && message.customType === "ultrathink-notice",
+				);
+				expect<readonly AgentMessage[]>(notices).toEqual([queued[2]]);
+				expect(mock.calls).toHaveLength(2);
+				const delivered = JSON.stringify(mock.calls[1].context.messages);
+				expect(delivered).toContain("keep B");
+				expect(delivered).not.toContain("cancel A");
+				expect(delivered).toContain(JSON.stringify(notices[0].content).slice(1, -1));
+				expect(session.agent.hasQueuedMessages()).toBe(false);
+			});
+		}
+
 		it("prevents delivery of a promoted prompt and its hidden companions", async () => {
 			const { session, mock } = await createSession([{ content: ["initial"] }]);
 			let injected = false;
