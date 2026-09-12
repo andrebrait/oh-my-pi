@@ -16,6 +16,7 @@ ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
+QueuedMessageQueue: TypeAlias = Literal["steering", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
@@ -917,6 +918,11 @@ class OpenSessionResult:
 
 
 @dataclass(slots=True, frozen=True)
+class RemoveQueuedMessageResult:
+    removed: bool
+
+
+@dataclass(slots=True, frozen=True)
 class BranchMessage:
     entry_id: str
     text: str
@@ -1579,6 +1585,10 @@ def parse_open_session_result(payload: JsonObject) -> OpenSessionResult:
         session_id=_require_str(payload, "sessionId"),
         session_file=_optional_str(payload, "sessionFile"),
     )
+
+
+def parse_remove_queued_message_result(payload: JsonObject) -> RemoveQueuedMessageResult:
+    return RemoveQueuedMessageResult(removed=_require_bool(payload, "removed"))
 
 
 def parse_branch_result(payload: JsonObject | None) -> BranchResult:
