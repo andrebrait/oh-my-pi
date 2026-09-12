@@ -252,8 +252,8 @@ steering until the current turn completes.
 
 `peekSteeringQueue()` and `peekFollowUpQueue()` include pending originals while queued-message preparation is running.
 Use `replaceQueue("steering" | "followUp", messages)` to replace just one queue and cancel only its preparation;
-the other queue's in-flight preparation and delivery stay intact. `replaceQueues(steering, followUp)` replaces both queues
-and cancels preparation in both.
+the other queue's in-flight preparation and delivery stay intact. Already prepared batches retain recovery ownership
+until delivery. `replaceQueues(steering, followUp)` replaces both queues and cancels preparation in both.
 
 ## Custom Message Types
 

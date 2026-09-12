@@ -5,7 +5,7 @@
 ### Added
 
 - Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Added `remove_queued_message` to RPC and `removeQueuedMessage()` to the session and TypeScript client APIs to cancel a pending user-authored steering or follow-up message without resending, aborting, or restarting preparation in the other queue.
+- Added `remove_queued_message` to RPC and `removeQueuedMessage()` to the session and TypeScript client APIs to cancel a pending user-authored steering or follow-up message without resending, aborting, or restarting preparation in the other queue ([#3](https://github.com/andrebrait/oh-my-pi/pull/3) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
