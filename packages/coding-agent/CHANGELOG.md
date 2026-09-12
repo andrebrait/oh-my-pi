@@ -94,6 +94,7 @@
 - The structural summary cache now keys on the parser language path, so one file read through different extensions no longer reuses a stale summary ([#11892](https://github.com/can1357/oh-my-pi/pull/11892) by [@h4vc](https://github.com/h4vc)).
 - Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session.
 - Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session ([#11835](https://github.com/can1357/oh-my-pi/pull/11835) by [@andrebrait](https://github.com/andrebrait)).
+- Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session; returned overrides also stay current when hooks change tools ([#11835](https://github.com/can1357/oh-my-pi/pull/11835) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.18] - 2026-09-11
 
