@@ -1090,7 +1090,13 @@ export class Agent {
 	replaceQueue(queue: QueuedMessageQueue, messages: readonly AgentMessage[]): void {
 		if (queue === "steering") this.#steeringQueue = messages.slice();
 		else this.#followUpQueue = messages.slice();
-		this.#cancelQueuedMessagePreparation(queue);
+		// Prepared batches are no longer in the pending snapshot; keep their
+		// recovery ownership if a later batch fails before delivery.
+		const claim = this.#queuedMessageClaims[queue];
+		if (claim) {
+			delete this.#queuedMessageClaims[queue];
+			claim.controller.abort();
+		}
 		if (queue === "steering") this.#notifySteeringWaiters();
 	}
 
