@@ -250,6 +250,11 @@ agent.followUp({
 Steering messages are checked after each tool call by default. Set `interruptMode` to `"wait"` to defer
 steering until the current turn completes.
 
+`peekSteeringQueue()` and `peekFollowUpQueue()` include pending originals while queued-message preparation is running.
+Use `replaceQueue("steering" | "followUp", messages)` to replace just one queue and cancel only its preparation;
+the other queue's in-flight preparation and delivery stay intact. `replaceQueues(steering, followUp)` replaces both queues
+and cancels preparation in both.
+
 ## Custom Message Types
 
 Extend `AgentMessage` via declaration merging:

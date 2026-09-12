@@ -6419,9 +6419,7 @@ export class AgentSession {
 		messages: readonly AgentMessage[],
 		signal: AbortSignal,
 	): Promise<QueuedMessagePreparation> | undefined => {
-		const userMessages = messages.filter(
-			message => isUserQueuedMessage(message) && !("attribution" in message && message.attribution === "agent"),
-		);
+		const userMessages = messages.filter(isUserQueuedMessage);
 		const first = userMessages[0];
 		if (!first) return undefined;
 		const text: string[] = [];
@@ -7604,9 +7602,7 @@ export class AgentSession {
 	 * delivered target changes nothing; repeated calls may remove further duplicates.
 	 */
 	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const selected = queue === "steering" ? steering : followUp;
+		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		const index = selected.findIndex(message => {
 			if (!isUserQueuedMessage(message)) return false;
@@ -7619,10 +7615,7 @@ export class AgentSession {
 		while (start > 0 && isHiddenUserCompanion(selected[start - 1])) start--;
 		const remaining = selected.slice();
 		remaining.splice(start, index - start + 1);
-		this.agent.replaceQueues(
-			queue === "steering" ? remaining : steering.slice(),
-			queue === "followUp" ? remaining : followUp.slice(),
-		);
+		this.agent.replaceQueue(queue, remaining);
 		this.#reconcileQueuedMessageDrain();
 		return true;
 	}

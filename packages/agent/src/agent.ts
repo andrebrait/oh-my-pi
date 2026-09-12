@@ -1071,6 +1071,14 @@ export class Agent {
 		this.#notifySteeringWaiters();
 	}
 
+	/** Replace one pending queue, cancelling only that queue's in-flight preparation. */
+	replaceQueue(queue: QueuedMessageQueue, messages: readonly AgentMessage[]): void {
+		if (queue === "steering") this.#steeringQueue = messages.slice();
+		else this.#followUpQueue = messages.slice();
+		this.#cancelQueuedMessagePreparation(queue);
+		if (queue === "steering") this.#notifySteeringWaiters();
+	}
+
 	appendMessage(m: AgentMessage) {
 		this.#state.messages.push(m);
 		for (const delivery of this.#queuedMessageDeliveries) {
