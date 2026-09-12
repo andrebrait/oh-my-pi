@@ -50,6 +50,7 @@ import type {
 	AgentToolContext,
 	AgentTurnEndContext,
 	AsideMessage,
+	PrepareQueuedMessages,
 	SpeculativeToolExecutionConfig,
 	StreamFn,
 	ToolCallContext,
@@ -362,6 +363,13 @@ interface CursorToolResultEntry {
 	pending?: Promise<void>;
 }
 
+type QueuedMessageQueue = "steering" | "followUp";
+
+interface QueuedMessageClaim {
+	messages: AgentMessage[];
+	controller: AbortController;
+}
+
 export class Agent {
 	#state: AgentState = {
 		systemPrompt: [],
@@ -383,6 +391,7 @@ export class Agent {
 	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
+	#queuedMessageClaims: Partial<Record<QueuedMessageQueue, QueuedMessageClaim>> = {};
 	#steeringWaiters = new Set<() => void>();
 	#queuedMessageGrouping?: (previous: AgentMessage, next: AgentMessage) => boolean;
 
@@ -450,6 +459,8 @@ export class Agent {
 
 	streamFn: StreamFn;
 	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
+	/** Prepare actual queue deliveries after dequeue gates; commit runs only while ownership remains valid. */
+	prepareQueuedMessages?: PrepareQueuedMessages;
 	/**
 	 * Hook invoked after tool arguments are validated and before execution.
 	 * Reassign at any time to swap the implementation (e.g. on extension reload).
@@ -845,16 +856,63 @@ export class Agent {
 		for (const hook of this.#beforeQueuedMessageDequeueHooks) await hook(signal);
 	}
 
-	async #dequeueSteeringMessagesAfterHooks(signal?: AbortSignal): Promise<AgentMessage[]> {
-		if (signal?.aborted || this.#steeringQueue.length === 0) return [];
+	async #dequeueSteeringMessagesAfterHooks(signal: AbortSignal): Promise<AgentMessage[]> {
+		if (signal.aborted || this.#steeringQueue.length === 0) return [];
 		await this.#runBeforeQueuedMessageDequeueHooks(signal);
-		return signal?.aborted ? [] : this.#dequeueSteeringMessages();
+		return signal.aborted ? [] : this.#prepareQueuedMessageBatch("steering", signal);
 	}
 
-	async #dequeueFollowUpMessagesAfterHooks(signal?: AbortSignal): Promise<AgentMessage[]> {
-		if (signal?.aborted || this.#followUpQueue.length === 0) return [];
+	async #dequeueFollowUpMessagesAfterHooks(signal: AbortSignal): Promise<AgentMessage[]> {
+		if (signal.aborted || this.#followUpQueue.length === 0) return [];
 		await this.#runBeforeQueuedMessageDequeueHooks(signal);
-		return signal?.aborted ? [] : this.#dequeueFollowUpMessages();
+		return signal.aborted ? [] : this.#prepareQueuedMessageBatch("followUp", signal);
+	}
+
+	async #prepareQueuedMessageBatch(queue: QueuedMessageQueue, signal: AbortSignal): Promise<AgentMessage[]> {
+		if (this.#queuedMessageClaims[queue]) return [];
+		const messages = queue === "steering" ? this.#dequeueSteeringMessages() : this.#dequeueFollowUpMessages();
+		const prepare = this.prepareQueuedMessages;
+		if (!prepare || messages.length === 0) return messages;
+
+		const claim: QueuedMessageClaim = { messages, controller: new AbortController() };
+		const runController = this.#abortController;
+		this.#queuedMessageClaims[queue] = claim;
+		const preparationSignal = AbortSignal.any([signal, claim.controller.signal]);
+		try {
+			const preparation = await prepare(messages, preparationSignal);
+			signal.throwIfAborted();
+			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
+			const additional = preparation?.commit();
+			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
+			if (preparation && additional === undefined) {
+				// Stop this attempt before the loop can immediately reclaim the restored batch.
+				runController?.abort();
+				throw new DOMException("Queued message preparation cancelled", "AbortError");
+			}
+			delete this.#queuedMessageClaims[queue];
+			return additional?.length ? [...messages, ...additional] : messages;
+		} catch (error) {
+			if (signal.aborted) throw error;
+			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
+			throw error;
+		} finally {
+			if (this.#queuedMessageClaims[queue] === claim) this.#cancelQueuedMessagePreparation(queue, true);
+		}
+	}
+
+	#cancelQueuedMessagePreparation(queue: QueuedMessageQueue, restore = false): void {
+		const claim = this.#queuedMessageClaims[queue];
+		if (!claim) return;
+		delete this.#queuedMessageClaims[queue];
+		if (restore) {
+			if (queue === "steering") {
+				this.#steeringQueue = [...claim.messages, ...this.#steeringQueue];
+				this.#notifySteeringWaiters();
+			} else {
+				this.#followUpQueue = [...claim.messages, ...this.#followUpQueue];
+			}
+		}
+		claim.controller.abort();
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -989,6 +1047,8 @@ export class Agent {
 	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[]) {
 		this.#steeringQueue = steering.slice();
 		this.#followUpQueue = followUp.slice();
+		this.#cancelQueuedMessagePreparation("steering");
+		this.#cancelQueuedMessagePreparation("followUp");
 		this.#notifySteeringWaiters();
 	}
 
@@ -1023,11 +1083,13 @@ export class Agent {
 
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
+		this.#cancelQueuedMessagePreparation("steering");
 		this.#notifySteeringWaiters();
 	}
 
 	clearFollowUpQueue() {
 		this.#followUpQueue = [];
+		this.#cancelQueuedMessagePreparation("followUp");
 	}
 
 	/**
@@ -1042,26 +1104,36 @@ export class Agent {
 	clearAllQueues() {
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		this.#cancelQueuedMessagePreparation("steering");
+		this.#cancelQueuedMessagePreparation("followUp");
 		this.#notifySteeringWaiters();
 		this.clearDeferredToolDirectives();
 	}
 
 	hasQueuedMessages(): boolean {
-		return this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
+		return (
+			this.#steeringQueue.length > 0 ||
+			this.#followUpQueue.length > 0 ||
+			this.#queuedMessageClaims.steering !== undefined ||
+			this.#queuedMessageClaims.followUp !== undefined
+		);
 	}
 
 	/** Non-consuming view of the pending steering queue (insertion order, newest
 	 *  last). The session layer derives its queued-message display/count from
 	 *  this live view instead of a mirror, so the agent-core queue stays the
-	 *  single source of truth. */
+	 *  single source of truth. Includes exclusively claimed originals while
+	 *  preparation is pending, so editor restoration can cancel their delivery. */
 	peekSteeringQueue(): readonly AgentMessage[] {
-		return this.#steeringQueue;
+		const claim = this.#queuedMessageClaims.steering;
+		return claim ? [...claim.messages, ...this.#steeringQueue] : this.#steeringQueue;
 	}
 
 	/** Non-consuming view of the pending follow-up queue. See
 	 *  {@link peekSteeringQueue}. */
 	peekFollowUpQueue(): readonly AgentMessage[] {
-		return this.#followUpQueue;
+		const claim = this.#queuedMessageClaims.followUp;
+		return claim ? [...claim.messages, ...this.#followUpQueue] : this.#followUpQueue;
 	}
 
 	/** Nonblocking snapshot of the latest results, including provisional payloads while transforms are pending. */
@@ -1108,6 +1180,7 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
+		if (this.#steeringQueue.length === 0) this.#cancelQueuedMessagePreparation("steering", true);
 		return this.#steeringQueue.pop();
 	}
 
@@ -1116,6 +1189,7 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
+		if (this.#followUpQueue.length === 0) this.#cancelQueuedMessagePreparation("followUp", true);
 		return this.#followUpQueue.pop();
 	}
 
@@ -1155,15 +1229,19 @@ export class Agent {
 	}
 
 	reset() {
+		if (this.#queuedMessageClaims.steering || this.#queuedMessageClaims.followUp) {
+			this.#abortController?.abort();
+			this.#abortController = undefined;
+			this.#resolveRunningPrompt?.();
+			this.#runningPrompt = undefined;
+			this.#resolveRunningPrompt = undefined;
+		}
 		this.#state.messages.length = 0;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls.clear();
 		this.#state.error = undefined;
-		this.#steeringQueue = [];
-		this.#followUpQueue = [];
-		this.#notifySteeringWaiters();
-		this.clearDeferredToolDirectives();
+		this.clearAllQueues();
 	}
 
 	/** Send a prompt with an AgentMessage */
@@ -1236,42 +1314,7 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	/**
-	 * Prepare only the delivery unit that opens a queued run. Keep it queued until
-	 * preparation succeeds so cancellation or a failing hook cannot lose input.
-	 */
-	async #dequeueRunMessages(
-		mode: "steer" | "followUp",
-		signal: AbortSignal | undefined,
-		prepare?: (messages: readonly AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
-	): Promise<AgentMessage[]> {
-		if (!prepare) {
-			return mode === "steer"
-				? this.#dequeueSteeringMessagesAfterHooks(signal)
-				: this.#dequeueFollowUpMessagesAfterHooks(signal);
-		}
-		const getQueue = () => (mode === "steer" ? this.#steeringQueue : this.#followUpQueue);
-		if (signal?.aborted || getQueue().length === 0) return [];
-		await this.#runBeforeQueuedMessageDequeueHooks(signal);
-		signal?.throwIfAborted();
-		const selected = this.#dequeueMessages(getQueue(), mode === "steer" ? this.#steeringMode : this.#followUpMode);
-		if (selected.length === 0) return [];
-		const prepared = await prepare(selected, signal);
-		signal?.throwIfAborted();
-		const current = getQueue();
-		if (selected.some((message, index) => current[index] !== message)) {
-			throw new DOMException("Queued input changed during run preparation", "AbortError");
-		}
-		if (mode === "steer") this.#steeringQueue = current.slice(selected.length);
-		else this.#followUpQueue = current.slice(selected.length);
-		return prepared;
-	}
-
-	async continue(
-		signal?: AbortSignal,
-		/** Runs only when queued messages open a new run, never on in-run delivery or tool resumption. */
-		prepareQueuedRun?: (messages: readonly AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
-	) {
+	async continue(signal?: AbortSignal) {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1286,27 +1329,54 @@ export class Agent {
 		this.#state.error = undefined;
 
 		try {
-			const dequeueSignal = this.#continuationDequeueSignal(signal);
+			const dequeueSignal = this.#continuationDequeueSignal(signal) ?? continuationAbortController.signal;
 			const messages = this.#state.messages;
-			const last = messages[messages.length - 1];
-			// Resume unpaired tool calls before injecting any queued directive.
-			if (last?.role === "assistant" && unpairedToolCallTail(messages)) {
-				await this.#runLoop(undefined, undefined, signal, true);
-				return;
-			}
-			// A steer opens the run even after a non-conversational transcript tail.
-			const queuedSteering = await this.#dequeueRunMessages("steer", dequeueSignal, prepareQueuedRun);
-			if (queuedSteering.length > 0) {
-				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
-				return;
-			}
-			if (!last || last.role === "assistant") {
-				const queuedFollowUp = await this.#dequeueRunMessages("followUp", dequeueSignal, prepareQueuedRun);
+			if (messages.length === 0) {
+				// An empty transcript has nothing to resume, but a queued steer/follow-up
+				// must still be delivered as the opening turn — mirroring the assistant-tail
+				// branch below. Throwing here leaves the message undeliverable, and idle-drain
+				// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
+				// microtask because hasQueuedMessages() never clears, spinning an unbounded
+				// allocation loop until OOM (issue #6344).
+				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
+				if (this.#abortController !== continuationAbortController) return;
+				if (queuedSteering.length > 0) {
+					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					return;
+				}
+				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
+				if (this.#abortController !== continuationAbortController) return;
 				if (queuedFollowUp.length > 0) {
 					await this.#runLoop(queuedFollowUp, undefined, signal, true);
 					return;
 				}
-				throw new Error(!last ? "No messages to continue from" : "Cannot continue from message role: assistant");
+				throw new Error("No messages to continue from");
+			}
+			if (messages[messages.length - 1].role === "assistant") {
+				// A tail with unpaired runnable tool calls resumes by re-executing
+				// them (see `unpairedToolCallTail` in agent-loop). This must win over
+				// queued-message delivery: injecting a message between the tool_use
+				// blocks and their results would break the provider's pairing
+				// invariant. Queued messages drain inside the resumed loop instead.
+				if (unpairedToolCallTail(messages)) {
+					await this.#runLoop(undefined, undefined, signal, true);
+					return;
+				}
+				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
+				if (this.#abortController !== continuationAbortController) return;
+				if (queuedSteering.length > 0) {
+					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					return;
+				}
+
+				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
+				if (this.#abortController !== continuationAbortController) return;
+				if (queuedFollowUp.length > 0) {
+					await this.#runLoop(queuedFollowUp, undefined, signal, true);
+					return;
+				}
+
+				throw new Error("Cannot continue from message role: assistant");
 			}
 
 			await this.#runLoop(undefined, undefined, signal, true);
@@ -1526,7 +1596,7 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.#dequeueSteeringMessagesAfterHooks(signal);
+				return this.#dequeueSteeringMessagesAfterHooks(signal ?? loopSignal);
 			},
 			hasSteeringMessages: () => {
 				if (this.#steeringQueue.length === 0) {
@@ -1551,7 +1621,7 @@ export class Agent {
 			},
 			waitForSteeringMessages: signal => this.#waitForSteeringMessages(signal),
 			hasIrcInterrupts: this.hasIrcInterrupts,
-			getFollowUpMessages: signal => this.#dequeueFollowUpMessagesAfterHooks(signal),
+			getFollowUpMessages: signal => this.#dequeueFollowUpMessagesAfterHooks(signal ?? loopSignal),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
 			telemetry: this.#telemetry,
@@ -1567,6 +1637,7 @@ export class Agent {
 				: agentLoopContinue(context, config, loopSignal, this.streamFn);
 
 			for await (const event of stream) {
+				if (this.#abortController !== loopAbortController) return;
 				if (event.type === "turn_start") turnOpen = true;
 				if (event.type === "turn_end") turnOpen = false;
 				// Update internal state based on events
@@ -1637,6 +1708,7 @@ export class Agent {
 				}
 			}
 		} catch (err) {
+			if (this.#abortController !== loopAbortController) return;
 			const stoppedForAbort = loopSignal.aborted;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(loopSignal)

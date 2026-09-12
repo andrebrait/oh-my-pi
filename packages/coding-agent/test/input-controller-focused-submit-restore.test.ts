@@ -108,7 +108,7 @@ describe("InputController focused submit restore-on-error", () => {
 	});
 
 	for (const key of ["Enter", "Ctrl+Enter"] as const) {
-		it(`${key} intercepts focused input with the target runner and restores transformed failures`, async () => {
+		it(`${key} preserves focused chat and restores failed drafts without input interception`, async () => {
 			const { ctx, editor, prompt } = createContext({ pendingImages: [] });
 			const mainInput = vi.fn();
 			const focusedInput = vi.fn(async () => ({ text: "transformed normal mode" }));
@@ -121,16 +121,15 @@ describe("InputController focused submit restore-on-error", () => {
 			else await controller.handleFollowUp();
 
 			expect(mainInput).not.toHaveBeenCalled();
-			expect(focusedInput).toHaveBeenCalledTimes(1);
-			expect(focusedInput).toHaveBeenCalledWith("normal mode", undefined, "interactive");
-			expect(prompt).toHaveBeenCalledWith("transformed normal mode", {
+			expect(focusedInput).not.toHaveBeenCalled();
+			expect(prompt).toHaveBeenCalledWith("normal mode", {
 				streamingBehavior: key === "Enter" ? "steer" : "followUp",
 				images: undefined,
 			});
-			expect(editor.getText()).toBe("transformed normal mode");
+			expect(editor.getText()).toBe("normal mode");
 		});
 
-		it(`${key} lets the focused input hook consume commands before the chat-only gate`, async () => {
+		it(`${key} enforces the focused chat-only gate without letting input hooks consume commands`, async () => {
 			const { ctx, editor, prompt } = createContext({ pendingImages: [] });
 			const focusedInput = vi.fn(async () => ({ handled: true }));
 			const showStatus = vi.fn();
@@ -142,10 +141,10 @@ describe("InputController focused submit restore-on-error", () => {
 			if (key === "Enter") await ctx.editor.onSubmit?.(editor.getText());
 			else await controller.handleFollowUp();
 
-			expect(focusedInput).toHaveBeenCalledTimes(1);
+			expect(focusedInput).not.toHaveBeenCalled();
 			expect(prompt).not.toHaveBeenCalled();
-			expect(showStatus).not.toHaveBeenCalled();
-			expect(editor.getText()).toBe("");
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(editor.getText()).toBe("/help");
 		});
 	}
 });

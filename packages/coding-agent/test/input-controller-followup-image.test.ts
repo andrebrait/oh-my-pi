@@ -337,7 +337,7 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		expect(editor.pendingImageLinks).toEqual(["blob://transformed.png"]);
 	});
 
-	it("observes a typed continue shortcut once without emitting its synthetic directive as input", async () => {
+	it("keeps typed continue shortcuts on the synthetic path without external input interception", async () => {
 		const { ctx, editor, emitInput } = createContext({
 			isStreaming: false,
 			pendingImages: [],
@@ -350,8 +350,7 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		controller.setupEditorSubmitHandler();
 		await editor.onSubmit?.(".");
 
-		expect(emitInput).toHaveBeenCalledTimes(1);
-		expect(emitInput).toHaveBeenCalledWith(".", undefined, "interactive");
+		expect(emitInput).not.toHaveBeenCalled();
 		expect(onInput).toHaveBeenCalledWith(expect.objectContaining({ synthetic: true, userInitiated: true }));
 	});
 });

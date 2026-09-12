@@ -22,7 +22,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { dispatchRpcSkillPrompt, RpcExtensionUserMessageTracker } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import { tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -329,10 +329,8 @@ describe("AgentSession queued steer delivery", () => {
 			session.agent.setOnBeforeYield(async () => {
 				if (injected) return;
 				injected = true;
-				const queued = Promise.withResolvers<void>();
-				await dispatchRpcSkillPrompt({
-					id: "queued-skill",
-					session: {
+				await tryRunRpcSkillCommand(
+					{
 						skillsSettings: { enableSkillCommands: true },
 						skills: [
 							{
@@ -343,19 +341,11 @@ describe("AgentSession queued steer delivery", () => {
 								source: "project",
 							},
 						],
-						async promptCustomMessage(message, options) {
-							const result = await session.promptCustomMessage(message, options);
-							queued.resolve();
-							return result;
-						},
+						promptCustomMessage: session.promptCustomMessage.bind(session),
 					},
-					message: invocation,
-					streamingBehavior: "followUp",
-					output: () => {},
-					onError: error => queued.reject(error),
-					extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
-				});
-				await withTimeout(queued.promise, 2_000, "Skill did not reach the native queue");
+					invocation,
+					"followUp",
+				);
 				promoted = session.promoteQueuedMessage(invocation);
 				queueAfterPromotion = session.getQueuedMessages();
 				promotedAgain = session.promoteQueuedMessage(invocation);

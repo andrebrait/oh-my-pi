@@ -309,20 +309,41 @@ Cancelable pre-events:
 - `turn_start` / `turn_end`
 - `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached message snapshot, so use `tool_result` or `context` when an extension needs to change provider context
 
-Interactive Enter/Ctrl+Enter and RPC `prompt`, `steer`, `follow_up`, and
-`abort_and_prompt` emit `input` once at submission, before command interpretation
-or queueing. Handlers may replace text/images or return `{ handled: true }`.
-Focused editor submissions use the focused session's handlers. Queue delivery
-and synthetic continuation directives do not replay external input events;
-extension `sendUserMessage` remains a raw-message API, not command invocation.
+#### External input interception
 
-When queued user messages open a new agent run, `before_agent_start` prepares
-their system prompt and companion messages before the provider request. Its
-prompt/images describe the user messages in the opening delivery unit; grouped
-hidden companions retain their delivery order.
-Delivery into an already-running loop, synthetic-only queued continuations, and
-retry/tool resumption do not trigger this additional preparation. Queue ownership
-is retained if preparation fails or is cancelled.
+`input` runs once at submission ingress, before command interpretation, skill or
+prompt-template expansion, and queue insertion:
+
+| Submission | `source` |
+|---|---|
+| Main-session Enter or Ctrl+Enter | `"interactive"` |
+| `prompt`, `steer`, `follow_up`, or `abort_and_prompt` in RPC or RPC UI mode | `"rpc"` |
+
+Handlers run in extension/registration order. Returned `text` and `images`
+replacements feed subsequent handlers; omitted fields preserve the current value,
+and `images: []` removes attachments. Replacement text is trimmed before dispatch.
+`handled: true` stops the remaining handlers and normal dispatch. Empty text with
+no remaining images also stops normal dispatch. Work explicitly scheduled by a
+handler through `sendUserMessage` or `sendMessage` is not discarded.
+
+This is an ingress event, not a user-role message event. Queue delivery and replay
+do not emit it again. Programmatic `sendUserMessage`/`sendMessage` calls and
+synthetic continuations do not automatically emit `input`. Main-session Enter's
+`.`/`c` continuation shortcuts retain their synthetic path. Focused-subagent
+input retains its chat-only routing and does not invoke main-session input hooks.
+Print and ACP input are outside this interception contract.
+
+RPC input handlers may await extension UI responses without blocking the stdin
+reader. See [RPC completion and ordering](./rpc.md#promptqueue-concurrency-and-ordering),
+including local-only completion for consumed `abort_and_prompt` replacements.
+
+#### Delivery policy preparation
+
+`before_agent_start` prepares policy for an ordinary prompt and for each steering or follow-up batch containing user work when that batch is actually dequeued. It is not an enqueue notification: a live batch can fire it without another `agent_start`. Queue peeks, retries, tool-only iterations, and synthetic-only queued continuations do not fire it. Explicit synthetic prompts retain their ordinary prompt lifecycle.
+
+For queued batches, `prompt` contains the already-transformed text of every selected user message, joined with two newlines between messages; text blocks within a message are concatenated. `images` contains their already-normalized images in delivery order. Hidden agent-attributed companions are excluded from these event inputs but remain in the delivered batch. Input hooks, commands, templates, and original attachment preprocessing are not rerun.
+
+Handlers chain from the current base system prompt. Their final override governs the next provider request and its continuations until another prompt or user-containing batch prepares policy. Returned custom messages are appended once after the original batch; originals retain their order, identity, attribution, and metadata. Host application of results is cancelled if the turn is aborted or the session or queue ownership changes while handlers are pending. Handlers should not assume that their own external side effects can be rolled back; a cancelled delivery may be prepared again when resumed.
 
 ### Tool lifecycle
 
