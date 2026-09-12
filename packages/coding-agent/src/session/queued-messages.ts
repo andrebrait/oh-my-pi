@@ -59,7 +59,7 @@ export function isTerminalTextAssistantAnswer(message: AgentMessage | undefined)
 
 /** Whether queued content was authored by the user and can be restored to the editor. */
 export function isUserQueuedMessage(message: AgentMessage): boolean {
-	if (message.role === "user") return true;
+	if (message.role === "user") return message.attribution !== "agent";
 	return message.role === "custom" && message.attribution === "user" && message.display !== false;
 }
 
@@ -69,13 +69,18 @@ const MAGIC_KEYWORD_NOTICE_TYPES: ReadonlySet<string> = new Set(MAGIC_KEYWORDS.m
 /** Hidden companion carrying vision descriptions for a text-only model. */
 export const IMAGE_ATTACHMENT_DESCRIPTION_TYPE = "image-attachment-description";
 
+/** Hidden companion carrying the source path of a video contact sheet. */
+export const VIDEO_ATTACHMENT_TYPE = "video-attachment";
+
 /** Whether a hidden queued message is a companion of an adjacent user prompt. */
 export function isHiddenUserCompanion(message: AgentMessage): boolean {
 	return (
 		message.role === "custom" &&
 		message.attribution === "user" &&
 		message.display === false &&
-		(MAGIC_KEYWORD_NOTICE_TYPES.has(message.customType) || message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE)
+		(MAGIC_KEYWORD_NOTICE_TYPES.has(message.customType) ||
+			message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE ||
+			message.customType === VIDEO_ATTACHMENT_TYPE)
 	);
 }
 
