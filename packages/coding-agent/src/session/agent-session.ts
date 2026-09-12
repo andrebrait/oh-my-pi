@@ -1317,6 +1317,10 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.tokenRate = new TokenRateMeter(text => this.agent.tokenizer.countTokens(text));
 		this.#reseedTokenRate();
+		this.agent.setQueuedMessageGrouping(
+			(previous, next) =>
+				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
+		);
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
@@ -6463,14 +6467,12 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			// Steer/follow-up/aside the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
+				preprocessed: {
+					keywordNotices,
+				},
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -6518,15 +6520,13 @@ export class AgentSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				preprocessed: {
 					images: normalizedImages,
 					descriptionNotice: imageDescriptionNotice,
+					keywordNotices,
 				},
 			});
 			outcome.sessionClaimed = true;
@@ -6678,30 +6678,11 @@ export class AgentSession {
 			);
 		}
 
-		if (options?.queueOnly) {
+		if (options?.queueOnly || this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
-			outcome.sessionClaimed = true;
-			return true;
-		}
-		if (this.isStreaming) {
-			const streamingBehavior = options?.streamingBehavior;
-			if (!streamingBehavior) {
-				// Mirrors #dispatchPrompt: busy because the agent owns a turn claims the
-				// session; busy only from another prompt's setup claims nothing.
-				outcome.sessionClaimed = this.agent.state.isStreaming;
-				throw new AgentBusyError();
-			}
-
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, keywordNotices);
 			outcome.sessionClaimed = true;
 			return true;
 		}
@@ -7340,12 +7321,18 @@ export class AgentSession {
 		options?: {
 			timestamp?: number;
 			attribution?: MessageAttribution;
-			preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined };
+			prependMessages?: readonly CustomMessage[];
+			preprocessed?: {
+				images?: ImageContent[];
+				descriptionNotice?: CustomMessage;
+				keywordNotices?: readonly CustomMessage[];
+			};
 		},
 	): Promise<void> {
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const preprocessed = options?.preprocessed;
+		const prependMessages = options?.prependMessages ?? preprocessed?.keywordNotices ?? [];
 		// Captured before any await below so the aside branch can detect a
 		// newSession()/switchSession() that completed while normalization/vision
 		// description was in flight and drop a record that would otherwise land in a
@@ -7377,7 +7364,7 @@ export class AgentSession {
 				: undefined;
 		if (mode === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
-			const records: AgentMessage[] = [];
+			const records: AgentMessage[] = [...prependMessages];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			records.push({ role: "user", content, attribution, timestamp: timestamp ?? Date.now() });
 			this.#irc.queueAside(records);
@@ -7389,7 +7376,9 @@ export class AgentSession {
 			return;
 		}
 		this.#allowQueuedMessageDrainRetry();
+		// Publish the complete group without yielding: removal owns contiguous companions.
 		if (mode === "followUp") {
+			for (const notice of prependMessages) this.agent.followUp(notice);
 			for (const notice of attachmentSourceNotices) this.agent.followUp(notice);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -7399,6 +7388,7 @@ export class AgentSession {
 				timestamp: timestamp ?? Date.now(),
 			});
 		} else {
+			for (const notice of prependMessages) this.agent.steer(notice);
 			for (const notice of attachmentSourceNotices) this.agent.steer(notice);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer({
@@ -7604,6 +7594,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp" | "aside",
 		queueChipText?: string,
+		prependMessages: readonly CustomMessage[] = [],
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
@@ -7632,7 +7623,7 @@ export class AgentSession {
 			// Non-interrupting: rides the same step-boundary aside poll as
 			// sendCustomMessage's streaming aside branch — not an agent-core queue
 			// entry, so no drain-retry latch and no idle-queue drain scheduling.
-			this.#irc.queueAside([normalizedAppMessage]);
+			this.#irc.queueAside([...prependMessages, normalizedAppMessage]);
 			// The image-normalization await above can span the run's settle, so the run may
 			// already be idle by the time the record lands in the aside queue with no loop
 			// left to drain it. Resuming here is a no-op while streaming and wakes/folds
@@ -7641,9 +7632,12 @@ export class AgentSession {
 			return;
 		}
 		this.#allowQueuedMessageDrainRetry();
+		// Keyword notices and their user message must enter the queue in one synchronous phase.
 		if (deliverAs === "followUp") {
+			for (const notice of prependMessages) this.agent.followUp(notice);
 			this.agent.followUp(normalizedAppMessage);
 		} else {
+			for (const notice of prependMessages) this.agent.steer(notice);
 			this.agent.steer(normalizedAppMessage);
 		}
 		this.#scheduleIdleQueueDrain();
@@ -7960,13 +7954,18 @@ export class AgentSession {
 		});
 		if (index < 0) return false;
 
-		let start = index;
-		while (start > 0 && isHiddenUserCompanion(selected[start - 1])) start--;
-		const remaining = selected.slice();
-		remaining.splice(start, index - start + 1);
-		this.agent.replaceQueue(queue, remaining);
+		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
 		this.#reconcileQueuedMessageDrain();
 		return true;
+	}
+
+	/** Companions are inserted contiguously before their user; preserve every other group. */
+	#withoutQueuedUserMessage(queue: readonly AgentMessage[], userIndex: number): AgentMessage[] {
+		let start = userIndex;
+		while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
+		const remaining = queue.slice();
+		remaining.splice(start, userIndex - start + 1);
+		return remaining;
 	}
 
 	/**
@@ -7983,27 +7982,17 @@ export class AgentSession {
 			}
 			return -1;
 		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
-		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
-			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
-			const next = queue.slice();
-			next.splice(start, userIndex - start + 1);
-			return next;
-		};
 		const fromSteer = lastUserIndex(steering);
 		if (fromSteer >= 0) {
 			const removed = steering[fromSteer];
-			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
+			this.agent.replaceQueues(this.#withoutQueuedUserMessage(steering, fromSteer), followUp.slice());
 			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
-			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
+			this.agent.replaceQueues(steering.slice(), this.#withoutQueuedUserMessage(followUp, fromFollowUp));
 			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
