@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+
+### Fixed
+
+- Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC submissions and interactive follow-ups now run extension input hooks before command interpretation and queueing, preserving transformed attachments and handled-input results.
+- Queued user messages that start a new agent run now refresh extension startup policy and hidden context without repeating input hooks or applying startup hooks to in-run delivery.
+
 ## [18.1.18] - 2026-09-11
 
 ### Added
@@ -22,22 +34,11 @@
 - `models.yml` now validates the per-model `compat.stripImageInput` opt-out, so a wrong-typed value is rejected like every other declared compat key instead of being silently accepted ([#11697](https://github.com/can1357/oh-my-pi/issues/11697)).
 - `/mcp reload` now distinguishes servers still connecting after the bounded reload window instead of reporting a healthy asynchronous reload as zero active servers ([#11639](https://github.com/can1357/oh-my-pi/issues/11639)).
 - Fixed isolated tasks dropping nested-repo work: nested diffs persist as `<agent>.nested-*.patch` before cleanup, `apply=false` lists each file, isolated agents report as non-resumable, and runs needing manual recovery report failed ([#11343](https://github.com/can1357/oh-my-pi/pull/11343) by [@grapexy](https://github.com/grapexy)).
-- RPC submissions and interactive follow-ups now run extension input hooks before command interpretation and queueing, preserving transformed attachments and handled-input results.
-- Queued user messages that start a new agent run now refresh extension startup policy and hidden context without repeating input hooks or applying startup hooks to in-run delivery.
 - Fixed the Windows PowerShell installer (`install.ps1`) aborting on Windows PowerShell 5.1 when bun or git wrote normal progress to stderr: native commands now run with `$ErrorActionPreference` scoped to `Continue` and success is gated on the process exit code, so `$ErrorActionPreference = "Stop"`'s stderr-as-terminating-error behavior no longer kills the install ([#11675](https://github.com/can1357/oh-my-pi/issues/11675)).
 - Eval cell timeouts no longer fatally terminate the session when a browser tab worker is being recycled ([#11707](https://github.com/can1357/oh-my-pi/issues/11707)).
 - Models whose images are stripped on the wire (`compat.stripImageInput`) now trigger the `describeForTextModels` vision fallback and are skipped when resolving the vision model, instead of silently dropping images ([#9697](https://github.com/can1357/oh-my-pi/issues/9697)).
 - `#readProjectSettings` now logs capability warnings when a project `.claude/settings.json` fails to parse, instead of silently dropping them ([#11570](https://github.com/can1357/oh-my-pi/issues/11570)).
 - A malformed project `.claude/settings.json` now produces a warning instead of being silently ignored ([#11570](https://github.com/can1357/oh-my-pi/issues/11570)).
-### Added
-
-- Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-
-### Fixed
-
-- Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.17] - 2026-09-10
 
