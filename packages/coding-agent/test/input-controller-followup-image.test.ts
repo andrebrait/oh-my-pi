@@ -10,6 +10,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { InputEventResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 
 interface StubEditor {
 	onSubmit?: (text: string) => Promise<void>;
@@ -302,21 +303,23 @@ describe("InputController.handleFollowUp image forwarding", () => {
 
 		it(`${key} queues transformed input rather than the original draft during compaction`, async () => {
 			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
-			const { ctx, editor, emitInput, queueCompactionMessage } = createContext({
+			const { ctx, editor, emitInput } = createContext({
 				isStreaming: true,
 				pendingImages: [],
 				input: async text => ({ text: `transformed ${text}`, images: [image] }),
 			});
+			const helpers = new UiHelpers(ctx);
+			ctx.showStatus = vi.fn();
+			ctx.queueCompactionMessage = (text, mode, images, options) =>
+				helpers.queueCompactionMessage(text, mode, images, options);
 			Object.assign(ctx.session, { isCompacting: true });
 			editor.setText("stop ponytail");
 			await submit(new InputController(ctx), editor);
 
 			expect(emitInput).toHaveBeenCalledTimes(1);
-			expect(queueCompactionMessage).toHaveBeenCalledWith(
-				"transformed stop ponytail",
-				key === "Enter" ? "steer" : "followUp",
-				[image],
-			);
+			expect(ctx.compactionQueuedMessages).toEqual([
+				{ text: "transformed stop ponytail", mode: key === "Enter" ? "steer" : "followUp", images: [image] },
+			]);
 		});
 	}
 
