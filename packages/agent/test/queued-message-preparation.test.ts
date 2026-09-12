@@ -168,6 +168,42 @@ describe("queued message preparation", () => {
 		},
 	);
 
+	it("editing a pending queue preserves recovery of its already prepared batch", async () => {
+		const mock = createMockModel({ handler: { content: ["done"] } });
+		const agent = new Agent({
+			streamFn: mock.stream,
+			initialState: { model: mock.model },
+			steeringMode: "all",
+			followUpMode: "all",
+		});
+		const prepared = createUserMessage("keep prepared");
+		const following = createUserMessage("following batch");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		agent.setOnBeforeYield(() => {
+			agent.setOnBeforeYield(undefined);
+			agent.steer(prepared);
+			agent.followUp(following);
+		});
+		agent.prepareQueuedMessages = async messages => {
+			if (messages.includes(prepared)) return { commit: () => [] };
+			started.resolve();
+			await release.promise;
+			throw new Error("later preparation failed");
+		};
+		const running = agent.prompt("ordinary");
+		await started.promise;
+		agent.steer(createUserMessage("cancel pending"));
+		agent.replaceQueue("steering", []);
+		release.resolve();
+		await running;
+		expect(agent.peekSteeringQueue()).toEqual([prepared]);
+		expect(agent.peekFollowUpQueue()).toEqual([following]);
+		agent.prepareQueuedMessages = undefined;
+		await agent.continue();
+		expect(userTexts(mock.calls.at(-1)!.context.messages)).toEqual(["ordinary", "keep prepared", "following batch"]);
+	});
+
 	it("restores an aborted idle claim ahead of new enqueues without committing stale context", async () => {
 		const mock = createMockModel({ handler: { content: ["done"] } });
 		const agent = new Agent({ streamFn: mock.stream, initialState: { model: mock.model }, followUpMode: "all" });
