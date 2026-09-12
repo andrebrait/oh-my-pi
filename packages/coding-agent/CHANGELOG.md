@@ -11,8 +11,9 @@
 - Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- RPC submissions and interactive follow-ups now run extension input hooks before command interpretation and queueing, preserving transformed attachments and handled-input results.
-- Queued user messages that start a new agent run now refresh extension startup policy and hidden context without repeating input hooks or applying startup hooks to in-run delivery.
+- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations and local-only completion.
+- Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session.
+- Skill invocations through RPC retain and normalize attachments after input-hook transformations.
 
 ## [18.1.18] - 2026-09-11
 

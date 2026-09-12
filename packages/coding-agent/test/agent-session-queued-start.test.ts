@@ -108,7 +108,7 @@ describe("AgentSession queued run before_agent_start", () => {
 		expect(requestText(request)).toContain("Context for first queued request");
 	});
 
-	it("does not repeat bootstrap messages when steering an already-running turn", async () => {
+	it("prepares live steering context once without duplicating the original bootstrap", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		let calls = 0;
@@ -139,8 +139,8 @@ describe("AgentSession queued run before_agent_start", () => {
 		expect(requests).toHaveLength(2);
 		const text = requestText(requests[1]);
 		expect(text).toContain("mid-run correction");
-		expect(text.match(/Bootstrap for /g)).toHaveLength(1);
-		expect(text).toContain("Bootstrap for original request");
+		expect(text.match(/Bootstrap for original request/g)).toHaveLength(1);
+		expect(text.match(/Bootstrap for mid-run correction/g)).toHaveLength(1);
 	});
 
 	it("retains policy for synthetic continuations but refreshes it for the next idle user steer", async () => {
