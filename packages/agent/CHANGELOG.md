@@ -43,6 +43,12 @@
 ### Fixed
 
 - Speculative stream sessions are now discarded when a hook or argument transform replaces a call's arguments while keeping its ID, instead of releasing deferred work planned from the original code ([#11889](https://github.com/can1357/oh-my-pi/pull/11889) by [@h4vc](https://github.com/h4vc)).
+### Added
+
+- Added `Agent.setQueuedMessageGrouping()` so hosts can deliver adjacent companion records and their prompt together in `one-at-a-time` queue modes ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Added optional queued-message preparation with cancellation-safe delivery and appended context.
+- Added optional queued-message grouping so attachment context and its user message stay together in one-at-a-time delivery ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Added `Agent.replaceQueue()` to update one pending queue without restarting preparation in the other.
 
 ## [18.1.18] - 2026-09-11
 
