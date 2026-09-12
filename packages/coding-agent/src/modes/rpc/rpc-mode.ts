@@ -141,6 +141,7 @@ export type RpcSkillCommandResult = { agentInvoked: true };
 
 export interface RpcSkillInvocation extends SkillPromptInput {
 	skill: Skill;
+	queueChipText: string;
 }
 
 /**
@@ -154,7 +155,7 @@ export function resolveRpcSkillInvocation(session: RpcSkillCommandSession, text:
 	if (!parsed) return null;
 	const skill = session.skills.find(candidate => candidate.name === parsed.name);
 	if (!skill) return null;
-	return { skill, args: parsed.args, prompt: parsed.prompt };
+	return { skill, args: parsed.args, prompt: parsed.prompt, queueChipText: text };
 }
 
 /**
@@ -179,7 +180,7 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior },
+		{ streamingBehavior, queueChipText: invocation.queueChipText },
 	);
 }
 
@@ -1223,6 +1224,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "follow_up": {
 				await session.followUp(command.message, command.images);
 				return success(id, "follow_up");
+			}
+
+			case "remove_queued_message": {
+				if (typeof command.message !== "string") {
+					return error(id, "remove_queued_message", "message must be a string");
+				}
+				if (command.queue !== "steering" && command.queue !== "followUp") {
+					return error(id, "remove_queued_message", 'queue must be "steering" or "followUp"');
+				}
+				return success(id, "remove_queued_message", {
+					removed: session.removeQueuedMessage(command.message, command.queue),
+				});
 			}
 
 			case "abort": {
