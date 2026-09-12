@@ -24,6 +24,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { assistantMsg } from "./utilities";
 
 interface BtwBranchResult {
@@ -184,6 +185,34 @@ describe("AgentSession concurrent prompt dispatch", () => {
 						entry.message.content.some(block => block.type === "text" && block.text === "Still belongs here"),
 				),
 		).toBe(true);
+	});
+
+	it("does not dispatch a custom image prompt after aborting its normalization", async () => {
+		createSession();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(imageLoading, "normalizeModelContextImages").mockImplementationOnce(async images => {
+			entered.resolve();
+			await release.promise;
+			return images;
+		});
+		const provider = vi.spyOn(session.agent, "streamFn");
+		const prompt = session.promptCustomMessage({
+			customType: "collab-prompt",
+			content: [
+				{ type: "text", text: "cancel this attachment" },
+				{ type: "image", mimeType: "image/png", data: "aW1hZ2U=" },
+			],
+			display: true,
+			attribution: "user",
+		});
+		await entered.promise;
+		const abort = session.abort();
+		release.resolve();
+		expect(await prompt).toBe(false);
+		await abort;
+		expect(provider).not.toHaveBeenCalled();
+		expect(session.messages).toEqual([]);
 	});
 
 	it("queues a prompt that loses the pre-dispatch race instead of racing a second turn", async () => {
