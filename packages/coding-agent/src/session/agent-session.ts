@@ -6326,22 +6326,26 @@ export class AgentSession {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
+		const generation = this.#promptGeneration;
+		const disposingBeforePreparation = this.#isDisposed;
+		const signal = this.#postPromptTasksAbortController.signal;
+		// Command expansion and attachment preparation precede turn ownership.
+		// An abort during either must not let this submission acquire a fresh slot.
+		const typedText = text;
+		const wasCancelled = () => {
+			if (this.#promptGeneration === generation && (!this.#isDisposed || disposingBeforePreparation)) return false;
+			if (!options?.synthetic) this.#promptDropped?.({ text: typedText, images: options?.images });
+			return true;
+		};
 		// A manual `/compact` runs with the agent subscription disconnected until its
 		// cleanup finally re-drains the preserved queues. Starting a turn before then
 		// would neither persist nor forward its events and could race the in-flight
 		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
-		// here, and a waiting prompt supersedes the interrupted-turn resume the
-		// compaction would otherwise schedule — but only once it actually claims the
-		// session (a turn dispatched or queued, or one already running). A locally
-		// handled command, a pre-dispatch throw, or a prompt dropped by the
-		// abort/preflight race hands the resume back via `release(false)`. A prompt
-		// arriving after the cleanup while an earlier parked prompt is still settling
-		// takes part in the same decision. No-op otherwise.
 		const release = await this.#maintenance.waitForManualCompactionCleanup();
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
+		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome, wasCancelled, signal);
 		try {
-			return await this.#dispatchPrompt(text, options, submittedAt, outcome);
+			return await this.#dispatchPrompt(text, options, submittedAt, outcome, wasCancelled, signal);
 		} finally {
 			release(outcome.sessionClaimed);
 		}
@@ -6352,7 +6356,10 @@ export class AgentSession {
 		options: PromptOptions | undefined,
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
+		wasCancelled: () => boolean,
+		signal: AbortSignal,
 	): Promise<boolean> {
+		if (wasCancelled()) return false;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		// Slash/custom-command handling below rewrites `text`; keep the original
 		// so a dropped prompt is handed back exactly as the user typed it.
@@ -6363,6 +6370,7 @@ export class AgentSession {
 			if (handled) {
 				return false;
 			}
+			if (wasCancelled()) return false;
 
 			// Try custom commands (TypeScript slash commands)
 			const customResult = await this.#tryExecuteCustomCommand(text);
@@ -6379,6 +6387,7 @@ export class AgentSession {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+		if (wasCancelled()) return false;
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -6413,16 +6422,9 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			// Steer/follow-up/aside the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
-				timestamp: submittedAt,
-				attribution: promptAttribution,
-			});
+			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, keywordNotices);
 			outcome.sessionClaimed = true;
+			return true;
 			return true;
 		}
 
@@ -6443,6 +6445,7 @@ export class AgentSession {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
 		const videoAttachmentNotices = this.#createVideoAttachmentNotices(options?.images, submittedAt);
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+		if (wasCancelled()) return false;
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
@@ -6451,8 +6454,9 @@ export class AgentSession {
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, signal)
 			: undefined;
+		if (wasCancelled()) return false;
 
 		// A concurrent prompt() can start a turn during the awaits above: image
 		// normalization and the vision-description call suspend after the
@@ -6468,16 +6472,9 @@ export class AgentSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
-				timestamp: submittedAt,
-				attribution: promptAttribution,
-				preprocessed: {
-					images: normalizedImages,
-					descriptionNotice: imageDescriptionNotice,
-				},
+			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, keywordNotices, {
+				images: normalizedImages,
+				descriptionNotice: imageDescriptionNotice,
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -6776,7 +6773,7 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPromptAdmitted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -6790,6 +6787,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
 		try {
+			options?.onPromptAdmitted?.();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Prepare custom attachments once, within prompt ownership, before publishing their companions.
@@ -7270,11 +7268,9 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp" | "aside",
-		options?: {
-			timestamp?: number;
-			attribution?: MessageAttribution;
-			preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined };
-		},
+		timestamp?: number,
+		prependMessages: readonly CustomMessage[] = [],
+		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
 	): Promise<void> {
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
@@ -7311,7 +7307,7 @@ export class AgentSession {
 				: undefined;
 		if (mode === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
-			const records: AgentMessage[] = [];
+			const records: AgentMessage[] = [...prependMessages];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			records.push({ role: "user", content, attribution, timestamp: timestamp ?? Date.now() });
 			this.#irc.queueAside(records);
@@ -7326,7 +7322,9 @@ export class AgentSession {
 		// but not the non-interrupting aside path above.
 		if (this.#isDisposed || this.#promptGeneration !== generation) return;
 		this.#allowQueuedMessageDrainRetry();
+		// Publish every companion and its user record together, without yielding.
 		if (mode === "followUp") {
+			for (const notice of prependMessages) this.agent.followUp(notice);
 			for (const notice of videoAttachmentNotices) this.agent.followUp(notice);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -7336,6 +7334,7 @@ export class AgentSession {
 				timestamp: timestamp ?? Date.now(),
 			});
 		} else {
+			for (const notice of prependMessages) this.agent.steer(notice);
 			for (const notice of videoAttachmentNotices) this.agent.steer(notice);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer({
