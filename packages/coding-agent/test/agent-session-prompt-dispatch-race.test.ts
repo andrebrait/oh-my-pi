@@ -177,7 +177,12 @@ describe("AgentSession concurrent prompt dispatch", () => {
 			runtime,
 			"cancel-tree",
 		);
-		createSession(undefined, false, manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
+		createSession(
+			undefined,
+			false,
+			manager,
+			new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry),
+		);
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);

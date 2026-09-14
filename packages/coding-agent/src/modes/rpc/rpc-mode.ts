@@ -1174,11 +1174,7 @@ export async function runRpcMode(
 			if (inputTransition) await inputTransition;
 			await session.abort({ reason: USER_INTERRUPT_LABEL });
 		};
-		const completion = Promise.allSettled([abortTail, abort()]).then(results => {
-			for (const result of results) {
-				if (result.status === "rejected") throw result.reason;
-			}
-		});
+		const completion = abortTail.then(abort);
 		abortTail = completion.catch(() => {});
 		return { generation, completion };
 	};
