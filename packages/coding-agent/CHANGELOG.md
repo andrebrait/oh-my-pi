@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations, local-only completion, and serialized RPC abort cleanup ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+
 ## [18.1.21] - 2026-09-14
 
 ### Fixed
@@ -92,10 +97,6 @@
 - Fixed the Windows installer failing on Windows PowerShell 5.1: OS architecture detection no longer depends on the .NET `RuntimeInformation` type that only resolves reliably on PowerShell 7, and the script now requires PowerShell 5.1+ with a clear upgrade message instead of failing cryptically ([#11905](https://github.com/can1357/oh-my-pi/pull/11905) by [@h4vc](https://github.com/h4vc)).
 - Speculative reads now infer the summary language from the requested path while reading the resolved target, so cross-language symlinks summarize exactly like ordinary reads ([#11892](https://github.com/can1357/oh-my-pi/pull/11892) by [@h4vc](https://github.com/h4vc)).
 - The structural summary cache now keys on the parser language path, so one file read through different extensions no longer reuses a stale summary ([#11892](https://github.com/can1357/oh-my-pi/pull/11892) by [@h4vc](https://github.com/h4vc)).
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations and local-only completion.
-- Skill invocations through RPC retain and normalize attachments after input-hook transformations.
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations and local-only completion ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.18] - 2026-09-11
 
