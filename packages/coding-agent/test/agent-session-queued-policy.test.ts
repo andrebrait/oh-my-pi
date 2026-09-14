@@ -792,6 +792,88 @@ describe("queued user delivery policy", () => {
 		},
 	);
 
+	it("pauses automatic draining after live queued policy exhaustion until an explicit retry", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const tools: AgentTool[] = ["old_tool", "new_tool"].map(name => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+		}));
+		const { agent, requests, delivered, extensions } = setup(
+			[
+				{ content: ["existing turn"] },
+				async () => {
+					started.resolve();
+					await release.promise;
+					return { content: ["running turn"] };
+				},
+				{ content: ["queued response"] },
+				{ content: ["explicit resume response"] },
+			],
+			async toolNames => ({ systemPrompt: [...BASE, `tools:${toolNames.join(",")}`] }),
+			{ tools },
+		);
+		await session.setActiveToolsByName(["old_tool"]);
+		let attempts = 0;
+		extensions.push(
+			extension("churn", async event => {
+				if (event.prompt === "retain original" && ++attempts <= 3) {
+					// Stabilize after three changes so the broken scheduler makes a measurable
+					// fourth attempt instead of looping forever.
+					await session.setActiveToolsByName([attempts % 2 === 1 ? "new_tool" : "old_tool"]);
+				}
+			}),
+		);
+		await session.prompt("existing work");
+		await session.steer("running work");
+		const running = session.waitForIdle();
+		try {
+			await Promise.race([
+				started.promise,
+				running.then(() => {
+					throw new Error("Scheduled continuation ended before the live queue boundary");
+				}),
+			]);
+			await session.steer("retain original");
+		} finally {
+			release.resolve();
+		}
+		await running;
+		await session.waitForIdle();
+
+		expect(attempts).toBe(3);
+		expect(requests).toHaveLength(2);
+		expect(agent.peekSteeringQueue()).toMatchObject([
+			{ role: "user", content: [{ type: "text", text: "retain original" }], attribution: "user" },
+		]);
+		const errors = delivered.filter(message => message.role === "assistant" && message.stopReason === "error");
+		expect(errors).toHaveLength(1);
+		expect(errors[0].role === "assistant" && errors[0].errorMessage).toContain("System prompt changed");
+		expect(
+			delivered.filter(message => message.role === "custom" && message.customType === "prepared-context"),
+		).toMatchObject([{ content: "context:existing work" }, { content: "context:running work" }]);
+
+		await session.followUp("resume paused queue");
+		await session.waitForIdle();
+		expect(attempts).toBe(4);
+		expect(requests).toHaveLength(4);
+		expect(requests[2].tools?.map(tool => tool.name)).toEqual(["new_tool"]);
+		expect(requests[2].systemPrompt).toContain("policy:retain original");
+		expect(delivered.filter(message => message.role === "user")).toMatchObject([
+			{ content: [{ type: "text", text: "existing work" }] },
+			{ content: [{ type: "text", text: "running work" }] },
+			{ content: [{ type: "text", text: "retain original" }] },
+			{ content: [{ type: "text", text: "resume paused queue" }] },
+		]);
+		expect(delivered.filter(message => message.role === "assistant" && message.stopReason === "error")).toHaveLength(
+			1,
+		);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("lets cancellation during retry retain the queued original without consuming recall", async () => {
 		let recalls = 0;
 		const { agent, requests, delivered, pausePreparation } = await setupMemory(
