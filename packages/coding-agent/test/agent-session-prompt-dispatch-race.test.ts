@@ -283,6 +283,60 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		}
 	}
 
+	it("never publishes queued magic or vision companions without their cancelled user prompt", async () => {
+		const active = Promise.withResolvers<void>();
+		const finishActive = Promise.withResolvers<void>();
+		createSession(
+			[
+				async () => {
+					active.resolve();
+					await finishActive.promise;
+					return { content: ["Active done"] };
+				},
+				{ content: ["Unexpected orphan turn"] },
+			],
+			true,
+		);
+		const provider = vi.spyOn(session.agent, "streamFn");
+		const run = session.prompt("ACTIVE_BEFORE_ATTACHMENT");
+		await active.promise;
+		const describing = Promise.withResolvers<void>();
+		const finishDescription = Promise.withResolvers<void>();
+		vi.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel").mockImplementationOnce(async () => {
+			describing.resolve();
+			await finishDescription.promise;
+			return [{ type: "text", text: "CANCELLED_IMAGE_DESCRIPTION" }];
+		});
+		const pending = session.prompt("ultrathink CANCELLED_USER", {
+			streamingBehavior: "followUp",
+			images: [
+				{
+					type: "image",
+					mimeType: "image/png",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+				},
+			],
+		});
+		try {
+			await describing.promise;
+			finishActive.resolve();
+			await run;
+			await session.waitForIdle();
+			await session.abort();
+		} finally {
+			finishActive.resolve();
+			finishDescription.resolve();
+			await pending;
+		}
+		await session.waitForIdle();
+		expect(provider).toHaveBeenCalledTimes(1);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		const transcript = JSON.stringify(session.messages);
+		expect(transcript).not.toContain("ultrathink-notice");
+		expect(transcript).not.toContain("image-attachment-description");
+		expect(transcript).not.toContain("CANCELLED_USER");
+	});
+
 	it("keeps a skill's image companion and queue metadata together while an idle description is in flight", async () => {
 		createSession(undefined, true);
 		const entered = Promise.withResolvers<void>();

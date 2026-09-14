@@ -6199,16 +6199,25 @@ export class AgentSession {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
+		const generation = this.#promptGeneration;
+		const disposingBeforePreparation = this.#isDisposed;
+		const signal = this.#postPromptTasksAbortController.signal;
+		// Command expansion and attachment preparation precede turn ownership.
+		// An abort during either must not let this submission acquire a fresh slot.
+		const typedText = text;
+		const wasCancelled = () => {
+			if (this.#promptGeneration === generation && (!this.#isDisposed || disposingBeforePreparation)) return false;
+			if (!options?.synthetic) this.#promptDropped?.({ text: typedText, images: options?.images });
+			return true;
+		};
 		// A manual `/compact` runs with the agent subscription disconnected until its
 		// cleanup finally re-drains the preserved queues. Starting a turn before then
 		// would neither persist nor forward its events and could race the in-flight
 		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
 		// here. No-op when no manual compaction is active.
 		await this.#maintenance.manualCompactionCleanup;
+		if (wasCancelled()) return false;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-		// Slash/custom-command handling below rewrites `text`; keep the original
-		// so a dropped prompt is handed back exactly as the user typed it.
-		const typedText = text;
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6216,6 +6225,7 @@ export class AgentSession {
 			if (handled) {
 				return false;
 			}
+			if (wasCancelled()) return false;
 
 			// Try custom commands (TypeScript slash commands)
 			const customResult = await this.#tryExecuteCustomCommand(text);
@@ -6232,6 +6242,7 @@ export class AgentSession {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+		if (wasCancelled()) return false;
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -6279,6 +6290,7 @@ export class AgentSession {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
 		const videoAttachmentNotices = this.#createVideoAttachmentNotices(options?.images, submittedAt);
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+		if (wasCancelled()) return false;
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
@@ -6287,8 +6299,9 @@ export class AgentSession {
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, signal)
 			: undefined;
+		if (wasCancelled()) return false;
 
 		// A concurrent prompt() can start a turn during the awaits above: image
 		// normalization and the vision-description call suspend after the
@@ -6564,7 +6577,7 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPromptAdmitted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -6578,6 +6591,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
 		try {
+			options?.onPromptAdmitted?.();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Prepare custom attachments once, within prompt ownership, before publishing their companions.

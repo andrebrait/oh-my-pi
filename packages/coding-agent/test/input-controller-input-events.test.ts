@@ -8,6 +8,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { ExtensionFactory, InputEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { CustomEditor } from "@oh-my-pi/pi-coding-agent/modes/components/custom-editor";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { getEditorTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -303,6 +304,38 @@ describe("interactive native input ingress", () => {
 		await submitting;
 		expect(draftDuringDispatch).toBe("new draft");
 		expect(h.editor.getExpandedText()).toBe("/skill:review original\n\nnew draft still typing");
+	});
+
+	it("Ctrl+Enter restores a rejected builtin /new alongside a newer draft", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const h = await createHarness(pi => {
+			pi.on("input", () => ({ text: "/new", images: [transformedImage] }));
+		});
+		h.ctx.clearTransientSessionUi = vi.fn();
+		h.ctx.session.newSession = async () => {
+			entered.resolve();
+			await release.promise;
+			throw new Error("new session rejected");
+		};
+		const commands = new CommandController(h.ctx);
+		h.ctx.handleClearCommand = () => commands.handleClearCommand();
+		h.draftWithImage("/new original [Image #1]");
+		const submitting = h.pressSubmit(FOLLOW_UP);
+		await entered.promise;
+		h.draftWithImage("newer [Image #1]");
+		release.resolve();
+		await submitting;
+
+		expect(h.editor.getExpandedText()).toBe("/new\n\nnewer [Image #1]");
+		expect(h.editor.pendingImages).toEqual([originalImage, transformedImage]);
+		const link = h.editor.pendingImageLinks[1];
+		if (!link) throw new Error("transformed image has no restored link");
+		expect(h.blobs.get(link)?.toString()).toBe("replacement");
+		expect(h.editor.pendingImageLinks).toEqual(["local://original.png", link]);
+		expect(h.editor.imageLinks).toEqual(["local://original.png", link]);
+		expect(h.ctx.showError).toHaveBeenCalledWith("new session rejected");
+		expect(h.prompt).not.toHaveBeenCalled();
 	});
 
 	it.each(["/clear", "/export"])(

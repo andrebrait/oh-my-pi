@@ -17,6 +17,8 @@
 - Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC image prompts retain submission order during preparation, and queued prompts keep hidden notices with their user message instead of starting orphaned turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Ctrl+Enter restores submitted text and attachments alongside newer drafts when a builtin command throws an error ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.21] - 2026-09-14
 

@@ -561,6 +561,120 @@ for (const mode of ["rpc", "rpc-ui"] as const) {
 			}, 60000);
 		}
 
+		for (const { route, laterType } of [
+			{ route: "idle", laterType: "prompt" },
+			{ route: "idle", laterType: "follow_up" },
+			{ route: "followUp", laterType: "follow_up" },
+		] as const) {
+			test(`orders an ordinary ${route} image prompt before later ${laterType} input without waiting for its model turn`, async () => {
+				const probe = new NativeInputProbe();
+				try {
+					await probe.start(mode, undefined, { textModel: true });
+					await probe.command({ type: "set_interrupt_mode", mode: "wait" });
+					let active: ProviderRequest | undefined;
+					if (route === "followUp") {
+						await probe.command({ type: "prompt", message: "ACTIVE_BEFORE_ORDERING" });
+						active = await probe.request(0);
+					}
+					await probe.command({
+						type: "prompt",
+						message: "FIRST_IMAGE_PROMPT",
+						images: [
+							{
+								type: "image",
+								mimeType: "image/png",
+								data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+							},
+						],
+						streamingBehavior: route === "idle" ? undefined : route,
+					});
+					const visionIndex = active ? 1 : 0;
+					const vision = await probe.request(visionIndex);
+					expect(vision.body.model).toBe("vision-probe");
+					const later = await probe.send(
+						laterType === "prompt"
+							? { type: "prompt", message: "SECOND_QUEUED_INPUT", streamingBehavior: "followUp" }
+							: { type: "follow_up", message: "SECOND_QUEUED_INPUT" },
+					);
+					await probe.command({ type: "bash", command: "true" });
+					if (active) {
+						active.release();
+						await probe.wait(
+							() =>
+								probe.frames.find(
+									frame =>
+										frame.type === "message_end" &&
+										isRecord(frame.message) &&
+										frame.message.role === "assistant",
+								),
+							"active answer while ordinary image preparation is gated",
+						);
+					}
+					vision.release();
+					const first = await probe.request(visionIndex + 1);
+					expect(first.body.model).toBe("text-probe");
+					expect(userContent(first)).toContain("FIRST_IMAGE_PROMPT");
+					expect(JSON.stringify(first.body.messages)).toContain("VISION_DESCRIPTION_RED_PIXEL");
+					// Queue processing must finish while the first target response is still gated.
+					expect(await probe.response(later)).toMatchObject({ success: true });
+					if (laterType === "prompt") {
+						// Prompt acknowledgements precede admission; a consumed queue command
+						// behind it proves ingress advanced while the first model turn is gated.
+						await probe.command({ type: "follow_up", message: "handled" });
+					}
+					first.release();
+					const second = await probe.request(visionIndex + 2);
+					expect(userContent(second)).toContain("SECOND_QUEUED_INPUT");
+					await probe.finish(second);
+					const transcript = await probe.command({ type: "get_messages" });
+					if (!isRecord(transcript.data) || !Array.isArray(transcript.data.messages))
+						throw new Error("Missing transcript");
+					const users = JSON.stringify(
+						transcript.data.messages.filter(message => isRecord(message) && message.role === "user"),
+					);
+					expect(users.indexOf("FIRST_IMAGE_PROMPT")).toBeLessThan(users.indexOf("SECOND_QUEUED_INPUT"));
+				} finally {
+					await probe.close();
+				}
+			}, 60000);
+		}
+
+		test("aborts ordinary prompt admission during vision preprocessing without a ghost turn", async () => {
+			const probe = new NativeInputProbe();
+			try {
+				await probe.start(mode, undefined, { textModel: true });
+				const pending = await probe.command({
+					type: "prompt",
+					message: "ultrathink CANCELLED_ORDINARY_PROMPT",
+					images: [
+						{
+							type: "image",
+							mimeType: "image/png",
+							data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+						},
+					],
+				});
+				const vision = await probe.request(0);
+				expect(vision.body.model).toBe("vision-probe");
+				await probe.command({ type: "abort" });
+				// Neither abort nor the cancelled prompt waits for the vision HTTP response.
+				expect(await probe.localResult(String(pending.id))).toMatchObject({ agentInvoked: false });
+				await probe.command({ type: "prompt", message: "SUCCESSOR_AFTER_ORDINARY_ABORT" });
+				const successor = await probe.request(1);
+				expect(successor.body.model).toBe("text-probe");
+				expect(userContent(successor)).toContain("SUCCESSOR_AFTER_ORDINARY_ABORT");
+				vision.release();
+				await probe.finish(successor);
+				const transcript = JSON.stringify((await probe.command({ type: "get_messages" })).data);
+				expect(transcript).not.toContain("CANCELLED_ORDINARY_PROMPT");
+				expect(transcript).not.toContain("ultrathink-notice");
+				expect(transcript).not.toContain("image-attachment-description");
+				expect(probe.requests).toHaveLength(2);
+			} finally {
+				await probe.close();
+			}
+		}, 60000);
+
 		for (const route of ["idle", "followUp"] as const) {
 			test(`cancels a slow ${route} skill description without a ghost companion or detached turn`, async () => {
 				const probe = new NativeInputProbe();
