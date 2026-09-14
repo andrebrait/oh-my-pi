@@ -241,6 +241,48 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		expect(session.messages).toEqual([]);
 	});
 
+	for (const mode of ["steer", "followUp"] as const) {
+		for (const stage of ["normalization", "description"] as const) {
+			it(`drops ${mode} attachment preparation when abort overtakes ${stage}`, async () => {
+				createSession(undefined, stage === "description");
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				if (stage === "normalization") {
+					vi.spyOn(imageLoading, "normalizeModelContextImages").mockImplementationOnce(async images => {
+						entered.resolve();
+						await release.promise;
+						return images;
+					});
+				} else {
+					vi.spyOn(imageVisionFallback, "describeAttachedImagesForTextModel").mockImplementationOnce(async () => {
+						entered.resolve();
+						await release.promise;
+						return [{ type: "text", text: "CANCELLED_IMAGE_DESCRIPTION" }];
+					});
+				}
+				const provider = vi.spyOn(session.agent, "streamFn");
+				const queued = session[mode]("CANCELLED_ATTACHMENT", [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=",
+					},
+				]);
+				try {
+					await entered.promise;
+					await session.abort();
+				} finally {
+					release.resolve();
+				}
+				await queued;
+				await session.waitForIdle();
+				expect(provider).not.toHaveBeenCalled();
+				expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				expect(session.messages).toEqual([]);
+			});
+		}
+	}
+
 	it("keeps a skill's image companion and queue metadata together while an idle description is in flight", async () => {
 		createSession(undefined, true);
 		const entered = Promise.withResolvers<void>();
