@@ -6960,6 +6960,7 @@ export class AgentSession {
 		// description was in flight and drop a record that would otherwise land in a
 		// different session's queue.
 		const sessionGeneration = this.#sessionGeneration;
+		const generation = this.#promptGeneration;
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed. An aside is non-interrupting by design — it must
@@ -6997,6 +6998,9 @@ export class AgentSession {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
+		// An abort or history replacement during attachment preparation cancels user work,
+		// but not the non-interrupting aside path above.
+		if (this.#isDisposed || this.#promptGeneration !== generation) return;
 		this.#allowQueuedMessageDrainRetry();
 		if (mode === "followUp") {
 			for (const notice of videoAttachmentNotices) this.agent.followUp(notice);
