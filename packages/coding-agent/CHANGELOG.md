@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations, local-only completion, and serialized RPC abort cleanup ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+
 ## [18.1.21] - 2026-09-14
 
 ### Fixed

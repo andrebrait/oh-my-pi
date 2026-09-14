@@ -28,7 +28,11 @@ class NativeInputProbe {
 	async start(
 		mode: "rpc" | "rpc-ui",
 		pipedCommands?: RpcCommand[],
-		options?: { textModel?: boolean; images?: { blockImages?: boolean; describeForTextModels?: boolean } },
+		options?: {
+			textModel?: boolean;
+			images?: { blockImages?: boolean; describeForTextModels?: boolean };
+			abortCleanup?: boolean;
+		},
 	): Promise<void> {
 		this.#server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -100,22 +104,24 @@ class NativeInputProbe {
 		);
 		await Bun.write(this.temp.join("agent", "prompts", "native-template.md"), "NATIVE_TEMPLATE_BODY $ARGUMENTS\n");
 		this.#child = Bun.spawn(
-			[
-				process.execPath,
-				path.join(import.meta.dir, "..", "src", "cli.ts"),
-				"--mode",
-				mode,
-				"--no-session",
-				"--no-tools",
-				"--no-lsp",
-				"--no-rules",
-				"--no-title",
-				"--no-extensions",
-				"--extension",
-				path.join(import.meta.dir, "fixtures", "native-input-extension.ts"),
-				"--model",
-				options?.textModel ? "native-input-probe/text-probe" : "native-input-probe/probe",
-			],
+			options?.abortCleanup
+				? [process.execPath, path.join(import.meta.dir, "fixtures", "rpc-abort-cleanup-agent.ts")]
+				: [
+						process.execPath,
+						path.join(import.meta.dir, "..", "src", "cli.ts"),
+						"--mode",
+						mode,
+						"--no-session",
+						"--no-tools",
+						"--no-lsp",
+						"--no-rules",
+						"--no-title",
+						"--no-extensions",
+						"--extension",
+						path.join(import.meta.dir, "fixtures", "native-input-extension.ts"),
+						"--model",
+						options?.textModel ? "native-input-probe/text-probe" : "native-input-probe/probe",
+					],
 			{
 				cwd: this.temp.path(),
 				env: {
@@ -128,6 +134,7 @@ class NativeInputProbe {
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "pipe",
+				...(options?.abortCleanup ? { ipc: () => {} } : {}),
 			},
 		);
 		const child = this.#child;
@@ -213,6 +220,14 @@ class NativeInputProbe {
 
 	gate(name: string): Promise<() => void> {
 		return this.wait(() => this.#gates.get(name), `extension gate ${name}`);
+	}
+
+	async abortCheckpoint(): Promise<Frame> {
+		this.#child?.send("checkpoint");
+		return this.wait(
+			() => this.events.find(event => event.event === "abort-cleanup-checkpoint"),
+			"abort cleanup checkpoint",
+		);
 	}
 
 	localResult(id: string): Promise<Frame> {
@@ -1082,3 +1097,58 @@ for (const mode of ["rpc", "rpc-ui"] as const) {
 		}, 60000);
 	});
 }
+
+test("serializes real abort cleanup before queued steering or later native input can resume", async () => {
+	const probe = new NativeInputProbe();
+	try {
+		await probe.start("rpc", undefined, { abortCleanup: true });
+		await probe.command({ type: "prompt", message: "ACTIVE" });
+		await probe.request(0);
+		await probe.command({ type: "steer", message: "QUEUED_STEER" });
+		expect((await probe.command({ type: "get_state" })).data).toMatchObject({ queuedMessageCount: 1 });
+
+		const stale = await probe.send({ type: "abort_and_prompt", message: "STALE_REPLACEMENT" });
+		const release = await probe.gate("abort-cleanup");
+		const stop = await probe.send({ type: "abort" });
+		const later = await probe.send({ type: "follow_up", message: "LATER_INPUT" });
+		// Background bash proves both later frames reached ingress without waiting for cleanup.
+		await probe.command({ type: "bash", command: "true" });
+		expect(await probe.abortCheckpoint()).toMatchObject({
+			isStreaming: false,
+			steering: ["QUEUED_STEER"],
+			followUp: [],
+			maxActiveAborts: 1,
+		});
+		expect(probe.frames.filter(frame => [stale, stop, later].includes(String(frame.id)))).toEqual([]);
+		expect(probe.requests).toHaveLength(1);
+
+		release();
+		expect(await probe.response(stale)).toMatchObject({ success: true });
+		expect(await probe.localResult(stale)).toMatchObject({ agentInvoked: false });
+		expect(await probe.response(stop)).toMatchObject({ success: true });
+		expect(await probe.response(later)).toMatchObject({ success: true });
+		// A serialized later abort may stop the queued turn after it starts. Either way,
+		// its user message is retained exactly once and the later follow-up still runs.
+		const resumed = await probe.request(1);
+		if (!userContent(resumed).includes("LATER_INPUT")) resumed.release();
+		const followUp = await probe.wait(
+			() => probe.requests.find(request => userContent(request).includes("LATER_INPUT")),
+			"later follow-up provider request",
+		);
+		await probe.finish(followUp);
+		expect((await probe.command({ type: "get_state" })).data).toMatchObject({
+			isStreaming: false,
+			queuedMessageCount: 0,
+		});
+		const { data } = await probe.command({ type: "get_messages" });
+		if (!isRecord(data) || !Array.isArray(data.messages)) throw new Error("Missing RPC messages");
+		const users = data.messages.filter(isRecord).filter(message => message.role === "user");
+		expect(users.map(message => message.content)).toEqual([
+			[{ type: "text", text: "ACTIVE" }],
+			[{ type: "text", text: "QUEUED_STEER" }],
+			[{ type: "text", text: "LATER_INPUT" }],
+		]);
+	} finally {
+		await probe.close();
+	}
+}, 60000);
