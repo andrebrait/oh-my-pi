@@ -6552,6 +6552,11 @@ export class AgentSession {
 				},
 			};
 		}
+		if (signal !== undefined) {
+			// Only queued preparation receives a signal. Block its settle drain before Agent
+			// converts this error into an assistant message and resolves the running turn.
+			this.#queuedMessageDrainBlocked = true;
+		}
 		throw new AgentStartPolicyChangedError();
 	}
 
