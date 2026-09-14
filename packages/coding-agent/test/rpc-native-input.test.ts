@@ -607,6 +607,47 @@ for (const mode of ["rpc", "rpc-ui"] as const) {
 			}, 60000);
 		}
 
+		for (const command of ["steer", "follow_up"] as const) {
+			test(`cancels slow ${command} attachment preparation before queue publication`, async () => {
+				const probe = new NativeInputProbe();
+				try {
+					await probe.start(mode, undefined, { textModel: true });
+					await probe.command({ type: "prompt", message: "ACTIVE_BEFORE_ATTACHMENT" });
+					await probe.request(0);
+					const pending = await probe.send({
+						type: command,
+						message: "CANCELLED_ATTACHMENT",
+						images: [
+							{
+								type: "image",
+								mimeType: "image/png",
+								data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=",
+							},
+						],
+					});
+					const vision = await probe.request(1);
+					expect(vision.body.model).toBe("vision-probe");
+					await probe.command({ type: "abort" });
+					vision.release();
+					expect(await probe.response(pending)).toMatchObject({ command, success: true });
+					expect((await probe.command({ type: "get_state" })).data).toMatchObject({
+						isStreaming: false,
+						queuedMessageCount: 0,
+					});
+					await probe.command({ type: "prompt", message: "SUCCESSOR_AFTER_CANCEL" });
+					const successor = await probe.request(2);
+					const payload = JSON.stringify(successor.body.messages);
+					expect(payload).toContain("SUCCESSOR_AFTER_CANCEL");
+					expect(payload).not.toContain("CANCELLED_ATTACHMENT");
+					expect(payload).not.toContain("VISION_DESCRIPTION_RED_PIXEL");
+					await probe.finish(successor);
+					expect(probe.requests).toHaveLength(3);
+				} finally {
+					await probe.close();
+				}
+			}, 60000);
+		}
+
 		for (const gate of ["vision-target", "disabled", "blocked"] as const) {
 			test(`does not describe skill attachments when ${gate}`, async () => {
 				const probe = new NativeInputProbe();
