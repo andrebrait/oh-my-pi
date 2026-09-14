@@ -585,16 +585,27 @@ hidden description stays with its skill message; cancelling preparation does
 not publish either message. Vision-capable targets and the `images.blockImages`
 and `images.describeForTextModels` settings retain their normal behavior.
 
-Input interception and route scheduling are ordered, without serializing whole
-model turns. `prompt`/`abort_and_prompt` acknowledge before asynchronous input
-handlers finish; subsequent failures retain the original command and id. UI and
-host-tool/URI responses remain dispatchable while handlers await them. Abort
-commands can overtake a waiting input handler; its normal forwarding is cancelled
-when it finishes. Commands accepted after an abort wait for its cleanup, including
-all earlier aborts still settling. A newer abort or replacement invalidates an
-older `abort_and_prompt` replacement before it can dispatch.
+Input interception and route scheduling are ordered through asynchronous image
+normalization and vision description, without serializing whole model turns.
+An ordinary prompt holds later input until it owns an idle turn slot or finishes
+queue insertion/local handling. Hidden keyword and attachment companions publish
+with their user message, never ahead of unfinished preparation.
+`prompt`/`abort_and_prompt` acknowledge before asynchronous input handlers finish;
+subsequent failures retain the original command and id. UI and host-tool/URI
+responses remain dispatchable while handlers await them. Abort commands can
+overtake a waiting input handler or prompt preparation; cancelled work cannot
+publish messages or start a later turn. Commands accepted after an abort wait for
+its cleanup, including all earlier aborts still settling. A newer abort or
+replacement invalidates an older `abort_and_prompt` replacement before dispatch.
 An abort received during a session transition invalidates ingress immediately,
 but waits for that transition before running session-abort cleanup.
+
+SDK hosts implementing the same ordering can pass `PromptOptions.onPromptAdmitted`
+to `AgentSession.prompt()`. It runs synchronously when that call acquires the idle
+turn slot, before asynchronous preflight, and does not prove provider dispatch.
+Race this per-call notification against the returned promise: queued, local-only,
+cancelled, and failed calls can settle without an admission notification. The
+returned promise still tracks the existing prompt completion, not just admission.
 
 Session transitions suspend pending ingress until the transition settles. A
 committed transition cancels old-session input; a vetoed transition preserves it

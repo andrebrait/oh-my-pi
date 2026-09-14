@@ -1180,25 +1180,23 @@ export async function runRpcMode(
 					});
 					await inputTransition;
 					if (builtinResult !== false) {
-						return {
-							completion:
-								"prompt" in builtinResult && isCurrent()
-									? session.prompt(builtinResult.prompt, {
-											images,
-											streamingBehavior: command.streamingBehavior,
-										})
-									: Promise.resolve("agentInvoked" in builtinResult && builtinResult.agentInvoked === true),
-						};
+						if (!("prompt" in builtinResult)) {
+							return { completion: Promise.resolve(builtinResult.agentInvoked === true) };
+						}
+						text = builtinResult.prompt;
 					}
 				}
-				return {
-					completion: isCurrent()
-						? session.prompt(text, {
-								images,
-								...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
-							})
-						: Promise.resolve(false),
-				};
+				if (!isCurrent()) return { completion: Promise.resolve(false) };
+				const admitted = Promise.withResolvers<void>();
+				const completion = session.prompt(text, {
+					images,
+					...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
+					onPromptAdmitted: admitted.resolve,
+				});
+				// Hold ingress through preparation and route admission, not a model turn.
+				// Queued/local/cancelled/failed paths release through completion instead.
+				await Promise.race([admitted.promise, completion]);
+				return { completion };
 			}),
 		);
 		inputTail = dispatch.then(
