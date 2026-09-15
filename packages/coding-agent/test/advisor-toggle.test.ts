@@ -16,7 +16,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import * as advisorModule from "../src/advisor";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -25,6 +25,9 @@ describe("AgentSession advisor toggle", () => {
 	let modelRegistry: ModelRegistry;
 	let model: Model;
 	let replacementModel: Model;
+
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 	beforeAll(() => {
 		authStorage = createInMemoryAuthStorage();
@@ -42,6 +45,12 @@ describe("AgentSession advisor toggle", () => {
 
 	afterAll(() => {
 		authStorage.close();
+		if (originalAgentDir) {
+			setAgentDir(originalAgentDir);
+		} else {
+			setAgentDir(fallbackAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
 	});
 
 	let tempDir: TempDir;
@@ -50,6 +59,9 @@ describe("AgentSession advisor toggle", () => {
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-advisor-toggle-");
+		const testAgentDir = path.join(tempDir.path(), "agent");
+		await fs.mkdir(testAgentDir, { recursive: true });
+		setAgentDir(testAgentDir);
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const agent = new Agent({
 			initialState: {
@@ -71,6 +83,12 @@ describe("AgentSession advisor toggle", () => {
 
 	afterEach(async () => {
 		await session.dispose();
+		if (originalAgentDir) {
+			setAgentDir(originalAgentDir);
+		} else {
+			setAgentDir(fallbackAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
 		try {
 			await tempDir.remove();
 		} catch {}
