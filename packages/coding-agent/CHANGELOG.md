@@ -10,6 +10,10 @@
 
 - Codex Spark, all MiniMax models, and GLM-5.3-Flash now default to replace edits instead of hashline; explicit edit-mode overrides remain honored.
 
+### Fixed
+
+- Compiled bytecode binaries now start correctly when bundled dependencies use `import.meta.resolve`.
+
 ## [18.2.0] - 2026-09-15
 
 ### Breaking Changes
