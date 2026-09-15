@@ -674,6 +674,38 @@ for (const mode of ["rpc", "rpc-ui"] as const) {
 				await probe.close();
 			}
 		}, 60000);
+		for (const streamingBehavior of ["steer", "followUp"] as const) {
+			test(`reports a cancelled queued ${streamingBehavior} prompt as locally completed`, async () => {
+				const probe = new NativeInputProbe();
+				try {
+					await probe.start(mode, undefined, { textModel: true });
+					await probe.command({ type: "set_interrupt_mode", mode: "wait" });
+					await probe.command({ type: "prompt", message: "ACTIVE_BEFORE_CANCEL" });
+					const active = await probe.request(0);
+					const pending = await probe.command({
+						type: "prompt",
+						message: "CANCELLED_QUEUED_PROMPT",
+						streamingBehavior,
+						images: [
+							{
+								type: "image",
+								mimeType: "image/png",
+								data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=",
+							},
+						],
+					});
+					const vision = await probe.request(1);
+					expect(vision.body.model).toBe("vision-probe");
+					await probe.command({ type: "abort" });
+					vision.release();
+					expect(await probe.localResult(String(pending.id))).toMatchObject({ agentInvoked: false });
+					active.release();
+					expect((await probe.command({ type: "get_state" })).data).toMatchObject({ queuedMessageCount: 0 });
+				} finally {
+					await probe.close();
+				}
+			}, 60000);
+		}
 
 		for (const route of ["idle", "followUp"] as const) {
 			test(`cancels a slow ${route} skill description without a ghost companion or detached turn`, async () => {

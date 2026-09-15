@@ -6422,10 +6422,15 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, keywordNotices);
-			outcome.sessionClaimed = true;
-			return true;
-			return true;
+			const queued = await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior,
+				submittedAt,
+				keywordNotices,
+			);
+			outcome.sessionClaimed = queued;
+			return queued;
 		}
 
 		// Skip eager preludes when the user has already queued a directive
@@ -6472,12 +6477,19 @@ export class AgentSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, keywordNotices, {
-				images: normalizedImages,
-				descriptionNotice: imageDescriptionNotice,
-			});
-			outcome.sessionClaimed = true;
-			return true;
+			const queued = await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior,
+				submittedAt,
+				keywordNotices,
+				{
+					images: normalizedImages,
+					descriptionNotice: imageDescriptionNotice,
+				},
+			);
+			outcome.sessionClaimed = queued;
+			return queued;
 		}
 
 		if (externalThinkingToolChoice) {
@@ -7271,10 +7283,8 @@ export class AgentSession {
 		timestamp?: number,
 		prependMessages: readonly CustomMessage[] = [],
 		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
-	): Promise<void> {
-		const attribution = options?.attribution ?? "user";
-		const timestamp = options?.timestamp;
-		const preprocessed = options?.preprocessed;
+	): Promise<boolean> {
+		const attribution: MessageAttribution = "user";
 		// Captured before any await below so the aside branch can detect a
 		// newSession()/switchSession() that completed while normalization/vision
 		// description was in flight and drop a record that would otherwise land in a
@@ -7306,7 +7316,7 @@ export class AgentSession {
 				? await this.#buildImageDescriptionNotice(normalizedImages)
 				: undefined;
 		if (mode === "aside") {
-			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
+			if (await this.#sessionGenerationChanged(sessionGeneration)) return false;
 			const records: AgentMessage[] = [...prependMessages];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			records.push({ role: "user", content, attribution, timestamp: timestamp ?? Date.now() });
@@ -7316,11 +7326,11 @@ export class AgentSession {
 			// queue with no loop left to drain it. Resuming here is a no-op while streaming and
 			// wakes/folds correctly once idle (see #resumeStrandedIrcAsides).
 			this.#resumeStrandedIrcAsides();
-			return;
+			return true;
 		}
 		// An abort or history replacement during attachment preparation cancels user work,
 		// but not the non-interrupting aside path above.
-		if (this.#isDisposed || this.#promptGeneration !== generation) return;
+		if (this.#isDisposed || this.#promptGeneration !== generation) return false;
 		this.#allowQueuedMessageDrainRetry();
 		// Publish every companion and its user record together, without yielding.
 		if (mode === "followUp") {
@@ -7346,6 +7356,7 @@ export class AgentSession {
 			});
 		}
 		this.#scheduleIdleQueueDrain();
+		return true;
 	}
 
 	#scheduleIdleQueueDrain(): void {
