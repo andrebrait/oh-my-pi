@@ -16,7 +16,15 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getConfigRootDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+
+function restoreEnv(key: string, value: string | undefined): void {
+	if (value === undefined) {
+		delete process.env[key];
+	} else {
+		process.env[key] = value;
+	}
+}
 import * as advisorModule from "../src/advisor";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -27,7 +35,8 @@ describe("AgentSession advisor toggle", () => {
 	let replacementModel: Model;
 
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+	const originalPiProfile = process.env.PI_PROFILE;
+	const originalOmpProfile = process.env.OMP_PROFILE;
 
 	beforeAll(() => {
 		authStorage = createInMemoryAuthStorage();
@@ -45,12 +54,10 @@ describe("AgentSession advisor toggle", () => {
 
 	afterAll(() => {
 		authStorage.close();
-		if (originalAgentDir) {
-			setAgentDir(originalAgentDir);
-		} else {
-			setAgentDir(fallbackAgentDir);
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
+		restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
+		restoreEnv("PI_PROFILE", originalPiProfile);
+		restoreEnv("OMP_PROFILE", originalOmpProfile);
+		__resetDirsFromEnvForTests();
 	});
 
 	let tempDir: TempDir;
@@ -82,16 +89,17 @@ describe("AgentSession advisor toggle", () => {
 	});
 
 	afterEach(async () => {
-		await session.dispose();
-		if (originalAgentDir) {
-			setAgentDir(originalAgentDir);
-		} else {
-			setAgentDir(fallbackAgentDir);
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
 		try {
-			await tempDir.remove();
-		} catch {}
+			await session?.dispose();
+		} finally {
+			restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
+			restoreEnv("PI_PROFILE", originalPiProfile);
+			restoreEnv("OMP_PROFILE", originalOmpProfile);
+			__resetDirsFromEnvForTests();
+			try {
+				await tempDir?.remove();
+			} catch {}
+		}
 	});
 
 	function advisorMessage(cost: number, timestamp: number): AssistantMessage {
