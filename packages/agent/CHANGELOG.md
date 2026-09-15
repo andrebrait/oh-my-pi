@@ -16,6 +16,9 @@
 - Native replay compatibility checks the active provider and Responses API independently of whether future native compaction is enabled. ([#11525](https://github.com/can1357/oh-my-pi/pull/11525) by [@rpie9](https://github.com/rpie9))
 - Fixed compaction retaining oversized older steps beyond the recent-history budget and skipping previously retained history on later passes, preventing long tool loops from freeing enough context ([#11365](https://github.com/can1357/oh-my-pi/issues/11365)).
 - Fixed Codex remote compaction retries for both Bun and proxy socket-closure messages and stopped falling back to the unsupported `/responses/compact` endpoint after V2 failures.
+### Added
+
+- Added `Agent.setQueuedMessageGrouping()` so hosts can deliver adjacent companion records and their prompt together in `one-at-a-time` queue modes ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.19] - 2026-09-12
 
@@ -41,9 +44,6 @@
 ### Fixed
 
 - `compact()` now forwards the caller's `oneshotRetry` opt-out to every summarization oneshot; auto-compaction's outer retry loop no longer multiplies with the inner transient-failure retries.
-### Added
-
-- Added `Agent.setQueuedMessageGrouping()` so hosts can deliver adjacent companion records and their prompt together in `one-at-a-time` queue modes ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.17] - 2026-09-10
 
