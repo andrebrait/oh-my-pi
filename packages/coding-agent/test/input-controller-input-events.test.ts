@@ -292,18 +292,24 @@ describe("interactive native input ingress", () => {
 			await dispatchRelease.promise;
 			throw new Error("skill queue rejected");
 		});
-		h.editor.setText("/skill:review original");
+		h.draftWithImage("/skill:review original [Image #1]");
 		const submitting = h.pressSubmit(FOLLOW_UP);
 		await entered.promise;
-		h.editor.setText("new draft");
+		h.editor.pendingImages = [transformedImage];
+		h.editor.pendingImageLinks = ["local://new.jpeg"];
+		h.editor.imageLinks = h.editor.pendingImageLinks;
+		h.editor.setText("new draft [Image #1]");
 		release.resolve();
 		await dispatchEntered.promise;
 		const draftDuringDispatch = h.editor.getText();
 		h.editor.setText(`${draftDuringDispatch} still typing`);
 		dispatchRelease.resolve();
 		await submitting;
-		expect(draftDuringDispatch).toBe("new draft");
-		expect(h.editor.getExpandedText()).toBe("/skill:review original\n\nnew draft still typing");
+		expect(draftDuringDispatch).toBe("new draft [Image #1]");
+		expect(h.editor.getExpandedText()).toBe("/skill:review original [Image #2]\n\nnew draft [Image #1] still typing");
+		expect(h.editor.pendingImages).toEqual([transformedImage, originalImage]);
+		expect(h.editor.pendingImageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
+		expect(h.editor.imageLinks).toEqual(["local://new.jpeg", "local://original.png"]);
 	});
 
 	it("Ctrl+Enter restores a rejected builtin /new alongside a newer draft", async () => {
