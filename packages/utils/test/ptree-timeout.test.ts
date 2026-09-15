@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import { createLinuxSubreaperScript, exec, NonZeroExitError, spawn, TimeoutError } from "@oh-my-pi/pi-utils/ptree";
 
 async function supportsLinuxMountNamespaces(): Promise<boolean> {
@@ -85,14 +86,23 @@ sleep 30
 
 			try {
 				const setupDeadline = Date.now() + 2_000;
-				// Stat freshly per poll: a reused Bun.file handle can serve a cached
-				// negative exists() after the file appears, stalling until the deadline.
 				// Real wall-clock polling is required here — the awaited condition is a
 				// genuine subprocess filesystem write, which fake timers cannot produce.
-				while (!(await Bun.file(pidFile).exists()) && Date.now() < setupDeadline) await Bun.sleep(10);
-				expect(await Bun.file(pidFile).exists(), "the launcher must create its worker").toBe(true);
+				// Fresh node:fs reads per poll: a reused Bun.file handle serves a cached
+				// negative exists() and an empty text() after the file appears (Bun
+				// 1.4.0), so single-handle polling would stall until the deadline.
+				let workerPid = Number.NaN;
+				while (Date.now() < setupDeadline) {
+					try {
+						workerPid = Number.parseInt((await fs.readFile(pidFile, "utf8")).trim(), 10);
+						if (Number.isSafeInteger(workerPid) && workerPid > 0) break;
+					} catch (error) {
+						if (!isEnoent(error)) throw error;
+					}
+					await Bun.sleep(10);
+				}
+				expect(Number.isSafeInteger(workerPid) && workerPid > 0, "the launcher must create its worker").toBe(true);
 
-				const workerPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
 				const subreaper = Process.fromPid(child.pid);
 				const command = subreaper?.children()[0];
 				const worker = Process.fromPid(workerPid);
