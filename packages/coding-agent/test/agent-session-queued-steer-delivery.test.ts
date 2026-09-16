@@ -667,6 +667,18 @@ describe("AgentSession queued steer delivery", () => {
 			expect(session.removeQueuedMessage("/skill:reviewer", "followUp")).toBe(true);
 			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: ["keep"] });
 		});
+
+		it("prefers an exact queue-chip match over an earlier template expansion", async () => {
+			const { session } = await createSession(
+				[],
+				[{ name: "review", description: "Review", content: "Review $1", source: "(test)" }],
+			);
+			await session.followUp("/review foo");
+			await session.followUp("/review foo", undefined, { expandPromptTemplates: false });
+
+			expect(session.removeQueuedMessage("/review foo", "followUp")).toBe(true);
+			expect(session.getQueuedMessages().followUp).toEqual(["Review foo"]);
+		});
 	});
 
 	describe("promoteQueuedMessage", () => {

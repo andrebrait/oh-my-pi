@@ -59,6 +59,7 @@ async function runWithDetachedModeDraft(
 			editor.imageLinks = editor.pendingImageLinks.length > 0 ? editor.pendingImageLinks : undefined;
 		}
 	} catch (error) {
+		if (runtime.draftDetached) throw error;
 		if (!editor.getText() && editor.pendingImages.length === 0) {
 			editor.setText(command.text);
 			editor.pendingImages = runtime.input?.images ? [...runtime.input.images] : [];

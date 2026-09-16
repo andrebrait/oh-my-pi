@@ -7330,7 +7330,10 @@ export class AgentSession {
 		}
 		// An abort or history replacement during attachment preparation cancels user work,
 		// but not the non-interrupting aside path above.
-		if (this.#isDisposed || this.#promptGeneration !== generation) return false;
+		if (this.#isDisposed || this.#promptGeneration !== generation) {
+			this.#promptDropped?.({ text, images });
+			return false;
+		}
 		this.#allowQueuedMessageDrainRetry();
 		// Publish the complete group without yielding: removal owns contiguous companions.
 		if (mode === "followUp") {
@@ -7922,11 +7925,10 @@ export class AgentSession {
 	promoteQueuedMessage(text: string): boolean {
 		const followUp = this.agent.peekFollowUpQueue();
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		const index = followUp.findIndex(message => {
-			if (!isUserQueuedMessage(message)) return false;
-			const chipText = queueChipText(message);
-			return chipText === text || chipText === expandedText;
-		});
+		let index = followUp.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === text);
+		if (index < 0 && expandedText !== text) {
+			index = followUp.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === expandedText);
+		}
 		if (index < 0) return false;
 
 		let start = index;
@@ -7954,11 +7956,10 @@ export class AgentSession {
 	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
 		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		const index = selected.findIndex(message => {
-			if (!isUserQueuedMessage(message)) return false;
-			const chipText = queueChipText(message);
-			return chipText === text || chipText === expandedText;
-		});
+		let index = selected.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === text);
+		if (index < 0 && expandedText !== text) {
+			index = selected.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === expandedText);
+		}
 		if (index < 0) return false;
 
 		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
