@@ -649,6 +649,34 @@ describe("collision handling", () => {
 		expect(warnings.filter(warning => warning.message.includes("name collision"))).toHaveLength(2);
 	});
 
+	it("keeps a differing skill whose body matches a genuine ~N raw name", async () => {
+		// A legal raw name ending in `~N` must not be read as a generated
+		// collision suffix: `tilde-third/foo` shares a body with
+		// `tilde-second/foo~2`, whose raw name is `foo~2`, not `foo` — so it is
+		// a distinct skill and must be kept under its own namespace.
+		const tildeMain = path.join(collisionFixturesDir, "tilde-main");
+		const tildeSecond = path.join(collisionFixturesDir, "tilde-second");
+		const tildeThird = path.join(collisionFixturesDir, "tilde-third");
+		const { skills, warnings } = await loadSkills({
+			...DISABLE_ALL_BUILTIN_SKILLS,
+			customDirectories: [tildeMain, tildeSecond, tildeThird],
+		});
+		expect(skills.map(skill => skill.name).sort()).toEqual([
+			"foo",
+			"foo~2",
+			"tilde-second/foo",
+			"tilde-second/foo~2",
+			"tilde-third/foo",
+		]);
+		expect(skills.find(skill => skill.name === "tilde-second/foo~2")?.filePath).toBe(
+			path.join(tildeSecond, "foo-raw", "SKILL.md"),
+		);
+		expect(skills.find(skill => skill.name === "tilde-third/foo")?.filePath).toBe(
+			path.join(tildeThird, "foo", "SKILL.md"),
+		);
+		expect(warnings.filter(warning => warning.message.includes("name collision"))).toHaveLength(3);
+	});
+
 	it("refuses a raw skill name that claims a namespaced address", async () => {
 		const squatter = path.join(collisionFixturesDir, "squatter");
 		const { skills, warnings } = await loadSkills({
