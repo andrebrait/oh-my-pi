@@ -110,6 +110,11 @@
 - RPC image prompts retain submission order during preparation, and queued prompts keep hidden notices with their user message instead of starting orphaned turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 - Ctrl+Enter restores submitted text and attachments alongside newer drafts when a builtin command throws an error ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 - Same-named skills from different sources are no longer silently discarded. A byte-identical duplicate (the same skill installed twice) still collapses without a warning; a skill whose body differs stays reachable as `<namespace>/<name>` (the owning plugin or skill-root directory) via `skill://<namespace>/<name>` and the leading `/skill:<namespace>/<name>` form, with a collision warning naming both files; a taken namespaced slot gets a `~N` suffix. Raw skill names containing a path separator are now rejected at scan time, since `/` is reserved for that addressing ([#12151](https://github.com/can1357/oh-my-pi/pull/12151) by [@andrebrait](https://github.com/andrebrait)).
+- Fixed sloppy edits crashing with a char-boundary panic instead of reporting a match error when the file contains multibyte (e.g. CJK) text.
+### Added
+
+- Added the `omp skills` command listing discovered skills for a directory exactly as a session resolves them (`--json` for machine-readable output with discovery warnings), so tools can query skill listings without drift-prone reimplementations ([#12273](https://github.com/can1357/oh-my-pi/pull/12273) by [@andrebrait](https://github.com/andrebrait))
+
 ## [18.2.2] - 2026-09-16
 
 ### Added
