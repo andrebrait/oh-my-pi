@@ -69,12 +69,12 @@ function skillNamespace(skill: Pick<CapabilitySkill, "path" | "_source">): strin
 	return namespace && !namespace.startsWith(".") ? namespace : skill._source.provider;
 }
 
-function matchesRawName(registeredName: string, rawName: string): boolean {
-	if (registeredName === rawName) return true;
-	const slash = registeredName.indexOf("/");
-	if (slash < 0) return false;
-	const tail = registeredName.slice(slash + 1);
-	return tail === rawName || tail.startsWith(`${rawName}~`);
+interface AdmittedBody {
+	/** Pre-collision frontmatter name. Kept explicitly because a legal raw
+	 * name may itself end in `~N`, making a registered alias like
+	 * `<ns>/foo~2` indistinguishable from a generated collision suffix. */
+	rawName: string;
+	body: string;
 }
 
 /**
@@ -85,19 +85,18 @@ function matchesRawName(registeredName: string, rawName: string): boolean {
  */
 function resolveCollision(
 	skillMap: Map<string, Skill>,
-	bodies: Map<string, string>,
+	admitted: Map<string, AdmittedBody>,
 	candidate: Skill,
 	candidateBody: string,
 	namespace: string,
 ): { name: string; warning?: string } | undefined {
 	const existing = skillMap.get(candidate.name);
 	if (!existing) return { name: candidate.name };
-	for (const [name, body] of bodies) {
-		if (matchesRawName(name, candidate.name) && body === candidateBody) return undefined;
+	for (const entry of admitted.values()) {
+		if (entry.rawName === candidate.name && entry.body === candidateBody) return undefined;
 	}
 	let namespaced = `${namespace}/${candidate.name}`;
 	for (let n = 2; skillMap.has(namespaced); n++) {
-		if (bodies.get(namespaced) === candidateBody) return undefined;
 		namespaced = `${namespace}/${candidate.name}~${n}`;
 	}
 	return {
@@ -249,8 +248,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
-	/** Body per loaded skill name; identical duplicates collapse silently. */
-	const bodies = new Map<string, string>();
+	/** Admission per registered skill name; identical raw name + body collapses silently. */
+	const admitted = new Map<string, AdmittedBody>();
 	const collisionWarnings: SkillWarning[] = [];
 
 	// Check if skill name matches any of the include patterns
@@ -290,14 +289,15 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	 * leave a namespaced candidate with nothing to collide against.
 	 */
 	function admit(skill: Skill, body: string, namespace: string): string | undefined {
-		const resolved = resolveCollision(skillMap, bodies, skill, body, namespace);
+		const resolved = resolveCollision(skillMap, admitted, skill, body, namespace);
 		if (!resolved) return undefined;
 		const { name, warning } = resolved;
 		if (disabledSkillNames.has(name) || matchesIgnorePatterns(name)) return undefined;
 		if (warning) collisionWarnings.push({ skillPath: skill.filePath, message: warning });
+		const rawName = skill.name;
 		skill.name = name;
 		skillMap.set(name, skill);
-		bodies.set(name, body);
+		admitted.set(name, { rawName, body });
 		return name;
 	}
 
@@ -399,11 +399,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			// higher-priority source (issue #7190). The displaced default is
 			// re-admitted afterwards so it keeps a namespaced name unless it is
 			// the same skill.
-			const existingBody = bodies.get(existing.name) ?? "";
+			const existingBody = admitted.get(existing.name)?.body ?? "";
 			skillMap.delete(existing.name);
-			bodies.delete(existing.name);
+			admitted.delete(existing.name);
 			skillMap.set(skill.name, skill);
-			bodies.set(skill.name, body);
+			admitted.set(skill.name, { rawName: skill.name, body });
 			realPathSet.add(resolvedPath);
 			if (existing._source) {
 				admit(
