@@ -1512,7 +1512,6 @@ export class InputController {
 
 		if (preserveDraft) this.ctx.editor.addToHistory(text);
 		else this.ctx.editor.clearDraft(text);
-		let optimistic = false;
 		try {
 			const dispatched = await invokeSkillCommandFromText(this.ctx, text, streamingBehavior, {
 				images: draftImages,

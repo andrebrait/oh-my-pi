@@ -6330,7 +6330,6 @@ export class AgentSession {
 		const submittedAt = Date.now();
 		const generation = this.#promptGeneration;
 		const disposingBeforePreparation = this.#isDisposed;
-		const signal = this.#postPromptTasksAbortController.signal;
 		// Command expansion and attachment preparation precede turn ownership.
 		// An abort during either must not let this submission acquire a fresh slot.
 		const typedText = text;
@@ -6460,6 +6459,7 @@ export class AgentSession {
 		if (normalizedImages?.length) {
 			userContent.push(...normalizedImages);
 		}
+		const signal = this.#postPromptTasksAbortController.signal;
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
@@ -7342,7 +7342,10 @@ export class AgentSession {
 		}
 		// An abort or history replacement during attachment preparation cancels user work,
 		// but not the non-interrupting aside path above.
-		if (this.#isDisposed || this.#promptGeneration !== generation) return false;
+		if (this.#isDisposed || this.#promptGeneration !== generation) {
+			this.#promptDropped?.({ text, images });
+			return false;
+		}
 		this.#allowQueuedMessageDrainRetry();
 		// Publish every companion and its user record together, without yielding.
 		if (mode === "followUp") {

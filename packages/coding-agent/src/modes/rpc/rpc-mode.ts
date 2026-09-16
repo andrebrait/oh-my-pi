@@ -11,7 +11,6 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { once } from "node:events";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
