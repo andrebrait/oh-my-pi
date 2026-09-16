@@ -7947,11 +7947,10 @@ export class AgentSession {
 	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
 		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		const index = selected.findIndex(message => {
-			if (!isUserQueuedMessage(message)) return false;
-			const chipText = queueChipText(message);
-			return chipText === text || chipText === expandedText;
-		});
+		let index = selected.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === text);
+		if (index < 0 && expandedText !== text) {
+			index = selected.findIndex(message => isUserQueuedMessage(message) && queueChipText(message) === expandedText);
+		}
 		if (index < 0) return false;
 
 		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
