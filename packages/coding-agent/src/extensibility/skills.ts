@@ -69,9 +69,17 @@ function skillNamespace(skill: Pick<CapabilitySkill, "path" | "_source">): strin
 	return namespace && !namespace.startsWith(".") ? namespace : skill._source.provider;
 }
 
+function matchesRawName(registeredName: string, rawName: string): boolean {
+	if (registeredName === rawName) return true;
+	const slash = registeredName.indexOf("/");
+	if (slash < 0) return false;
+	const tail = registeredName.slice(slash + 1);
+	return tail === rawName || tail.startsWith(`${rawName}~`);
+}
+
 /**
  * Resolve a same-name skill against what is already loaded.
- * - Identical body → silently drop (duplicate installs of the same skill).
+ * - Identical body to any admitted instance of this raw name → silently drop.
  * - Different body → keep it under `<namespace>/<name>` so neither is lost;
  *   a taken namespaced slot gets a numeric suffix rather than losing the skill.
  */
@@ -84,7 +92,9 @@ function resolveCollision(
 ): { name: string; warning?: string } | undefined {
 	const existing = skillMap.get(candidate.name);
 	if (!existing) return { name: candidate.name };
-	if (bodies.get(existing.name) === candidateBody) return undefined;
+	for (const [name, body] of bodies) {
+		if (matchesRawName(name, candidate.name) && body === candidateBody) return undefined;
+	}
 	let namespaced = `${namespace}/${candidate.name}`;
 	for (let n = 2; skillMap.has(namespaced); n++) {
 		if (bodies.get(namespaced) === candidateBody) return undefined;
