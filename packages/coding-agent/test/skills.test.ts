@@ -618,6 +618,25 @@ describe("collision handling", () => {
 		expect(nested.content).toContain("Calendar (Second)");
 	});
 
+	it("normalizes derived namespaces to a token-safe form", async () => {
+		const spaced = await fs.mkdtemp(path.join(os.tmpdir(), "My Skills-"));
+		try {
+			await fs.mkdir(path.join(spaced, "calendar"), { recursive: true });
+			await fs.copyFile(path.join(second, "calendar", "SKILL.md"), path.join(spaced, "calendar", "SKILL.md"));
+			const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [first, spaced] });
+			const alias = skills.find(skill => skill.name.includes("/"));
+			// The temp root is "My Skills-<suffix>" → sanitized to "My-Skills-<suffix>".
+			expect(alias?.name).toMatch(/^My-Skills-[^/]+\/calendar$/);
+			expect(alias?.name).not.toContain(" ");
+			const handler = new SkillProtocolHandler();
+			const resolved = await handler.resolve(parseInternalUrl(`skill://${alias!.name}`)!, { skills });
+			expect(resolved.content).toContain("Calendar (Second)");
+			expect(parseSkillInvocation(`/skill:${alias!.name}`)?.name).toBe(alias!.name);
+		} finally {
+			await removeWithRetries(spaced);
+		}
+	});
+
 	it("prefers an exact namespaced skill over a bare skill sharing the namespace", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "skills-selfnamed-"));
 		try {
