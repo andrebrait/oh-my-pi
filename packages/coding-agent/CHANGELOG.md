@@ -123,6 +123,23 @@
 - A corrupted or externally modified session file no longer leaves the session impossible to close; a subsequent Ctrl+C exits without rewriting the session log.
 - Fixed silent MCP requests being terminated by an undeclared idle timeout; closing a legacy SSE connection now also cancels pending requests and notifications.
 - Fixed browser reuse for Chromium installed behind Linux wrapper scripts and prevented duplicate launches when a profile is locked ([#12236](https://github.com/can1357/oh-my-pi/pull/12236) by [@shivamklr](https://github.com/shivamklr)).
+- Fixed browser reuse for Chromium installed behind Linux wrapper scripts and prevented duplicate launches when a profile is locked.
+- Added `tui.titleSpinner` (`braille` | `dots` | `line`, default `braille`) to pick the terminal-title working-state spinner glyphs alongside the existing `tui.titleState` on/off toggle.
+- Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Added `remove_queued_message` to RPC and `removeQueuedMessage()` to the session and TypeScript client APIs to cancel a pending user-authored steering or follow-up message without resending, aborting, or restarting preparation in the other queue ([#3](https://github.com/andrebrait/oh-my-pi/pull/3) by [@andrebrait](https://github.com/andrebrait)).
+- Added typed queued-message removal to the official Python RPC client, including validated success and refusal results ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
+
+### Fixed
+
+- Compiled bytecode binaries now start correctly when bundled dependencies use `import.meta.resolve`.
+- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations, local-only completion, serialized RPC abort cleanup, and cancellation of queued attachments still being prepared ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Cancelling a concurrently queued prompt now preserves the other prompt's hidden keyword context instead of removing it with the cancelled message ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
+- Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC image prompts retain submission order during preparation, and queued prompts keep hidden notices with their user message instead of starting orphaned turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Ctrl+Enter restores submitted text and attachments alongside newer drafts when a builtin command throws an error ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.2.1] - 2026-09-15
 
@@ -233,9 +250,6 @@
 - User-shell `!` commands now keep their transcript block mutable until queued PTY replay finishes, preventing successful and nonzero stdout/stderr from disappearing into immutable terminal history ([#12062](https://github.com/can1357/oh-my-pi/issues/12062); [#12080](https://github.com/can1357/oh-my-pi/pull/12080) by [@Dante-dan](https://github.com/Dante-dan)).
 - Headless print mode now stays alive while first-turn mnemopi recall waits for its embedding worker ([#12067](https://github.com/can1357/oh-my-pi/issues/12067)).
 - Deferred TTSR reminders no longer repeat before the configured `repeatGap` has elapsed ([#12065](https://github.com/can1357/oh-my-pi/pull/12065) by [@Dante-dan](https://github.com/Dante-dan)).
-- Compiled bytecode binaries now start correctly when bundled dependencies use `import.meta.resolve`.
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations, local-only completion, serialized RPC abort cleanup, and cancellation of queued attachments still being prepared ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 - Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session; returned overrides stay current when hooks change tools, and repeated policy changes pause automatic draining until an explicit retry ([#11835](https://github.com/can1357/oh-my-pi/pull/11835) by [@andrebrait](https://github.com/andrebrait)).
 - Fixed the TODO HUD auto-dismiss lifecycle: completed plans now persist their hidden state, survive session reopen, and can be explicitly revealed without stale timers hiding replacement plans.
 - Agents shipped by omp-installed marketplace plugins now honor their `model:` frontmatter instead of always inheriting `@default`; only Claude Code-format plugins (declaring `.claude-plugin/plugin.json`) keep dropping their provider-specific aliases ([#12028](https://github.com/can1357/oh-my-pi/issues/12028)).
@@ -492,13 +506,6 @@
 ### Removed
 
 - Removed the dangling `MCPManager.setOnNotification` single-slot setter, which had no callers in the runtime. Replaced by `MCPManager.addNotificationListener` — multi-listener, per-listener error isolation, returns an unsubscribe function.
-- Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-
-### Fixed
-
-- Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.2.0] - 2026-09-15
 
@@ -567,12 +574,6 @@
 - Multi-step logins (e.g. Perplexity email → code) now move the input field under the latest prompt instead of leaving it stuck beneath the first one.
 - Todo updates made through Eval's `tool.todo(...)` now persist to the session, so they survive resume/rewind/fork and no longer trigger false incomplete-todo reminders.
 - Native background security scans now accept provider-owned AWS authentication for Amazon Bedrock and Bedrock Mantle without requiring a stored OAuth account ([#12013](https://github.com/can1357/oh-my-pi/issues/12013)).
-### Fixed
-
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations, local-only completion, serialized RPC abort cleanup, and cancellation of queued attachments still being prepared ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- RPC image prompts retain submission order during preparation, and queued prompts keep hidden notices with their user message instead of starting orphaned turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Ctrl+Enter restores submitted text and attachments alongside newer drafts when a builtin command throws an error ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.21] - 2026-09-14
 
@@ -664,26 +665,6 @@
 - Fixed the Windows installer failing on Windows PowerShell 5.1: OS architecture detection no longer depends on the .NET `RuntimeInformation` type that only resolves reliably on PowerShell 7, and the script now requires PowerShell 5.1+ with a clear upgrade message instead of failing cryptically ([#11905](https://github.com/can1357/oh-my-pi/pull/11905) by [@h4vc](https://github.com/h4vc)).
 - Speculative reads now infer the summary language from the requested path while reading the resolved target, so cross-language symlinks summarize exactly like ordinary reads ([#11892](https://github.com/can1357/oh-my-pi/pull/11892) by [@h4vc](https://github.com/h4vc)).
 - The structural summary cache now keys on the parser language path, so one file read through different extensions no longer reuses a stale summary ([#11892](https://github.com/can1357/oh-my-pi/pull/11892) by [@h4vc](https://github.com/h4vc)).
-### Added
-
-- Added `promote_queued_message` to RPC and `promoteQueuedMessage()` to the session and TypeScript RPC client APIs, allowing queued follow-ups to become steering messages without duplicating their text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Added `remove_queued_message` to RPC and `removeQueuedMessage()` to the session and TypeScript client APIs to cancel a pending user-authored steering or follow-up message without resending, aborting, or restarting preparation in the other queue ([#3](https://github.com/andrebrait/oh-my-pi/pull/3) by [@andrebrait](https://github.com/andrebrait)).
-- Added typed queued-message removal to the official Python RPC client, including validated success and refusal results ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
-
-### Fixed
-
-- Cancelling a concurrently queued prompt now preserves the other prompt's hidden keyword context instead of removing it with the cancelled message ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
-- Skill commands queued through RPC can now be promoted to steering using their original invocation ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Queued prompts now reach the model together with their hidden attachment and keyword notices in `one-at-a-time` mode, including after promotion to steering ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Restoring or clearing a queued video prompt now removes its hidden source-path notice instead of delivering it without the prompt ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations and local-only completion.
-- Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session.
-- Skill invocations through RPC retain and normalize attachments after input-hook transformations.
-- MCP HTTP reconnects now release obsolete tool generations instead of growing session memory on every reconnect ([#11784](https://github.com/can1357/oh-my-pi/issues/11784)).
-- `/debug` memory reports now keep large heap snapshots out of JavaScript strings and reject empty snapshots instead of saving zero-byte files ([#11785](https://github.com/can1357/oh-my-pi/issues/11785)).
-- Native extension input handlers now intercept RPC submissions and main-session Ctrl+Enter, including queued input, with consistent transformations and local-only completion ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
-- Queued user steering and follow-up messages now refresh extension policy at delivery, including the first steering turn in a new session; returned overrides also stay current when hooks change tools ([#11835](https://github.com/can1357/oh-my-pi/pull/11835) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.1.18] - 2026-09-11
 
