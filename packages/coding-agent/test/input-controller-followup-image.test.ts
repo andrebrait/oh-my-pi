@@ -7,11 +7,13 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { InputEventResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 
 interface StubEditor {
+	onSubmit?: (text: string) => Promise<void>;
 	setText: (text: string) => void;
 	getText: () => string;
 	getExpandedText: () => string;
@@ -32,6 +34,7 @@ function createContext(opts: {
 	isStreaming: boolean;
 	pendingImages: ImageContent[];
 	pendingImageLinks?: (string | undefined)[];
+	input?: (text: string, images: ImageContent[] | undefined, source: string) => Promise<InputEventResult>;
 }) {
 	let editorText = "";
 	const editor: StubEditor = {
@@ -65,6 +68,8 @@ function createContext(opts: {
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
 	const showError = vi.fn();
+	const emitInput = vi.fn(opts.input ?? (async () => ({})));
+	const queueCompactionMessage = vi.fn();
 
 	const handleGoalModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
 	const handlePlanModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
@@ -73,13 +78,19 @@ function createContext(opts: {
 		editor,
 		ui: { requestRender },
 		skillCommands: new Map<string, string>(),
+		fileSlashCommands: new Set<string>(),
+		isKnownSlashCommand: () => false,
+		sessionManager: { putBlob: async () => ({ displayPath: "blob://transformed.png" }) },
+		queueCompactionMessage,
 		session: {
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
 			isBashRunning: false,
 			isEvalRunning: false,
-			extensionRunner: undefined,
+			extensionRunner: opts.input ? { hasHandlers: () => true, emitInput, getCommand: () => undefined } : undefined,
 			prompt,
+			customCommands: [],
+			promptTemplates: [],
 		},
 		loopModeEnabled: false,
 		compactionQueuedMessages: [],
@@ -97,7 +108,17 @@ function createContext(opts: {
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, handleGoalModeCommand, handlePlanModeCommand, handleVibeModeCommand, prompt, showError };
+	return {
+		ctx,
+		editor,
+		handleGoalModeCommand,
+		handlePlanModeCommand,
+		handleVibeModeCommand,
+		prompt,
+		showError,
+		emitInput,
+		queueCompactionMessage,
+	};
 }
 
 describe("InputController.handleFollowUp image forwarding", () => {

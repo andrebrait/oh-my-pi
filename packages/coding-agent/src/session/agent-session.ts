@@ -6422,13 +6422,10 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			const queued = await this.#queueUserMessage(
-				expandedText,
-				options?.images,
-				streamingBehavior,
-				submittedAt,
-				keywordNotices,
-			);
+			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+				timestamp: submittedAt,
+				prependMessages: keywordNotices,
+			});
 			outcome.sessionClaimed = queued;
 			return queued;
 		}
@@ -6477,21 +6474,17 @@ export class AgentSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			const queued = await this.#queueUserMessage(
-				expandedText,
-				options?.images,
-				streamingBehavior,
-				submittedAt,
-				keywordNotices,
-				{
+			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+				timestamp: submittedAt,
+				prependMessages: keywordNotices,
+				preprocessed: {
 					images: normalizedImages,
 					descriptionNotice: imageDescriptionNotice,
 				},
-			);
+			});
 			outcome.sessionClaimed = queued;
 			return queued;
 		}
-
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -7273,16 +7266,21 @@ export class AgentSession {
 			}
 		}
 	}
-
 	async #queueUserMessage(
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp" | "aside",
-		timestamp?: number,
-		prependMessages: readonly CustomMessage[] = [],
-		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
+		options?: {
+			timestamp?: number;
+			attribution?: MessageAttribution;
+			prependMessages?: readonly CustomMessage[];
+			preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined };
+		},
 	): Promise<boolean> {
-		const attribution: MessageAttribution = "user";
+		const attribution = options?.attribution ?? "user";
+		const timestamp = options?.timestamp;
+		const prependMessages = options?.prependMessages ?? [];
+		const preprocessed = options?.preprocessed;
 		// Captured before any await below so the aside branch can detect a
 		// newSession()/switchSession() that completed while normalization/vision
 		// description was in flight and drop a record that would otherwise land in a
