@@ -22,7 +22,12 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { dispatchRpcSkillPrompt, RpcExtensionUserMessageTracker } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import {
+	dispatchRpcSkillPrompt,
+	type RpcSkillCommandSession,
+	RpcExtensionUserMessageTracker,
+	tryRunRpcSkillCommand,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -694,8 +699,8 @@ describe("AgentSession queued steer delivery", () => {
 								source: "project",
 							},
 						],
-						async promptCustomMessage(message, options) {
-							const result = await session.promptCustomMessage(message, options);
+						promptCustomMessage: async (...args: Parameters<RpcSkillCommandSession["promptCustomMessage"]>) => {
+							const result = await session.promptCustomMessage(...args);
 							queued.resolve();
 							return result;
 						},
@@ -703,7 +708,7 @@ describe("AgentSession queued steer delivery", () => {
 					message: invocation,
 					streamingBehavior: "followUp",
 					output: () => {},
-					onError: error => queued.reject(error),
+					onError: (error: Error) => queued.reject(error),
 					extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
 				});
 				await withTimeout(queued.promise, 2_000, "Skill did not reach the native queue");
