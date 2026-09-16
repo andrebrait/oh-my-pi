@@ -123,6 +123,9 @@
 - A corrupted or externally modified session file no longer leaves the session impossible to close; a subsequent Ctrl+C exits without rewriting the session log.
 - Fixed silent MCP requests being terminated by an undeclared idle timeout; closing a legacy SSE connection now also cancels pending requests and notifications.
 - Fixed browser reuse for Chromium installed behind Linux wrapper scripts and prevented duplicate launches when a profile is locked ([#12236](https://github.com/can1357/oh-my-pi/pull/12236) by [@shivamklr](https://github.com/shivamklr)).
+- Fixed browser reuse for Chromium installed behind Linux wrapper scripts and prevented duplicate launches when a profile is locked.
+- Added `tui.titleSpinner` (`braille` | `dots` | `line`, default `braille`) to pick the terminal-title working-state spinner glyphs alongside the existing `tui.titleState` on/off toggle.
+- Same-named skills from different sources are no longer silently discarded. A byte-identical duplicate (the same skill installed twice) still collapses without a warning; a skill whose body differs stays reachable as `<namespace>/<name>` (the owning plugin or skill-root directory) via `skill://<namespace>/<name>` and the leading `/skill:<namespace>/<name>` form, with a collision warning naming both files; a taken namespaced slot gets a `~N` suffix. Raw skill names containing a path separator are now rejected at scan time, since `/` is reserved for that addressing ([#12151](https://github.com/can1357/oh-my-pi/pull/12151) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.2.1] - 2026-09-15
 
@@ -136,7 +139,6 @@
 ### Added
 
 - Added keyless Parallel web search when the provider is explicitly selected ([#9770](https://github.com/can1357/oh-my-pi/pull/9770) by [@georgeatparallel](https://github.com/georgeatparallel)).
-- Same-named skills from different sources are no longer silently discarded. A byte-identical duplicate (the same skill installed twice) still collapses without a warning; a skill whose body differs stays reachable as `<namespace>/<name>` (the owning plugin or skill-root directory) via `skill://<namespace>/<name>` and the leading `/skill:<namespace>/<name>` form, with a collision warning naming both files; a taken namespaced slot gets a `~N` suffix. Raw skill names containing a path separator are now rejected at scan time, since `/` is reserved for that addressing.
 - Sloppy edits support `<SM:AFTER>` to insert new lines after an anchor without repeating or replacing it.
 - Fixed eligible full OpenAI Responses request-body timeouts by retrying once after conservative local tool-result elision, while preserving assistant/user history, unsafe partial output, and existing stateful retries ([#11878](https://github.com/can1357/oh-my-pi/pull/11878) by [@hellofrommorgan](https://github.com/hellofrommorgan)).
 - User append instructions (`APPEND_SYSTEM.md`, `--append-system-prompt`) now render under their own `## User Instructions` heading whenever generated blocks precede them, instead of trailing the `## MCP Server Instructions` section and reading as server-supplied, unverified content ([#11832](https://github.com/can1357/oh-my-pi/pull/11832) by [@iacore](https://github.com/iacore)).
