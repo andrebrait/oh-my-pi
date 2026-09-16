@@ -583,6 +583,27 @@ describe("collision handling", () => {
 		expect(warnings.filter(warning => warning.message.includes("collision"))).toHaveLength(0);
 	});
 
+	it("silently collapses identical bodies across different namespaces", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skills-mirror-"));
+		const thirdDir = path.join(tempDir, "third", "calendar");
+		await fs.mkdir(thirdDir, { recursive: true });
+		await fs.copyFile(path.join(second, "calendar", "SKILL.md"), path.join(thirdDir, "SKILL.md"));
+
+		try {
+			const { skills, warnings } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [first, second, path.join(tempDir, "third")],
+			});
+			const names = skills.map(skill => skill.name).sort();
+			expect(names).toEqual(["calendar", "second/calendar"]);
+			const collision = warnings.filter(warning => warning.message.includes("name collision"));
+			expect(collision).toHaveLength(1);
+			expect(collision[0].message).toContain('available as "second/calendar"');
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
 	it("resolves namespaced skills through skill:// URLs", async () => {
 		const { skills } = await loadSkills({
 			...DISABLE_ALL_BUILTIN_SKILLS,
