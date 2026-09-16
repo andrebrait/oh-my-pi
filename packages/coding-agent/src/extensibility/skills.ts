@@ -66,7 +66,13 @@ function skillNamespace(skill: Pick<CapabilitySkill, "path" | "_source">): strin
 	const root = skillsIndex > 0 ? segments[skillsIndex - 1] : segments[segments.length - 3];
 	const cached = root?.split("___");
 	const namespace = cached?.length === 3 ? cached[1] : root;
-	return namespace && !namespace.startsWith(".") ? namespace : skill._source.provider;
+	if (!namespace || namespace.startsWith(".")) return skill._source.provider;
+	// Namespaces are addressed through `/skill:<ns>/<name>` and `skill://<ns>/<name>`,
+	// so they must be a single token: collapse runs of whitespace and other
+	// non-name characters to `-` (a distinct root whose sanitized namespace
+	// collides just resolves through the normal `~N` suffix path).
+	const safe = namespace.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "");
+	return safe || skill._source.provider;
 }
 
 interface AdmittedBody {
