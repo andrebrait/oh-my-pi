@@ -6393,14 +6393,14 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			// Steer/follow-up/aside the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
+			// Queue the keyword notices atomically with the user message so
+			// image normalization cannot leave a notice stranded in the queue.
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
+				preprocessed: {
+					keywordNotices,
+				},
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -6448,15 +6448,13 @@ export class AgentSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				preprocessed: {
 					images: normalizedImages,
 					descriptionNotice: imageDescriptionNotice,
+					keywordNotices,
 				},
 			});
 			outcome.sessionClaimed = true;
@@ -6612,10 +6610,7 @@ export class AgentSession {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, keywordNotices);
 			outcome.sessionClaimed = true;
 			return true;
 		}
@@ -6628,10 +6623,7 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, keywordNotices);
 			outcome.sessionClaimed = true;
 			return true;
 		}
@@ -7253,7 +7245,11 @@ export class AgentSession {
 		options?: {
 			timestamp?: number;
 			attribution?: MessageAttribution;
-			preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined };
+			preprocessed?: {
+				images?: ImageContent[];
+				descriptionNotice?: CustomMessage;
+				keywordNotices?: readonly CustomMessage[];
+			};
 		},
 	): Promise<void> {
 		const attribution = options?.attribution ?? "user";
@@ -7288,9 +7284,12 @@ export class AgentSession {
 			: normalizedImages?.length
 				? await this.#buildImageDescriptionNotice(normalizedImages)
 				: undefined;
+		const keywordNotices = preprocessed?.keywordNotices ?? [];
 		if (mode === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
 			const records: AgentMessage[] = [];
+			for (const notice of keywordNotices) records.push(notice);
+			for (const notice of videoAttachmentNotices) records.push(notice);
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			records.push({ role: "user", content, attribution, timestamp: timestamp ?? Date.now() });
 			this.#irc.queueAside(records);
@@ -7303,6 +7302,7 @@ export class AgentSession {
 		}
 		this.#allowQueuedMessageDrainRetry();
 		if (mode === "followUp") {
+			for (const notice of keywordNotices) this.agent.followUp(notice);
 			for (const notice of videoAttachmentNotices) this.agent.followUp(notice);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -7312,6 +7312,7 @@ export class AgentSession {
 				timestamp: timestamp ?? Date.now(),
 			});
 		} else {
+			for (const notice of keywordNotices) this.agent.steer(notice);
 			for (const notice of videoAttachmentNotices) this.agent.steer(notice);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer({
@@ -7517,6 +7518,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp" | "aside",
 		queueChipText?: string,
+		prependNotices?: readonly CustomMessage[],
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
@@ -7545,7 +7547,12 @@ export class AgentSession {
 			// Non-interrupting: rides the same step-boundary aside poll as
 			// sendCustomMessage's streaming aside branch — not an agent-core queue
 			// entry, so no drain-retry latch and no idle-queue drain scheduling.
-			this.#irc.queueAside([normalizedAppMessage]);
+			const records: AgentMessage[] = [];
+			if (prependNotices?.length) {
+				for (const notice of prependNotices) records.push(notice);
+			}
+			records.push(normalizedAppMessage);
+			this.#irc.queueAside(records);
 			// The image-normalization await above can span the run's settle, so the run may
 			// already be idle by the time the record lands in the aside queue with no loop
 			// left to drain it. Resuming here is a no-op while streaming and wakes/folds
@@ -7555,8 +7562,14 @@ export class AgentSession {
 		}
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
+			if (prependNotices?.length) {
+				for (const notice of prependNotices) this.agent.followUp(notice);
+			}
 			this.agent.followUp(normalizedAppMessage);
 		} else {
+			if (prependNotices?.length) {
+				for (const notice of prependNotices) this.agent.steer(notice);
+			}
 			this.agent.steer(normalizedAppMessage);
 		}
 		this.#scheduleIdleQueueDrain();

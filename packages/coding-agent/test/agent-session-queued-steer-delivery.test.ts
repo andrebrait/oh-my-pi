@@ -657,6 +657,69 @@ describe("AgentSession queued steer delivery", () => {
 			expect(session.agent.hasQueuedMessages()).toBe(false);
 		});
 
+		it("enqueues live keyword companion groups synchronously during streaming in one-at-a-time mode", async () => {
+			const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["steered"] }]);
+			session.settings.set("magicKeywords.enabled", true);
+			session.settings.set("magicKeywords.ultrathink", true);
+			session.setSteeringMode("one-at-a-time");
+			const image = {
+				type: "image" as const,
+				mimeType: "image/png",
+				data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+			};
+
+			let steerPromise: Promise<boolean> | undefined;
+			session.agent.setOnBeforeYield(async () => {
+				if (steerPromise) return;
+				steerPromise = session.prompt("review this ?ultrathink", {
+					images: [image],
+					streamingBehavior: "steer",
+				});
+			});
+
+			await session.prompt("start");
+			await steerPromise;
+			await session.waitForIdle();
+
+			expect(mock.calls).toHaveLength(2);
+			const steeredContext = JSON.stringify(mock.calls[1].context.messages);
+			expect(steeredContext).toContain("Multi-step reasoning");
+			expect(steeredContext).toContain("review this ?ultrathink");
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			const ultrathinkMessage = session.messages.find(
+				message => message.role === "custom" && message.customType === "ultrathink-notice",
+			);
+			expect(ultrathinkMessage).toBeDefined();
+		});
+
+		it("promotes live keyword companion groups queued as follow-ups into steering atomically", async () => {
+			const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["steered"] }]);
+			session.settings.set("magicKeywords.enabled", true);
+			session.settings.set("magicKeywords.ultrathink", true);
+			session.setSteeringMode("one-at-a-time");
+
+			let followUpPromise: Promise<boolean> | undefined;
+			let promoted = false;
+			session.agent.setOnBeforeYield(async () => {
+				if (followUpPromise) return;
+				followUpPromise = session.prompt("follow-up with ?ultrathink", {
+					streamingBehavior: "followUp",
+				});
+				await followUpPromise;
+				promoted = session.promoteQueuedMessage("follow-up with ?ultrathink");
+			});
+
+			await session.prompt("start");
+			await session.waitForIdle();
+
+			expect(promoted).toBe(true);
+			expect(mock.calls).toHaveLength(2);
+			const steeredContext = JSON.stringify(mock.calls[1].context.messages);
+			expect(steeredContext).toContain("Multi-step reasoning");
+			expect(steeredContext).toContain("follow-up with ?ultrathink");
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+		});
+
 		it("wakes an idle follow-up and rejects a stale promotion without replaying it", async () => {
 			const { session, mock } = await createSession([{ content: ["delivered"] }]);
 			await session.followUp("wake me");
