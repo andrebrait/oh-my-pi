@@ -618,6 +618,29 @@ describe("collision handling", () => {
 		expect(nested.content).toContain("Calendar (Second)");
 	});
 
+	it("collapses a custom override whose body matches an existing alias", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skills-override-"));
+		const previousHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			// Provider copy of Second's calendar in ~/.agents/skills; the custom
+			// directory then overrides the bare name with the identical body.
+			const providerDir = path.join(home, ".agents", "skills", "calendar");
+			await fs.mkdir(providerDir, { recursive: true });
+			await fs.copyFile(path.join(second, "calendar", "SKILL.md"), path.join(providerDir, "SKILL.md"));
+			const { skills } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				enableAgentsUser: true,
+				customDirectories: [second],
+			});
+			expect(skills.map(skill => skill.name)).toEqual(["calendar"]);
+			expect(skills[0].filePath).toBe(path.join(second, "calendar", "SKILL.md"));
+		} finally {
+			restoreEnvValue("HOME", previousHome);
+			await removeWithRetries(home);
+		}
+	});
+
 	it("normalizes derived namespaces to a token-safe form", async () => {
 		const spaced = await fs.mkdtemp(path.join(os.tmpdir(), "My Skills-"));
 		try {
