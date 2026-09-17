@@ -408,10 +408,21 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			const existingBody = admitted.get(existing.name)?.body ?? "";
 			skillMap.delete(existing.name);
 			admitted.delete(existing.name);
+			// The override subsumes any other admitted instance whose body it
+			// equals (e.g. a second provider copy parked under an alias):
+			// byte-identical duplicates collapse even across the override.
+			for (const [name, entry] of [...admitted]) {
+				if (entry.body === body) {
+					skillMap.delete(name);
+					admitted.delete(name);
+				}
+			}
 			skillMap.set(skill.name, skill);
 			admitted.set(skill.name, { rawName: skill.name, body });
 			realPathSet.add(resolvedPath);
-			if (existing._source) {
+			// A displaced provider whose body equals the override is fully
+			// subsumed; only a differing one keeps a namespaced name.
+			if (existingBody !== body && existing._source) {
 				admit(
 					{ ...existing },
 					existingBody,
