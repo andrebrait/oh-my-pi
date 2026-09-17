@@ -81,13 +81,25 @@ interface AdmittedBody {
 	 * `<ns>/foo~2` indistinguishable from a generated collision suffix. */
 	rawName: string;
 	body: string;
+	namespace: string;
+	filePath: string;
+}
+
+interface CollisionResolution {
+	name: string;
+	warning?: string;
+	displaced?: {
+		skill: Skill;
+		newName: string;
+		warning: string;
+	};
 }
 
 /**
  * Resolve a same-name skill against what is already loaded.
  * - Identical body to any admitted instance of this raw name → silently drop.
- * - Different body → keep it under `<namespace>/<name>` so neither is lost;
- *   a taken namespaced slot gets a numeric suffix rather than losing the skill.
+ * - Different body → every variant receives a `<namespace>/<name>` prefix so
+ *   neither is ambiguous; a taken namespaced slot gets a numeric suffix.
  */
 function resolveCollision(
 	skillMap: Map<string, Skill>,
@@ -95,19 +107,39 @@ function resolveCollision(
 	candidate: Skill,
 	candidateBody: string,
 	namespace: string,
-): { name: string; warning?: string } | undefined {
-	const existing = skillMap.get(candidate.name);
-	if (!existing) return { name: candidate.name };
+): CollisionResolution | undefined {
 	for (const entry of admitted.values()) {
 		if (entry.rawName === candidate.name && entry.body === candidateBody) return undefined;
 	}
+	const existingEntries = [...admitted.entries()].filter(([_, e]) => e.rawName === candidate.name);
+	if (existingEntries.length === 0) {
+		return { name: candidate.name };
+	}
+
+	let displaced: CollisionResolution["displaced"] | undefined;
+	const bareSkill = skillMap.get(candidate.name);
+	if (bareSkill) {
+		const bareEntry = admitted.get(candidate.name)!;
+		let namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}`;
+		for (let n = 2; skillMap.has(namespacedBare) || namespacedBare === `${namespace}/${candidate.name}`; n++) {
+			namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}~${n}`;
+		}
+		displaced = {
+			skill: bareSkill,
+			newName: namespacedBare,
+			warning: `name collision: "${bareEntry.rawName}" from ${bareSkill.filePath} differs from ${candidate.filePath}; available as "${namespacedBare}"`,
+		};
+	}
+
 	let namespaced = `${namespace}/${candidate.name}`;
-	for (let n = 2; skillMap.has(namespaced); n++) {
+	for (let n = 2; skillMap.has(namespaced) || (displaced && displaced.newName === namespaced); n++) {
 		namespaced = `${namespace}/${candidate.name}~${n}`;
 	}
+	const referencePath = existingEntries[0][1].filePath;
 	return {
 		name: namespaced,
-		warning: `name collision: "${candidate.name}" from ${candidate.filePath} differs from ${existing.filePath}; available as "${namespaced}"`,
+		warning: `name collision: "${candidate.name}" from ${candidate.filePath} differs from ${referencePath}; available as "${namespaced}"`,
+		displaced,
 	};
 }
 
@@ -295,13 +327,26 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	function admit(skill: Skill, body: string, namespace: string): string | undefined {
 		const resolved = resolveCollision(skillMap, admitted, skill, body, namespace);
 		if (!resolved) return undefined;
-		const { name, warning } = resolved;
+		const { name, warning, displaced } = resolved;
 		if (disabledSkillNames.has(name) || matchesIgnorePatterns(name)) return undefined;
+
+		if (displaced) {
+			skillMap.delete(displaced.skill.name);
+			const displacedEntry = admitted.get(displaced.skill.name)!;
+			admitted.delete(displaced.skill.name);
+			displaced.skill.name = displaced.newName;
+			if (!disabledSkillNames.has(displaced.newName) && !matchesIgnorePatterns(displaced.newName)) {
+				skillMap.set(displaced.newName, displaced.skill);
+				admitted.set(displaced.newName, displacedEntry);
+			}
+			collisionWarnings.push({ skillPath: displaced.skill.filePath, message: displaced.warning });
+		}
+
 		if (warning) collisionWarnings.push({ skillPath: skill.filePath, message: warning });
 		const rawName = skill.name;
 		skill.name = name;
 		skillMap.set(name, skill);
-		admitted.set(name, { rawName, body });
+		admitted.set(name, { rawName, body, namespace, filePath: skill.filePath });
 		return name;
 	}
 
@@ -394,41 +439,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const { skill, body, namespace } = allCustomSkills[i];
 		const resolvedPath = customRealPaths[i];
 		if (realPathSet.has(resolvedPath)) continue;
-
-		const existing = skillMap.get(skill.name);
-		if (existing && !existing.source.startsWith("custom:")) {
-			// A skill name claimed by a DEFAULT-path provider (e.g.
-			// ~/.claude/skills/<name>) yields to the explicitly configured
-			// skills.customDirectories entry — the user's custom dir is the
-			// higher-priority source (issue #7190). The displaced default is
-			// re-admitted afterwards so it keeps a namespaced name unless it is
-			// the same skill.
-			const existingBody = admitted.get(existing.name)?.body ?? "";
-			skillMap.delete(existing.name);
-			admitted.delete(existing.name);
-			// The override subsumes any other admitted instance whose body it
-			// equals (e.g. a second provider copy parked under an alias):
-			// byte-identical duplicates collapse even across the override.
-			for (const [name, entry] of [...admitted]) {
-				if (entry.body === body) {
-					skillMap.delete(name);
-					admitted.delete(name);
-				}
-			}
-			skillMap.set(skill.name, skill);
-			admitted.set(skill.name, { rawName: skill.name, body });
-			realPathSet.add(resolvedPath);
-			// A displaced provider whose body equals the override is fully
-			// subsumed; only a differing one keeps a namespaced name.
-			if (existingBody !== body && existing._source) {
-				admit(
-					{ ...existing },
-					existingBody,
-					skillNamespace({ path: existing.filePath, _source: existing._source }),
-				);
-			}
-			continue;
-		}
 		if (admit(skill, body, namespace) !== undefined) realPathSet.add(resolvedPath);
 	}
 
