@@ -4,6 +4,7 @@ export * from "./binary";
 export * from "./color";
 export * from "./dirs";
 export * from "./env";
+export * from "./executable";
 export * from "./fetch-retry";
 export * from "./file-lock";
 export * from "./format";
@@ -39,6 +40,7 @@ export * from "./tls-fetch";
 export * from "./type-guards";
 export * from "./version";
 export * from "./which";
+export * from "./yaml-config";
 
 function isPlainObject(val: object): val is Record<string, unknown> {
 	return Object.getPrototypeOf(val) === Object.prototype || Array.isArray(val);

@@ -158,6 +158,7 @@ export const commands: CommandEntry[] = [
 	{
 		name: "plugin",
 		load: () => import("./commands/plugin").then(m => m.default),
+		aliases: ["plugins"],
 		help: commandHelp.pluginHelp,
 	},
 	{
@@ -204,6 +205,11 @@ export const commands: CommandEntry[] = [
 		name: "stats",
 		load: () => import("./commands/stats").then(m => m.default),
 		help: commandHelp.statsHelp,
+	},
+	{
+		name: "stream",
+		load: () => import("./commands/stream").then(m => m.default),
+		help: commandHelp.streamHelp,
 	},
 	{
 		name: "update",

@@ -406,6 +406,16 @@ Use `ANTHROPIC_SEARCH_BASE_URL` (optionally with `ANTHROPIC_SEARCH_API_KEY`) to 
 | ------------------- | ------------------------------------------------------------------------------- |
 | `PI_AUTH_NO_BORROW` | If set, disables macOS native-app token borrowing path in Perplexity login flow |
 
+### TypeSafe judgments
+
+Small typed decisions the agent makes about its own state (the `auto` thinking-level difficulty classifier, Smart unexpected-stop detection, git TUI AI staging) go through one judgment interface. With a TypeSafe credential they run on TypeSafe's System One model (`POST /v1/systemone`); a failed request falls back through the `tiny`, `smol`, `default`, and active-session models. Without TypeSafe, features use that chat chain or their configured local on-device model. `providers.judgmentProvider` (`auto` / `typesafe` / `llm`) pins the preferred backend.
+
+| Variable                 | Default / behavior                                                          |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `TYPESAFE_API_KEY`       | TypeSafe API key; alternatively use `/login typesafe`                       |
+| `TYPESAFE_BASE_URL`      | API root override (default `https://api.typesafe.ai`); also used by `/login` validation |
+| `TYPESAFE_DEFAULT_MODEL` | System One model name (default `jev-latest`)                                |
+
 ---
 
 ## 4) Python tooling and kernel runtime
@@ -579,7 +589,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `PI_FORCE_IMAGE_PROTOCOL`      | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`). Setting `kitty` inside a terminal multiplexer also opts into Kitty Unicode placeholder placement unless `PI_KITTY_PLACEHOLDERS=0` or `PI_NO_KITTY_PLACEHOLDERS=1` disables it |
 | `PI_KITTY_PLACEHOLDERS`        | `1` forces Kitty Unicode placeholder placement on; `0` forces it off. Under a terminal multiplexer, use `1` only after confirming the outer terminal supports Kitty `U=1` placeholders—otherwise U+10EEEE may render as literal PUA boxes              |
 | `PI_NO_KITTY_PLACEHOLDERS`     | `1` hard-disables Kitty Unicode placeholder placement and takes precedence over `PI_KITTY_PLACEHOLDERS`                                                                                                                                            |
-| `PI_TUI_RESIZE_IN_PLACE`       | `1`/`true` force in-place resize (no alt-screen borrow, no ED3 rewrap); `0`/`false` force the alt-screen fast path. Default-on for Warp, which re-reports its size on alt-screen toggles                                                           |
+| `PI_TUI_RESIZE_IN_PLACE`       | `1`/`true` force in-place resize (no alt-screen borrow, no ED3 rewrap); `0`/`false` force the alt-screen fast path. Default-on for Warp, which re-reports its size on alt-screen toggles — except on a ConPTY host (Windows, and WSL through `wslhost`), where conhost owns the grid and repaints its own viewport on resize, so the anchor cannot be recovered |
 
 ### Browser launch/proxy controls
 

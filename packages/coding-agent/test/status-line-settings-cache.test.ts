@@ -4,9 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/presets";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-tui/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-tui/status-line/presets";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
@@ -74,7 +75,7 @@ function makeSession(sessionName = "Cache Session") {
 }
 
 function makeComponent(statusLineSettings: StatusLineSettings): StatusLineComponent {
-	const component = statusLines.track(new StatusLineComponent(makeSession()));
+	const component = statusLines.track(new StatusLineComponent(makeSession(), statusLineHost));
 	component.updateSettings(statusLineSettings);
 	return component;
 }
@@ -112,7 +113,7 @@ describe("StatusLineComponent effective settings cache", () => {
 			snapshotCalls++;
 			return getSnapshot();
 		};
-		const component = statusLines.track(new StatusLineComponent(session));
+		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["model", "mode"],
@@ -204,6 +205,24 @@ describe("StatusLineComponent effective settings cache", () => {
 		expect(customComponent.getEffectiveSettingsForTest().leftSegments).toEqual([]);
 		expect(customComponent.getEffectiveSettingsForTest().rightSegments).toEqual([]);
 		expect(customComponent.getTopBorder(120)).toEqual({ content: "", width: 0, revision: 0 });
+	});
+
+	it("renders custom preset defaults when segment arrays are unconfigured", () => {
+		Settings.instance.override("statusLine.preset", "custom");
+		const component = makeComponent({
+			preset: Settings.instance.get("statusLine.preset"),
+			leftSegments: Settings.instance.get("statusLine.leftSegments"),
+			rightSegments: Settings.instance.get("statusLine.rightSegments"),
+			sessionAccent: false,
+		});
+
+		const effective = component.getEffectiveSettingsForTest();
+		expect(effective.leftSegments).toEqual(STATUS_LINE_PRESETS.custom.leftSegments);
+		expect(effective.rightSegments).toEqual(STATUS_LINE_PRESETS.custom.rightSegments);
+
+		const content = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(content).toContain("Test Model");
+		expect(content).toContain("Cache Session");
 	});
 
 	it("surfaces active subagents even when custom segments omit subagents", () => {
