@@ -35,7 +35,8 @@ const expectedFixtureSkillOrder: string[] = [
  * MUST spread this in: the discovery surface only ignores `~/.<dir>/skills/*` if
  * every provider toggle resolves to false, otherwise stray skills from the
  * developer's real `$HOME` (e.g. `~/.agents/skills/<name>/SKILL.md`) leak into
- * the assertion.
+ * the assertion. `excludeProviders` additionally drops omp's own plugin
+ * installs (`~/.omp/plugins`), which load unconditionally on dev machines.
  */
 const DISABLE_ALL_BUILTIN_SKILLS = {
 	enableCodexUser: false,
@@ -45,7 +46,8 @@ const DISABLE_ALL_BUILTIN_SKILLS = {
 	enablePiProject: false,
 	enableAgentsUser: false,
 	enableAgentsProject: false,
-} as const;
+	excludeProviders: ["omp-plugins", "claude-plugins"] as string[],
+};
 
 describe("skills", () => {
 	describe("loadSkillsFromDir", () => {
@@ -625,25 +627,23 @@ describe("collision handling", () => {
 	});
 
 	it("collapses a custom override whose body matches an existing alias", async () => {
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skills-override-"));
-		const previousHome = process.env.HOME;
-		process.env.HOME = home;
+		// Two custom directories carry the identical calendar body; the
+		// higher-priority (first) directory wins and the other collapses
+		// silently. (A real user-level provider copy is not usable here:
+		// `os.homedir()` is cached per process under Bun, so HOME mutation
+		// cannot isolate the user lane on machines with real ~/.agents skills.)
+		const providerCopy = await fs.mkdtemp(path.join(os.tmpdir(), "skills-override-"));
 		try {
-			// Provider copy of Second's calendar in ~/.agents/skills; the custom
-			// directory then overrides the bare name with the identical body.
-			const providerDir = path.join(home, ".agents", "skills", "calendar");
-			await fs.mkdir(providerDir, { recursive: true });
-			await fs.copyFile(path.join(second, "calendar", "SKILL.md"), path.join(providerDir, "SKILL.md"));
+			await fs.mkdir(path.join(providerCopy, "calendar"), { recursive: true });
+			await fs.copyFile(path.join(second, "calendar", "SKILL.md"), path.join(providerCopy, "calendar", "SKILL.md"));
 			const { skills } = await loadSkills({
 				...DISABLE_ALL_BUILTIN_SKILLS,
-				enableAgentsUser: true,
-				customDirectories: [second],
+				customDirectories: [second, providerCopy],
 			});
 			expect(skills.map(skill => skill.name)).toEqual(["calendar"]);
 			expect(skills[0].filePath).toBe(path.join(second, "calendar", "SKILL.md"));
 		} finally {
-			restoreEnvValue("HOME", previousHome);
-			await removeWithRetries(home);
+			await removeWithRetries(providerCopy);
 		}
 	});
 
