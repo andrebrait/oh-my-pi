@@ -1,5 +1,5 @@
 import { runPauseScreen } from "@oh-my-pi/pi-tui/overlays/pause-screen";
-import { clearSubmittedText } from "./helpers/draft"; b785b37f86 (fix(coding-agent): keep detached drafts across builtin cleanup)
+import { clearSubmittedText } from "./helpers/draft";
 import { shutdownHandlerTui } from "./builtin-lifecycle";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import type { SlashCommandSpec } from "./types";
