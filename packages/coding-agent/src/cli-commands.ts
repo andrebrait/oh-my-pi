@@ -197,6 +197,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.renderHelp,
 	},
 	{
+		name: "skills",
+		load: () => import("./commands/skills").then(m => m.default),
+		help: commandHelp.skillsHelp,
+	},
+	{
 		name: "ssh",
 		load: () => import("./commands/ssh").then(m => m.default),
 		help: commandHelp.sshHelp,
@@ -205,6 +210,11 @@ export const commands: CommandEntry[] = [
 		name: "stats",
 		load: () => import("./commands/stats").then(m => m.default),
 		help: commandHelp.statsHelp,
+	},
+	{
+		name: "stream",
+		load: () => import("./commands/stream").then(m => m.default),
+		help: commandHelp.streamHelp,
 	},
 	{
 		name: "update",
