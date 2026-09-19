@@ -6426,10 +6426,24 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 
+			// Attachment preparation must run before queueing: #queueUserMessage treats
+			// a truthy `preprocessed` as authoritative, so a partial object (keyword
+			// notices only) would skip the vision description for image-bearing queued
+			// prompts and strand the submission without its companion notice.
+			const queuedImages = await this.#normalizeImagesForModel(options?.images);
+			if (wasCancelled()) return false;
+			const queuedSignal = this.#postPromptTasksAbortController.signal;
+			const queuedDescriptionNotice = queuedImages?.length
+				? await this.#buildImageDescriptionNotice(queuedImages, queuedSignal)
+				: undefined;
+			if (wasCancelled()) return false;
+
 			outcome.sessionClaimed = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				preprocessed: {
+					images: queuedImages,
+					descriptionNotice: queuedDescriptionNotice,
 					keywordNotices,
 				},
 			});
