@@ -608,6 +608,40 @@ export function hasGlobPathChars(filePath: string): boolean {
 	return GLOB_PATH_CHARS.some(char => filePath.includes(char));
 }
 
+/**
+ * Whether {@link rawPath} resolves through the external-URL branch of
+ * {@link resolveToolSearchScope}'s pipeline rather than the local filesystem
+ * pipeline. Backs the `ExtensionContext.isRemotePath` extension API (scoped
+ * to a session's cwd there); this lower-level form takes `cwd` explicitly
+ * so `resolveToolSearchScope` can call it once per raw path in its loop.
+ *
+ * Applies {@link normalizePathLikeInput} itself (trim + strip outer quotes)
+ * so a caller that hasn't already run the rest of the pipeline still lands
+ * on the same verdict `resolveToolSearchScope` would for the same raw text.
+ *
+ * A strict `http:`/`https:`/`ftp:`/`ws:`/`wss:` scheme is always remote. `file://`
+ * is intentionally NOT remote: it has local-path semantics (expandPath
+ * strips it downstream), so it flows through the ordinary filesystem
+ * pipeline. A fuzzy URL spelling the read parser accepts (`www.host/…`,
+ * collapsed `https:/host/…`) only counts as remote when no local path of
+ * that name exists — an existing local path wins so a directory literally
+ * named `www.foo` stays searchable; only a definitive ENOENT/ENOTDIR flips
+ * it to remote (any other stat outcome, including success, means the path
+ * exists and stays local).
+ */
+export async function isExternalUrlPath(rawPath: string, cwd: string): Promise<boolean> {
+	const normalizedRawPath = normalizePathLikeInput(rawPath);
+	const strictExternalUrlRe = /^(?:https?|ftp|ws|wss):\/\//i;
+	if (strictExternalUrlRe.test(normalizedRawPath)) return true;
+	if (!isReadableUrlPath(normalizedRawPath) || hasGlobPathChars(normalizedRawPath)) return false;
+	try {
+		await fs.promises.stat(resolveToCwd(normalizedRawPath, cwd));
+		return false;
+	} catch (err) {
+		return isEnoent(err) || isEnotdir(err);
+	}
+}
+
 type PathEntrySplitter = (item: string) => { basePath: string };
 
 const TOP_LEVEL_WHITESPACE_RE = /\s/;
@@ -1365,28 +1399,11 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("Search scope entries must be non-empty paths or globs");
 	}
-	// Strict external-URL schemes. `file://` is intentionally absent: it has
-	// local-path semantics (expandPath strips it downstream), so it flows through
-	// the ordinary filesystem pipeline instead of the external-URL resolver.
-	const strictExternalUrlRe = /^(?:https?|ftp|ws|wss):\/\//i;
 	const internalRouter = InternalUrlRouter.instance();
 	const resolvedPathInputs: string[] = [];
 	const immutableSourcePaths = new Set<string>();
 	for (const rawPath of rawPaths) {
-		let externalUrl = strictExternalUrlRe.test(rawPath);
-		if (!externalUrl && isReadableUrlPath(rawPath) && !hasGlobPathChars(rawPath)) {
-			// Fuzzy spelling the read parser accepts (`www.host/…`, collapsed
-			// `https:/host/…`). An existing local path wins over URL
-			// interpretation so a directory literally named `www.foo` stays
-			// searchable; only a definitive ENOENT/ENOTDIR flips to URL handling
-			// (any other stat error means the path exists — let the local
-			// pipeline surface it).
-			try {
-				await fs.promises.stat(resolveToCwd(rawPath, cwd));
-			} catch (err) {
-				externalUrl = isEnoent(err) || isEnotdir(err);
-			}
-		}
+		const externalUrl = await isExternalUrlPath(rawPath, cwd);
 		if (externalUrl) {
 			const resolved = opts.resolveExternalUrl ? await opts.resolveExternalUrl(rawPath) : undefined;
 			if (resolved) {

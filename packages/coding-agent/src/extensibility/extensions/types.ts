@@ -518,6 +518,18 @@ export interface ExtensionContext {
 	 * by default -- it does not narrow or widen OMP's own security model.
 	 */
 	isProjectTrusted(): boolean;
+
+	/**
+	 * Whether OMP's read/search pipeline resolves this path as non-local. A
+	 * strict `http:`/`https:`/`ftp:`/`ws:`/`wss:` scheme is always remote; `file://`
+	 * is never remote (it has local-path semantics); a fuzzy URL spelling
+	 * (`www.host/…`) is remote only when no local path of that name exists
+	 * under this session's `cwd`. Backs the same classification `search`,
+	 * `ast_grep`, and `ast_edit` use, so a re-registered tool or hook guard
+	 * can match host behavior instead of reconstructing it from scheme
+	 * heuristics.
+	 */
+	isRemotePath(path: string): Promise<boolean>;
 }
 
 /**
