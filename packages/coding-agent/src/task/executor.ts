@@ -105,6 +105,7 @@ import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
+import { SubagentStopHook } from "./subagent-stop-hook";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
@@ -427,6 +428,12 @@ export interface ExecutorOptions {
 	id: string;
 	parentToolCallId?: string;
 	/**
+	 * Spawning session's id, reported as the `subagent_stop` event's
+	 * `parent_session_id`. Supplied by the spawn site: the child session cannot
+	 * derive it, and guessing from the child's own context would misreport it.
+	 */
+	parentSessionId?: string;
+	/**
 	 * Spawn runs as a detached background job (parent turn not blocked on it).
 	 * Rides the subagent lifecycle/progress payloads so HUD-style surfaces can
 	 * skip spawns the transcript already renders inline. See
@@ -504,6 +511,11 @@ export interface ExecutorOptions {
 	 */
 	invokedAt?: number;
 	acquiredAt?: number;
+	/**
+	 * Parent session transcript file. The child records it as its
+	 * `SessionHeader.parentSession` and reports it as the `subagent_stop` event's
+	 * `parent_session_file`.
+	 */
 	sessionFile?: string | null;
 	persistArtifacts?: boolean;
 	artifactsDir?: string;
@@ -681,6 +693,8 @@ export const SUBAGENT_WARNING_NULL_YIELD = "SYSTEM WARNING: Subagent called yiel
 export const SUBAGENT_WARNING_MISSING_YIELD =
 	"SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.";
 export const SUBAGENT_WARNING_EMPTY_MESSAGE = "SYSTEM WARNING: Subagent ended without a final message.";
+export const SUBAGENT_STOP_REFUSAL_UNRESOLVED =
+	"Subagent stopped at a yield that a subagent_stop handler refused; the continuation turn ended without a replacement yield.";
 
 /** Build a schema_violation outcome — surfaced as a non-zero exit so callers treat it as a failure. */
 function buildSchemaViolationOutcome(
@@ -1266,6 +1280,14 @@ interface SubagentRunMonitor {
 	 */
 	yieldInvalidatedByAsync(): boolean;
 	/**
+	 * True when a recorded yield was refused by a `subagent_stop` handler and no
+	 * fresh yield has landed since: the payload was explicitly rejected, so it
+	 * must not be accepted or published as the run's result.
+	 */
+	yieldInvalidatedByStop(): boolean;
+	/** Drop the recorded terminal yield so the ladder demands a fresh one after a `subagent_stop` continuation. */
+	invalidateYieldForStop(): void;
+	/**
 	 * True once a terminal yield with pending owner async work stopped the
 	 * free-running turn (recoverable, like a budget stop) instead of
 	 * terminating the run. Cleared when {@link waitForYieldTurnStop} settles.
@@ -1380,6 +1402,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	/** True while the reminder ladder's forced final `yield` is outstanding. */
 	let finalYieldForced = false;
 	let yieldInvalidatedByAsync = false;
+	/** True once a `subagent_stop` handler refused the recorded yield. */
+	let yieldInvalidatedByStop = false;
 	/** Epoch ms the current terminal yield was recorded; cleared when it is invalidated. */
 	let yieldAcceptedAt: number | undefined;
 	let yieldTurnStopRequested = false;
@@ -1511,6 +1535,17 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 
 	/** Owner async work that can still re-wake the run (quiescence barrier predicate). */
 	const sessionHasPendingAsyncWork = (): boolean => activeSession?.hasPendingAsyncWork?.() ?? false;
+
+	/**
+	 * Whether the live child session has `subagent_stop` handlers. A terminal
+	 * yield is parked for the stop pass instead of terminating the run — the same
+	 * reason owner async work parks it (see {@link requestYieldTurnStop}): the
+	 * pass runs inside the drive loop, which a terminated run signal makes
+	 * unreachable. Queried per terminal yield; a session's handler set is fixed
+	 * for the run.
+	 */
+	const sessionHasSubagentStopHandlers = (): boolean =>
+		activeSession?.extensionRunner?.hasHandlers("subagent_stop") === true;
 
 	// Handle abort signal
 	if (signal) {
@@ -1729,6 +1764,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			yieldCallPending = false;
 			if (yieldCalled) {
 				yieldInvalidatedByAsync = false;
+				yieldInvalidatedByStop = false;
 				yieldAcceptedAt = Date.now();
 				// Submitted: the remaining work is finalization (or waiting on owned
 				// async jobs), so stop showing the last stale self-estimate.
@@ -1934,10 +1970,16 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						}) === true;
 					const forcedFinalYield = event.toolName === "yield" && finalYieldForced && yieldCalled;
 					if (wantsTerminate || forcedFinalYield) {
-						if (event.toolName === "yield" && sessionHasPendingAsyncWork()) {
-							// Terminal yield with owner jobs still pending: park the
-							// run behind the quiescence barrier instead of completing
-							// it (see requestYieldTurnStop).
+						if (
+							event.toolName === "yield" &&
+							(sessionHasPendingAsyncWork() || sessionHasSubagentStopHandlers())
+						) {
+							// Terminal yield that is not yet the run's final answer:
+							// owner jobs still pending, or a `subagent_stop` pass
+							// waiting to judge it. Park the run behind the drive
+							// loop instead of completing it (see
+							// requestYieldTurnStop) so the candidate is settled —
+							// and offered to handlers — before it is accepted.
 							requestYieldTurnStop();
 						} else {
 							requestAbort("terminate");
@@ -2252,6 +2294,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		budgetStopRequested: () => budgetStopRequested,
 		waitForBudgetStop: () => budgetStopAbortPromise ?? Promise.resolve(),
 		yieldInvalidatedByAsync: () => yieldInvalidatedByAsync,
+		yieldInvalidatedByStop: () => yieldInvalidatedByStop,
+		invalidateYieldForStop: () => {
+			yieldCalled = false;
+			yieldInvalidatedByStop = true;
+			yieldAcceptedAt = undefined;
+		},
 		yieldTurnStopRequested: () => yieldTurnStopRequested,
 		waitForYieldTurnStop: async () => {
 			const pending = yieldTurnStopPromise;
@@ -2367,6 +2415,10 @@ async function driveSessionToResult(
 	session: AgentSession,
 	monitor: SubagentRunMonitor,
 	task: string,
+	// `subagent_stop` pass for this run. The hook owns its own per-run state
+	// (continuation allowance, stop_hook_active) and is offered each candidate
+	// terminal yield before the result can be accepted or published.
+	stopHook: SubagentStopHook,
 	options: {
 		/** Open-endedness description forwarded to the session's `auto` thinking classifier. */
 		solutionSpace?: string;
@@ -2600,7 +2652,23 @@ async function driveSessionToResult(
 			// prompting again (mirrors waitForBudgetStop).
 			await awaitAbortable(monitor.waitForYieldTurnStop());
 			if (!session.hasPendingAsyncWork()) {
-				if (monitor.yieldCalled()) break;
+				if (!monitor.yieldCalled()) continue;
+				// The candidate is terminal: owner async work has quiesced, so this
+				// yield is what the parent would accept and publish. Offer it to
+				// `subagent_stop` handlers here — after the child's own work is
+				// done, before every acceptance/finalize path downstream. A refusal
+				// drops the latch so nothing can accept or publish the refused
+				// payload, and the SAME child session runs again; the loop then
+				// demands a fresh terminal yield.
+				const stop = await stopHook.run(session);
+				if (stop.kind === "aborted") {
+					monitor.invalidateYieldForStop();
+					break;
+				}
+				if (stop.kind === "allow") break;
+				monitor.invalidateYieldForStop();
+				await dispatchPrompt(stop.text, { attribution: "agent", synthetic: true }, "subagent_stop continuation");
+				await awaitAbortable(session.waitForIdle());
 				continue;
 			}
 			if (!monitor.yieldCalled()) {
@@ -2697,6 +2765,15 @@ async function driveSessionToResult(
 		}
 	} finally {
 		error ??= monitor.terminalError();
+		// A yield a `subagent_stop` handler refused and the model never replaced
+		// is stale: publishing it would launder an explicit refusal into a
+		// successful result. Applies to the cancelled case too — handlers never
+		// confirmed that payload, so the failure must survive the abort
+		// reconciliation below.
+		if (monitor.yieldInvalidatedByStop() && !monitor.yieldCalled()) {
+			error ??= SUBAGENT_STOP_REFUSAL_UNRESOLVED;
+			if (exitCode === 0) exitCode = 1;
+		}
 		if (abortSignal.aborted && (!monitor.yieldCalled() || monitor.runtimeLimitExceeded())) {
 			aborted = monitor.isAbortedRun();
 			if (aborted) {
@@ -2761,7 +2838,21 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// the narration of earlier turns.
 	const structured = args.structured !== false;
 	let rawOutput = structured ? monitor.rawOutput() : (monitor.lastReportTurnText() ?? "");
-	const yieldItems = progress.extractedToolData?.yield as YieldItem[] | undefined;
+	// A `subagent_stop` handler refused the run's candidate `yield` and no
+	// continuation turn produced a replacement: the payload was explicitly
+	// rejected, so none of it may be published. Dropping the yield items keeps
+	// the refused report out of result assembly, the `<id>.md` artifact, and the
+	// structured sidecar; on a resumed turn that leaves the previous accepted
+	// artifact (and its sidecar) in place. The child's transcript remains the
+	// audit trail — the refusal gates publication, not the record of what ran.
+	const refusedYield = monitor.yieldInvalidatedByStop() && !monitor.yieldCalled();
+	const yieldItems = refusedYield ? undefined : (progress.extractedToolData?.yield as YieldItem[] | undefined);
+	if (refusedYield && progress.extractedToolData) {
+		// The run failed on the refusal, so the rejected payload must not reach
+		// the caller's progress/result snapshot either (TUI result card, nested
+		// `task` details).
+		delete progress.extractedToolData.yield;
+	}
 	// Breadcrumb the synchronous yield-payload shaping (O(rawOutput)) so a block
 	// here is attributed to this subagent rather than logged as "unknown".
 	pushLoopPhase(`subagent:${id}`);
@@ -2786,6 +2877,12 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	rawOutput = finalized.rawOutput;
 	exitCode = finalized.exitCode;
 	stderr = finalized.stderr;
+	if (refusedYield) {
+		// The refused candidate may itself have been the child's prose (a
+		// data-less `yield` finalizes on the last report turn), so the failed run
+		// publishes the refusal diagnostic instead of output that could carry it.
+		rawOutput = stderr || SUBAGENT_STOP_REFUSAL_UNRESOLVED;
+	}
 	// Salvage for cancelled/aborted children that produced no completed output:
 	// surface the last assistant text + stats instead of "(no output)" so the
 	// parent doesn't redo work the child already finished.
@@ -2812,6 +2909,11 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// replace the accepted artifact with a missing-yield warning (issue #9518).
 	// Message-result agents publish successful reports the parent or the user
 	// asked for, not conversational replies to peers or cancelled follow-ups.
+	//
+	// An unresolved stop refusal republishes nothing on either turn: there is no
+	// accepted payload to write, and overwriting (or dropping the sidecar of) a
+	// resumed worker's previous accepted artifact would destroy the last result a
+	// `subagent_stop` handler did authorize.
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
 	const hasMessageResult =
@@ -2822,7 +2924,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		!signal?.aborted &&
 		!monitor.runtimeLimitExceeded() &&
 		rawOutput.trim().length > 0;
-	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
+	if (args.artifactsDir && !refusedYield && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		try {
 			await writeArtifact(candidatePath, rawOutput);
@@ -3567,6 +3669,10 @@ export interface FollowUpTurnOptions {
 	eventBus?: EventBus;
 	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
+	/** Spawning session's id, reported as the `subagent_stop` event's `parent_session_id`. */
+	parentSessionId?: string;
+	/** Spawning session's transcript file, reported as the event's `parent_session_file`. */
+	parentSessionFile?: string;
 	/**
 	 * When set, a turn that yields or completes a successful, non-empty message
 	 * result when requested by the parent (re)writes `<artifactsDir>/<id>.md` so
@@ -3696,7 +3802,16 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	let attemptUnsubscribe = monitor.attach(session);
 	const structured = options.structured !== false;
 	try {
-		outcome = await driveSessionToResult(session, monitor, message, {
+		const stopHook = new SubagentStopHook(
+			{
+				agentId: id,
+				agentType: agent.name,
+				parentSessionId: options.parentSessionId,
+				parentSessionFile: options.parentSessionFile,
+			},
+			monitor.abortSignal,
+		);
+		outcome = await driveSessionToResult(session, monitor, message, stopHook, {
 			structured,
 			restore: options.restore,
 			onPromptBusy: async () => {
@@ -4752,7 +4867,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			readyAt = performance.now();
-			const outcome = await driveSessionToResult(session, monitor, task, {
+			const stopHook = new SubagentStopHook(
+				{
+					agentId: id,
+					agentType: agent.name,
+					parentSessionId: options.parentSessionId,
+					// The spawning session's transcript: the child records the same
+					// path as its own `SessionHeader.parentSession`.
+					parentSessionFile: options.sessionFile ?? undefined,
+				},
+				monitor.abortSignal,
+			);
+			const outcome = await driveSessionToResult(session, monitor, task, stopHook, {
 				solutionSpace: options.solutionSpace,
 				structured,
 			});
