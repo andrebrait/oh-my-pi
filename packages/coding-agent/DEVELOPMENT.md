@@ -26,6 +26,12 @@ Never invoke `tsc`/`npx tsc` directly — `bun run check` is the typecheck gate.
 changing the React tool renderers under `collab-web/src/tool-render/`, rebuild them
 with `bun run gen:tool-views`.
 
+Direct `bun test` runs from either the repository root or this package preload a
+temporary agent directory, including for child processes. Keep both `bunfig.toml`
+preload entries in sync. Tests that relocate sessions should also create their
+session manager with `SessionManager.getDefaultSessionDir(cwd, agentDir)` so moves
+remain inside the test's own agent directory without relying on the preload.
+
 ## Downstream integration builds
 
 In the `andrebrait/oh-my-pi` fork, `origin/integration` is the canonical source for
