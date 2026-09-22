@@ -94,6 +94,9 @@ pub struct LiveCallbacks {
 	pub level:   Box<dyn Fn(f64) + Send + Sync>,
 	/// Terminal transport failure; reported at most once per peer.
 	pub failure: Box<dyn Fn(String) + Send + Sync>,
+	/// Decoded remote output samples (48 kHz mono) for hosts that render
+	/// playback themselves.
+	pub samples: Box<dyn Fn(&[f32]) + Send + Sync>,
 }
 
 struct LiveResources {
@@ -102,14 +105,15 @@ struct LiveResources {
 	input_tx:     flume::Sender<InputCommand>,
 	input_task:   JoinHandle<()>,
 	rtcp_task:    JoinHandle<()>,
-	playback:     PlaybackStream,
+	playback:     Option<PlaybackStream>,
 }
 
 /// WebRTC live-conversation peer: accepts 16 kHz mono PCM input and renders
-/// remote Opus audio to the default speaker. Owned as an `Arc` by the N-API
-/// `LiveWebRtcPeer` wrapper.
+/// remote Opus audio to the default speaker unless local playback is
+/// disabled. Owned as an `Arc` by the N-API `LiveWebRtcPeer` wrapper.
 pub struct LivePeerCore {
 	callbacks:        LiveCallbacks,
+	play_locally:     bool,
 	resources:        Mutex<Option<LiveResources>>,
 	signal_tx:        watch::Sender<PeerSignal>,
 	started:          AtomicBool,
@@ -120,11 +124,14 @@ pub struct LivePeerCore {
 }
 
 impl LivePeerCore {
-	/// Create an idle peer with its host callbacks registered.
-	pub fn new(callbacks: LiveCallbacks) -> Self {
+	/// Create an idle peer with its host callbacks registered. When
+	/// `play_locally` is false, remote audio is only reported through the
+	/// samples callback and no speaker device is opened.
+	pub fn new(callbacks: LiveCallbacks, play_locally: bool) -> Self {
 		let (signal_tx, _) = watch::channel(PeerSignal::Connecting);
 		Self {
 			callbacks,
+			play_locally,
 			resources: Mutex::new(None),
 			signal_tx,
 			started: AtomicBool::new(false),
@@ -147,8 +154,12 @@ impl LivePeerCore {
 			return Err("Native live WebRTC peer is closed".to_owned());
 		}
 
-		let playback = PlaybackStream::start(OUTPUT_SAMPLE_RATE)?;
-		let playback_tx = playback.writer()?;
+		let playback = if self.play_locally {
+			Some(PlaybackStream::start(OUTPUT_SAMPLE_RATE)?)
+		} else {
+			None
+		};
+		let playback_tx = playback.as_ref().map(|stream| stream.writer()).transpose()?;
 		let mut media_engine = MediaEngine::default();
 		let capability = opus_capability();
 		media_engine
@@ -334,6 +345,10 @@ impl LivePeerCore {
 		(self.callbacks.level)(level.clamp(0.0, 1.0));
 	}
 
+	fn report_samples(&self, samples: &[f32]) {
+		(self.callbacks.samples)(samples);
+	}
+
 	fn mark_open(&self) {
 		if !self.closing.load(Ordering::Acquire) {
 			self.signal_tx.send_replace(PeerSignal::Open);
@@ -368,7 +383,9 @@ impl LivePeerCore {
 		if let Some(mut resources) = resources {
 			let _ = resources.input_tx.send(InputCommand::Close);
 			let _ = resources.peer.close().await;
-			let _ = resources.playback.stop();
+			if let Some(mut playback) = resources.playback.take() {
+				let _ = playback.stop();
+			}
 			let _ = tokio::time::timeout(CLOSE_TASK_TIMEOUT, resources.input_task).await;
 			resources.rtcp_task.abort();
 			let _ = resources.rtcp_task.await;
@@ -392,7 +409,7 @@ fn opus_capability() -> RTCRtpCodecCapability {
 fn install_peer_callbacks(
 	peer: &Arc<RTCPeerConnection>,
 	core: Weak<LivePeerCore>,
-	playback_tx: PlaybackWriter,
+	playback_tx: Option<PlaybackWriter>,
 ) {
 	let output_sender = Arc::new(Mutex::new(Some(playback_tx)));
 	let output_sender_for_track = Arc::clone(&output_sender);
@@ -594,7 +611,7 @@ async fn drain_rtcp(sender: Arc<RTCRtpSender>) {
 
 async fn receive_output_audio(
 	track: Arc<TrackRemote>,
-	playback_tx: PlaybackWriter,
+	playback_tx: Option<PlaybackWriter>,
 	core: Weak<LivePeerCore>,
 ) {
 	if !track
@@ -647,27 +664,24 @@ async fn receive_output_audio(
 					if let Ok(samples) =
 						decoder.decode_float(&[], &mut decoded[..OUTPUT_FRAME_SAMPLES], false)
 					{
-						if !write_output(&playback_tx, &decoded[..samples], &core) {
+						if !handle_decoded(&playback_tx, &decoded[..samples], &core, &mut level) {
 							return;
 						}
-						level.observe(&decoded[..samples], &core);
 					}
 				}
 				if let Ok(samples) = decoder.decode_float(&packet.payload, &mut decoded, true) {
-					if !write_output(&playback_tx, &decoded[..samples], &core) {
+					if !handle_decoded(&playback_tx, &decoded[..samples], &core, &mut level) {
 						return;
 					}
-					level.observe(&decoded[..samples], &core);
 				}
 			}
 		}
 		expected_sequence = Some(sequence.wrapping_add(1));
 		match decoder.decode_float(&packet.payload, &mut decoded, false) {
 			Ok(samples) => {
-				if !write_output(&playback_tx, &decoded[..samples], &core) {
+				if !handle_decoded(&playback_tx, &decoded[..samples], &core, &mut level) {
 					return;
 				}
-				level.observe(&decoded[..samples], &core);
 			},
 			Err(error) => {
 				if let Some(core) = core.upgrade() {
@@ -679,7 +693,22 @@ async fn receive_output_audio(
 	}
 }
 
-fn write_output(playback_tx: &PlaybackWriter, samples: &[f32], core: &Weak<LivePeerCore>) -> bool {
+/// Report decoded remote samples to the host, write them to the local speaker
+/// when enabled, and fold them into the output-level window. Returns false
+/// when local speaker playback failed and the track loop should stop.
+fn handle_decoded(
+	playback_tx: &Option<PlaybackWriter>,
+	samples: &[f32],
+	core: &Weak<LivePeerCore>,
+	level: &mut OutputLevel,
+) -> bool {
+	if let Some(core) = core.upgrade() {
+		core.report_samples(samples);
+	}
+	level.observe(samples, core);
+	let Some(playback_tx) = playback_tx else {
+		return true;
+	};
 	match playback_tx.write(samples) {
 		Ok(()) => true,
 		Err(error) => {

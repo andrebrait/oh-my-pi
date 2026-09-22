@@ -1,11 +1,11 @@
 import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
+import { NativeLiveAudioSource, type LiveAudioSource } from "./audio-source";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
 import {
@@ -54,6 +54,19 @@ export interface LiveSessionControllerOptions {
 	extractAssistantText(message: AssistantMessage): string;
 	/** Realtime output voice, defaulting to sol. */
 	voice?: string;
+	/**
+	 * Producer of microphone audio, defaulting to native capture. Hosts that
+	 * receive the user's voice from elsewhere (for example a browser) supply
+	 * their own source and feed it directly.
+	 */
+	audioSource?: LiveAudioSource;
+	/**
+	 * Receives decoded remote output samples (48 kHz mono). Set together with
+	 * `playLocally: false` when the host renders playback itself.
+	 */
+	onOutputAudio?: (samples: Float32Array) => void;
+	/** Renders remote audio through the local speaker, defaulting to true. */
+	playLocally?: boolean;
 }
 
 function errorFrom(cause: unknown): Error {
@@ -93,9 +106,12 @@ export class LiveSessionController {
 	readonly #callbacks: LiveSessionCallbacks;
 	readonly #extractAssistantText: (message: AssistantMessage) => string;
 	readonly #voice: string;
+	readonly #audioSource: LiveAudioSource;
+	readonly #onOutputAudio: ((samples: Float32Array) => void) | undefined;
+	readonly #playLocally: boolean;
 
 	#transport: CodexLiveTransport | undefined;
-	#recorder: AudioCapture | undefined;
+	#audioSourceStarted = false;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
 	#stopPromise: Promise<void> | undefined;
@@ -121,6 +137,9 @@ export class LiveSessionController {
 		this.#callbacks = options.callbacks;
 		this.#extractAssistantText = options.extractAssistantText;
 		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
+		this.#audioSource = options.audioSource ?? new NativeLiveAudioSource();
+		this.#onOutputAudio = options.onOutputAudio;
+		this.#playLocally = options.playLocally ?? true;
 	}
 
 	/** Current realtime call phase. */
@@ -156,9 +175,13 @@ export class LiveSessionController {
 				sessionId: this.#session.sessionId,
 				instructions,
 				voice: this.#voice,
+				playLocally: this.#playLocally,
 				callbacks: {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
+					onOutputSamples: this.#onOutputAudio
+						? samples => this.#guardEvent(() => this.#onOutputAudio?.(samples))
+						: undefined,
 				},
 			});
 			this.#transport = transport;
@@ -173,22 +196,14 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped before recording began.");
 			}
-			const recorder = new AudioCapture(16_000, (error, samples) => {
-				if (error) {
-					this.#reportFailure(error);
-					return;
-				}
-				this.#handleMicrophoneAudio(samples);
+			this.#audioSource.start({
+				onAudio: samples => this.#guardEvent(() => this.#handleMicrophoneAudio(samples)),
+				onError: error => this.#reportFailure(error),
 			});
+			this.#audioSourceStarted = true;
 			if (this.#stopped) {
-				try {
-					recorder.stop();
-				} catch {
-					// Preserve the failure that stopped startup.
-				}
 				throw this.#failure ?? new Error("The live session stopped while recording began.");
 			}
-			this.#recorder = recorder;
 			this.#refreshAudioPhase();
 		} catch (cause) {
 			const error = errorFrom(cause);
@@ -200,16 +215,21 @@ export class LiveSessionController {
 
 	/** Toggles microphone capture while leaving output and the session connected. */
 	toggleMute(): void {
-		if (this.#stopped) return;
-		this.#muted = !this.#muted;
-		if (this.#muted) {
+		this.setMuted(!this.#muted);
+	}
+
+	/** Sets microphone capture while leaving output and the session connected. */
+	setMuted(muted: boolean): void {
+		if (this.#stopped || this.#muted === muted) return;
+		this.#muted = muted;
+		if (muted) {
 			this.#inputLevel = 0;
 			this.#emitLevels();
 		}
 		this.#refreshAudioPhase();
 		const transport = this.#transport;
 		if (transport) {
-			void transport.setMuted(this.#muted).catch(cause => this.#reportFailure(errorFrom(cause)));
+			void transport.setMuted(muted).catch(cause => this.#reportFailure(errorFrom(cause)));
 		}
 	}
 
@@ -225,11 +245,10 @@ export class LiveSessionController {
 		this.#unsubscribeSession = undefined;
 		let cleanupError: Error | undefined;
 
-		const recorder = this.#recorder;
-		this.#recorder = undefined;
-		if (recorder) {
+		if (this.#audioSourceStarted) {
+			this.#audioSourceStarted = false;
 			try {
-				recorder.stop();
+				this.#audioSource.stop();
 			} catch (cause) {
 				cleanupError = errorFrom(cause);
 			}

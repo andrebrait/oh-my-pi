@@ -5,6 +5,9 @@
 ### Fixed
 
 - Fixed a stale workspace addon failing as `<symbol> is not a function` inside whichever tool used it first; the missing export now names the addon, the loaded and expected releases, and `bun run build:native` ([#12698](https://github.com/can1357/oh-my-pi/pull/12698) by [@iacore](https://github.com/iacore)).
+### Added
+
+- Added an optional output-samples callback and `playLocally` flag to the native live WebRTC peer, letting hosts receive decoded 48 kHz remote audio and disable local speaker playback.
 
 ## [18.2.7] - 2026-09-21
 

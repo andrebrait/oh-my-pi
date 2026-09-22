@@ -5,6 +5,7 @@
 ### Added
 
 - `find` (and `omp find`) accepts an `omp://` docs scope: `omp://` searches every embedded harness doc and `omp://<file>.md` searches one, reporting hits as canonical `omp://` URLs that `read` opens directly, including with `:start-end` selectors ([#12758](https://github.com/can1357/oh-my-pi/pull/12758) by [@H4vC](https://github.com/H4vC)).
+- Added a live voice bridge so non-TUI hosts can drive `/live`: the new `live_bridge_start` / `live_bridge_stop` RPC commands expose a token-gated loopback WebSocket that streams 16 kHz microphone PCM from a remote client (for example a browser) into the live session and delivers 48 kHz remote output samples plus phase, level, and transcript events, while Codex OAuth, device attestation, and the native WebRTC peer stay inside the omp process.
 
 ### Changed
 

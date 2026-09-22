@@ -10,6 +10,7 @@
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
@@ -30,6 +31,12 @@ import {
 	type SkillPromptInput,
 } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
+import {
+	LIVE_BRIDGE_INPUT_SAMPLE_RATE,
+	LIVE_BRIDGE_OUTPUT_SAMPLE_RATE,
+	startLiveBridge,
+	type LiveBridgeHandle,
+} from "../../live/bridge";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -60,6 +67,7 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcLiveBridgeStartData,
 	RpcResponse,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
@@ -869,6 +877,18 @@ export async function runRpcMode(
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 
+	let liveBridge: LiveBridgeHandle | undefined;
+
+	const extractAssistantText = (message: AssistantMessage): string => {
+		let text = "";
+		for (const content of message.content) {
+			if (content.type === "text") {
+				text += content.text;
+			}
+		}
+		return text.trim();
+	};
+
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
@@ -1111,6 +1131,11 @@ export async function runRpcMode(
 	 */
 	const disposeAndExit = async (): Promise<never> => {
 		try {
+			if (liveBridge) {
+				const bridge = liveBridge;
+				liveBridge = undefined;
+				await bridge.stop();
+			}
 			await session.dispose();
 		} catch (error) {
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
@@ -1501,6 +1526,45 @@ export async function runRpcMode(
 			case "abort_bash": {
 				session.abortBash();
 				return success(id, "abort_bash");
+			}
+
+			// =================================================================
+			// Live voice bridge
+			// =================================================================
+
+			case "live_bridge_start": {
+				if (!liveBridge) {
+					liveBridge = startLiveBridge({
+						session,
+						extractAssistantText,
+						voice: command.voice,
+						port: command.port,
+					});
+				}
+				try {
+					await liveBridge.started;
+				} catch (cause) {
+					liveBridge = undefined;
+					const message = cause instanceof Error ? cause.message : String(cause);
+					return error(id, "live_bridge_start", message);
+				}
+				const data: RpcLiveBridgeStartData = {
+					url: liveBridge.url,
+					port: liveBridge.port,
+					token: liveBridge.token,
+					inputSampleRate: LIVE_BRIDGE_INPUT_SAMPLE_RATE,
+					outputSampleRate: LIVE_BRIDGE_OUTPUT_SAMPLE_RATE,
+				};
+				return success(id, "live_bridge_start", data);
+			}
+
+			case "live_bridge_stop": {
+				if (liveBridge) {
+					const bridge = liveBridge;
+					liveBridge = undefined;
+					await bridge.stop();
+				}
+				return success(id, "live_bridge_stop");
 			}
 
 			// =================================================================

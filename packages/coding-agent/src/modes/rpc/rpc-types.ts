@@ -70,6 +70,10 @@ export type RpcCommand =
 	| { id?: string; type: "bash"; command: string }
 	| { id?: string; type: "abort_bash" }
 
+	// Live voice bridge
+	| { id?: string; type: "live_bridge_start"; voice?: string; port?: number }
+	| { id?: string; type: "live_bridge_stop" }
+
 	// Session
 	| { id?: string; type: "get_session_stats" }
 	| { id?: string; type: "export_html"; outputPath?: string }
@@ -156,6 +160,17 @@ export interface RpcChunkFrame {
 
 export interface RpcHandoffResult {
 	savedPath?: string;
+}
+
+/** Payload returned by a successful `live_bridge_start` command. */
+export interface RpcLiveBridgeStartData {
+	/** WebSocket endpoint: `ws://127.0.0.1:<port>/live`. */
+	url: string;
+	port: number;
+	/** Shared secret clients present as `?token=` on the WebSocket URL. */
+	token: string;
+	inputSampleRate: number;
+	outputSampleRate: number;
 }
 
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
@@ -297,6 +312,10 @@ export type RpcResponse =
 	// Bash
 	| { id?: string; type: "response"; command: "bash"; success: true; data: BashResult }
 	| { id?: string; type: "response"; command: "abort_bash"; success: true }
+
+	// Live voice bridge
+	| { id?: string; type: "response"; command: "live_bridge_start"; success: true; data: RpcLiveBridgeStartData }
+	| { id?: string; type: "response"; command: "live_bridge_stop"; success: true }
 
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }

@@ -48,6 +48,8 @@ class LiveSignalingError extends Error {
 export interface LiveTransportCallbacks {
 	onEvent(event: LiveServerEvent): void;
 	onOutputLevel(level: number): void;
+	/** Reports decoded remote output samples (48 kHz mono) when registered. */
+	onOutputSamples?: (samples: Float32Array) => void;
 }
 
 /** Configuration required to establish a Codex live call. */
@@ -56,6 +58,11 @@ export interface LiveTransportOptions {
 	sessionId: string;
 	instructions: string;
 	voice: string;
+	/**
+	 * Renders remote audio through the local speaker. Disable when a host
+	 * plays the samples reported by `callbacks.onOutputSamples` itself.
+	 */
+	playLocally?: boolean;
 	callbacks: LiveTransportCallbacks;
 	signal?: AbortSignal;
 }
@@ -169,6 +176,18 @@ export class CodexLiveTransport {
 				}
 			},
 			(error, message) => this.#handlePeerFailure(error?.message ?? message),
+			this.#options.callbacks.onOutputSamples
+				? (error, samples) => {
+						if (error) {
+							this.#handlePeerFailure(error.message);
+							return;
+						}
+						try {
+							this.#options.callbacks.onOutputSamples?.(samples);
+						} catch {}
+					}
+				: undefined,
+			this.#options.playLocally,
 		);
 		this.#peer = peer;
 		const offer = await peer.createOffer();

@@ -195,9 +195,10 @@ export declare class HighlightStream {
 export declare class LiveWebRtcPeer {
   /**
    * Create an idle peer and register its event, output-level, and failure
-   * callbacks.
+   * callbacks. When `play_locally` is false, remote audio is only reported
+   * through `on_output_samples` and no speaker device is opened.
    */
-  constructor(onEvent: (error: Error | null, payload: string) => void, onLevel: (error: Error | null, level: number) => void, onFailure: (error: Error | null, message: string) => void)
+  constructor(onEvent: (error: Error | null, payload: string) => void, onLevel: (error: Error | null, level: number) => void, onFailure: (error: Error | null, message: string) => void, onOutputSamples?: (error: Error | null, samples: Float32Array) => void, playLocally?: boolean | undefined | null)
   /** Start the native media peer and return its SDP offer. */
   createOffer(): Promise<string>
   /** Apply the remote SDP answer returned by Codex signaling. */

@@ -16,6 +16,7 @@ use pi_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
 
 type StringCallback = ThreadsafeFunction<String, UnknownReturnValue>;
 type LevelCallback = ThreadsafeFunction<f64, UnknownReturnValue>;
+type SamplesCallback = ThreadsafeFunction<Float32Array, UnknownReturnValue>;
 
 /// WebRTC peer that accepts 16 kHz mono PCM and renders remote Opus audio.
 #[napi]
@@ -26,7 +27,8 @@ pub struct LiveWebRtcPeer {
 #[napi]
 impl LiveWebRtcPeer {
 	/// Create an idle peer and register its event, output-level, and failure
-	/// callbacks.
+	/// callbacks. When `play_locally` is false, remote audio is only reported
+	/// through `on_output_samples` and no speaker device is opened.
 	#[napi(constructor)]
 	pub fn new(
 		#[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
@@ -34,19 +36,37 @@ impl LiveWebRtcPeer {
 		#[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
 		#[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
 		on_failure: StringCallback,
+		#[napi(ts_arg_type = "(error: Error | null, samples: Float32Array) => void")]
+		on_output_samples: Option<SamplesCallback>,
+		play_locally: Option<bool>,
 	) -> Self {
+		let on_output_samples = on_output_samples.map(|on_output_samples| {
+			move |samples: &[f32]| {
+				on_output_samples.call(
+					Ok(Float32Array::new(samples.to_vec())),
+					ThreadsafeFunctionCallMode::NonBlocking,
+				);
+			}
+		});
 		Self {
-			inner: Arc::new(LivePeerCore::new(LiveCallbacks {
-				event:   Box::new(move |payload| {
-					on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-				level:   Box::new(move |level| {
-					on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-				failure: Box::new(move |message| {
-					on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-			})),
+			inner: Arc::new(LivePeerCore::new(
+				LiveCallbacks {
+					event:   Box::new(move |payload| {
+						on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+					}),
+					level:   Box::new(move |level| {
+						on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
+					}),
+					failure: Box::new(move |message| {
+						on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
+					}),
+					samples: Box::new(move |samples| match &on_output_samples {
+						Some(on_output_samples) => on_output_samples(samples),
+						None => {},
+					}),
+				},
+				play_locally.unwrap_or(true),
+			)),
 		}
 	}
 
