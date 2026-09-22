@@ -11,6 +11,16 @@ import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
+/**
+ * init() defers the prewarm probe behind a setImmediate, and immediates are
+ * FIFO, so awaiting one queued later drains the callback init() queued first.
+ */
+function flushImmediates(): Promise<void> {
+	const flushed = Promise.withResolvers<void>();
+	setImmediate(flushed.resolve);
+	return flushed.promise;
+}
+
 // Issue #6462: the first submit used to spawn the local tiny-title worker
 // synchronously ahead of the first frame, and title generation started before
 // the optimistic user row painted. Startup now prewarms an idle worker, and the
@@ -73,14 +83,11 @@ describe("InteractiveMode tiny-title prewarm", () => {
 	});
 
 	afterEach(async () => {
-		// init() defers the prewarm probe behind a setImmediate. Flush one
-		// immediate tick while this case's spies are still installed: an
-		// unflushed callback otherwise fires during a later case, with
+		// Flush the deferred probe while this case's spies are still installed:
+		// an unflushed callback otherwise fires during a later case, with
 		// `getSessionName` already restored and this mode's tiny role still
 		// configured, and lands in that case's `prewarm` spy (flaky in CI).
-		const pendingImmediates = Promise.withResolvers<void>();
-		setImmediate(pendingImmediates.resolve);
-		await pendingImmediates.promise;
+		await flushImmediates();
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
@@ -99,14 +106,9 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		const prewarm = vi.spyOn(tinyTitleClient, "prewarm").mockImplementation(() => {});
 
 		await mode.init();
-		// The prewarm call is deferred behind a setImmediate queued during
-		// init() (see interactive-mode.ts); init()'s own awaits are promise
-		// microtasks that can resolve without yielding to the immediate
-		// queue, so the prewarm may not have fired yet when init() settles.
-		// Flush one immediate tick before asserting.
-		const immediateFlushed = Promise.withResolvers<void>();
-		setImmediate(immediateFlushed.resolve);
-		await immediateFlushed.promise;
+		// init()'s own awaits are promise microtasks that can resolve without
+		// yielding to the immediate queue, so the probe may not have fired yet.
+		await flushImmediates();
 
 		expect(prewarm).toHaveBeenCalledWith("lfm2.5-230m");
 	});
@@ -117,6 +119,7 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		const prewarm = vi.spyOn(tinyTitleClient, "prewarm").mockImplementation(() => {});
 
 		await mode.init();
+		await flushImmediates();
 
 		expect(prewarm).not.toHaveBeenCalled();
 	});
@@ -125,9 +128,7 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		const prewarm = vi.spyOn(tinyTitleClient, "prewarm").mockImplementation(() => {});
 
 		await mode.init();
-		const immediateFlushed = Promise.withResolvers<void>();
-		setImmediate(immediateFlushed.resolve);
-		await immediateFlushed.promise;
+		await flushImmediates();
 
 		expect(prewarm).not.toHaveBeenCalled();
 	});
@@ -137,9 +138,7 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		session.settings.setModelRole("tiny", "anthropic/claude-haiku-4-5");
 
 		await mode.init();
-		const immediateFlushed = Promise.withResolvers<void>();
-		setImmediate(immediateFlushed.resolve);
-		await immediateFlushed.promise;
+		await flushImmediates();
 
 		expect(prewarm).not.toHaveBeenCalled();
 	});
