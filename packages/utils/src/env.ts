@@ -65,6 +65,48 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 	}
 	return result;
 }
+/**
+ * Git variables that pin a repository location. They describe the checkout the
+ * agent process itself was launched from (git hooks, `git --git-dir` wrappers),
+ * so forwarding them to a child shell makes `git` ignore the command's `cwd`
+ * and mutate the wrong worktree or index. Stripped from child shell envs so git
+ * rediscovers the repository from the working directory. Mirrors the
+ * `env_remove` list in `crates/pi-vcs/src/git/cli.rs`.
+ */
+const GIT_REPO_LOCATION_ENV_NAMES = [
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+] as const;
+
+/**
+ * Removes {@link GIT_REPO_LOCATION_ENV_NAMES} from a copied child env in place.
+ *
+ * Windows environment lookups are case-insensitive, so a block that spells a
+ * variable `git_dir` is just as binding there; match case-insensitively on
+ * win32 and exactly elsewhere (POSIX env names are case-sensitive).
+ */
+export function stripGitRepoLocationEnv(
+	env: Record<string, string>,
+	platform: NodeJS.Platform = process.platform,
+): void {
+	if (platform !== "win32") {
+		for (const name of GIT_REPO_LOCATION_ENV_NAMES) {
+			delete env[name];
+		}
+		return;
+	}
+	const folded = new Set<string>(GIT_REPO_LOCATION_ENV_NAMES.map(name => name.toLowerCase()));
+	for (const key of Object.keys(env)) {
+		if (folded.has(key.toLowerCase())) {
+			delete env[key];
+		}
+	}
+}
+
 // Bun autoloads the project's dotenv files into `process.env` before user code
 // runs — including inside `bun build --compile` binaries — so a snapshot of
 // `Bun.env` is only pre-dotenv when autoloading was explicitly disabled. Linux
@@ -108,10 +150,10 @@ function expandDotenvValues(values: Record<string, string>, env: Record<string, 
 	return expanded;
 }
 
-/** Filters process env for child shells without launch-cwd dotenv values. */
-export function filterChildShellEnv(
+function filterChildShellEnvInternal(
 	env: Record<string, string | undefined>,
-	cwd: string = getProjectDir(),
+	cwd: string,
+	onDotenvValue?: (value: string) => void,
 ): Record<string, string> {
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
@@ -148,6 +190,12 @@ export function filterChildShellEnv(
 		}
 	}
 	const allLaunchEnv = fallbackLaunchEnv ? { ...launchEnv, ...fallbackLaunchEnv } : launchEnv;
+	if (onDotenvValue) {
+		// Every value the project's dotenv files define is dotenv-sourced, whether
+		// or not this process loaded it (a `--cwd` launch never did).
+		for (const key in allLaunchEnv) onDotenvValue(allLaunchEnv[key]!);
+		for (const key in expandedLaunchEnv) onDotenvValue(expandedLaunchEnv[key]!);
+	}
 	for (const key in allLaunchEnv) {
 		const launchValue = runtimeLaunchEnvValues?.get(key);
 		if (launchValue !== undefined) {
@@ -169,6 +217,8 @@ export function filterChildShellEnv(
 			// Strong provenance: the launch environment is known and this name is
 			// absent from it, or OMP itself injected the value — either way it came
 			// from a project dotenv file, not the parent shell.
+			const value = result[key];
+			if (value !== undefined) onDotenvValue?.(value);
 			delete result[key];
 		} else if (
 			result[key] === launchEnv[key] ||
@@ -178,10 +228,33 @@ export function filterChildShellEnv(
 		) {
 			// No launch-env snapshot (dotenv autoloaded without procfs): best-effort
 			// value match against the Bun-parsed dotenv.
+			const value = result[key];
+			if (value !== undefined) onDotenvValue?.(value);
 			delete result[key];
 		}
 	}
+	// Last, after dotenv merging: no source (inherited, launcher, or dotenv) may
+	// pin the child shell to the agent's own repository.
+	stripGitRepoLocationEnv(result);
 	return result;
+}
+
+/** Filters process env for child shells without launch-cwd dotenv values. */
+export function filterChildShellEnv(
+	env: Record<string, string | undefined>,
+	cwd: string = getProjectDir(),
+): Record<string, string> {
+	return filterChildShellEnvInternal(env, cwd);
+}
+
+/** Return every value defined by `cwd`'s dotenv files, plus environment values that came from them. */
+export function getDotenvEnvValues(
+	cwd: string = getProjectDir(),
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	const values = new Set<string>();
+	filterChildShellEnvInternal(env, cwd, value => values.add(value));
+	return [...values];
 }
 
 /**

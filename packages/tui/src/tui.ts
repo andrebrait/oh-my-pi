@@ -52,7 +52,8 @@ import {
 	visibleWidth,
 } from "./utils";
 
-const SEGMENT_RESET = "\x1b[0m";
+/** Full-attribute reset terminating each rendered content row. */
+export const SEGMENT_RESET = "\x1b[0m";
 /**
  * Per-line terminator written after every non-image content row. It closes both
  * SGR state and any in-flight OSC 8 hyperlink so styles/links cannot bleed
@@ -122,8 +123,23 @@ export interface RenderScheduler {
 	scheduleRender(callback: () => void, delayMs: number): RenderTimer;
 }
 
+/** Rows painted by one TUI frame, observed through `TUIOptions.onPaint`. */
+export interface TuiPaint {
+	/** Rows committed above the viewport by this paint (native scrollback). Empty on diff paints and alt-screen paints. */
+	readonly history: readonly string[];
+	/** Complete live viewport after this paint: one prepared (normalized, width-truncated, SGR-coalesced) ANSI string per row. */
+	readonly viewport: readonly string[];
+	/** True when this paint erased scrollback and repainted from row zero (destructive reset or history replay): consumers drop their history copy before applying `history`. */
+	readonly reset: boolean;
+	/** True when `viewport` is an alternate-screen overlay; history is untouched. */
+	readonly alt: boolean;
+	readonly columns: number;
+	readonly rows: number;
+}
+
 export interface TUIOptions {
 	renderScheduler?: RenderScheduler;
+	onPaint?: (paint: TuiPaint) => void;
 }
 /** Physical terminal dimensions supplied to a frame provider. */
 export interface ViewportSize {
@@ -773,6 +789,7 @@ export class TUI extends Container {
 	#debugNextWindowTop = 0;
 	#inputListeners = new Set<InputListener>();
 	#startListeners = new Set<StartListener>();
+	#paintListener: ((paint: TuiPaint) => void) | null;
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
@@ -905,12 +922,18 @@ export class TUI extends Container {
 		super();
 		this.terminal = terminal;
 		this.#renderScheduler = options?.renderScheduler ?? DEFAULT_RENDER_SCHEDULER;
+		this.#paintListener = options?.onPaint ?? null;
 		this.#showHardwareCursor = showHardwareCursor === undefined ? this.#showHardwareCursor : showHardwareCursor;
 		this.#watchdog = new LoopWatchdog();
 	}
 	static #initialResizeScrollbackMode(): ResizeScrollbackMode {
 		const mode = Bun.env.PI_TUI_RESIZE_SCROLLBACK;
 		return mode === "append" || mode === "rebuild" || mode === "preserve" ? mode : "preserve";
+	}
+
+	/** Install a listener for completed terminal paints. */
+	setPaintListener(listener: ((paint: TuiPaint) => void) | null): void {
+		this.#paintListener = listener;
 	}
 
 	/** Install the product-owned bounded frame provider. */
@@ -1234,6 +1257,13 @@ export class TUI extends Container {
 			if (!supported && isInsideHerdr() && status === 0) return;
 			this.#setSynchronizedOutput(supported);
 		});
+		// Icons painted before the Glyph Protocol registration landed may sit in
+		// the terminal as tofu; a full repaint re-emits them against the glossary.
+		this.terminal.onGlyphProtocolReport?.(supported => {
+			if (!supported || this.#stopped) return;
+			this.invalidate();
+			this.requestRender(true);
+		});
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
@@ -1313,11 +1343,21 @@ export class TUI extends Container {
 	 * there self-sustains. Every other terminal keeps the alt-borrow path. Inside a
 	 * multiplexer the mux owns the grid and consumes the toggles itself, so an
 	 * inherited Warp marker must not divert the mux-tuned borrow path.
+	 *
+	 * A ConPTY host is excluded for the same reason as a multiplexer: conhost owns
+	 * the grid the application writes to. Measured on conhost, resizing the
+	 * pseudoconsole makes it re-emit its whole viewport from `CSI H` with absolute
+	 * addressing while the application writes nothing, and it re-homes the cursor,
+	 * so the settled DSR reply carries column 1 instead of the probe's tag column
+	 * and can never be attributed. In-place resize has neither of its
+	 * preconditions there — a recoverable anchor and a grid nobody else
+	 * repaints — so keep the borrow, whose settled transaction ends in the
+	 * {@link ResizeScrollbackMode} rebuild that erases conhost's stale copy.
 	 */
 	#resizeRepaintsInPlace(): boolean {
 		const override = resizeInPlaceOverride();
 		if (override !== null) return override;
-		if (isInsideTerminalMultiplexer()) return false;
+		if (isInsideTerminalMultiplexer() || this.terminal.hostOwnsGridOnResize === true) return false;
 		return Bun.env.TERM_PROGRAM?.toLowerCase() === "warpterminal";
 	}
 
@@ -1484,6 +1524,7 @@ export class TUI extends Container {
 				this.#parkedViewportOffset = 0;
 			}
 			this.#noteAltBufferToggle();
+			this.#imageBudget.beginAltScreenLifecycle();
 			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
 		}
 		this.#resizeSettleTimer?.cancel();
@@ -1531,6 +1572,24 @@ export class TUI extends Container {
 			epoch: this.#geometryEpoch,
 			retried: retry,
 		};
+		// A ConPTY host re-homes the cursor on every resize, so its reply carries
+		// column 1 and can never be attributed to a tag. Sending the DSR would
+		// only burn a tag column for the rest of the session (dead tags are
+		// deliberately never reclaimed) and stall the settled repaint for the
+		// full timeout, so anchor from the fallback immediately. Two exemptions:
+		// a multiplexer answers DSR from its own grid, so under WSL-in-tmux the
+		// reply is attributable and the width-reflow / hidden-grow / reversed-
+		// burst logic still needs it; and PI_TUI_RESIZE_IN_PLACE=1 forces the
+		// in-place repaint, whose anchor is only as good as this probe, so the
+		// documented escape hatch restores the whole pre-change path.
+		if (
+			this.terminal.hostOwnsGridOnResize === true &&
+			!isInsideTerminalMultiplexer() &&
+			resizeInPlaceOverride() !== true
+		) {
+			this.#resolveResizeAnchor(undefined);
+			return;
+		}
 		// Tags are never expired by age: a reply has no lifetime guarantee, and
 		// freeing a column while its reply may still arrive would let that
 		// reply match a newer tag on the reused column. Dead tags only
@@ -1687,14 +1746,15 @@ export class TUI extends Container {
 		const provider = this.#frameProvider;
 		let rendered: readonly string[];
 		do {
-			this.#imageBudget.beginPass();
+			this.#imageBudget.beginPass(false, true);
 			rendered =
 				provider?.renderResizeFrame?.({ columns: width, rows: height }) ??
 				(provider ? provider.renderFrame({ columns: width, rows: height }).viewport : this.render(width));
 		} while (this.#imageBudget.endPass());
 		const viewport = rendered.length > height ? rendered.slice(rendered.length - height) : Array.from(rendered);
 		this.#extractCursorMarkers(viewport);
-		this.#emitAltFrame(this.#prepareLinesArray(viewport, width, this.#altPreparedRows, height), width, height);
+		// The borrowed resize buffer is transient, not a streamable session paint.
+		this.#emitAltFrame(this.#prepareLinesArray(viewport, width, this.#altPreparedRows, height), width, height, false);
 	}
 
 	/**
@@ -1857,6 +1917,18 @@ export class TUI extends Container {
 		this.#paintEndSequence = enabled ? PAINT_END : PAINT_END_NO_SYNC;
 	}
 
+	/**
+	 * Retire every eligible history batch into native scrollback before quitting.
+	 *
+	 * The only frame path that deliberately does not composite overlays. Its
+	 * output is the transcript the shell prompt lands under, and it forces
+	 * commits that {@link #compositeOverlaysIntoWindow} otherwise relies on being
+	 * frozen while an overlay is up — so a modal painted here would leave debris
+	 * above the prompt and could reach native scrollback. `stop()` drops the
+	 * alternate buffer without unstacking the overlay, so leaving it in would also
+	 * charge a no-longer-painted modal's images against the cap and delete the
+	 * transcript's visible graphics on the way out.
+	 */
 	#flushHistoryBeforeStop(): void {
 		const provider = this.#frameProvider;
 		if (provider?.beginHistoryFlush === undefined) return;
@@ -1866,13 +1938,14 @@ export class TUI extends Container {
 		provider.beginHistoryFlush();
 		while (true) {
 			let plan: TerminalFramePlan;
+			let viewport: string[];
 			do {
 				this.#imageBudget.beginPass();
 				plan = provider.renderFrame({ columns: width, rows: height });
+				viewport = Array.from(plan.viewport);
+				if (viewport.length > height) viewport = viewport.slice(0, height);
 			} while (this.#imageBudget.endPass());
 			if (plan.history === undefined) return;
-			let viewport = Array.from(plan.viewport);
-			if (viewport.length > height) viewport = viewport.slice(0, height);
 			const acceptedBefore = this.#acceptedHistoryBatchId;
 			this.#emitPlanFrame(width, height, viewport, plan.history, provider);
 			if (plan.history.id > acceptedBefore && this.#acceptedHistoryBatchId === acceptedBefore) {
@@ -2068,7 +2141,6 @@ export class TUI extends Container {
 	#prepareForcedRender(clearScrollback: boolean): void {
 		if (clearScrollback && !this.#clearScrollbackOnNextRender) {
 			this.#frameProvider?.beginHistoryReplay?.();
-			if (TERMINAL.imageProtocol === ImageProtocol.Kitty) this.#imageBudget.forgetTransmitted();
 		}
 		this.#clearScrollbackOnNextRender ||= clearScrollback;
 		this.#forceViewportRepaintOnNextRender = true;
@@ -2405,6 +2477,19 @@ export class TUI extends Container {
 	 * frozen while an overlay is visible, so overlay pixels can never enter
 	 * native scrollback.
 	 */
+	/**
+	 * Composite the visible overlays onto a full-height copy of `viewport`, or
+	 * hand it back untouched when nothing is stacked. Callers run this inside
+	 * their image-budget pass so the frame's whole image set — transcript plus
+	 * modal — reaches one reconcile, instead of leaving the overlay's graphics
+	 * outside the cap for as long as it stays up.
+	 */
+	#compositeVisibleOverlays(viewport: string[], width: number, height: number): string[] {
+		if (this.#getTopmostVisibleOverlay() === undefined) return viewport;
+		while (viewport.length < height) viewport.push("");
+		return this.#compositeOverlaysIntoWindow(viewport, width, height);
+	}
+
 	#compositeOverlaysIntoWindow(window: string[], termWidth: number, termHeight: number): string[] {
 		const result = [...window];
 		for (const entry of this.overlayStack) {
@@ -2549,22 +2634,33 @@ export class TUI extends Container {
 	#terminalLine(line: PreparedLine): string {
 		return line.terminalContent + (line.hasOsc8 ? LINE_TERMINATOR : SEGMENT_RESET);
 	}
+
+	#notifyPaint(paint: TuiPaint): void {
+		try {
+			this.#paintListener?.(paint);
+		} catch (err) {
+			logger.error("TUI paint listener failed", { err });
+		}
+	}
+
 	#renderProviderFrame(width: number, height: number): void {
 		const provider = this.#frameProvider;
 		if (!provider || width <= 0 || height <= 0) return;
 		this.#debugNextWindowTop = 0;
 		let plan: TerminalFramePlan;
+		let viewport: string[];
 		do {
 			this.#imageBudget.beginPass();
 			plan = provider.renderFrame({ columns: width, rows: height });
+			viewport = Array.from(plan.viewport);
+			if (viewport.length > height) {
+				const message = `Frame provider returned ${viewport.length} rows for a ${height}-row viewport`;
+				if (Bun.env.NODE_ENV === "test" || Bun.env.NODE_ENV === "development") throw new Error(message);
+				logger.error("TUI layout contract violated", { rows: viewport.length, height });
+				viewport = viewport.slice(0, height);
+			}
+			viewport = this.#compositeVisibleOverlays(viewport, width, height);
 		} while (this.#imageBudget.endPass());
-		let viewport = Array.from(plan.viewport);
-		if (viewport.length > height) {
-			const message = `Frame provider returned ${viewport.length} rows for a ${height}-row viewport`;
-			if (Bun.env.NODE_ENV === "test" || Bun.env.NODE_ENV === "development") throw new Error(message);
-			logger.error("TUI layout contract violated", { rows: viewport.length, height });
-			viewport = viewport.slice(0, height);
-		}
 		if (this.#maybeDeferGhosttyInitialImagePaint()) return;
 		this.#emitPlanFrame(width, height, viewport, plan.history, provider);
 	}
@@ -2666,11 +2762,12 @@ export class TUI extends Container {
 		offered: HistoryBatch | undefined,
 		provider: TerminalFrameProvider | undefined,
 	): void {
+		// Callers composite their overlays inside the budget pass, so `viewportRows`
+		// is already the complete frame. Bound the store here rather than at
+		// endPass(): this is the last point before the purge and transmit bytes go
+		// out, and it runs once per emitted frame instead of once per retry.
 		let viewport = viewportRows;
-		if (this.#getTopmostVisibleOverlay() !== undefined) {
-			while (viewport.length < height) viewport.push("");
-			viewport = this.#compositeOverlaysIntoWindow(viewport, width, height);
-		}
+		this.#imageBudget.limitResidentImages();
 		const history = offered !== undefined && offered.id > this.#acceptedHistoryBatchId ? offered : undefined;
 		if (offered !== undefined && offered.id <= this.#acceptedHistoryBatchId) provider?.acknowledgeHistory(offered.id);
 
@@ -2716,13 +2813,18 @@ export class TUI extends Container {
 		const pendingAltExit = this.#pendingAltExit;
 		let buffer = this.#paintBeginSequence + pendingAltExit;
 		if (destructiveReset && TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-			// ED2/ED3 erase text cells but leave Kitty graphics visible. A reset is
-			// explicitly destructive, so remove every placement—not only the ones
-			// this TUI tracked—then resend images composed for the clean replay.
+			// A reset is explicitly destructive, so remove every placement—not only
+			// the ones this TUI tracked—then resend images composed for the clean
+			// replay. ED2 below reclaims the rest, but only on terminals that treat
+			// an erase as a graphics clear; the explicit delete covers the others.
 			buffer += encodeKittyDeleteAllImages();
+			// `d=A` spares virtual placements, and erasing the placeholder text it
+			// leaves behind does not remove the prototype either. The ids this
+			// reset forgot are named explicitly here — their tracking is gone, so
+			// nothing downstream could find them again.
+			for (const id of this.#imageBudget.takeResetPurgeIds()) buffer += encodeKittyDeleteImage(id);
 			this.#imageBudget.resetPlacementEpochs();
 		}
-		for (const sequence of this.#imageBudget.takeTransmits()) buffer += sequence;
 		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
 			for (const id of this.#imageBudget.takePurgeIds()) buffer += encodeKittyDeleteImage(id);
 		} else {
@@ -2735,7 +2837,16 @@ export class TUI extends Container {
 		// ED2-then-ED3 clears the screen, then wipes history including that
 		// push. On xterm-family terminals the two erases are independent and
 		// the order is irrelevant.
+		//
+		// Both erases MUST precede the image transmits. kitty and Ghostty treat
+		// ED2 as a graphics clear that also frees every image left without a
+		// placement — which is exactly what freshly transmitted data is until
+		// the row carrying its placement is written. Transmitting first let the
+		// erase reclaim the data, so the replay's placements then referenced an
+		// image the terminal no longer had and every inline image vanished
+		// after a settled width resize.
 		if (destructiveReset) buffer += "\x1b[H\x1b[2J\x1b[3J";
+		for (const sequence of this.#imageBudget.takeTransmits()) buffer += sequence;
 		const diffable =
 			geometryStable &&
 			historyRows.length === 0 &&
@@ -2780,7 +2891,7 @@ export class TUI extends Container {
 			buffer += `\x1b[${startTop + 1};1H`;
 			let screenRow = startTop;
 			for (let index = 0; index < preparedHistory.lines.length; index++) {
-				if (screenRow > startTop) buffer += "\r\n";
+				if (screenRow > startTop) buffer += "\n";
 				buffer += this.#lineRewriteSequence(
 					preparedHistory.rows[index]!,
 					width,
@@ -2792,7 +2903,7 @@ export class TUI extends Container {
 				screenRow++;
 			}
 			for (let index = 0; index < rows; index++) {
-				if (screenRow > startTop) buffer += "\r\n";
+				if (screenRow > startTop) buffer += "\n";
 				buffer += this.#lineRewriteSequence(
 					prepared.rows[index]!,
 					width,
@@ -2852,6 +2963,16 @@ export class TUI extends Container {
 		this.#forceViewportRepaintOnNextRender = false;
 		this.#hasEverRendered = true;
 		this.#resizeReplaySize = undefined;
+		// Replay-split rows in `prepared.lines` now occupy the physical viewport;
+		// only `preparedHistory.lines` crossed above it into native scrollback.
+		this.#notifyPaint({
+			history: preparedHistory.lines,
+			viewport: prepared.lines,
+			reset: destructiveReset || history?.kind === "replay",
+			alt: false,
+			columns: width,
+			rows: height,
+		});
 		if (history !== undefined) {
 			this.#acceptedHistoryBatchId = history.id;
 			provider?.acknowledgeHistory(history.id);
@@ -2903,6 +3024,7 @@ export class TUI extends Container {
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
 			this.#noteAltBufferToggle();
+			this.#imageBudget.beginAltScreenLifecycle();
 			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
 			this.#setMouseTracking(wantMouse);
 			setAltScreenActive(true);
@@ -2959,12 +3081,35 @@ export class TUI extends Container {
 			this.#renderAltFrame(width, height);
 			return;
 		}
+		// #prepareResizeReplay can latch this frame's reset itself (a settled
+		// rebuild-mode resize does), so it runs before the gate; the gate then runs
+		// before either arm composes anything.
+		if (this.#frameProvider !== undefined) this.#prepareResizeReplay(width, height);
+		this.#forgetTransmittedForPendingReset();
 		if (this.#frameProvider !== undefined) {
-			this.#prepareResizeReplay(width, height);
 			this.#renderProviderFrame(width, height);
 			return;
 		}
 		this.#renderChildrenFrame(width, height);
+	}
+
+	/**
+	 * Drop transmit tracking when a destructive repaint is about to compose the
+	 * normal screen, so the pass re-sends every image's data alongside its
+	 * placement. That repaint opens with `d=A`, which is what removes the store —
+	 * queueing per-id deletes when the reset was merely *latched* lets them ride
+	 * out on an unrelated frame instead, and a frame painted on the alternate
+	 * buffer carries them off without the repaint that restores them. A latch that
+	 * never reaches a repaint — `stop()` drops it — then deletes nothing.
+	 *
+	 * Must run after everything that can latch the reset for this frame and before
+	 * anything composes it — one call on the normal-screen dispatch path, ahead of
+	 * the arm split, so a new arm cannot be added without it.
+	 */
+	#forgetTransmittedForPendingReset(): void {
+		if (!this.#clearScrollbackOnNextRender) return;
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
+		this.#imageBudget.forgetTransmitted();
 	}
 
 	/**
@@ -2973,14 +3118,15 @@ export class TUI extends Container {
 	 * mutable viewport. Nothing is ever appended to terminal history.
 	 */
 	#renderChildrenFrame(width: number, height: number): void {
-		let composed: readonly string[];
+		let viewport: string[];
 		do {
 			this.#imageBudget.beginPass();
-			composed = this.render(width);
+			const composed = this.render(width);
+			this.#debugNextWindowTop = Math.max(0, composed.length - height);
+			viewport = composed.length > height ? composed.slice(composed.length - height) : Array.from(composed);
+			viewport = this.#compositeVisibleOverlays(viewport, width, height);
 		} while (this.#imageBudget.endPass());
 		if (this.#maybeDeferGhosttyInitialImagePaint()) return;
-		this.#debugNextWindowTop = Math.max(0, composed.length - height);
-		const viewport = composed.length > height ? composed.slice(composed.length - height) : Array.from(composed);
 		this.#emitPlanFrame(width, height, viewport, undefined, undefined);
 	}
 
@@ -3291,6 +3437,12 @@ export class TUI extends Container {
 		committedTo = -1,
 		spacerGlyphWidth = -1,
 	): string {
+		// End every rewrite at column zero. ConPTY can materialize a pending
+		// wrap before a following cursor-addressing sequence even while DECAWM is
+		// disabled; on the bottom row that becomes an untracked scroll and leaks
+		// live chrome into native history (#9783). The row loops append only LF
+		// because this CR supplies the other half of their explicit CRLF.
+		let rewrite: string;
 		// Reserved lower half of a scaled OSC 66 heading. The glyph re-emitted on
 		// the row above owns columns `[0, spacerGlyphWidth)` here, so preserve
 		// them (any erase there clears the glyph — issue #8318) but still clear
@@ -3298,25 +3450,26 @@ export class TUI extends Container {
 		// spacer, and the glyph write never covers those columns. Leading reset
 		// keeps the erase on the default background (BCE).
 		if (spacerGlyphWidth >= 0) {
-			if (spacerGlyphWidth >= width) return "";
-			return `${SEGMENT_RESET}\x1b[${spacerGlyphWidth}C${ERASE_TO_END_OF_LINE}`;
+			rewrite = spacerGlyphWidth >= width ? "" : `${SEGMENT_RESET}\x1b[${spacerGlyphWidth}C${ERASE_TO_END_OF_LINE}`;
+		} else if (line.isImage) {
+			rewrite = ERASE_LINE + this.#imageLineSequence(line.line, screenRow, frameRow, committedTo);
+		} else {
+			const terminalLine = this.#terminalLine(line);
+			if (line.asciiWidth !== undefined) {
+				// Exact width model: skip the erase only when the row truly fills
+				// the line (an EL there would eat the last cell via pending-wrap).
+				rewrite = line.asciiWidth >= width ? terminalLine : terminalLine + ERASE_TO_END_OF_LINE;
+			} else {
+				// Non-ASCII rows: the native measure can over-count combining-heavy
+				// scripts, so a row it calls "full" may render short and leave stale
+				// cells from the previous occupant — which would then scroll into
+				// history baked into the committed row. Erase the line first instead
+				// (rewrites always start at column 1, so EL-to-end clears the whole
+				// row); the leading reset keeps BCE on the default background.
+				rewrite = SEGMENT_RESET + ERASE_TO_END_OF_LINE + terminalLine;
+			}
 		}
-		if (line.isImage) {
-			return ERASE_LINE + this.#imageLineSequence(line.line, screenRow, frameRow, committedTo);
-		}
-		const terminalLine = this.#terminalLine(line);
-		if (line.asciiWidth !== undefined) {
-			// Exact width model: skip the erase only when the row truly fills
-			// the line (an EL there would eat the last cell via pending-wrap).
-			return line.asciiWidth >= width ? terminalLine : terminalLine + ERASE_TO_END_OF_LINE;
-		}
-		// Non-ASCII rows: the native measure can over-count combining-heavy
-		// scripts, so a row it calls "full" may render short and leave stale
-		// cells from the previous occupant — which would then scroll into
-		// history baked into the committed row. Erase the line first instead
-		// (rewrites always start at column 1, so EL-to-end clears the whole
-		// row); the leading reset keeps BCE on the default background.
-		return SEGMENT_RESET + ERASE_TO_END_OF_LINE + terminalLine;
+		return `${rewrite}\r`;
 	}
 
 	#targetHardwareCursorState(
@@ -3374,10 +3527,14 @@ export class TUI extends Container {
 	#renderAltFrame(width: number, height: number): void {
 		// oxlint-disable-next-line unicorn/no-new-array -- alt-frame length preallocation
 		const base: string[] = new Array(Math.max(0, height)).fill("");
-		const lines = this.#compositeOverlaysIntoWindow(base, width, height);
+		let lines: string[];
+		do {
+			this.#imageBudget.beginPass(false, true);
+			lines = this.#compositeOverlaysIntoWindow(base, width, height);
+		} while (this.#imageBudget.endPass());
 		this.#extractCursorMarkers(lines);
 		const prepared = this.#prepareLinesArray(lines, width, this.#altPreparedRows, height);
-		this.#emitAltFrame(prepared, width, height);
+		this.#emitAltFrame(prepared, width, height, true);
 	}
 
 	/**
@@ -3385,13 +3542,20 @@ export class TUI extends Container {
 	 * brackets, a cursor home, and per-row rewrites — never ED3 or any
 	 * native-scrollback byte. The hardware cursor stays hidden here.
 	 */
-	#emitAltFrame(prepared: PreparedLines, width: number, height: number): void {
+	#emitAltFrame(prepared: PreparedLines, width: number, height: number, notifyPaint: boolean): void {
+		// The pass that composed this frame ran with `altScreen`, so the normal
+		// screen's own placements behind it are not treated as retired.
+		this.#imageBudget.limitResidentImages();
 		// Flush queued image-data transmits (`a=t`, no visible output) before the
 		// paint so id-keyed placements and placeholder cells composed into this
 		// frame resolve against loaded data. The normal-screen path flushes these
 		// ahead of its paint; without this, an image first shown inside a
 		// fullscreen overlay (e.g. the settings shape preview) would render as
 		// blank placeholder cells until the overlay closed.
+		const purgeIds = this.#imageBudget.takePurgeIds();
+		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
+			for (const id of purgeIds) this.terminal.write(encodeKittyDeleteImage(id));
+		}
 		const imageTransmits = this.#imageBudget.takeTransmits();
 		if (imageTransmits.length > 0) {
 			let transmitBuffer = "";
@@ -3428,7 +3592,7 @@ export class TUI extends Container {
 		}
 		let buffer = `${this.#paintBeginSequence}\x1b[H`;
 		for (let r = 0; r < height; r++) {
-			if (r > 0) buffer += "\r\n";
+			if (r > 0) buffer += "\n";
 			buffer += this.#lineRewriteSequence(
 				prepared.rows[r]!,
 				width,
@@ -3443,6 +3607,16 @@ export class TUI extends Container {
 		this.#altPreviousLines = prepared.lines;
 		this.#altPreparedRows = prepared.rows;
 		this.#debugPaint = { lines: prepared.lines, windowTop: 0, altScreen: true };
+		if (notifyPaint) {
+			this.#notifyPaint({
+				history: [],
+				viewport: prepared.lines,
+				reset: false,
+				alt: true,
+				columns: width,
+				rows: height,
+			});
+		}
 		this.#fullRedrawCount += 1;
 	}
 }

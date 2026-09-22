@@ -1,10 +1,27 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
 import { searchOllama } from "@oh-my-pi/pi-coding-agent/web/search/providers/ollama";
 import { parseSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search/query";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 const OLLAMA_SEARCH_URL = "https://ollama.com/api/web_search";
+const catalogAuthStorage = createInMemoryAuthStorage();
+const modelRegistry = new ModelRegistry(catalogAuthStorage);
+
+function requireOllamaModel() {
+	const model = modelRegistry.find("web", "ollama");
+	if (!model) throw new Error("Expected bundled web/ollama model");
+	return model;
+}
+
+const ollamaModel = requireOllamaModel();
+
+afterAll(() => {
+	catalogAuthStorage.close();
+});
 
 /** Build a fake AuthStorage that resolves an API key (or undefined). */
 function makeAuthStorage(apiKey: string | undefined): AuthStorage {
@@ -20,12 +37,14 @@ function makeAuthStorage(apiKey: string | undefined): AuthStorage {
 }
 
 /** Build standard search params with sensible defaults. */
-function makeParams(query: string, extras: Record<string, unknown> = {}) {
+function makeParams(query: string, extras: Partial<SearchParams> = {}): SearchParams {
 	return {
+		...extras,
 		query,
 		authStorage: makeAuthStorage("test-key"),
 		systemPrompt: "Ollama test prompt",
-		...extras,
+		model: ollamaModel,
+		modelRegistry,
 	};
 }
 
@@ -287,6 +306,28 @@ describe("Ollama searchOllama response mapping", () => {
 		expect(response.sources[1]?.title).toBe("https://example.com/empty-title");
 	});
 
+	it("collapses tabs and newlines in title and snippet", async () => {
+		const fetchMock: FetchImpl = async () =>
+			new Response(
+				JSON.stringify({
+					results: [
+						{
+							title: "Line one\n\tline two",
+							url: "https://example.com/messy",
+							content: "first\nsecond\t\tthird",
+						},
+					],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+
+		const response = await searchOllama({ ...makeParams("test"), fetch: fetchMock });
+
+		expect(response.sources).toHaveLength(1);
+		expect(response.sources[0]?.title).toBe("Line one line two");
+		expect(response.sources[0]?.snippet).toBe("first second third");
+	});
+
 	it("skips results with missing or non-string url", async () => {
 		const fetchMock: FetchImpl = async () =>
 			new Response(
@@ -488,6 +529,8 @@ describe("Ollama searchOllama auth resolution", () => {
 			query: "test",
 			authStorage: noKeyStorage,
 			systemPrompt: "",
+			model: ollamaModel,
+			modelRegistry,
 			fetch: fetchMock,
 		});
 

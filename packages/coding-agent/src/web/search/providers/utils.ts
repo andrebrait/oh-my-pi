@@ -1,11 +1,6 @@
 import type { AgentStorage } from "../../../session/agent-storage";
-import {
-	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
-	SEARCH_PROVIDER_LABELS,
-	SearchProviderError,
-	type SearchProviderId,
-	type SearchSource,
-} from "../../../web/search/types";
+import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, SearchProviderError } from "../../../web/search/types";
+import { SEARCH_PROVIDER_LABELS, type SearchProviderId, type SearchSource } from "../types";
 import { dateToAgeSeconds } from "../utils";
 
 /**
@@ -128,6 +123,17 @@ export function classifyProviderHttpError(
 		return new SearchProviderError(provider, `${provider}: 403 forbidden`, status);
 	}
 	return null;
+}
+
+/**
+ * Collapse runs of whitespace in a loosely-typed provider field, returning
+ * `undefined` for missing/non-string/blank values. Shared so tab/newline
+ * folding cannot drift between providers.
+ */
+export function normalizeSearchText(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.replace(/\s+/g, " ").trim();
+	return text.length > 0 ? text : undefined;
 }
 
 /**
