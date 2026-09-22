@@ -228,6 +228,27 @@ export class PluginManager {
 		}
 	}
 
+	/**
+	 * Re-add a manifest edge the pre-install prune removed when `bun install`
+	 * did not write one back. Bun rewrites plugins/package.json only when the
+	 * install changes the resolution, so reinstalling the version already in
+	 * node_modules leaves the plugin loaded with no dependency entry — and the
+	 * next install drops it from the tree.
+	 */
+	async #restoreDependencyEntry(pkgJsonPath: string, name: string, spec: string | undefined): Promise<void> {
+		if (!spec) return;
+		const pkgJson: { dependencies?: Record<string, string>; [key: string]: unknown } =
+			await Bun.file(pkgJsonPath).json();
+		// Any edge resolving to this package counts, including a malformed
+		// `@scope/name@version` key: restoring alongside one would recreate the
+		// duplicate manifest edge the prune exists to collapse (#12296).
+		for (const key in pkgJson.dependencies) {
+			if (extractPackageName(key) === name) return;
+		}
+		pkgJson.dependencies = { ...pkgJson.dependencies, [name]: spec };
+		await Bun.write(pkgJsonPath, JSON.stringify(pkgJson, null, 2));
+	}
+
 	#collectInstalledNames(deps: Record<string, string>, config: PluginRuntimeConfig): Set<string> {
 		const installedNames = new Set<string>();
 		for (const name of Object.keys(deps)) {
@@ -580,6 +601,7 @@ export class PluginManager {
 				actualName = resolved;
 			} else {
 				actualName = extractPackageName(spec.packageName);
+				await this.#restoreDependencyEntry(pkgJsonPath, actualName, depsBefore[actualName]);
 			}
 
 			// Step 2: refresh the git lockfile pin when re-installing an existing

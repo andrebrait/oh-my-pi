@@ -142,4 +142,48 @@ describe("PluginManager.install npm idempotency", () => {
 		const dependencies = (await Bun.file(pluginsPkgJson).json()).dependencies;
 		expect(dependencies).toEqual({ "pi-lens": "npm:pi-lens@4.2.0" });
 	});
+
+	test("a bun install that only writes a malformed key is not given a second edge", async () => {
+		await Bun.write(
+			pluginsPkgJson,
+			JSON.stringify({ name: "omp-plugins", private: true, dependencies: { "pi-lens": "v4.1.6" } }, null, 2),
+		);
+		// bun sometimes records the full spec as the key (#12727). The pruned
+		// canonical key must stay pruned in that case: re-adding it next to the
+		// malformed edge is the duplicate state that breaks the next install.
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+			expect(cmd[1]).toBe("install");
+			const prepare = (async () => {
+				await Bun.write(
+					pluginsPkgJson,
+					JSON.stringify(
+						{
+							name: "omp-plugins",
+							private: true,
+							dependencies: { "npm:pi-lens@4.2.0": "npm:pi-lens@4.2.0" },
+						},
+						null,
+						2,
+					),
+				);
+				const installedDir = path.join(pluginsNodeModules, "pi-lens");
+				await fs.mkdir(installedDir, { recursive: true });
+				await Bun.write(
+					path.join(installedDir, "package.json"),
+					JSON.stringify({ name: "pi-lens", version: "4.2.0" }),
+				);
+			})();
+			return {
+				pid: 1,
+				stdout: emptyStream(),
+				stderr: emptyStream(),
+				exited: prepare.then(() => 0),
+			} as Subprocess;
+		}) as typeof Bun.spawn);
+
+		await new PluginManager(tmpRoot).install("npm:pi-lens@4.2.0");
+
+		const dependencies = (await Bun.file(pluginsPkgJson).json()).dependencies;
+		expect(dependencies).toEqual({ "npm:pi-lens@4.2.0": "npm:pi-lens@4.2.0" });
+	});
 });
