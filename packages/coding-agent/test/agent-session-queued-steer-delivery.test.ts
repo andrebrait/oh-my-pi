@@ -323,6 +323,34 @@ describe("AgentSession queued steer delivery", () => {
 		expect(hasQueuedAfterClear).toBe(false);
 	});
 
+	it("keeps the attachment of a keyword prompt steered mid-stream", async () => {
+		const { session } = await createSession([{ content: ["host answer"] }]);
+		const image = {
+			type: "image" as const,
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+		};
+		let queuedUserContent: string[] | undefined;
+		let injected = false;
+		session.agent.setOnBeforeYield(async () => {
+			if (injected) return;
+			injected = true;
+			// The mid-stream branch queues before normalization runs: its
+			// companion notices must not be mistaken for prepared attachments,
+			// or the image never reaches the queued message.
+			await session.prompt("ultrathink look at this", { images: [image], streamingBehavior: "steer" });
+			const queued = session.agent.peekSteeringQueue();
+			const userMessage = queued.find(message => message.role === "user");
+			queuedUserContent = Array.isArray(userMessage?.content)
+				? userMessage.content.map(part => part.type)
+				: undefined;
+		});
+
+		await session.prompt("hello");
+
+		expect(queuedUserContent).toEqual(["text", "image"]);
+	});
+
 	it("a fresh user prompt delivers queued steer and follow-up work", async () => {
 		const { session } = await createSession([{ content: ["one"] }, { content: ["two"] }, { content: ["three"] }]);
 		// Queue real pending work before the user's next send.

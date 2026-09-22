@@ -6470,9 +6470,7 @@ export class AgentSession {
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
-				preprocessed: {
-					keywordNotices,
-				},
+				prependMessages: keywordNotices,
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -6523,10 +6521,10 @@ export class AgentSession {
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
+				prependMessages: keywordNotices,
 				preprocessed: {
 					images: normalizedImages,
 					descriptionNotice: imageDescriptionNotice,
-					keywordNotices,
 				},
 			});
 			outcome.sessionClaimed = true;
@@ -7322,17 +7320,22 @@ export class AgentSession {
 			timestamp?: number;
 			attribution?: MessageAttribution;
 			prependMessages?: readonly CustomMessage[];
+			/**
+			 * Set only when image normalization and the vision description already
+			 * ran for this prompt; its presence suppresses both here. Companions
+			 * travel in `prependMessages` so a notice-only caller cannot claim
+			 * attachments were prepared (they would be silently dropped).
+			 */
 			preprocessed?: {
 				images?: ImageContent[];
 				descriptionNotice?: CustomMessage;
-				keywordNotices?: readonly CustomMessage[];
 			};
 		},
 	): Promise<void> {
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const preprocessed = options?.preprocessed;
-		const prependMessages = options?.prependMessages ?? preprocessed?.keywordNotices ?? [];
+		const prependMessages = options?.prependMessages ?? [];
 		// Captured before any await below so the aside branch can detect a
 		// newSession()/switchSession() that completed while normalization/vision
 		// description was in flight and drop a record that would otherwise land in a
