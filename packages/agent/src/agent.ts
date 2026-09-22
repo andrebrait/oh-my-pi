@@ -1091,13 +1091,23 @@ export class Agent {
 		this.#notifySteeringWaiters();
 	}
 
-	/** Replace one pending queue without changing the other queue. */
+	/**
+	 * Replace one pending queue without changing the other queue.
+	 *
+	 * The caller's snapshot comes from {@link peekSteeringQueue} /
+	 * {@link peekFollowUpQueue}, which prepend the live claimed batch. Installing
+	 * it while that claim is still live would commit a removed message anyway and
+	 * deliver the surviving claimed prefix twice, so the claim and its pending
+	 * delivery are dropped here exactly as {@link replaceQueues} does.
+	 */
 	replaceQueue(queue: "steering" | "followUp", messages: readonly AgentMessage[]): void {
 		if (queue === "steering") {
 			this.#steeringQueue = messages.slice();
+			this.#cancelQueuedMessagePreparation("steering");
 			this.#notifySteeringWaiters();
 		} else {
 			this.#followUpQueue = messages.slice();
+			this.#cancelQueuedMessagePreparation("followUp");
 		}
 	}
 
