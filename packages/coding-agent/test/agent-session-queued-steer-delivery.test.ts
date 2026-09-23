@@ -26,9 +26,21 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { tagImageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 const COLLAB_PROMPT_TYPE = "collab-prompt";
+const IMAGE_SOURCE_PATH = "/tmp/private-project/screenshot.png";
+/** A path-pasted image: its source path rides in a hidden `image-attachment` companion. */
+const PATH_PASTED_IMAGE = tagImageAttachmentSource(
+	{
+		type: "image",
+		mimeType: "image/png",
+		data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+	},
+	IMAGE_SOURCE_PATH,
+	"image",
+);
 
 interface SteerHarness {
 	session: AgentSession;
@@ -351,6 +363,26 @@ describe("AgentSession queued steer delivery", () => {
 		expect(queuedUserContent).toEqual(["text", "image"]);
 	});
 
+	it("delivers a queued path-pasted image prompt in the same one-at-a-time turn as its source path", async () => {
+		const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["image answer"] }]);
+		session.agent.setFollowUpMode("one-at-a-time");
+		let injected = false;
+		session.agent.setOnBeforeYield(async () => {
+			if (injected) return;
+			injected = true;
+			await session.followUp("What is in [Image #1]?", [PATH_PASTED_IMAGE]);
+		});
+
+		await session.prompt("start");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		const delivered = JSON.stringify(mock.calls[1].context.messages);
+		expect(delivered).toContain(IMAGE_SOURCE_PATH);
+		expect(delivered).toContain("What is in [Image #1]?");
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("a fresh user prompt delivers queued steer and follow-up work", async () => {
 		const { session } = await createSession([{ content: ["one"] }, { content: ["two"] }, { content: ["three"] }]);
 		// Queue real pending work before the user's next send.
@@ -618,6 +650,28 @@ describe("AgentSession queued steer delivery", () => {
 				expect(session.getQueuedMessages()[queue]).toEqual([]);
 			});
 		}
+
+		it("removes a queued path-pasted image prompt together with its private source path", async () => {
+			const { session, mock } = await createSession([{ content: ["initial"] }]);
+			let injected = false;
+			let removed: boolean | undefined;
+			session.agent.setOnBeforeYield(async () => {
+				if (injected) return;
+				injected = true;
+				await session.followUp("What is in [Image #1]?", [PATH_PASTED_IMAGE]);
+				removed = session.removeQueuedMessage("What is in [Image #1]?", "followUp");
+			});
+
+			await session.prompt("start");
+			await session.waitForIdle();
+
+			expect(removed).toBe(true);
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			expect(mock.calls).toHaveLength(1);
+			expect(session.messages.filter(message => message.role === "user" || message.role === "custom")).toEqual([
+				expect.objectContaining({ role: "user", content: [{ type: "text", text: "start" }] }),
+			]);
+		});
 
 		it("matches raw and expanded prompt-template chips without changing surviving work", async () => {
 			const { session } = await createSession(
