@@ -6661,22 +6661,29 @@ export class AgentSession implements SettingsScope {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
+		const generation = this.#promptGeneration;
+		const disposingBeforePreparation = this.#isDisposed;
+		// Command expansion and attachment preparation precede turn ownership.
+		// An abort during either must not let this submission acquire a fresh slot.
+		const typedText = text;
+		const wasCancelled = () => {
+			if (this.#promptGeneration === generation && (!this.#isDisposed || disposingBeforePreparation)) return false;
+			if (!options?.synthetic) this.#promptDropped?.({ text: typedText, images: options?.images });
+			return true;
+		};
 		// A manual `/compact` runs with the agent subscription disconnected until its
 		// cleanup finally re-drains the preserved queues. Starting a turn before then
 		// would neither persist nor forward its events and could race the in-flight
 		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
-		// here, and a waiting prompt supersedes the interrupted-turn resume the
-		// compaction would otherwise schedule — but only once it actually claims the
-		// session (a turn dispatched or queued, or one already running). A locally
-		// handled command, a pre-dispatch throw, or a prompt dropped by the
-		// abort/preflight race hands the resume back via `release(false)`. A prompt
-		// arriving after the cleanup while an earlier parked prompt is still settling
-		// takes part in the same decision. No-op otherwise.
 		const release = await this.#maintenance.waitForManualCompactionCleanup();
+		if (wasCancelled()) {
+			release?.(false);
+			return false;
+		}
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
+		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome, wasCancelled);
 		try {
-			return await this.#dispatchPrompt(text, options, submittedAt, outcome);
+			return await this.#dispatchPrompt(text, options, submittedAt, outcome, wasCancelled);
 		} finally {
 			release(outcome.sessionClaimed);
 		}
@@ -6687,6 +6694,7 @@ export class AgentSession implements SettingsScope {
 		options: PromptOptions | undefined,
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
+		wasCancelled: () => boolean,
 	): Promise<boolean> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		// Slash/custom-command handling below rewrites `text`; keep the original
@@ -6698,6 +6706,7 @@ export class AgentSession implements SettingsScope {
 			if (handled) {
 				return false;
 			}
+			if (wasCancelled()) return false;
 
 			// Try custom commands (TypeScript slash commands)
 			const customResult = await this.#tryExecuteCustomCommand(text);
@@ -6714,6 +6723,7 @@ export class AgentSession implements SettingsScope {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+		if (wasCancelled()) return false;
 
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -6749,14 +6759,25 @@ export class AgentSession implements SettingsScope {
 				throw new AgentBusyError();
 			}
 
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+			// Prepare attachments here, before queueing, so an abort during preparation
+			// cancels the submission through wasCancelled; `preprocessed` then hands the
+			// finished normalization and vision description to #queueUserMessage.
+			const queuedImages = await this.#normalizeImagesForModel(options?.images);
+			if (wasCancelled()) return false;
+			const queuedSignal = this.#postPromptTasksAbortController.signal;
+			const queuedDescriptionNotice = queuedImages?.length
+				? await this.#buildImageDescriptionNotice(queuedImages, queuedSignal)
+				: undefined;
+			if (wasCancelled()) return false;
+
+			outcome.sessionClaimed = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				prependMessages: keywordNotices,
 				rawText: typedText,
+				preprocessed: { images: queuedImages, descriptionNotice: queuedDescriptionNotice },
 			});
-			outcome.sessionClaimed = true;
-			return true;
+			return outcome.sessionClaimed;
 		}
 
 		// Skip eager preludes when the user has already queued a directive
@@ -6776,16 +6797,19 @@ export class AgentSession implements SettingsScope {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
 		const attachmentSourceNotices = this.#createAttachmentSourceNotices(options?.images, submittedAt);
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+		if (wasCancelled()) return false;
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
 			userContent.push(...normalizedImages);
 		}
+		const signal = this.#postPromptTasksAbortController.signal;
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, signal)
 			: undefined;
+		if (wasCancelled()) return false;
 
 		// A concurrent prompt() can start a turn during the awaits above: image
 		// normalization and the vision-description call suspend after the
@@ -6801,7 +6825,7 @@ export class AgentSession implements SettingsScope {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+			outcome.sessionClaimed = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				prependMessages: keywordNotices,
@@ -6811,8 +6835,7 @@ export class AgentSession implements SettingsScope {
 					descriptionNotice: imageDescriptionNotice,
 				},
 			});
-			outcome.sessionClaimed = true;
-			return true;
+			return outcome.sessionClaimed;
 		}
 
 		if (externalThinkingToolChoice) {
@@ -7631,7 +7654,7 @@ export class AgentSession implements SettingsScope {
 				descriptionNotice?: CustomMessage;
 			};
 		},
-	): Promise<void> {
+	): Promise<boolean> {
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const rawText = options?.rawText ?? text;
@@ -7642,6 +7665,7 @@ export class AgentSession implements SettingsScope {
 		// description was in flight and drop a record that would otherwise land in a
 		// different session's queue.
 		const sessionGeneration = this.#sessionGeneration;
+		const generation = this.#promptGeneration;
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed. An aside is non-interrupting by design — it must
@@ -7667,7 +7691,7 @@ export class AgentSession implements SettingsScope {
 				? await this.#buildImageDescriptionNotice(normalizedImages)
 				: undefined;
 		if (mode === "aside") {
-			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
+			if (await this.#sessionGenerationChanged(sessionGeneration)) return false;
 			const records: AgentMessage[] = [...prependMessages];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			const userMessage: AgentMessage = { role: "user", content, attribution, timestamp: timestamp ?? Date.now() };
@@ -7679,7 +7703,13 @@ export class AgentSession implements SettingsScope {
 			// queue with no loop left to drain it. Resuming here is a no-op while streaming and
 			// wakes/folds correctly once idle (see #resumeStrandedIrcAsides).
 			this.#resumeStrandedIrcAsides();
-			return;
+			return true;
+		}
+		// An abort or history replacement during attachment preparation cancels user work,
+		// but not the non-interrupting aside path above.
+		if (this.#isDisposed || this.#promptGeneration !== generation) {
+			this.#promptDropped?.({ text, images });
+			return false;
 		}
 		this.#allowQueuedMessageDrainRetry();
 		// Publish the complete group without yielding: removal owns contiguous companions.
@@ -7710,6 +7740,7 @@ export class AgentSession implements SettingsScope {
 			this.agent.steer(userMessage);
 		}
 		this.#scheduleIdleQueueDrain();
+		return true;
 	}
 
 	#scheduleIdleQueueDrain(): void {
