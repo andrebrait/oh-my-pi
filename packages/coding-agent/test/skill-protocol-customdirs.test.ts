@@ -122,7 +122,7 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 		expect(text).not.toContain("tail-skill skill.");
 	});
 
-	it("keeps first-wins across multiple custom directories", async () => {
+	it("keeps the first-admitted custom directory on the bare name", async () => {
 		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "pi-custom-a-"));
 		tempDirs.push(dirA);
 		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "pi-custom-b-"));
@@ -140,19 +140,20 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 		});
 		setActiveSkills(skills);
 
-		const nsA = path.basename(dirA);
 		const nsB = path.basename(dirB);
-		const skillAEntry = skills.find(s => s.name === `${nsA}/same-name`);
+		const bareEntry = skills.find(s => s.name === "same-name");
 		const skillBEntry = skills.find(s => s.name === `${nsB}/same-name`);
-		expect(skillAEntry).toBeDefined();
+		expect(bareEntry).toBeDefined();
 		expect(skillBEntry).toBeDefined();
-		expect(skillAEntry!.filePath).toBe(path.join(skillA, "SKILL.md"));
+		expect(bareEntry!.filePath).toBe(path.join(skillA, "SKILL.md"));
 		expect(skillBEntry!.filePath).toBe(path.join(skillB, "SKILL.md"));
 		expect(warnings.some(w => w.message.includes("collision"))).toBe(true);
 
 		const handler = new SkillProtocolHandler();
-		const resource = await handler.resolve(parseInternalUrl(`skill://${nsA}/same-name/`));
-		expect(resource.sourcePath).toBe(path.join(skillA, "SKILL.md"));
+		const bareResource = await handler.resolve(parseInternalUrl("skill://same-name/"));
+		expect(bareResource.sourcePath).toBe(path.join(skillA, "SKILL.md"));
+		const namespaced = await handler.resolve(parseInternalUrl(`skill://${nsB}/same-name/`));
+		expect(namespaced.sourcePath).toBe(path.join(skillB, "SKILL.md"));
 	});
 
 	it("lets a custom-directory skill override a same-named default-path skill", async () => {
@@ -184,16 +185,17 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 		});
 		setActiveSkills(skills);
 
-		const customNs = path.basename(customDir);
-		const customEntry = skills.find(s => s.name === `${customNs}/shared-name`);
+		// The custom-directory skill overrides onto the bare name (#7190); the
+		// displaced provider skill stays reachable under its namespaced form.
+		const bareEntry = skills.find(s => s.name === "shared-name");
 		const defaultEntry = skills.find(s => s.name === "claude/shared-name");
-		expect(customEntry).toBeDefined();
+		expect(bareEntry).toBeDefined();
 		expect(defaultEntry).toBeDefined();
-		expect(customEntry!.filePath).toBe(path.join(customSkill, "SKILL.md"));
+		expect(bareEntry!.filePath).toBe(path.join(customSkill, "SKILL.md"));
 		expect(defaultEntry!.filePath).toBe(path.join(defaultSkill, "SKILL.md"));
 
 		const handler = new SkillProtocolHandler();
-		const resource = await handler.resolve(parseInternalUrl(`skill://${customNs}/shared-name/`));
+		const resource = await handler.resolve(parseInternalUrl("skill://shared-name/"));
 		expect(resource.sourcePath).toBe(path.join(customSkill, "SKILL.md"));
 		expect(resource.content).toContain("from custom");
 	});

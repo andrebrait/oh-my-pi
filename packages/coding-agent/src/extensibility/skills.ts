@@ -20,6 +20,9 @@ import { expandTilde } from "../tools/path-utils";
 
 export { allowsSkillTokens, SKILL_TOKEN_RE };
 
+/** Provider id for skills loaded from `skills.customDirectories` (see `loadSkills`). */
+const CUSTOM_DIR_PROVIDER_ID = "custom";
+
 export interface Skill {
 	name: string;
 	description: string;
@@ -99,11 +102,18 @@ interface CollisionResolution {
 /**
  * Resolve a same-name skill against what is already loaded.
  * - Identical body to any admitted instance of this raw name → silently drop.
- * - An authored skill colliding with a registry-installed package → authorship
- *   is the deliberate override, so it holds the bare name and the installed
- *   copy becomes `<namespace>/<name>` (skillshare discovery's contract).
- * - Otherwise → every variant receives a `<namespace>/<name>` prefix so neither
- *   is ambiguous; a taken namespaced slot gets a numeric suffix.
+ * - Otherwise the higher-precedence side keeps the bare name and the other
+ *   side is namespaced as `<namespace>/<name>` (a taken namespaced slot gets
+ *   a numeric `~N` suffix). Precedence, when raw names collide:
+ *   1. An authored skill always outranks a registry-installed package
+ *      (`omp skill install`, the `skillshare` provider) — installed steps
+ *      aside regardless of admission order.
+ *   2. A custom-directory skill always outranks a provider skill (#7190's
+ *      override contract) — the provider skill steps aside even though it
+ *      was admitted first (custom directories are merged after providers).
+ *   3. Otherwise, whichever was admitted first — provider-priority order for
+ *      providers, array order within `skills.customDirectories` for custom
+ *      directories — keeps the bare name; the later candidate is namespaced.
  */
 function resolveCollision(
 	skillMap: Map<string, Skill>,
@@ -120,10 +130,12 @@ function resolveCollision(
 		return { name: candidate.name };
 	}
 
-	let displaced: CollisionResolution["displaced"] | undefined;
 	const bareSkill = skillMap.get(candidate.name);
 	const candidateInstalled = candidate._source?.provider === SKILLSHARE_PROVIDER_ID;
 	const bareInstalled = bareSkill?._source?.provider === SKILLSHARE_PROVIDER_ID;
+	const candidateCustom = candidate._source?.provider === CUSTOM_DIR_PROVIDER_ID;
+	const bareCustom = bareSkill?._source?.provider === CUSTOM_DIR_PROVIDER_ID;
+
 	if (bareSkill && !bareInstalled && candidateInstalled) {
 		// The authored skill already holds the name; the package steps aside.
 		let namespaced = `${namespace}/${candidate.name}`;
@@ -147,28 +159,34 @@ function resolveCollision(
 			},
 		};
 	}
-	if (bareSkill) {
+	if (bareSkill && candidateCustom && !bareCustom) {
+		// A custom-directory skill overrides a same-named provider skill, even
+		// though the provider skill was admitted first (#7190's override contract:
+		// custom directories are always merged after provider discovery).
 		const bareEntry = admitted.get(candidate.name)!;
 		let namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}`;
-		for (let n = 2; skillMap.has(namespacedBare) || namespacedBare === `${namespace}/${candidate.name}`; n++) {
+		for (let n = 2; skillMap.has(namespacedBare); n++)
 			namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}~${n}`;
-		}
-		displaced = {
-			skill: bareSkill,
-			newName: namespacedBare,
-			warning: `name collision: "${bareEntry.rawName}" from ${bareSkill.filePath} differs from ${candidate.filePath}; available as "${namespacedBare}"`,
+		return {
+			name: candidate.name,
+			displaced: {
+				skill: bareSkill,
+				newName: namespacedBare,
+				warning: `name collision: "${bareEntry.rawName}" from ${bareSkill.filePath} is overridden by ${candidate.filePath}; available as "${namespacedBare}"`,
+			},
 		};
 	}
 
+	// Otherwise the already-admitted skill keeps the bare name (first-admitted
+	// wins); only the new candidate is namespaced.
 	let namespaced = `${namespace}/${candidate.name}`;
-	for (let n = 2; skillMap.has(namespaced) || (displaced && displaced.newName === namespaced); n++) {
+	for (let n = 2; skillMap.has(namespaced); n++) {
 		namespaced = `${namespace}/${candidate.name}~${n}`;
 	}
 	const referencePath = existingEntries[0][1].filePath;
 	return {
 		name: namespaced,
 		warning: `name collision: "${candidate.name}" from ${candidate.filePath} differs from ${referencePath}; available as "${namespaced}"`,
-		displaced,
 	};
 }
 
@@ -216,7 +234,7 @@ export interface LoadSkillsFromDirOptions {
 
 export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Promise<LoadSkillsResult> {
 	const [rawProviderId, rawLevel] = options.source.split(":", 2);
-	const providerId = rawProviderId || "custom";
+	const providerId = rawProviderId || CUSTOM_DIR_PROVIDER_ID;
 	const level: "user" | "project" = rawLevel === "project" ? "project" : "user";
 	const result = await scanSkillsFromDir(
 		{ cwd: getProjectDir(), home: os.homedir(), repoRoot: null },
@@ -426,7 +444,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				{ cwd, home: os.homedir(), repoRoot: null },
 				{
 					dir: expandedDir,
-					providerId: "custom",
+					providerId: CUSTOM_DIR_PROVIDER_ID,
 					level: "user",
 					requireDescription: true,
 				},
