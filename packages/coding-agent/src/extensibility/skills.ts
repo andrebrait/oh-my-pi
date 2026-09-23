@@ -14,6 +14,7 @@ import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import { allowsSkillTokens, SKILL_TOKEN_RE } from "@oh-my-pi/pi-tui/prompt/skill-tokens";
 import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text" };
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
+import { SKILLSHARE_PROVIDER_ID } from "../discovery/skillshare";
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
 
@@ -98,8 +99,11 @@ interface CollisionResolution {
 /**
  * Resolve a same-name skill against what is already loaded.
  * - Identical body to any admitted instance of this raw name → silently drop.
- * - Different body → every variant receives a `<namespace>/<name>` prefix so
- *   neither is ambiguous; a taken namespaced slot gets a numeric suffix.
+ * - An authored skill colliding with a registry-installed package → authorship
+ *   is the deliberate override, so it holds the bare name and the installed
+ *   copy becomes `<namespace>/<name>` (skillshare discovery's contract).
+ * - Otherwise → every variant receives a `<namespace>/<name>` prefix so neither
+ *   is ambiguous; a taken namespaced slot gets a numeric suffix.
  */
 function resolveCollision(
 	skillMap: Map<string, Skill>,
@@ -118,6 +122,31 @@ function resolveCollision(
 
 	let displaced: CollisionResolution["displaced"] | undefined;
 	const bareSkill = skillMap.get(candidate.name);
+	const candidateInstalled = candidate._source?.provider === SKILLSHARE_PROVIDER_ID;
+	const bareInstalled = bareSkill?._source?.provider === SKILLSHARE_PROVIDER_ID;
+	if (bareSkill && !bareInstalled && candidateInstalled) {
+		// The authored skill already holds the name; the package steps aside.
+		let namespaced = `${namespace}/${candidate.name}`;
+		for (let n = 2; skillMap.has(namespaced); n++) namespaced = `${namespace}/${candidate.name}~${n}`;
+		return {
+			name: namespaced,
+			warning: `name collision: installed "${candidate.name}" from ${candidate.filePath} is overridden by ${bareSkill.filePath}; available as "${namespaced}"`,
+		};
+	}
+	if (bareSkill && bareInstalled && !candidateInstalled) {
+		const bareEntry = admitted.get(candidate.name)!;
+		let namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}`;
+		for (let n = 2; skillMap.has(namespacedBare); n++)
+			namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}~${n}`;
+		return {
+			name: candidate.name,
+			displaced: {
+				skill: bareSkill,
+				newName: namespacedBare,
+				warning: `name collision: installed "${bareEntry.rawName}" from ${bareSkill.filePath} is overridden by ${candidate.filePath}; available as "${namespacedBare}"`,
+			},
+		};
+	}
 	if (bareSkill) {
 		const bareEntry = admitted.get(candidate.name)!;
 		let namespacedBare = `${bareEntry.namespace}/${bareEntry.rawName}`;
