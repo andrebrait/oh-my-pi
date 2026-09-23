@@ -66,6 +66,14 @@ async function runWithDetachedModeDraft(
 			editor.imageLinks = editor.pendingImageLinks.length > 0 ? editor.pendingImageLinks : undefined;
 		}
 	} catch (error) {
+		if (runtime.draftDetached) {
+			// The caller already took this draft out of the editor before
+			// dispatch (Ctrl+Enter's `handleFollowUp`, or `onSubmit` for these
+			// mode commands); it owns restoring the submission and reporting
+			// the error so a submission that failed after newer text was typed
+			// merges with it once, instead of being silently dropped here.
+			throw error;
+		}
 		if (!editor.getText() && editor.pendingImages.length === 0) {
 			editor.setText(command.text);
 			editor.pendingImages = runtime.input?.images ? [...runtime.input.images] : [];
