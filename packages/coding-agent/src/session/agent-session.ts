@@ -6680,7 +6680,13 @@ export class AgentSession {
 
 		if (options?.queueOnly || this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
-			if (!streamingBehavior) throw new AgentBusyError();
+			if (!streamingBehavior) {
+				// Mirrors #dispatchPrompt: busy because the agent owns a turn claims the
+				// session; busy only from queueOnly or another prompt's setup claims
+				// nothing.
+				if (this.isStreaming) outcome.sessionClaimed = this.agent.state.isStreaming;
+				throw new AgentBusyError();
+			}
 
 			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, keywordNotices);
 			outcome.sessionClaimed = true;
