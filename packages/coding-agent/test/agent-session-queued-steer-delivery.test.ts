@@ -687,6 +687,27 @@ describe("AgentSession queued steer delivery", () => {
 			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: ["keep"] });
 		});
 
+		it("removes a queued file-based slash command by its raw /cmd invocation", async () => {
+			const { session } = await createSession([]);
+			session.setSlashCommands([{ name: "cmd", description: "Test", content: "Expanded $1", source: "(test)" }]);
+
+			// #dispatchPrompt's slash-command rewrite only runs on prompt(); force
+			// the busy-session queueing branch without a real turn.
+			session.agent.state.isStreaming = true;
+			try {
+				const queued = await session.prompt("/cmd args", { streamingBehavior: "steer" });
+				expect(queued).toBe(true);
+				expect(session.getQueuedMessages().steering).toEqual(["Expanded args"]);
+
+				// The caller only ever holds its raw "/cmd args" invocation; removal
+				// must still find the slash-command-expanded queued chip.
+				expect(session.removeQueuedMessage("/cmd args", "steering")).toBe(true);
+				expect(session.getQueuedMessages().steering).toEqual([]);
+			} finally {
+				session.agent.state.isStreaming = false;
+			}
+		});
+
 		it("cancels a skill queued through RPC by its original invocation before it reaches the model", async () => {
 			const { session, mock } = await createSession([{ content: ["initial"] }]);
 			const skillPath = path.join(tempDir, "SKILL.md");
