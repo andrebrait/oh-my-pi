@@ -56,26 +56,34 @@ export interface LoadSkillsResult {
 
 /**
  * Namespace a skill takes when its bare name is already claimed by a different
- * skill. Derived from the path so every provider gets one without plumbing:
- * the directory owning `skills/` (a plugin or package root), else the
- * directory holding the skill (a custom skills root), else the provider.
+ * skill. Prefers the provider-supplied plugin identity (`_source.pluginName`,
+ * currently `claude-plugins`) when present, since Claude Code's own plugin
+ * cache layout (`<marketplace>/<plugin>/<version>/skills/...`) puts a version
+ * string, not the plugin name, in the path segment owning `skills/` — path
+ * parsing alone would namespace by version and collide across plugin updates.
+ * Otherwise derived from the path so every other provider gets one without
+ * plumbing: the directory owning `skills/` (a plugin or package root), else
+ * the directory holding the skill (a custom skills root), else the provider.
  * Dotted homes (`~/.claude/skills`) are not meaningful names.
  */
 function skillNamespace(skill: Pick<CapabilitySkill, "path" | "_source">): string {
-	const segments = skill.path.split(/[\\/]/);
-	const skillsIndex = segments.lastIndexOf("skills");
-	// `<root>/skills/**/SKILL.md` → root; marketplace caches name the root
-	// `<marketplace>___<plugin>___<version>` → plugin.
-	// `<root>/<skill>/SKILL.md` (no `skills/` segment) → root.
-	const root = skillsIndex > 0 ? segments[skillsIndex - 1] : segments[segments.length - 3];
-	const cached = root?.split("___");
-	const namespace = cached?.length === 3 ? cached[1] : root;
-	if (!namespace || namespace.startsWith(".")) return skill._source.provider;
+	let root = skill._source.pluginName;
+	if (root === undefined) {
+		const segments = skill.path.split(/[\\/]/);
+		const skillsIndex = segments.lastIndexOf("skills");
+		// `<root>/skills/**/SKILL.md` → root; marketplace caches name the root
+		// `<marketplace>___<plugin>___<version>` → plugin.
+		// `<root>/<skill>/SKILL.md` (no `skills/` segment) → root.
+		const pathRoot = skillsIndex > 0 ? segments[skillsIndex - 1] : segments[segments.length - 3];
+		const cached = pathRoot?.split("___");
+		root = cached?.length === 3 ? cached[1] : pathRoot;
+	}
+	if (!root || root.startsWith(".")) return skill._source.provider;
 	// Namespaces are addressed through `/skill:<ns>/<name>` and `skill://<ns>/<name>`,
 	// so they must be a single token: collapse runs of whitespace and other
 	// non-name characters to `-` (a distinct root whose sanitized namespace
 	// collides just resolves through the normal `~N` suffix path).
-	const safe = namespace.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "");
+	const safe = root.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/^-+|-+$/g, "");
 	return safe || skill._source.provider;
 }
 
