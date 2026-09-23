@@ -641,6 +641,46 @@ describe("collision handling", () => {
 		}
 	});
 
+	it("does not silently collapse identical bodies with differing frontmatter", async () => {
+		// Same markdown body, different `description` frontmatter: the two
+		// skills read differently to the model (and any other frontmatter
+		// field, e.g. allowed-tools, could differ too), so a body-only equality
+		// check must not treat them as the same skill.
+		const dirA = await fs.mkdtemp(path.join(os.tmpdir(), "skills-fm-a-"));
+		const dirB = await fs.mkdtemp(path.join(os.tmpdir(), "skills-fm-b-"));
+		try {
+			const body = "# Calendar\n\nSame body text for both skills.\n";
+			await fs.mkdir(path.join(dirA, "calendar"), { recursive: true });
+			await Bun.write(
+				path.join(dirA, "calendar", "SKILL.md"),
+				`---\nname: calendar\ndescription: Description A.\n---\n\n${body}`,
+			);
+			await fs.mkdir(path.join(dirB, "calendar"), { recursive: true });
+			await Bun.write(
+				path.join(dirB, "calendar", "SKILL.md"),
+				`---\nname: calendar\ndescription: Description B.\n---\n\n${body}`,
+			);
+
+			const { skills, warnings } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [dirA, dirB],
+			});
+			const nsB = path.basename(dirB);
+			const bareEntry = skills.find(skill => skill.name === "calendar");
+			const namespacedEntry = skills.find(skill => skill.name === `${nsB}/calendar`);
+			expect(bareEntry).toBeDefined();
+			expect(namespacedEntry).toBeDefined();
+			expect(bareEntry!.filePath).toBe(path.join(dirA, "calendar", "SKILL.md"));
+			expect(namespacedEntry!.filePath).toBe(path.join(dirB, "calendar", "SKILL.md"));
+			expect(bareEntry!.description).toBe("Description A.");
+			expect(namespacedEntry!.description).toBe("Description B.");
+			expect(warnings.some(warning => warning.message.includes("name collision"))).toBe(true);
+		} finally {
+			await removeWithRetries(dirA);
+			await removeWithRetries(dirB);
+		}
+	});
+
 	it("normalizes derived namespaces to a token-safe form", async () => {
 		const spaced = await fs.mkdtemp(path.join(os.tmpdir(), "My Skills-"));
 		try {

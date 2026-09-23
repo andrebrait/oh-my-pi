@@ -9,7 +9,12 @@ import {
 import { skillCapability } from "../capability/skill";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "./settings";
-import { type Skill as CapabilitySkill, isUserSourceEnabled, loadCapability } from "../discovery";
+import {
+	type Skill as CapabilitySkill,
+	isUserSourceEnabled,
+	loadCapability,
+	type SkillFrontmatter,
+} from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import { allowsSkillTokens, SKILL_TOKEN_RE } from "@oh-my-pi/pi-tui/prompt/skill-tokens";
 import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text" };
@@ -93,6 +98,10 @@ interface AdmittedBody {
 	 * `<ns>/foo~2` indistinguishable from a generated collision suffix. */
 	rawName: string;
 	body: string;
+	/** Parsed frontmatter, compared alongside `body` for the identical-content
+	 * collapse: two skills can share a body but differ in `description`,
+	 * `allowed-tools`, or another field, and must not be silently merged. */
+	frontmatter: SkillFrontmatter | undefined;
 	namespace: string;
 	filePath: string;
 }
@@ -109,9 +118,9 @@ interface CollisionResolution {
 
 /**
  * Resolve a same-name skill against what is already loaded.
- * - Identical body to any admitted instance of this raw name → silently
- *   drop, UNLESS the candidate outranks the current bare holder (see
- *   precedence below), in which case it still takes the bare name: the
+ * - Identical body AND frontmatter to any admitted instance of this raw name
+ *   → silently drop, UNLESS the candidate outranks the current bare holder
+ *   (see precedence below), in which case it still takes the bare name: the
  *   override contract is about which FILE is authoritative, not just which
  *   text currently renders the same.
  * - Otherwise the higher-precedence side keeps the bare name and the other
@@ -132,6 +141,7 @@ function resolveCollision(
 	admitted: Map<string, AdmittedBody>,
 	candidate: Skill,
 	candidateBody: string,
+	candidateFrontmatter: SkillFrontmatter | undefined,
 	namespace: string,
 ): CollisionResolution | undefined {
 	const existingEntries = [...admitted.entries()].filter(([_, e]) => e.rawName === candidate.name);
@@ -151,7 +161,8 @@ function resolveCollision(
 		bareSkill !== undefined && ((bareInstalled && !candidateInstalled) || (candidateCustom && !bareCustom));
 
 	for (const [name, entry] of admitted) {
-		if (entry.rawName !== candidate.name || entry.body !== candidateBody) continue;
+		if (entry.rawName !== candidate.name) continue;
+		if (entry.body !== candidateBody || !Bun.deepEquals(entry.frontmatter, candidateFrontmatter)) continue;
 		if (name === candidate.name && candidateOutranksBare) continue;
 		return undefined;
 	}
@@ -397,8 +408,13 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	 * the end of this function): filtering here would drop the bare skill and
 	 * leave a namespaced candidate with nothing to collide against.
 	 */
-	function admit(skill: Skill, body: string, namespace: string): string | undefined {
-		const resolved = resolveCollision(skillMap, admitted, skill, body, namespace);
+	function admit(
+		skill: Skill,
+		body: string,
+		frontmatter: SkillFrontmatter | undefined,
+		namespace: string,
+	): string | undefined {
+		const resolved = resolveCollision(skillMap, admitted, skill, body, frontmatter, namespace);
 		if (!resolved) return undefined;
 		const { name, warning, displaced } = resolved;
 		if (disabledSkillNames.has(name) || matchesIgnorePatterns(name)) return undefined;
@@ -419,7 +435,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const rawName = skill.name;
 		skill.name = name;
 		skillMap.set(name, skill);
-		admitted.set(name, { rawName, body, namespace, filePath: skill.filePath });
+		admitted.set(name, { rawName, body, frontmatter, namespace, filePath: skill.filePath });
 		return name;
 	}
 
@@ -454,7 +470,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
 			_source: capSkill._source,
 		};
-		if (admit(skill, capSkill.content, skillNamespace(capSkill)) !== undefined) realPathSet.add(resolvedPath);
+		if (admit(skill, capSkill.content, capSkill.frontmatter, skillNamespace(capSkill)) !== undefined)
+			realPathSet.add(resolvedPath);
 	}
 
 	const customDirectoryResults = await Promise.all(
@@ -473,7 +490,13 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		}),
 	);
 
-	const allCustomSkills: Array<{ skill: Skill; path: string; body: string; namespace: string }> = [];
+	const allCustomSkills: Array<{
+		skill: Skill;
+		path: string;
+		body: string;
+		frontmatter: SkillFrontmatter | undefined;
+		namespace: string;
+	}> = [];
 	for (const { expandedDir, scanResult } of customDirectoryResults) {
 		for (const capSkill of scanResult.items) {
 			if (disabledSkillNames.has(capSkill.name)) continue;
@@ -492,6 +515,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				},
 				path: capSkill.path,
 				body: capSkill.content,
+				frontmatter: capSkill.frontmatter,
 				namespace: skillNamespace(capSkill),
 			});
 		}
@@ -509,10 +533,10 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	);
 
 	for (let i = 0; i < allCustomSkills.length; i++) {
-		const { skill, body, namespace } = allCustomSkills[i];
+		const { skill, body, frontmatter, namespace } = allCustomSkills[i];
 		const resolvedPath = customRealPaths[i];
 		if (realPathSet.has(resolvedPath)) continue;
-		if (admit(skill, body, namespace) !== undefined) realPathSet.add(resolvedPath);
+		if (admit(skill, body, frontmatter, namespace) !== undefined) realPathSet.add(resolvedPath);
 	}
 
 	// Managed (auto-learn) skills resolve dead-last with first-wins. Source from
