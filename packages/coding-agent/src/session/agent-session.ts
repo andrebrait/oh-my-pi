@@ -371,6 +371,7 @@ import {
 	type PrewalkRestartResult,
 } from "./prewalk";
 import {
+	IMAGE_ATTACHMENT_TYPE,
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
 	isHiddenUserCompanion,
@@ -6557,7 +6558,7 @@ export class AgentSession implements SettingsScope {
 			const isVideo = source.kind === "video";
 			notices.push({
 				role: "custom",
-				customType: isVideo ? VIDEO_ATTACHMENT_TYPE : "image-attachment",
+				customType: isVideo ? VIDEO_ATTACHMENT_TYPE : IMAGE_ATTACHMENT_TYPE,
 				content: prompt.render(isVideo ? videoAttachmentPrompt : imageAttachmentPrompt, {
 					index: String(index + 1),
 					path: source.path,
