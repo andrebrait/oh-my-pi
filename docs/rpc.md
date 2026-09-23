@@ -227,6 +227,8 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 
 `prompt` is acknowledged once the message is admitted — an idle turn has started for it, it has been pushed onto the steer/follow-up/aside queue while the agent is busy, or it has been routed to a registered extension command (before that command's handler runs) — not after a model turn finishes. Admission runs any image normalization first (and, for a text-only model with vision description enabled, the vision-description call), so those complete before the acknowledgement. The same applies to a `/skill:` invocation sent through `prompt`. A prompt that settles without ever being admitted (dropped by an `abort`, or failing first) is acknowledged once it settles. Gating the acknowledgement does not change completion: the prompt still completes exactly once, through `data.agentInvoked: false` or its `prompt_result` (below).
 
+`prompt` is dispatched concurrently, like `bash`: the RPC server keeps reading and handling other commands — `abort`, `steer`, `follow_up`, `get_state`, and so on — while a prompt is still admitting, instead of holding the whole command queue behind a slow image normalization or vision-description call. An `abort` that lands before admission finishes drops the prompt instead of letting it start a turn afterward.
+
 ```json
 {
   "id": "req_1",

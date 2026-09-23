@@ -6760,6 +6760,10 @@ export class AgentSession implements SettingsScope {
 			return true;
 		}
 
+		// Captured before the normalization/vision-description awaits below so an
+		// abort() landing during either can be told apart from a fresh submission —
+		// see the drop check right after those awaits.
+		const preflightGeneration = this.#promptGeneration;
 		// Skip eager preludes when the user has already queued a directive
 		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
 		const activeModel = this.agent.state.model;
@@ -6787,6 +6791,20 @@ export class AgentSession implements SettingsScope {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+
+		// abort() bumps #promptGeneration and can land while normalization and the
+		// vision-description call above are still in flight. #promptWithMessage below
+		// captures its own generation fresh at entry, so it cannot see this race and
+		// would dispatch a brand-new turn as if the abort never happened. Drop the
+		// prompt here instead — same contract as #promptWithMessage's own
+		// generation-race checks further down.
+		if (this.#promptGeneration !== preflightGeneration) {
+			outcome.sessionClaimed = false;
+			if (!options?.synthetic) {
+				this.#promptDropped?.({ text: typedText, images: options?.images });
+			}
+			return true;
+		}
 
 		// A concurrent prompt() can start a turn during the awaits above: image
 		// normalization and the vision-description call suspend after the
