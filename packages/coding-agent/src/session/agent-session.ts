@@ -6603,6 +6603,26 @@ export class AgentSession implements SettingsScope {
 		return this.#providerBoundary.normalizeAgentMessageImages(message);
 	}
 
+	async #prepareCustomMessageImages<T>(
+		message: CustomMessage<T>,
+		signal: AbortSignal,
+	): Promise<{
+		message: CustomMessage<T>;
+		images: ImageContent[] | undefined;
+		descriptionNotice: CustomMessage | undefined;
+	}> {
+		const normalized = await this.#normalizeAgentMessageImages(message);
+		const images =
+			typeof normalized.content === "string"
+				? undefined
+				: normalized.content.filter((part): part is ImageContent => part.type === "image");
+		const descriptionNotice =
+			normalized.attribution === "user" && images?.length && !signal.aborted
+				? await this.#buildImageDescriptionNotice(images, signal)
+				: undefined;
+		return { message: normalized, images, descriptionNotice };
+	}
+
 	#magicKeywordEnabled(keyword: MagicKeywordId): boolean {
 		return cfgMagicKeywordsEnabled.get(this.settings) && cfgMagicKeyword[keyword].get(this.settings);
 	}
@@ -6993,9 +7013,13 @@ export class AgentSession implements SettingsScope {
 				throw new AgentBusyError();
 			}
 
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, keywordNotices);
-			outcome.sessionClaimed = true;
-			return true;
+			outcome.sessionClaimed = await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options?.queueChipText,
+				keywordNotices,
+			);
+			return outcome.sessionClaimed;
 		}
 
 		const customMessage: CustomMessage<T> = {
@@ -7162,6 +7186,27 @@ export class AgentSession implements SettingsScope {
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
+			// Prepare custom attachments once, within prompt ownership, before publishing their companions.
+			if (
+				message.role === "custom" &&
+				typeof message.content !== "string" &&
+				message.content.some(part => part.type === "image")
+			) {
+				if (this.#promptGeneration !== generation || this.#isDisposed) return false;
+				const prepared = await this.#prepareCustomMessageImages(
+					message,
+					this.#postPromptTasksAbortController.signal,
+				);
+				if (this.#promptGeneration !== generation || this.#isDisposed) return false;
+				message = prepared.message;
+				options = {
+					...options,
+					images: prepared.images,
+					prependMessages: prepared.descriptionNotice
+						? [...(options?.prependMessages ?? []), prepared.descriptionNotice]
+						: options?.prependMessages,
+				};
+			}
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -7936,9 +7981,10 @@ export class AgentSession implements SettingsScope {
 		deliverAs: "steer" | "followUp" | "aside",
 		queueChipText?: string,
 		prependMessages: readonly CustomMessage[] = [],
-	): Promise<void> {
-		// Captured before the normalization await below — see #sessionGeneration's doc comment.
+	): Promise<boolean> {
+		// Keep preparation local until the attachment and all companions can be published together.
 		const sessionGeneration = this.#sessionGeneration;
+		const generation = this.#promptGeneration;
 		const details =
 			queueChipText !== undefined
 				? ({
@@ -7958,30 +8004,47 @@ export class AgentSession implements SettingsScope {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
-		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		const prepared = await this.#prepareCustomMessageImages(
+			appMessage,
+			deliverAs === "aside"
+				? this.#modelDiscoveryAbortController.signal
+				: this.#postPromptTasksAbortController.signal,
+		);
+		// Staleness guard applies regardless of attribution: agent-attributed
+		// custom messages are dropped on disposal or prompt-generation change too.
+		if (this.#isDisposed || (deliverAs !== "aside" && this.#promptGeneration !== generation)) {
+			return false;
+		}
 		if (deliverAs === "aside") {
-			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
+			if (await this.#sessionGenerationChanged(sessionGeneration)) return false;
 			// Non-interrupting: rides the same step-boundary aside poll as
 			// sendCustomMessage's streaming aside branch — not an agent-core queue
 			// entry, so no drain-retry latch and no idle-queue drain scheduling.
-			this.#irc.queueAside([...prependMessages, normalizedAppMessage]);
-			// The image-normalization await above can span the run's settle, so the run may
+			this.#irc.queueAside([
+				...prependMessages,
+				...(prepared.descriptionNotice ? [prepared.descriptionNotice] : []),
+				prepared.message,
+			]);
+			// Image preparation can span the run's settle, so the run may
 			// already be idle by the time the record lands in the aside queue with no loop
 			// left to drain it. Resuming here is a no-op while streaming and wakes/folds
 			// correctly once idle, matching #queueUserMessage's aside branch.
 			this.#resumeStrandedIrcAsides();
-			return;
+			return true;
 		}
 		this.#allowQueuedMessageDrainRetry();
 		// Keyword notices and their user message must enter the queue in one synchronous phase.
 		if (deliverAs === "followUp") {
 			for (const notice of prependMessages) this.agent.followUp(notice);
-			this.agent.followUp(normalizedAppMessage);
+			if (prepared.descriptionNotice) this.agent.followUp(prepared.descriptionNotice);
+			this.agent.followUp(prepared.message);
 		} else {
 			for (const notice of prependMessages) this.agent.steer(notice);
-			this.agent.steer(normalizedAppMessage);
+			if (prepared.descriptionNotice) this.agent.steer(prepared.descriptionNotice);
+			this.agent.steer(prepared.message);
 		}
 		this.#scheduleIdleQueueDrain();
+		return true;
 	}
 
 	/**
