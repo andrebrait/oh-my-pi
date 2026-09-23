@@ -107,7 +107,9 @@ Important edge behavior from runtime:
 - Unknown command responses echo the request `id` when one was provided.
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
-- An accepted `prompt` or `abort_and_prompt` completes exactly once: either its success response carries `data.agentInvoked: false` (finished locally), or a later `prompt_result` frame with the same `id` reports how its work ended. `prompt_result` is always written after the response for that `id`.
+- An accepted `prompt` or `abort_and_prompt` completes exactly once, through a later `prompt_result` frame with the same `id` that reports how its work ended. `prompt_result` is always written after the response for that `id`.
+- Current runtimes never put `data.agentInvoked` on the `prompt` response. Older runtimes answered synchronously finished slash commands with `data.agentInvoked: false` and no `prompt_result`; clients supporting them should treat that field as completion.
+- `abort_and_prompt` always performs the abort before intercepting its replacement. Like `prompt`, a locally consumed replacement completes through a same-id `prompt_result` with `agentInvoked: false`; no replacement `agent_end` is fabricated. Hosts must recognize this hint rather than waiting unconditionally for a replacement turn.
 
 ## Command Schema (canonical)
 
@@ -231,26 +233,30 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
   "id": "req_1",
   "type": "response",
   "command": "prompt",
-  "success": true,
-  "data": { "agentInvoked": false }
+  "success": true
 }
 ```
 
-`data.agentInvoked: false` is the completion signal for slash commands that finish synchronously without starting an agent turn; no `prompt_result` follows. Every other accepted `prompt` (and every `abort_and_prompt`) is completed by one `prompt_result` frame carrying the command `id`, emitted once all work the prompt caused has settled:
+An acknowledgement is not completion. Every accepted `prompt` (and every `abort_and_prompt`) is completed by one `prompt_result` frame carrying the command `id`, emitted once all work the prompt caused has settled. This includes builtin, skill, and extension slash commands and native `input` handlers, which all run after the acknowledgement (see [Input interception](#input-interception)):
 
 ```json
 { "type": "prompt_result", "id": "req_1", "agentInvoked": true, "status": "completed", "sessionSettled": true }
 ```
 
-- `agentInvoked: false`: the prompt finished locally (an extension or custom command that started no turn) or failed before reaching the agent.
-- `agentInvoked: true`: the prompt reached the agent and the agent **yielded** — see [Yield vs settled](#yield-vs-settled). A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
-- `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
+- `agentInvoked: false`: the prompt finished locally (a builtin, extension, or custom command that started no turn, or input consumed by an `input` handler), was cancelled during input interception, or failed before reaching the agent.
+- `agentInvoked: true`: the prompt reached the agent and the agent **yielded** — see [Yield vs settled](#yield-vs-settled). A prompt dispatched as a fresh turn reports the first run that started after it was accepted and its input handlers finished, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
+- `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, dropped by an abort before dispatch, or cancelled while its input was still being intercepted), or `"error"`.
 - `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable }`. `message` is the provider's error text with OMP-local diagnostics (such as saved request-dump paths) removed. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
 
 Local-only slash commands may emit `command_output` frames before completing. They do not emit `agent_end`.
+
+If an input handler or extension command schedules agent work through
+`sendUserMessage` or `sendMessage`, that work is tracked before declaring a request
+local-only. One request's extension work does not suppress another request's
+local-only completion.
 
 ### Yield vs settled
 
@@ -685,9 +691,66 @@ This is the most important operational behavior.
 That means:
 
 - command acceptance != run completion
-- a prompt completes via `data.agentInvoked: false` on its response or via its own `prompt_result`
+- a prompt completes via its own `prompt_result`, including prompts handled locally
 - a run completes on an `agent_end` frame where `isTerminal !== false`; that frame carries no prompt identity, so correlate prompts through `prompt_result`
 - the session is done only at `session_settled`: background jobs can wake the agent after it yields
+
+### Input interception
+
+All four external input commands (`prompt`, `steer`, `follow_up`,
+`abort_and_prompt`) emit native `input` with `source: "rpc"` in both RPC modes,
+before command/skill/template interpretation or queue insertion. Text/image
+transformations chain once; omitted fields are preserved, `images: []` clears
+attachments, and handled or transformed-empty input does not dispatch normally.
+Queued delivery and programmatic extension messages do not emit input again.
+
+The existing command routes remain distinct: only `prompt` interprets RPC
+builtins and skills; explicit `steer`/`follow_up` retain their queue-only command
+rules, and `abort_and_prompt` retains its `session.prompt` replacement route.
+Prompts returned by builtins retain the original `prompt` command's explicit
+`streamingBehavior`, so they queue as steering or follow-up work while streaming.
+`steer`/`follow_up` success acknowledges completed input/queue processing, not a
+completed agent turn, including when a handler consumed the input locally.
+
+Image attachments on user-invoked skills use the same text-only-model vision
+description fallback as ordinary prompts, including queued skill turns. The
+hidden description stays with its skill message; cancelling preparation does
+not publish either message. Vision-capable targets and the `images.blockImages`
+and `images.describeForTextModels` settings retain their normal behavior.
+
+Input interception and route scheduling are ordered through asynchronous image
+normalization and vision description, without serializing whole model turns.
+An ordinary prompt holds later input until it owns an idle turn slot, is routed to
+an extension command, or finishes queue insertion/other local handling. Hidden
+keyword and attachment companions publish with their user message, never ahead
+of unfinished preparation.
+`prompt`/`abort_and_prompt` acknowledge before asynchronous input handlers finish;
+subsequent failures retain the original command and id. UI and host-tool/URI
+responses remain dispatchable while handlers await them. Abort commands can
+overtake a waiting input handler or prompt preparation; cancelled work cannot
+publish messages or start a later turn. A `prompt` or `abort_and_prompt` cancelled
+while its input is still being intercepted completes with `agentInvoked: false`
+and `status: "aborted"`. Commands accepted after an abort wait for
+its cleanup, including all earlier aborts still settling. A newer abort or
+replacement invalidates an older `abort_and_prompt` replacement before dispatch.
+An abort received during a session transition invalidates ingress immediately,
+but waits for that transition before running session-abort cleanup.
+
+SDK hosts implementing the same ordering can pass `PromptOptions.onPromptAdmitted`
+to `AgentSession.prompt()`. It runs synchronously when that call acquires the idle
+turn slot or is routed to an extension command, before asynchronous preflight or the
+command handler, and does not prove provider dispatch.
+Race this per-call notification against the returned promise: queued, other local-only,
+cancelled, and failed calls can settle without an admission notification. The
+returned promise still tracks the existing prompt completion, not just admission.
+
+Session transitions (`new_session`, `switch_session`, `branch`, `open_session`)
+suspend pending ingress until the transition settles. A committed transition
+cancels old-session input; a vetoed transition preserves it
+unless an abort also invalidated it. Requested shutdown prevents pending normal
+dispatch. Stdin EOF rejects unresolved UI/host requests and cancels input whose
+UI interaction disconnected, but still drains other accepted input, including
+one-shot piped prompts.
 
 ### While streaming
 

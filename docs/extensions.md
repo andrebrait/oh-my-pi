@@ -372,6 +372,7 @@ prompt-template expansion, and queue insertion:
 | Submission | `source` |
 |---|---|
 | Main-session Enter or Ctrl+Enter | `"interactive"` |
+| `prompt`, `steer`, `follow_up`, or `abort_and_prompt` in RPC or RPC UI mode | `"rpc"` |
 
 Handlers run in extension/registration order. Returned `text` and `images`
 replacements feed subsequent handlers; omitted fields preserve the current value,
@@ -386,6 +387,10 @@ synthetic continuations do not automatically emit `input`. Main-session Enter's
 `.`/`c` continuation shortcuts retain their synthetic path. Focused-subagent
 input retains its chat-only routing and does not invoke main-session input hooks.
 Print and ACP input are outside this interception contract.
+
+RPC input handlers may await extension UI responses without blocking the stdin
+reader. See [RPC completion and ordering](./rpc.md#promptqueue-concurrency-and-ordering),
+including local-only completion for consumed `abort_and_prompt` replacements.
 
 Ctrl+Enter detaches the submitted draft before awaiting native handlers, so
 another submission cannot reuse it and ordinary later typing remains a new draft.
