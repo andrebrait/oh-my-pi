@@ -109,7 +109,11 @@ interface CollisionResolution {
 
 /**
  * Resolve a same-name skill against what is already loaded.
- * - Identical body to any admitted instance of this raw name → silently drop.
+ * - Identical body to any admitted instance of this raw name → silently
+ *   drop, UNLESS the candidate outranks the current bare holder (see
+ *   precedence below), in which case it still takes the bare name: the
+ *   override contract is about which FILE is authoritative, not just which
+ *   text currently renders the same.
  * - Otherwise the higher-precedence side keeps the bare name and the other
  *   side is namespaced as `<namespace>/<name>` (a taken namespaced slot gets
  *   a numeric `~N` suffix). Precedence, when raw names collide:
@@ -130,9 +134,6 @@ function resolveCollision(
 	candidateBody: string,
 	namespace: string,
 ): CollisionResolution | undefined {
-	for (const entry of admitted.values()) {
-		if (entry.rawName === candidate.name && entry.body === candidateBody) return undefined;
-	}
 	const existingEntries = [...admitted.entries()].filter(([_, e]) => e.rawName === candidate.name);
 	if (existingEntries.length === 0) {
 		return { name: candidate.name };
@@ -143,6 +144,17 @@ function resolveCollision(
 	const bareInstalled = bareSkill?._source?.provider === SKILLSHARE_PROVIDER_ID;
 	const candidateCustom = candidate._source?.provider === CUSTOM_DIR_PROVIDER_ID;
 	const bareCustom = bareSkill?._source?.provider === CUSTOM_DIR_PROVIDER_ID;
+	// True exactly when a precedence rule below would displace the current
+	// bare holder in the candidate's favor; identical content must not
+	// short-circuit that displacement.
+	const candidateOutranksBare =
+		bareSkill !== undefined && ((bareInstalled && !candidateInstalled) || (candidateCustom && !bareCustom));
+
+	for (const [name, entry] of admitted) {
+		if (entry.rawName !== candidate.name || entry.body !== candidateBody) continue;
+		if (name === candidate.name && candidateOutranksBare) continue;
+		return undefined;
+	}
 
 	if (bareSkill && !bareInstalled && candidateInstalled) {
 		// The authored skill already holds the name; the package steps aside.
