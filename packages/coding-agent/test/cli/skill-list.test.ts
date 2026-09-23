@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runSkillsCommand } from "../../src/cli/skill-list";
+import { handleSkillList, runSkillsCommand } from "../../src/cli/skill-list";
+import { resetSettingsForTest } from "../../src/config/settings";
 import { removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("runSkillsCommand", () => {
@@ -69,5 +70,52 @@ describe("runSkillsCommand", () => {
 		} finally {
 			await removeWithRetries(directory);
 		}
+	});
+});
+
+describe("handleSkillList", () => {
+	afterEach(() => {
+		resetSettingsForTest();
+	});
+
+	test("keeps stdout to TSV rows and sends warnings to stderr", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), `omp-skills-list-${Snowflake.next()}-`));
+		for (const root of ["first", "second"]) {
+			await fs.mkdir(path.join(directory, root, "calendar"), { recursive: true });
+			await Bun.write(
+				path.join(directory, root, "calendar", "SKILL.md"),
+				`---\nname: calendar\ndescription: ${root} calendar.\n---\n\n# Calendar\n`,
+			);
+		}
+		await Bun.write(
+			path.join(directory, ".omp", "config.yml"),
+			"skills:\n  customDirectories:\n    - first\n    - second\n",
+		);
+
+		let stdout = "";
+		let stderr = "";
+		const originalStdoutWrite = process.stdout.write;
+		const originalStderrWrite = process.stderr.write;
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			stdout += chunk.toString();
+			return true;
+		}) as typeof process.stdout.write;
+		process.stderr.write = ((chunk: string | Uint8Array) => {
+			stderr += chunk.toString();
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			expect(await handleSkillList([], directory, false)).toBe(0);
+		} finally {
+			process.stdout.write = originalStdoutWrite;
+			process.stderr.write = originalStderrWrite;
+			await removeWithRetries(directory);
+		}
+
+		// `omp skill list | cut -f1` must see skill rows only.
+		const rows = stdout.split("\n").filter(Boolean);
+		expect(rows).toContain("calendar\tfirst calendar.");
+		for (const row of rows) expect(row).toMatch(/^[^\t]+\t/);
+		expect(stderr).toContain('warning: name collision: "calendar"');
 	});
 });
