@@ -5,12 +5,12 @@ import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 
-describe("RPC queued-message removal", () => {
+describe("RPC queued-message editing", () => {
 	let client: RpcClient;
 	let directory: string;
 
 	beforeEach(async () => {
-		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-remove-"));
+		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-queued-"));
 		client = new RpcClient({
 			command: [process.execPath, path.join(import.meta.dir, "fixtures", "queued-message-rpc-agent.ts")],
 			cwd: directory,
@@ -120,5 +120,33 @@ describe("RPC queued-message removal", () => {
 		} finally {
 			unsubscribe();
 		}
+	}, 30_000);
+
+	test("rejects malformed promotion, preserves missing targets, and promotes without duplicate delivery", async () => {
+		await client.start();
+		await client.followUp("queued request");
+		await expect(client.promoteQueuedMessage(null as unknown as string)).rejects.toMatchObject({
+			command: "promote_queued_message",
+		});
+		expect(await client.promoteQueuedMessage("missing")).toEqual({ promoted: false });
+		expect((await client.getState()).queuedMessageCount).toBe(1);
+
+		const idle = Promise.withResolvers<void>();
+		const unsubscribe = client.onEvent(event => {
+			if (event.type === "agent_end") idle.resolve();
+		});
+		try {
+			expect(await client.promoteQueuedMessage("queued request")).toEqual({ promoted: true });
+			await withTimeout(idle.promise, 10_000, "Promoted RPC message did not finish");
+		} finally {
+			unsubscribe();
+		}
+
+		expect(await client.promoteQueuedMessage("queued request")).toEqual({ promoted: false });
+		expect((await client.getState()).queuedMessageCount).toBe(0);
+		const messages = await client.getMessages();
+		expect(messages.filter(message => message.role === "user").map(message => message.content)).toEqual([
+			[{ type: "text", text: "queued request" }],
+		]);
 	}, 30_000);
 });

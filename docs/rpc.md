@@ -119,6 +119,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "steer", message: string, images?: ImageContent[] }`
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "remove_queued_message", message: string, queue: "steering" | "followUp" }`
+- `{ id?, type: "promote_queued_message", message: string }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "new_session", parentSession?: string }`
@@ -292,6 +293,21 @@ The check and removal are synchronous: `data.removed: false` means no matching u
 Clients must hide the chip or restore its draft only after `removed: true`. Older runtimes reject this command; clients must not fall back to aborting or resending queued messages. The TypeScript client exposes `removeQueuedMessage(message, queue): Promise<{ removed: boolean }>`.
 
 The official Python client exposes `remove_queued_message(message, queue) -> RemoveQueuedMessageResult`; inspect its `.removed` boolean rather than the result object's truthiness.
+
+### `promote_queued_message` payload
+
+Move the first matching user-authored follow-up to the end of the steering queue:
+
+```json
+{"id":"req_3","type":"promote_queued_message","message":"Use the existing parser"}
+{"id":"req_3","type":"response","command":"promote_queued_message","success":true,"data":{"promoted":true}}
+```
+
+The command moves the existing queued message, including its attachments and contiguous preceding hidden user companions, without reprocessing or duplicating it. `message` matches exactly as for `remove_queued_message`, so agent-authored entries never match. With duplicate text, each request moves only the first matching follow-up; repeating a successful request can move another occurrence.
+
+`data.promoted: false` means no matching user follow-up is pending at dispatch time (for example, it was already delivered). Non-string `message` values produce an error response. Existing steering, follow-up, and interrupt modes still apply; promotion does not abort the model stream or guarantee cancellation of running tools.
+
+Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate. The TypeScript client exposes `promoteQueuedMessage(message): Promise<{ promoted: boolean }>`.
 
 ### `get_state` payload
 
