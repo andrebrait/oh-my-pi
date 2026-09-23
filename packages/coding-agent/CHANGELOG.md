@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Same-named skills from different sources are no longer silently discarded. A byte-identical duplicate (the same skill installed twice) still collapses without a warning; a skill whose body differs stays reachable as `<namespace>/<name>` (the owning plugin or skill-root directory) via `skill://<namespace>/<name>` and the leading `/skill:<namespace>/<name>` form, with a collision warning naming both files; a taken namespaced slot gets a `~N` suffix. Raw skill names containing a path separator are now rejected at scan time, since `/` is reserved for that addressing ([#12151](https://github.com/can1357/oh-my-pi/pull/12151) by [@andrebrait](https://github.com/andrebrait)).
+- Same-named skills from different sources are no longer silently discarded. A byte-identical duplicate (the same skill installed twice) still collapses without a warning; on a skill whose body differs, the higher-precedence skill (an authored skill over an installed package, a custom-directory skill over a provider skill, otherwise whichever loaded first) keeps its bare name, and the other skill stays reachable as `<namespace>/<name>` (the owning plugin or skill-root directory) via `skill://<namespace>/<name>` and the leading `/skill:<namespace>/<name>` form, with a collision warning naming both files; a taken namespaced slot gets a `~N` suffix. Raw skill names containing a path separator are now rejected at scan time, since `/` is reserved for that addressing ([#12151](https://github.com/can1357/oh-my-pi/pull/12151) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.3.2] - 2026-09-25
 
