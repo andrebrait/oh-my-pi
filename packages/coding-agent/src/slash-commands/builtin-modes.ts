@@ -358,7 +358,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "<message>",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			await runtime.ctx.handleQueueCommand(command.args);
+			await runtime.ctx.handleQueueCommand(command.args, runtime.draftDetached ? (runtime.input ?? {}) : undefined);
 		},
 	},
 	{
