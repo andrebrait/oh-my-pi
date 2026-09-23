@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { handleSkillList, runSkillsCommand } from "../../src/cli/skill-list";
 import { resetSettingsForTest } from "../../src/config/settings";
 import { removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { CliUsageError } from "@oh-my-pi/pi-utils/cli";
 
 describe("runSkillsCommand", () => {
 	test("lists skills for a directory with public metadata", async () => {
@@ -117,5 +118,25 @@ describe("handleSkillList", () => {
 		expect(rows).toContain("calendar\tfirst calendar.");
 		for (const row of rows) expect(row).toMatch(/^[^\t]+\t/);
 		expect(stderr).toContain('warning: name collision: "calendar"');
+	});
+
+	test("rejects a target that is not a directory", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), `omp-skills-list-${Snowflake.next()}-`));
+		const file = path.join(directory, "file.txt");
+		await Bun.write(file, "not a directory");
+		try {
+			const missing = path.join(directory, "missing");
+			await expect(handleSkillList(["missing"], directory, false)).rejects.toThrow(
+				new CliUsageError(`Not a directory: ${missing}`),
+			);
+			await expect(handleSkillList(["file.txt"], directory, false)).rejects.toThrow(
+				new CliUsageError(`Not a directory: ${file}`),
+			);
+			await expect(handleSkillList(["file.txt/sub"], directory, false)).rejects.toThrow(
+				new CliUsageError(`Not a directory: ${path.join(file, "sub")}`),
+			);
+		} finally {
+			await removeWithRetries(directory);
+		}
 	});
 });

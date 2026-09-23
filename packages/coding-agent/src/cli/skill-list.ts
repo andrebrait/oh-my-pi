@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import { CliUsageError } from "@oh-my-pi/pi-utils/cli";
 import { Settings } from "../config/settings";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -99,9 +100,13 @@ function toTerminalSafe(value: string): string {
 export async function handleSkillList(args: string[], cwd: string, json: boolean): Promise<number> {
 	if (args.length > 1) throw new CliUsageError("usage: omp skill list [dir] [--json]");
 	const target = args[0] ? path.resolve(cwd, args[0]) : cwd;
-	if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
-		throw new CliUsageError(`Not a directory: ${target}`);
+	let isDirectory = false;
+	try {
+		isDirectory = (await fs.promises.stat(target)).isDirectory();
+	} catch (error) {
+		if (!isEnoent(error) && !isEnotdir(error)) throw error;
 	}
+	if (!isDirectory) throw new CliUsageError(`Not a directory: ${target}`);
 	const result = await runSkillsCommand({ cwd: target });
 	if (json) {
 		process.stdout.write(`${JSON.stringify(result)}\n`);
