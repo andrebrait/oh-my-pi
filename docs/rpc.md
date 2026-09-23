@@ -725,7 +725,7 @@ From `packages/agent/src/agent.ts` defaults:
 ### Mode semantics
 
 - `set_steering_mode` / `set_follow_up_mode`
-  - `"one-at-a-time"`: dequeue one queued message per turn
+  - `"one-at-a-time"`: dequeue one queued prompt together with its contiguous hidden companions per turn; other queued records remain independent
   - `"all"`: dequeue entire queue at once
 - `set_interrupt_mode`
   - `"immediate"`: tool execution checks steering between tool calls; pending steering can abort remaining tool calls in the turn

@@ -389,6 +389,23 @@ describe("AgentSession queued steer delivery", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 	});
 
+	it("keeps a path-pasted image's source path with a prompt sent as an aside mid-stream", async () => {
+		const { session, mock } = await createSession([{ content: ["initial"] }, { content: ["image answer"] }]);
+		let injected = false;
+		session.agent.setOnBeforeYield(async () => {
+			if (injected) return;
+			injected = true;
+			await session.prompt("What is in [Image #1]?", { images: [PATH_PASTED_IMAGE], streamingBehavior: "aside" });
+		});
+
+		await session.prompt("start");
+		await session.waitForIdle();
+
+		const delivered = JSON.stringify(mock.calls.at(-1)?.context.messages);
+		expect(delivered).toContain("What is in [Image #1]?");
+		expect(delivered).toContain(IMAGE_SOURCE_PATH);
+	});
+
 	it("a fresh user prompt delivers queued steer and follow-up work", async () => {
 		const { session } = await createSession([{ content: ["one"] }, { content: ["two"] }, { content: ["three"] }]);
 		// Queue real pending work before the user's next send.
