@@ -311,6 +311,8 @@ The command moves the existing queued message, including its attachments and con
 
 Since `prompt` acknowledges only once the message is admitted (see above), a `promote_queued_message` sent immediately after a queued `prompt`'s acknowledgement reliably observes it. Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate. The TypeScript client exposes `promoteQueuedMessage(message): Promise<{ promoted: boolean }>`.
 
+The official Python client exposes `promote_queued_message(message) -> PromoteQueuedMessageResult`; inspect its `.promoted` boolean rather than the result object's truthiness.
+
 ### `get_state` payload
 
 `tokensPerSecond` is a number when output throughput is available and `null`
