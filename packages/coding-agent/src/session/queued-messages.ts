@@ -57,10 +57,18 @@ export function isTerminalTextAssistantAnswer(message: AgentMessage | undefined)
 	return hasText;
 }
 
-/** Whether queued content was authored by the user and can be restored to the editor. */
+/** Whether a queued message is a user prompt: any user-role turn, or a visible user-attributed custom prompt. */
 export function isUserQueuedMessage(message: AgentMessage): boolean {
-	if (message.role === "user") return message.attribution !== "agent";
+	if (message.role === "user") return true;
 	return message.role === "custom" && message.attribution === "user" && message.display !== false;
+}
+
+/**
+ * Whether a queued user prompt was authored by the user rather than handed off by an
+ * agent. Queue editing (chips, removal, editor restore) only touches these.
+ */
+export function isUserAuthoredQueuedMessage(message: AgentMessage): boolean {
+	return isUserQueuedMessage(message) && !("attribution" in message && message.attribution === "agent");
 }
 
 /** Hidden magic-keyword notice types (`<id>-notice`) queued alongside a user prompt. */
