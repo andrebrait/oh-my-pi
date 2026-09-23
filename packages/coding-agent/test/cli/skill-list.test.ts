@@ -1,11 +1,33 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { handleSkillList, runSkillsCommand } from "../../src/cli/skill-list";
 import { resetSettingsForTest } from "../../src/config/settings";
-import { removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { getAgentDir, removeWithRetries, setAgentDir, Snowflake } from "@oh-my-pi/pi-utils";
 import { CliUsageError } from "@oh-my-pi/pi-utils/cli";
+
+// Every test below discovers skills through the real capability loader, which
+// walks `os.homedir()` and `getAgentDir()` for user-level providers (native
+// `<agentDir>/skills`, `~/.claude/skills`, managed auto-learn skills, and
+// `Settings.init()`'s own config.yml/settings.json lookup in the
+// `handleSkillList` tests below). Without isolating both seams, the developer's
+// or CI runner's real agent config leaks into every assertion here.
+let tempHome: string;
+let originalAgentDir: string;
+
+beforeEach(async () => {
+	originalAgentDir = getAgentDir();
+	tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-list-home-"));
+	spyOn(os, "homedir").mockReturnValue(tempHome);
+	setAgentDir(path.join(tempHome, ".omp", "agent"));
+});
+
+afterEach(async () => {
+	spyOn(os, "homedir").mockRestore();
+	setAgentDir(originalAgentDir);
+	await removeWithRetries(tempHome);
+});
 
 describe("runSkillsCommand", () => {
 	test("lists skills for a directory with public metadata", async () => {
@@ -28,9 +50,9 @@ describe("runSkillsCommand", () => {
 				skillsSettings: { customDirectories: [path.join(skillsRoot, "first"), path.join(skillsRoot, "second")] },
 			});
 
-			// Skills installed on the developer's machine also resolve here, so the
-			// fixtures are matched by name instead of pinning the whole listing.
-			expect(result.skills.map(skill => skill.name)).toEqual(expect.arrayContaining(["calendar", "reviewer"]));
+			// Home/agent-dir isolation (see the file-level beforeEach) means only the
+			// two fixture skills below are discoverable — pin the whole listing.
+			expect(result.skills.map(skill => skill.name)).toEqual(["calendar", "reviewer"]);
 			const reviewer = result.skills.find(skill => skill.name === "reviewer");
 			expect(reviewer?.description).toBe("Review code.");
 			expect(reviewer?.filePath).toBe(path.join(skillsRoot, "second", "reviewer", "SKILL.md"));
