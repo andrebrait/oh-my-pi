@@ -6,7 +6,6 @@ import { formatCurrentTime, formatMemories } from "../hindsight/content";
 import recallDescription from "../prompts/tools/recall.md" with { type: "text" };
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
-import { xdevEntries } from "./xdev";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 
@@ -22,7 +21,8 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 	readonly label = "Recall";
 	get description(): string {
 		return prompt.render(recallDescription, {
-			toolRefs: memoryToolRefs(this.session.xdev ? xdevEntries(this.session.xdev) : []),
+			// Names only: xdevEntries() reads device descriptions, which would recurse here.
+			toolRefs: memoryToolRefs([...(this.session.xdev?.mountedNames ?? [])].map(name => ({ name }))),
 		});
 	}
 	readonly parameters = memoryRecallSchema;

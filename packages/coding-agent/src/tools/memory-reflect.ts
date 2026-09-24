@@ -6,7 +6,6 @@ import { ensureBankExists } from "../hindsight/bank";
 import reflectDescription from "../prompts/tools/reflect.md" with { type: "text" };
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
-import { xdevEntries } from "./xdev";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 
@@ -23,7 +22,8 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 	readonly label = "Reflect";
 	get description(): string {
 		return prompt.render(reflectDescription, {
-			toolRefs: memoryToolRefs(this.session.xdev ? xdevEntries(this.session.xdev) : []),
+			// Names only: xdevEntries() reads device descriptions, which would recurse here.
+			toolRefs: memoryToolRefs([...(this.session.xdev?.mountedNames ?? [])].map(name => ({ name }))),
 		});
 	}
 	readonly parameters = memoryReflectSchema;
