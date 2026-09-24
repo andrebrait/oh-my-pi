@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Markdown now renders GitHub issue/PR references (`owner/repo#123`, and bare `#123` when `MarkdownTheme.githubRepo` is set) as OSC 8 hyperlinks without changing their visible text.
+
 ## [18.3.1] - 2026-09-25
 
 ### Breaking Changes
