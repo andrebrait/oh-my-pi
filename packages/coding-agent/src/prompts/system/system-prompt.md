@@ -186,9 +186,9 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 
 § Workflow
 # 1. Scope
-{{#ifAny skills.length rules.length}}
-- Read relevant {{#if skills.length}}skills{{#if rules.length}} and rules{{/if}}{{else}}rules{{/if}} first.
-{{/ifAny}}
+{{#if rules.length}}
+- Read relevant rules first.
+{{/if}}
 - Plan multi-file work before opening files.
 
 # 2. Research Before Editing

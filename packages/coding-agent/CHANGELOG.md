@@ -12,6 +12,7 @@
 ### Changed
 
 - Shortened the default system prompt by removing redundant rules and empty sections, reducing token usage by about 150 tokens with default settings.
+- Removed the Scope reminder to read relevant skills, which repeated the skills list instruction ([#13117](https://github.com/can1357/oh-my-pi/pull/13117) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
