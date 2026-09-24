@@ -119,6 +119,10 @@ export interface RpcSessionState {
 	hasPendingAsyncWork: boolean;
 	/** Same predicate as `session_settled`: idle with nothing queued or pending. */
 	isSettled: boolean;
+	/** Displayable queue-chip text for pending user-authored messages, mirroring
+	 *  `AgentSession.getQueuedMessages()`. Render the queue from this snapshot
+	 *  (and the `queue_update` event) instead of tracking chips independently. */
+	queuedMessages: { steering: string[]; followUp: string[] };
 	todoPhases: TodoPhase[];
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];

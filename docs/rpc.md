@@ -326,6 +326,7 @@ is re-armed.
   "autoCompactionEnabled": true,
   "messageCount": 0,
   "queuedMessageCount": 0,
+  "queuedMessages": { "steering": [], "followUp": [] },
   "todoPhases": [
     {
       "id": "phase-1",
@@ -354,6 +355,13 @@ is re-armed.
   }
 }
 ```
+
+`queuedMessages` holds the same displayable queue-chip text as the `queue_update`
+event below — every entry is a `message` value that `remove_queued_message`
+will match against that queue. Clients should render the pending-message queue
+from these snapshots instead of tracking chips independently, and treat
+`remove_queued_message` responses as confirmation of the change rather than a
+second source of truth.
 
 ### `set_fast_mode` payload
 
@@ -549,6 +557,25 @@ Common event types:
 - `ttsr_triggered`
 - `todo_reminder`, `todo_auto_clear`
 - `irc_message`, `notice`, `goal_updated`
+- `queue_update`
+
+### `queue_update` event
+
+```json
+{ "type": "queue_update", "steering": ["Use the existing parser"], "followUp": [] }
+```
+
+Emitted whenever the displayable steering/follow-up queue changes: a `steer`,
+`follow_up`, or queued `prompt` adds to it; delivery at the start of the next
+turn, `remove_queued_message`, an abort that drops in-flight queued messages,
+or a session switch removes from or clears it. The server coalesces this
+against the last value sent — a mutation that leaves the snapshot unchanged
+(for example, an agent-authored aside that never renders as a chip) never
+re-emits. `steering`/`followUp` mirror `get_state`'s `queuedMessages` field and
+carry the exact `message` text `remove_queued_message` expects back. Render
+the queue from this event rather than tracking chips independently, and treat
+`remove_queued_message`/promotion replies as confirmation of a change this
+event will also report.
 
 Extension runner errors are emitted separately as:
 

@@ -17,6 +17,7 @@ from omp_rpc import (
     AgentEndEvent,
     OpenSessionResult,
     PromptResultEvent,
+    QueueUpdateEvent,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
@@ -154,6 +155,7 @@ FAKE_SERVER = textwrap.dedent(
             "autoCompactionEnabled": auto_compaction_enabled,
             "messageCount": len(messages),
             "queuedMessageCount": sum(len(items) for items in queued_messages.values()),
+            "queuedMessages": {"steering": queued_messages["steering"], "followUp": queued_messages["followUp"]},
             "todoPhases": todo_phases,
             "dumpTools": [{"name": "read", "description": "Read files", "parameters": {"type": "object"}}] + registered_host_tools,
         }
@@ -480,6 +482,7 @@ FAKE_SERVER = textwrap.dedent(
             queue_name = "steering" if command_type == "steer" else "followUp"
             queued_messages[queue_name].append(command["message"])
             respond(request_id, command_type, {})
+            print(json.dumps({"type": "queue_update", "steering": queued_messages["steering"], "followUp": queued_messages["followUp"]}), flush=True)
         elif command_type == "remove_queued_message":
             items = queued_messages.get(command.get("queue"))
             if items is None:
@@ -489,6 +492,8 @@ FAKE_SERVER = textwrap.dedent(
             if removed:
                 items.remove(command["message"])
             respond(request_id, command_type, {"removed": removed})
+            if removed:
+                print(json.dumps({"type": "queue_update", "steering": queued_messages["steering"], "followUp": queued_messages["followUp"]}), flush=True)
         elif command_type == "abort":
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
@@ -1036,6 +1041,31 @@ class RpcClientTests(unittest.TestCase):
             self.assertIs(client.remove_queued_message("missing", "followUp").removed, False)
             self.assertEqual(client.get_state().queued_message_count, 1)
             self.assertIs(client.remove_queued_message("keep", "followUp").removed, True)
+
+    def test_queue_update_event_matches_get_state_and_removal_invariant(self) -> None:
+        updates: list[QueueUpdateEvent] = []
+        with self.make_client() as client:
+            client.on_queue_update(lambda event: updates.append(event))
+
+            client.follow_up("first")
+            client.follow_up("second")
+            # The server writes each queue_update after the command's response, and
+            # the reader thread dispatches frames in order: the get_state round trip
+            # guarantees both updates have reached the listener before asserting.
+            state = client.get_state()
+            self.assertEqual([event.follow_up for event in updates], [("first",), ("first", "second")])
+            self.assertEqual(updates[-1].steering, ())
+            self.assertEqual(state.queued_messages.follow_up, updates[-1].follow_up)
+            self.assertEqual(state.queued_messages.steering, updates[-1].steering)
+
+            # Snapshot-string-removal invariant: every chip string in a snapshot,
+            # passed back verbatim to remove_queued_message with its queue,
+            # removes that message.
+            for text in state.queued_messages.follow_up:
+                self.assertIs(client.remove_queued_message(text, "followUp").removed, True)
+
+            self.assertEqual(client.get_state().queued_messages.follow_up, ())
+            self.assertEqual(updates[-1].follow_up, ())
 
     def test_remove_queued_message_propagates_unsupported_command(self) -> None:
         server = FAKE_SERVER.replace(

@@ -1284,6 +1284,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "get_state": {
+				const queuedMessages = session.getQueuedMessages();
 				const state: RpcSessionState = {
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
@@ -1299,6 +1300,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					queuedMessageCount: session.queuedMessageCount,
 					hasPendingAsyncWork: session.hasPendingAsyncWork(),
 					isSettled: isRpcSessionSettled(session),
+					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),

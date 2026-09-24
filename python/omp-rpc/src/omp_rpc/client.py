@@ -45,6 +45,7 @@ from .protocol import (
     OpenSessionResult,
     PromptResultEvent,
     QueuedMessageQueue,
+    QueueUpdateEvent,
     ReadyEvent,
     RemoveQueuedMessageResult,
     RetryFallbackAppliedEvent,
@@ -116,6 +117,7 @@ RetryFallbackSucceededListener = Callable[[RetryFallbackSucceededEvent], None]
 TtsrTriggeredListener = Callable[[TtsrTriggeredEvent], None]
 TodoReminderListener = Callable[[TodoReminderEvent], None]
 TodoAutoClearListener = Callable[[TodoAutoClearEvent], None]
+QueueUpdateListener = Callable[[QueueUpdateEvent], None]
 ProtocolErrorListener = Callable[["RpcProtocolError"], None]
 ListenerErrorListener = Callable[["ListenerErrorEvent"], None]
 TListener = TypeVar("TListener")
@@ -825,6 +827,9 @@ class RpcClient:
 
     def on_todo_auto_clear(self, listener: TodoAutoClearListener) -> Callable[[], None]:
         return self._add_typed_event_listener("todo_auto_clear", listener)
+
+    def on_queue_update(self, listener: QueueUpdateListener) -> Callable[[], None]:
+        return self._add_typed_event_listener("queue_update", listener)
 
     def on_ui_request(self, listener: UiRequestListener) -> Callable[[], None]:
         self._ui_request_listeners.append(listener)
