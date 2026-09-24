@@ -4,7 +4,7 @@
 
 ### Added
 
-- Markdown now renders GitHub issue/PR references (`owner/repo#123`, and bare `#123` when `MarkdownTheme.githubRepo` is set) as OSC 8 hyperlinks without changing their visible text.
+- Markdown now renders GitHub issue/PR references (`owner/repo#123`, and bare `#123` when `MarkdownTheme.githubRepo` is set) as OSC 8 hyperlinks without changing their visible text ([#13078](https://github.com/can1357/oh-my-pi/pull/13078) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.3.1] - 2026-09-25
 
