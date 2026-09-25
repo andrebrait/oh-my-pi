@@ -4,7 +4,7 @@ import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import { formatCurrentTime, formatMemories } from "../hindsight/content";
 import recallDescription from "../prompts/tools/recall.md" with { type: "text" };
-import { memoryToolRefs } from "../memory-backend/tool-names";
+import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -21,8 +21,7 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 	readonly label = "Recall";
 	get description(): string {
 		return prompt.render(recallDescription, {
-			// Names only: xdevEntries() reads device descriptions, which would recurse here.
-			toolRefs: memoryToolRefs([...(this.session.xdev?.mountedNames ?? [])].map(name => ({ name }))),
+			toolRefs: sessionMemoryToolRefs(this.session),
 		});
 	}
 	readonly parameters = memoryRecallSchema;

@@ -2,7 +2,7 @@ import { type } from "@oh-my-pi/omptype";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import memoryEditDescription from "../prompts/tools/memory-edit.md" with { type: "text" };
-import { memoryToolRefs } from "../memory-backend/tool-names";
+import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -23,8 +23,7 @@ export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	readonly label = "Memory Edit";
 	get description(): string {
 		return prompt.render(memoryEditDescription, {
-			// Names only: xdevEntries() reads device descriptions, which would recurse here.
-			toolRefs: memoryToolRefs([...(this.session.xdev?.mountedNames ?? [])].map(name => ({ name }))),
+			toolRefs: sessionMemoryToolRefs(this.session),
 		});
 	}
 	readonly parameters = memoryEditSchema;
