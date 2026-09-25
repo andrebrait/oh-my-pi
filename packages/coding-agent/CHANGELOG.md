@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `additionalContext` to extension and hook `tool_result` results, so success- and failure-specific post-tool guidance reaches the model through the trusted developer channel instead of altering tool output.
+
 ## [18.3.2] - 2026-09-25
 
 ### Added
