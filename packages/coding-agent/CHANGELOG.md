@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Per-tool TTSR reminders now use the trusted passive-context channel instead of being prepended to untrusted tool output.
+
 ## [18.3.2] - 2026-09-25
 
 ### Added
