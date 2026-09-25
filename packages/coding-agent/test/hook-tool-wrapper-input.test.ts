@@ -184,6 +184,23 @@ describe("HookToolWrapper tool_call contract", () => {
 		expect(delivered).toEqual(["inspect the failed result before retrying"]);
 	});
 
+	it("keeps a non-throwing error result an error when a hook rewrites its content", async () => {
+		const runner = makeRunner(
+			makeHook(() => ({ content: [{ type: "text", text: "redacted failure" }] }), "tool_result"),
+		);
+		const failingTool: AgentTool = {
+			...makeRecordingTool([]),
+			execute: async () => ({ content: [{ type: "text" as const, text: "secret failure" }], isError: true }),
+		};
+
+		const result = await new HookToolWrapper(failingTool, runner).execute("call-patched-error", {
+			command: "false",
+		} as never);
+
+		expect(result.content).toEqual([{ type: "text", text: "redacted failure" }]);
+		expect(result.isError).toBe(true);
+	});
+
 	it("discards replacement input and collected context when a later hook blocks", async () => {
 		const executed: unknown[] = [];
 		const runner = makeRunner([
