@@ -7,6 +7,9 @@
 - Added `Agent.replaceQueue()` to replace one pending queue without changing the other queue ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 - Added queued-message grouping so owned companion records and their user prompt are dequeued together in `one-at-a-time` mode ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 - Added `Agent.onQueueChange()`, a listener called whenever a steering/follow-up queue mutator (enqueue, dequeue on delivery, clear, or restore) runs, so hosts can observe queue changes without polling ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
+### Added
+
+- Added `additionalContext` to `afterToolCall` results, allowing trusted post-tool guidance to reach the next provider request outside tool output, including after failed results ([#13266](https://github.com/can1357/oh-my-pi/pull/13266) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.3.2] - 2026-09-25
 
