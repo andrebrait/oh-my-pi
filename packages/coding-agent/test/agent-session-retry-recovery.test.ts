@@ -1,20 +1,20 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { Agent, AgentBusyError } from "@oh-my-pi/pi-agent-core";
-import type { ApiKeyResolveContext, AssistantMessage, AssistantRetryRecovery, Usage } from "@oh-my-pi/pi-ai";
+import type { ApiKey, AssistantMessage, AssistantRetryRecovery, Usage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { resolveAssistantErrorPresentation } from "@oh-my-pi/pi-coding-agent/modes/utils/transcript-render-helpers";
+import { resolveAssistantErrorPresentation } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -71,14 +71,14 @@ function retryRecovery(recovery: AssistantRetryRecovery["recovery"], note: strin
 	};
 }
 
-function resolveInitialApiKey(
-	apiKey: string | ((ctx: ApiKeyResolveContext) => string | Promise<string | undefined> | undefined) | undefined,
-): string {
+function resolveInitialApiKey(apiKey: ApiKey | undefined): string {
 	const resolved = typeof apiKey === "function" ? apiKey({ lastChance: false, error: undefined }) : apiKey;
-	if (typeof resolved !== "string") {
+	const bearer =
+		typeof resolved === "string" ? resolved : resolved && "apiKey" in resolved ? resolved.apiKey : undefined;
+	if (typeof bearer !== "string") {
 		throw new Error("Expected API key to be resolved before streaming");
 	}
-	return resolved;
+	return bearer;
 }
 
 interface AssistantEntry {
@@ -134,8 +134,8 @@ describe("AgentSession retry recovery", () => {
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-retry-recovery-");
 		vi.spyOn(aiStream, "getEnvApiKey").mockReturnValue(undefined);
-		await authStorage.remove("anthropic");
-		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.credentials.remove("anthropic");
+		authStorage.keys.removeRuntime("anthropic");
 		modelRegistry.clearSuppressedSelectors();
 		sessions = [];
 		managers = [];
@@ -163,8 +163,8 @@ describe("AgentSession retry recovery", () => {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
-		authStorage.removeRuntimeApiKey("anthropic");
-		await authStorage.set("anthropic", [
+		authStorage.keys.removeRuntime("anthropic");
+		await authStorage.credentials.set("anthropic", [
 			{ type: "api_key", key: "anthropic-key-1" },
 			{ type: "api_key", key: "anthropic-key-2" },
 		]);
@@ -208,7 +208,7 @@ describe("AgentSession retry recovery", () => {
 		});
 		sessions.push(session);
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
@@ -224,7 +224,7 @@ describe("AgentSession retry recovery", () => {
 	it("waitForIdle waits for retry recovery event delivery", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const mock = createMockModel({
 			responses: [{ throw: RETRIABLE_SERVER_ERROR }, { content: ["Recovered after retry."], stopReason: "stop" }],
 		});
@@ -249,7 +249,7 @@ describe("AgentSession retry recovery", () => {
 			modelRegistry,
 		});
 		sessions.push(session);
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 
 		const rewriteStarted = Promise.withResolvers<void>();
 		const resumeRewrite = Promise.withResolvers<void>();
@@ -353,7 +353,7 @@ describe("AgentSession retry recovery", () => {
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
-		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
 
 		const mock = createMockModel({
 			responses: [
@@ -395,7 +395,7 @@ describe("AgentSession retry recovery", () => {
 			modelRegistry,
 		});
 		sessions.push(session);
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
@@ -421,7 +421,7 @@ describe("AgentSession retry recovery", () => {
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
-		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
 
 		const mock = createMockModel({
 			responses: [{ throw: RETRIABLE_SERVER_ERROR }, { throw: RETRIABLE_SERVER_ERROR }],
@@ -453,7 +453,7 @@ describe("AgentSession retry recovery", () => {
 			modelRegistry,
 		});
 		sessions.push(session);
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		mockSchedulerWaitWithClock();
 		vi.spyOn(Date, "now").mockReturnValue(1_750_000_000_000);
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {

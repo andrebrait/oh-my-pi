@@ -8,6 +8,22 @@
  * - Interact with the user via UI primitives
  */
 
+import {
+	type ExtensionUiComponent,
+	type ExtensionUiComponentFactory,
+	type ExtensionWidgetContent,
+	type MessageRenderer,
+	type AssistantThinkingRenderer,
+} from "@oh-my-pi/pi-tui/chat/extension-types";
+export {
+	type ExtensionUiComponent,
+	type ExtensionUiComponentFactory,
+	type ExtensionWidgetContent,
+	type MessageRenderOptions,
+	type MessageRenderer,
+	type AssistantThinkingRenderContext,
+	type AssistantThinkingRenderer,
+} from "@oh-my-pi/pi-tui/chat/extension-types";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
@@ -20,6 +36,7 @@ import type {
 	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
+import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type {
 	Api,
 	AssistantMessageEvent,
@@ -43,7 +60,6 @@ import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	Component,
-	ComposerStyle,
 	EditorTheme,
 	KeyId,
 	OverlayHandle,
@@ -51,33 +67,30 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
+export type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { EditToolDetails } from "../../edit";
+import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
-import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { Theme } from "../../modes/theme/theme";
+import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
-import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
+import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
-import type {
-	BashToolDetails,
-	BashToolInput,
-	GlobToolDetails,
-	GlobToolInput,
-	GrepToolDetails,
-	GrepToolInput,
-	ReadToolDetails,
-	ReadToolInput,
-	WriteToolInput,
-} from "../../tools";
+import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
+import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
+import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type { ApprovalMode } from "../../tools/approval";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import type { EventBus } from "../../utils/event-bus";
 import type {
@@ -120,7 +133,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands";
 
 export type { OverlayHandle, OverlayOptions } from "@oh-my-pi/pi-tui";
-export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
+export type { AppKeybinding, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
 
@@ -135,45 +148,15 @@ export interface ExtensionUISelectOption {
 
 export type ExtensionUISelectItem = string | ExtensionUISelectOption;
 
-export interface ExtensionAskDialogOption {
-	label: string;
-	description?: string;
-	preview?: string;
-}
-
-export interface ExtensionAskDialogQuestion {
-	id: string;
-	question: string;
-	header?: string;
-	options: ExtensionAskDialogOption[];
-	multi?: boolean;
-	recommended?: number;
-}
-
-export interface ExtensionAskDialogResultItem {
-	id: string;
-	question: string;
-	options: string[];
-	multi: boolean;
-	selectedOptions: string[];
-	customInput?: string;
-	note?: string;
-	timedOut?: boolean;
-}
-
-export interface ExtensionAskDialogSubmitResult {
-	kind: "submit";
-	results: ExtensionAskDialogResultItem[];
-}
-
-/** Chat-redirect result: the user chose "Chat about this" instead of
- *  answering. Distinct from `undefined` (cancel) so AskTool can hand off to
- *  the chat loop rather than aborting. */
-export interface ExtensionAskDialogChatResult {
-	kind: "chat";
-}
-
-export type ExtensionAskDialogResult = ExtensionAskDialogSubmitResult | ExtensionAskDialogChatResult;
+import type { ExtensionAskDialogQuestion, ExtensionAskDialogResult } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
+export type {
+	ExtensionAskDialogOption,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResultItem,
+	ExtensionAskDialogSubmitResult,
+	ExtensionAskDialogChatResult,
+	ExtensionAskDialogResult,
+} from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 
 export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
 	return typeof option === "string" ? option : option.label;
@@ -224,10 +207,6 @@ export type WidgetPlacement = "aboveEditor" | "belowEditor";
 export interface ExtensionWidgetOptions {
 	placement?: WidgetPlacement;
 }
-
-export type ExtensionUiComponent = Component & { dispose?(): void };
-export type ExtensionUiComponentFactory = (tui: TUI, theme: Theme) => ExtensionUiComponent;
-export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | undefined;
 
 /** Options for `ExtensionUIContext.custom()` (overlay rendering of a custom component). */
 export interface ExtensionCustomOptions {
@@ -370,27 +349,11 @@ export interface ExtensionUIContext {
 	setToolsExpanded(expanded: boolean): void;
 }
 
-/** Visual composer style and selector copy registered by an extension. */
-export interface ComposerShapeDefinition {
-	/** User-facing name shown in composer-shape selectors. */
-	label: string;
-	/** Optional detail shown under the selector label. */
-	description?: string;
-	/** Renderer contract; its id becomes the persisted `composer.shape` value. */
-	style: ComposerStyle;
-}
-
 // ============================================================================
 // Extension Context
 // ============================================================================
 
-export interface ContextUsage {
-	/** Estimated context tokens. */
-	tokens: number;
-	contextWindow: number;
-	/** Context usage as percentage of context window. */
-	percent: number;
-}
+export type { ContextUsage };
 
 export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
@@ -463,6 +426,29 @@ export interface ExtensionModelQuery {
 /** Runtime host mode exposed to Pi-compatible extensions. */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/**
+ * The agent a session runs. Extension factories are rebound to every subagent session
+ * (task tool, eval `agent()`, `/tan` clones), so this tells a handler which agent it is serving.
+ */
+export interface ExtensionAgentIdentity {
+	/**
+	 * `"main"` for a top-level session, `"sub"` for any spawned session. Check this, not `depth`,
+	 * to tell subagents apart: `/tan` clones are subagents at depth 0.
+	 */
+	kind: "main" | "sub";
+	/** Agent registry id, e.g. `"Main"` or `"0-Explore"`. */
+	id: string;
+	/**
+	 * Lowercased agent definition name, e.g. `"main"`, `"task"`, `"explore"`. Subagents spawned
+	 * without a definition (such as `/tan` clones) report `"sub"`.
+	 */
+	name: string;
+	/** Task-tool nesting depth: 0 for a top-level session and for subagents not spawned by `task`. */
+	depth: number;
+	/** Registry id of the spawning agent; absent for a top-level session. */
+	parentId?: string;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -496,6 +482,8 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/** Identity of the agent this session runs: the top-level session or a subagent. */
+	agent: ExtensionAgentIdentity;
 	/**
 	 * Whether the current project/workspace is trusted. OMP performs no
 	 * project-trust gating — project-level settings and extensions load
@@ -506,6 +494,14 @@ export interface ExtensionContext {
 	isProjectTrusted(): boolean;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
+
+	/** Run a /btw-style side turn without appending to history or executing tool calls.
+	 * Pass tools: false to omit tool definitions; existing context/provider hooks still run.
+	 * Inherits event-handler and registered-tool cancellation, combined with options.signal.
+	 * Hooks reached within a running side turn cannot start another one (bounded recursion).
+	 * Optional for compatibility with hosts that do not provide side turns.
+	 */
+	runEphemeralTurn?(options: EphemeralTurnOptions): Promise<EphemeralTurnResult>;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
 	/**
@@ -526,6 +522,13 @@ export interface ExtensionContext {
 	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
 	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
 	clearTimer(timer: Timer): void;
+	/**
+	 * Attach trusted, extension-authored instructions to the next provider
+	 * request with developer/system priority where supported. Present only while
+	 * a registered tool is executing. Raw tool output and other untrusted data
+	 * must stay in the ordinary tool result.
+	 */
+	addAdditionalContext?(context: string): void;
 	/**
 	 * Run the NATIVE built-in implementation of the tool this handler re-registered, with `params`,
 	 * and return its result. Lets a tool that re-registers a built-in (e.g. wrapping `write` to add
@@ -786,6 +789,20 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string[];
 }
 
+/** Fired in the parent session before a subagent (task tool or eval `agent()`) resolves its model. */
+export interface BeforeSubagentSpawnEvent {
+	type: "before_subagent_spawn";
+	/** Agent definition name being spawned. */
+	agent: string;
+	invocationKind: "task" | "eval";
+	/** Pre-expansion role alias the patterns came from (`@task` -> "task"); undefined for explicit selectors. */
+	modelRole?: string;
+	/** Expanded model patterns core would spawn with, in attempt order. */
+	patterns: string[];
+	/** Stable per-spawn key for deterministic selection, when the caller supplies one. */
+	spawnKey?: string;
+}
+
 export type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -811,6 +828,7 @@ export interface MessageUpdateEvent {
 /**
  * Fired when a message ends. Notification-only: the message is a detached
  * snapshot, so in-place changes do not rewrite agent or provider context.
+ * Persistence and subscriber delivery do not wait for this handler to finish.
  */
 export interface MessageEndEvent {
 	type: "message_end";
@@ -862,6 +880,14 @@ export interface CredentialDisabledEvent {
 	provider: string;
 	/** Verbatim error captured for forensics (truncated upstream). */
 	disabledCause: string;
+	/** Database row id of the disabled credential. */
+	credentialId?: number;
+	/** Account identity recorded on the disabled OAuth credential, when the provider supplied one. */
+	email?: string;
+	accountId?: string;
+	/** Organization/workspace the credential was scoped to. */
+	orgId?: string;
+	orgName?: string;
 }
 
 // ============================================================================
@@ -1098,6 +1124,7 @@ export type ExtensionEvent =
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
+	| BeforeSubagentSpawnEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| SessionStopEvent
@@ -1170,6 +1197,17 @@ export interface BeforeAgentStartEventResult {
 	systemPrompt?: string[];
 }
 
+export interface BeforeSubagentSpawnEventResult {
+	/** Replacement model patterns in attempt order (selectors or role aliases). Role identity is preserved. */
+	model?: string | string[];
+	/** Refuse the spawn. */
+	block?: boolean;
+	/** Refusal reason surfaced to the caller. */
+	reason?: string;
+	/** Human-readable routing explanation surfaced with the resolved model. */
+	note?: string;
+}
+
 export type {
 	SessionBeforeBranchResult,
 	SessionBeforeCompactResult,
@@ -1181,28 +1219,6 @@ export type {
 // ============================================================================
 // Message Rendering
 // ============================================================================
-
-export interface MessageRenderOptions {
-	expanded: boolean;
-}
-
-export type MessageRenderer<T = unknown> = (
-	message: CustomMessage<T>,
-	options: MessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
-
-export interface AssistantThinkingRenderContext {
-	contentIndex: number;
-	thinkingIndex: number;
-	text: string;
-	requestRender(): void;
-}
-
-export type AssistantThinkingRenderer = (
-	context: AssistantThinkingRenderContext,
-	theme: Theme,
-) => Component | undefined;
 
 // ============================================================================
 // Command Registration
@@ -1234,6 +1250,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 
 /**
  * ExtensionAPI passed to extension factory functions.
+ *
+ * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
 	// =========================================================================
@@ -1287,6 +1305,10 @@ export interface ExtensionAPI {
 	): void;
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
+	on(
+		event: "before_subagent_spawn",
+		handler: ExtensionHandler<BeforeSubagentSpawnEvent, BeforeSubagentSpawnEventResult>,
+	): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;
@@ -1752,6 +1774,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

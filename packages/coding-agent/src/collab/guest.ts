@@ -19,12 +19,12 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
-import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
+import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
-import { shouldDisableReasoning, toReasoningEffort } from "../thinking";
+import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { setSessionTerminalTitle } from "../utils/title-generator";
 import { importRoomKey } from "./crypto";
@@ -481,7 +481,7 @@ export class CollabGuestLink {
 			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
 		} catch (err) {
 			// #clearTransientUi() above already dropped the pendingTools blocks,
-			// and #handleToolExecutionEnd settles a displaceable hub/todo result out
+			// and #handleToolExecutionEnd settles a displaceable wait/todo result out
 			// of pendingTools into EventController's own trackers instead (Codex
 			// review on #9377): orphanedLiveBlocks folds both in via
 			// takeDisplaceableComponents() above, or a still-animated "waiting" card

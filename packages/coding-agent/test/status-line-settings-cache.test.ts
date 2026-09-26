@@ -4,14 +4,22 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/presets";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-tui/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-tui/status-line/presets";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 import { StatusLineTestComponents } from "./helpers/status-line";
+
+import {
+	cfgGitEnabled,
+	cfgStatusLineLeftSegments,
+	cfgStatusLinePreset,
+	cfgStatusLineRightSegments,
+} from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 let settingsState: SettingsTestState | undefined;
 let projectDir = "";
@@ -74,7 +82,7 @@ function makeSession(sessionName = "Cache Session") {
 }
 
 function makeComponent(statusLineSettings: StatusLineSettings): StatusLineComponent {
-	const component = statusLines.track(new StatusLineComponent(makeSession()));
+	const component = statusLines.track(new StatusLineComponent(makeSession(), statusLineHost));
 	component.updateSettings(statusLineSettings);
 	return component;
 }
@@ -112,7 +120,7 @@ describe("StatusLineComponent effective settings cache", () => {
 			snapshotCalls++;
 			return getSnapshot();
 		};
-		const component = statusLines.track(new StatusLineComponent(session));
+		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 		component.updateSettings({
 			preset: "custom",
 			leftSegments: ["model", "mode"],
@@ -207,11 +215,11 @@ describe("StatusLineComponent effective settings cache", () => {
 	});
 
 	it("renders custom preset defaults when segment arrays are unconfigured", () => {
-		Settings.instance.override("statusLine.preset", "custom");
+		cfgStatusLinePreset.override(Settings.instance, "custom");
 		const component = makeComponent({
-			preset: Settings.instance.get("statusLine.preset"),
-			leftSegments: Settings.instance.get("statusLine.leftSegments"),
-			rightSegments: Settings.instance.get("statusLine.rightSegments"),
+			preset: cfgStatusLinePreset.get(Settings.instance),
+			leftSegments: cfgStatusLineLeftSegments.get(Settings.instance),
+			rightSegments: cfgStatusLineRightSegments.get(Settings.instance),
 			sessionAccent: false,
 		});
 
@@ -310,7 +318,7 @@ describe("StatusLineComponent effective settings cache", () => {
 		const statusSpy = spyOn(vcs, "watch");
 		const repoSpy = spyOn(vcs, "repo");
 		try {
-			Settings.instance.override("git.enabled", false);
+			cfgGitEnabled.override(Settings.instance, false);
 			const component = makeComponent({
 				preset: "custom",
 				leftSegments: ["git", "pr"],

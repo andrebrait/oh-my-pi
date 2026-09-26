@@ -14,18 +14,21 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
 import { writeThroughActiveTerminal } from "@oh-my-pi/pi-tui";
+import { SPINNER_FRAMES } from "@oh-my-pi/pi-tui/theme/symbols";
 import { $env, isTerminalHeadless, isWsl, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 
+import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { formatTitleUserMessage } from "../tiny/message-preproc";
-import { isTinyTitleLocalModelKey, ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
+
+import { cfgRetryModelFallback } from "../session/settings";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 const TITLE_MARKER_INSTRUCTION = prompt.render(titleMarkerInstruction);
@@ -119,7 +122,7 @@ const LEADING_PROSE_THINKING_PREAMBLE_RE =
 	/^[ \t]*(?:(?:here(?:['’]s| is)[ \t]+(?:a|the|my)[ \t]+)|my[ \t]+)?(?:thinking|thought|reasoning)[ \t]+process[ \t]*:?[ \t]*(?:\r?\n|$)/i;
 
 function getTitleModels(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api>[] {
-	const availableModels = registry.getAvailable();
+	const availableModels = roleCandidatePool("tiny", settings, registry);
 	if (availableModels.length === 0) return [];
 
 	const models = collectOnlineTinyCandidates(["tiny", "commit", "smol"], settings, availableModels).map(
@@ -127,7 +130,7 @@ function getTitleModels(registry: ModelRegistry, settings: Settings, currentMode
 	);
 	if (
 		currentModel &&
-		(models.length === 0 || settings.get("retry.modelFallback") !== false) &&
+		(models.length === 0 || cfgRetryModelFallback.get(settings) !== false) &&
 		!models.some(model => formatModelStringWithRouting(model) === formatModelStringWithRouting(currentModel))
 	) {
 		// Append currentModel and expand its own chain separately — never merge it
@@ -180,15 +183,20 @@ export async function generateSessionTitle(
 		return null;
 	}
 
+	const models = getTitleModels(registry, settings, currentModel);
+	const firstModel = models[0];
+	if (!firstModel) {
+		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
+		return null;
+	}
+
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
-	const tinyModel = settings.get("providers.tinyModel");
-	if (tinyModel === ONLINE_TINY_TITLE_MODEL_KEY) {
-		return generateTitleOnline(
+	if (firstModel.api !== "local-inference") {
+		return generateTitleOnlineWithModels(
 			firstMessage,
+			models,
 			registry,
-			settings,
 			sessionId,
-			currentModel,
 			metadataResolver,
 			signal,
 			titleSystemPrompt,
@@ -196,37 +204,28 @@ export async function generateSessionTitle(
 		);
 	}
 
-	// User explicitly picked a local tiny model. NEVER fall back to the online
-	// smol path (issue #3187): the smol role resolves through priority.json and
-	// silently bills whatever provider holds the resolved API key — OpenRouter
-	// in the reporter's case, leaking real credits without consent. If the
-	// local worker fails (unknown key, download missing, transformers.js
-	// crash, abort), leave the session untitled; the next user turn retries.
-	if (!isTinyTitleLocalModelKey(tinyModel)) {
-		logger.warn("title-generator: unknown local tiny model; skipping title (will not fall back to online)", {
-			sessionId,
-			model: tinyModel,
-			reason: "unknown-local-model",
-		});
-		return null;
-	}
+	// A local role selection is an explicit no-billing boundary. If the worker
+	// fails (download missing, runtime crash, abort, or no output), leave the
+	// session untitled rather than advancing into a paid fallback candidate.
 	try {
 		let localTitle: string | null;
 		if (signal) {
 			localTitle = await tinyTitleClient.generate(
-				tinyModel,
+				firstModel.id,
 				firstMessage,
 				titleSystemPrompt ? { signal, systemPrompt: titleSystemPrompt } : { signal },
 			);
 		} else if (titleSystemPrompt) {
-			localTitle = await tinyTitleClient.generate(tinyModel, firstMessage, { systemPrompt: titleSystemPrompt });
+			localTitle = await tinyTitleClient.generate(firstModel.id, firstMessage, {
+				systemPrompt: titleSystemPrompt,
+			});
 		} else {
-			localTitle = await tinyTitleClient.generate(tinyModel, firstMessage);
+			localTitle = await tinyTitleClient.generate(firstModel.id, firstMessage);
 		}
 		if (!localTitle) {
 			logger.warn("title-generator: local tiny model produced no title; skipping (no online fallback)", {
 				sessionId,
-				model: tinyModel,
+				model: firstModel.id,
 				reason: "local-no-output",
 			});
 			return null;
@@ -235,7 +234,7 @@ export async function generateSessionTitle(
 	} catch (err) {
 		logger.warn("title-generator: local tiny model errored; skipping (no online fallback)", {
 			sessionId,
-			model: tinyModel,
+			model: firstModel.id,
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return null;
@@ -258,7 +257,28 @@ export async function generateTitleOnline(
 		logger.warn("title-generator: no title model found", { sessionId, reason: "no-title-model" });
 		return null;
 	}
+	return generateTitleOnlineWithModels(
+		firstMessage,
+		models,
+		registry,
+		sessionId,
+		metadataResolver,
+		signal,
+		customSystemPrompt,
+		credentialSourceSessionId,
+	);
+}
 
+async function generateTitleOnlineWithModels(
+	firstMessage: string,
+	models: Model<Api>[],
+	registry: ModelRegistry,
+	sessionId?: string,
+	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
+	signal?: AbortSignal,
+	customSystemPrompt?: string,
+	credentialSourceSessionId?: string,
+): Promise<string | null> {
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	// The model is always asked to wrap the title in `<title>...</title>` and
 	// the title is parsed from text. A forced `set_title` tool call was the old
@@ -288,15 +308,11 @@ export async function generateTitleOnline(
 
 		try {
 			if (credentialSourceSessionId && sessionId && credentialSourceSessionId !== sessionId) {
-				const foregroundCredential = registry.authStorage
-					.listOAuthAccounts(model.provider, credentialSourceSessionId)
+				const foregroundCredential = registry.authStorage.oauth
+					.accounts(model.provider, credentialSourceSessionId)
 					.find(account => account.active);
 				if (foregroundCredential) {
-					registry.authStorage.pinSessionOAuthAccount(
-						model.provider,
-						sessionId,
-						foregroundCredential.credentialId,
-					);
+					registry.authStorage.sessions.pin(model.provider, sessionId, foregroundCredential.credentialId);
 				}
 			}
 			const apiKey = await registry.getApiKey(model, sessionId);
@@ -564,16 +580,62 @@ export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?
  * Repeating the same sanitized title is a no-op on every platform.
  */
 export function setTerminalTitle(title: string): void {
-	// The teardown latch belongs HERE, not only on the composed-state path: this
-	// is the sink every title write funnels through, and it is exported, so a
-	// direct importer firing from a delayed callback after
-	// `disposeTerminalTitleState()` would otherwise write straight into the
-	// parent shell's tab whose title teardown just restored.
+	writeTerminalTitle(title);
+}
+
+/**
+ * The sink every title write funnels through — and it is exported via
+ * {@link setTerminalTitle}, so the teardown latch belongs HERE, not only on
+ * the composed-state path: a direct importer firing from a delayed callback
+ * after `disposeTerminalTitleState()` would otherwise write straight into the
+ * parent shell's tab whose title teardown just restored.
+ *
+ * When `recomposeStaticOnFailure` is set (only the composed working title
+ * passes it), a native-path failure on Windows re-composes the title with the
+ * failure latched — the static `:` separator — instead of emitting the
+ * animated frame that just failed as OSC. Direct titles always preserve
+ * verbatim: the caller's own sanitized title is the OSC fallback. The latch
+ * check runs on every failure, not just the first: a direct write may latch
+ * first, and a later working emit must still collapse to static rather than
+ * emit one animated OSC frame.
+ */
+function writeTerminalTitle(title: string, recomposeStaticOnFailure = false): void {
 	if (terminalTitleRuntime.disposed) return;
 	if (!process.stdout.isTTY || isTerminalHeadless()) return;
 	const next = sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE;
 	if (next === lastTerminalTitle) return;
-	if (!setWindowsConsoleTitle(next)) writeTitleSequence(`\x1b]0;${next}\x07`);
+	if (!setWindowsConsoleTitle(next)) {
+		// Native path failed on a Windows console: every later frame would cross
+		// ConPTY as OSC and reintroduce the write-loop CPU cost the static
+		// separator exists to avoid. Latch static and stop the interval now.
+		// WSL never reaches this branch (the API getter returns null off win32);
+		// the platform guard keeps a mocked win32 in tests from mislatching.
+		if (process.platform === "win32") {
+			if (!terminalTitleRuntime.nativeTitleFailed) {
+				terminalTitleRuntime.nativeTitleFailed = true;
+				stopTerminalTitleSpinner();
+			}
+			if (recomposeStaticOnFailure) {
+				const latched =
+					terminalTitleRuntime.extensionOverride ??
+					buildTerminalTitleWithState(
+						terminalTitleRuntime.label,
+						terminalTitleRuntime.state,
+						terminalTitleRuntime.frame,
+						terminalTitleRuntime.enabled,
+						process.platform,
+						terminalTitleRuntime.style,
+						$env as NodeJS.ProcessEnv,
+						true,
+					);
+				if (latched === lastTerminalTitle) return;
+				writeTitleSequence(`\x1b]0;${latched}\x07`);
+				lastTerminalTitle = latched;
+				return;
+			}
+		}
+		writeTitleSequence(`\x1b]0;${next}\x07`);
+	}
 	lastTerminalTitle = next;
 }
 
@@ -623,7 +685,7 @@ export type TerminalTitleSpinnerStyle = "braille" | "pulse" | "dots" | "line";
  * title.
  */
 export const TERMINAL_TITLE_SPINNER_STYLES: Record<TerminalTitleSpinnerStyle, readonly string[]> = {
-	braille: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+	braille: SPINNER_FRAMES.unicode.activity,
 	pulse: ["○", "◔", "◑", "◕", "●", "◕", "◑", "◔"],
 	dots: ["⠁", "⠂", "⠄", "⠠", "⠐", "⠈"],
 	line: ["-", "\\", "|", "/"],
@@ -658,6 +720,13 @@ const terminalTitleRuntime: {
 	 *  title, so a later write would land in the parent shell's tab. Cleared only
 	 *  by `initTerminalTitleState()`, when the app takes the terminal over again. */
 	disposed: boolean;
+	/** Latched the first time the sink falls back to OSC on a Windows console.
+	 *  The 80ms spinner interval is only cheap through `SetConsoleTitleW`; once
+	 *  the native path fails, every new frame would cross ConPTY as OSC and
+	 *  reintroduce the write-loop CPU cost the static separator exists to avoid.
+	 *  While latched the working separator stays `:` and no interval is
+	 *  scheduled. */
+	nativeTitleFailed: boolean;
 } = {
 	label: undefined,
 	state: "idle",
@@ -667,13 +736,14 @@ const terminalTitleRuntime: {
 	timer: undefined,
 	extensionOverride: undefined,
 	disposed: false,
+	nativeTitleFailed: false,
 };
 
 /**
  * Compose the terminal title from the `π` brand, a state-carrying separator, and
  * the session label. Pure (no I/O) so the state→separator contract is testable:
  *   - `idle` (user's turn):  `π > label`;
- *   - `working`:             `π ⠋ label` (`π : label` under WSL);
+ *   - `working`:             `π ⠋ label` (static `π : label` under WSL, or on Windows once the native title path has failed);
  *   - `attention`:           `π ! label`;
  *   - disabled:              `π: label`.
  * Without a label the separator trails the brand (`π >`) so the state stays visible.
@@ -688,12 +758,14 @@ export function buildTerminalTitleWithState(
 	platform: NodeJS.Platform = process.platform,
 	style: TerminalTitleSpinnerStyle = "braille",
 	env: NodeJS.ProcessEnv = $env as NodeJS.ProcessEnv,
+	nativeTitleFailed = false,
 ): string {
 	if (!enabled) return label ? `${DEFAULT_TERMINAL_TITLE}: ${label}` : DEFAULT_TERMINAL_TITLE;
 	const frames = TERMINAL_TITLE_SPINNER_STYLES[style] ?? TERMINAL_TITLE_SPINNER_STYLES.braille;
+	const staticHost = isStaticTitleHost(platform, env) || (platform === "win32" && nativeTitleFailed);
 	const separator =
 		state === "working"
-			? isStaticTitleHost(platform, env)
+			? staticHost
 				? STATIC_TITLE_WORKING_SEPARATOR
 				: frames[frame % frames.length]
 			: state === "attention"
@@ -703,7 +775,7 @@ export function buildTerminalTitleWithState(
 }
 
 function emitTerminalTitle(): void {
-	// The teardown latch lives at the sink (`setTerminalTitle`), so every path
+	// The teardown latch lives at the sink (`writeTerminalTitle`), so every path
 	// here is covered without a second check.
 	// An extension override owns the terminal verbatim; the terminal sink
 	// deduplicates repeated state updates.
@@ -716,8 +788,18 @@ function emitTerminalTitle(): void {
 			terminalTitleRuntime.enabled,
 			process.platform,
 			terminalTitleRuntime.style,
+			$env as NodeJS.ProcessEnv,
+			terminalTitleRuntime.nativeTitleFailed,
 		);
-	setTerminalTitle(next);
+	// The composed working title is the only write that can fail into an
+	// animated OSC frame: on native failure it re-pins static (`:`), while a
+	// direct `setTerminalTitle` preserves its caller's title verbatim.
+	const recomposeStaticOnFailure =
+		terminalTitleRuntime.extensionOverride === undefined &&
+		terminalTitleRuntime.state === "working" &&
+		terminalTitleRuntime.enabled &&
+		!isStaticTitleHost();
+	writeTerminalTitle(next, recomposeStaticOnFailure);
 }
 
 function stopTerminalTitleSpinner(): void {
@@ -726,8 +808,15 @@ function stopTerminalTitleSpinner(): void {
 }
 
 function startTerminalTitleSpinner(): void {
-	if (isStaticTitleHost() || terminalTitleRuntime.disposed || terminalTitleRuntime.timer || !process.stdout.isTTY)
+	if (
+		isStaticTitleHost() ||
+		terminalTitleRuntime.disposed ||
+		terminalTitleRuntime.timer ||
+		terminalTitleRuntime.nativeTitleFailed ||
+		!process.stdout.isTTY
+	)
 		return;
+
 	terminalTitleRuntime.timer = setInterval(() => {
 		terminalTitleRuntime.frame =
 			(terminalTitleRuntime.frame + 1) % TERMINAL_TITLE_SPINNER_STYLES[terminalTitleRuntime.style].length;
@@ -786,9 +875,16 @@ export function setTerminalTitleSpinnerStyle(style: string | undefined): void {
  */
 export function initTerminalTitleState(): void {
 	terminalTitleRuntime.disposed = false;
+	// The native-failure latch is claim-scoped like the spinner timer: a fresh
+	// owner gets a re-probed native path, so a transient SetConsoleTitleW
+	// failure in one session must not pin every later session static. The next
+	// write re-latches only if the native path still fails. Reset the cached
+	// binding too — tests swap the dlopen double per case via beforeEach, and a
+	// stale failure-shaped binding would otherwise survive the reset.
+	disposeWindowsConsoleTitleApi();
+	terminalTitleRuntime.nativeTitleFailed = false;
 	// A fresh claim starts from the shell's title, not whatever the previous
 	// session last emitted: the dedupe cache must not swallow the first write.
-	lastTerminalTitle = undefined;
 	// Releasing the latch alone would leave a stopped timer behind a `working`
 	// state — a frozen spinner frame. Mirror the enable path and re-arm.
 	if (terminalTitleRuntime.state === "working" && terminalTitleRuntime.enabled) startTerminalTitleSpinner();

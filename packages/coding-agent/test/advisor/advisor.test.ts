@@ -16,7 +16,6 @@ import type {
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import type { TUI } from "@oh-my-pi/pi-tui";
 import {
 	AdviseTool,
 	type AdvisorAgent,
@@ -35,13 +34,9 @@ import {
 	isInterruptingSeverity,
 	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
-	type WatchdogConfigDoc,
 } from "../../src/advisor";
-import type { ModelRegistry } from "../../src/config/model-registry";
-import type { Settings } from "../../src/config/settings";
-import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../../src/modes/components/advisor-config";
-import { createAdvisorMessageCard } from "../../src/modes/components/advisor-message";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { obfuscateMessages } from "../../src/secrets/message-transform";
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { getOpenAiRemoteCompactionPayload } from "../../src/session/session-context";
@@ -69,6 +64,23 @@ function promptText(input: string | AgentMessage[]): string {
 			return String(m);
 		})
 		.join("\n");
+}
+
+/** High-entropy secret with no repeated 8-char window, so any surviving window is a leak. */
+function distinctSecret(length: number): string {
+	let secret = "";
+	for (let i = 0; secret.length < length; i++) secret += Bun.hash(`secret-${i}`).toString(36);
+	return secret.slice(0, length);
+}
+
+/** 8-char windows of `secret` present in `text`: a truncation cut leaks a secret as fragments, not whole. */
+function leakedSecretPieces(text: string, secret: string): string[] {
+	const pieces: string[] = [];
+	for (let i = 0; i + 8 <= secret.length; i++) {
+		const piece = secret.slice(i, i + 8);
+		if (text.includes(piece)) pieces.push(piece);
+	}
+	return pieces;
 }
 
 describe("advisor", () => {
@@ -2280,6 +2292,40 @@ describe("advisor", () => {
 			expect(rendered).not.toContain("BEGIN_SECRET_");
 			expect(rendered).not.toContain("_END_SECRET");
 		});
+
+		it("redacts an expanded edit diff before middle truncation", async () => {
+			// One giant diff line; the secret straddles the tail window's cut, so
+			// truncating first would leave its suffix, which no redaction pass can match.
+			const secret = distinctSecret(2_000);
+			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+			const diff = `--- a/big.ts\n+++ b/big.ts\n@@ -1 +1 @@\n+${".".repeat(10_000)}${secret}${".".repeat(3_000)}`;
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "c1", name: "edit", arguments: { path: "big.ts" } }],
+					timestamp: 1,
+				} as unknown as AgentMessage,
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "edit",
+					content: "ok",
+					details: { diff },
+					isError: false,
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, { snapshotMessages: () => messages, obfuscator });
+
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1_000, 1);
+
+			const rendered = promptText(promptInputs[0]);
+			expect(rendered).toContain("elided");
+			expect(leakedSecretPieces(rendered, secret)).toEqual([]);
+		});
 		it("does not scan tool-call arguments hidden by the primary-argument preview", async () => {
 			const obfuscator = new SecretObfuscator([
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
@@ -4219,6 +4265,82 @@ describe("advisor", () => {
 			const again = performance.now();
 			await runtime.waitForCatchup(60_000, 1);
 			expect(performance.now() - again).toBeLessThan(100);
+			runtime.dispose();
+		}, 10_000);
+
+		it("holds a recovery-aware catch-up through the failure but releases it on a terminal quota pause", async () => {
+			// Headless shutdown drains wait through a failing turn so disposal cannot
+			// abort the host's fallback switch. A recovery that ends in a quota pause
+			// can never drain, so the waiter must be released then — not held to its
+			// (ten-minute, in print mode) deadline.
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					throw new Error("insufficient_quota: you have exceeded your rate limit");
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "quota-turn", timestamp: 1 } as AgentMessage];
+			const recoveryStarted = Promise.withResolvers<void>();
+			const recoveryResult = Promise.withResolvers<boolean>();
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				onTurnError: () => {
+					recoveryStarted.resolve();
+					return recoveryResult.promise;
+				},
+				notifyQuotaExhausted: () => {},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			let settled = false;
+			const catchup = runtime.waitForCatchup(60_000, 1, undefined, { waitThroughRecovery: true }).then(caughtUp => {
+				settled = true;
+				return caughtUp;
+			});
+			// A failure-released waiter settles before onTurnError runs, so its
+			// continuation is already queued ahead of this one.
+			await recoveryStarted.promise;
+			expect(settled).toBe(false);
+
+			// No fallback available: the runtime latches its quota pause.
+			const released = performance.now();
+			recoveryResult.resolve(false);
+			expect(await catchup).toBe(false);
+			expect(performance.now() - released).toBeLessThan(2_000);
+			expect(runtime.quotaExhausted).toBe(true);
+			runtime.dispose();
+		}, 10_000);
+
+		it("releases a recovery-aware catch-up created while a session transition is paused", async () => {
+			// A paused runtime cannot drain until the transition resumes, which never
+			// happens on a shutdown path. A drain waiter created after the pause must
+			// release at once instead of parking for its (ten-minute) budget.
+			let abortPrompt: ((reason: unknown) => void) | undefined;
+			const agent: AdvisorAgent = {
+				prompt: () => {
+					const { promise, reject } = Promise.withResolvers<void>();
+					abortPrompt = reject;
+					return promise;
+				},
+				abort: reason => abortPrompt?.(new Error(String(reason))),
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "paused-turn", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = { snapshotMessages: () => messages };
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => abortPrompt !== undefined);
+			await runtime.pauseForSessionTransition();
+			expect(runtime.backlog).toBeGreaterThan(0);
+
+			const started = performance.now();
+			expect(await runtime.waitForCatchup(60_000, 1, undefined, { waitThroughRecovery: true })).toBe(false);
+			expect(performance.now() - started).toBeLessThan(100);
 			runtime.dispose();
 		}, 10_000);
 
@@ -6545,110 +6667,6 @@ describe("advisor", () => {
 			expect(isAdvisorTranscriptName("__advisor-2.jsonl")).toBe(false);
 			expect(isAdvisorTranscriptName("Foo.jsonl")).toBe(false);
 			expect(isAdvisorTranscriptName("__advisor.arch.bak")).toBe(false);
-		});
-	});
-
-	describe("AdvisorConfigOverlayComponent", () => {
-		const deps = {
-			modelRegistry: {} as unknown as ModelRegistry,
-			settings: {} as unknown as Settings,
-			scopedModels: [],
-			availableToolNames: ["read", "grep", "glob", "lsp", "web_search"],
-		};
-		const callbacks = {
-			loadDoc: async () => ({ advisors: [] }),
-			save: async () => {},
-			close: () => {},
-			requestRender: () => {},
-			notify: () => {},
-		};
-		const strip = (lines: readonly string[]): string => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-		const make = (doc: WatchdogConfigDoc, extra?: Partial<AdvisorConfigDeps>): AdvisorConfigOverlayComponent =>
-			new AdvisorConfigOverlayComponent({} as unknown as TUI, { ...deps, ...extra }, "project", doc, callbacks);
-		const fullHeight = Math.max(14, process.stdout.rows || 40);
-
-		it("paints a full-screen split frame: roster sidebar + selected-advisor preview", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				instructions: "shared baseline",
-				advisors: [
-					{ name: "Architecture", model: "x-ai/grok-code-fast:high" },
-					{ name: "Security", tools: ["read", "web_search"] },
-				],
-			});
-			const frame = overlay.render(200);
-			// Fills the screen top-to-bottom (the fix for the bottom-anchored frame
-			// whose offset broke mouse hit-testing and wasted the upper space).
-			expect(frame.length).toBe(fullHeight);
-			const text = strip(frame);
-			expect(text).toContain("Advisor configuration");
-			expect(text).toContain("project");
-			expect(text).toContain("Architecture");
-			expect(text).toContain("Security");
-			expect(text).toContain("+ Add advisor");
-			expect(text).toContain("Save & apply");
-			// Right preview reflects the highlighted (first) advisor.
-			expect(text).toContain("x-ai/grok-code-fast:high");
-			expect(text).toContain("read, grep, glob (default)");
-		});
-
-		it("renders an explicit no-tools advisor distinctly from the omitted default", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [{ name: "Blank", tools: [] }],
-			});
-
-			const text = strip(overlay.render(200));
-			expect(text.toLowerCase()).toContain("no tools");
-			expect(text).not.toContain("read, grep, glob (default)");
-		});
-
-		it("moves the preview with keyboard selection and preserves an explicit tool set", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [{ name: "Architecture" }, { name: "Security", tools: ["read", "web_search"] }],
-			});
-			overlay.render(200);
-			overlay.handleInput("\x1b[B"); // arrow down → highlight Security
-			expect(strip(overlay.render(200))).toContain("read, web_search");
-		});
-
-		it("opens an advisor's detail editor on a left click in the sidebar", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({ advisors: [{ name: "Architecture" }, { name: "Security" }] });
-			// Render once so the frame geometry is recorded; the first advisor sits on
-			// the first body row (0-based screen row 1 → SGR 1-based row 2).
-			overlay.render(120);
-			overlay.handleInput("\x1b[<0;4;2M"); // left-button press, col 4, row 2
-			const text = strip(overlay.render(120));
-			expect(text).toContain("Editing");
-			expect(text).toContain("Architecture");
-		});
-
-		it("shows disabled advisors with a dim circle marker and toggles them in the detail editor", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [
-					{ name: "Active", model: "x-ai/grok-code-fast:high" },
-					{ name: "Disabled", model: "openai/gpt-4", enabled: false },
-				],
-			});
-			const text = strip(overlay.render(200));
-			// The list shows ● for enabled and ○ for disabled.
-			expect(text).toContain("● Active");
-			expect(text).toContain("○ Disabled");
-			// The preview of the highlighted (first) advisor shows its enabled status.
-			expect(text).toContain("● on");
 		});
 	});
 });

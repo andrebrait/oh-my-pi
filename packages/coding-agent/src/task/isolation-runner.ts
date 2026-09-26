@@ -33,7 +33,7 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
-import type { SingleResult } from "./types";
+import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	applyNestedPatches,
 	captureBaseline,
@@ -46,9 +46,10 @@ import {
 	getRepoRoot,
 	type IsolationHandle,
 	mergeTaskBranches,
-	type NestedRepoPatch,
 	type WorktreeBaseline,
 } from "./worktree";
+
+import { cfgTaskIsolationCommits } from "./settings";
 
 type IsoBackendKind = natives.IsoBackendKind;
 
@@ -163,7 +164,7 @@ export type BuildCommitMessage = () => undefined | ((diff: string) => Promise<st
  */
 export function makeIsolationCommitMessage(session: ToolSession): BuildCommitMessage {
 	return () => {
-		const style = session.settings.get("task.isolation.commits");
+		const style = cfgTaskIsolationCommits.get(session.settings);
 		if (style !== "ai" || !session.modelRegistry) return undefined;
 		const registry = session.modelRegistry;
 		const settings = session.settings;

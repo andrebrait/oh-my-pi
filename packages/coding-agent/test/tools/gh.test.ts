@@ -17,7 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import { parseIssueUrl, parsePullRequestUrl } from "@oh-my-pi/pi-coding-agent/tools/gh-common";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
-import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withRepoLock } from "@oh-my-pi/pi-coding-agent/utils/repo-lock";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -123,6 +123,10 @@ async function buildPrFixtureTemplate(): Promise<PrFixture> {
 
 	await fs.mkdir(repoRoot, { recursive: true });
 	runGit(baseDir, ["init", "-b", "main", repoRoot]);
+	// createPrFixture copies this tree with fs.cp; a background
+	// `git maintenance run --auto` lock would race the copy.
+	runGit(repoRoot, ["config", "maintenance.auto", "false"]);
+	runGit(repoRoot, ["config", "gc.auto", "0"]);
 	await fs.writeFile(path.join(repoRoot, "README.md"), "base\n");
 	runGit(repoRoot, ["add", "README.md"]);
 	runGit(repoRoot, ["commit", "-m", "base commit"]);

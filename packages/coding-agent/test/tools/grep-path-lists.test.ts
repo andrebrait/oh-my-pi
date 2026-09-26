@@ -1,3 +1,4 @@
+import { agentTranscriptSource } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -7,21 +8,18 @@ import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
 import type { RenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
-import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/components/agent-transcript-viewer";
-import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tree-selector";
-import type {
-	ObservableSession,
-	SessionObserverRegistry,
-} from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
-import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { AgentTranscriptViewer } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
+import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
+import type { ObservableSession, SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { Text } from "@oh-my-pi/pi-tui";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { grepToolRenderer } from "../../src/tools/grep";
+import { grepToolRenderer } from "@oh-my-pi/pi-tui/tools/grep";
 
 function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -367,6 +365,7 @@ describe("tool path arrays", () => {
 		});
 
 		const viewer = new AgentTranscriptViewer({
+			transcript: agentTranscriptSource,
 			agentId: "search-overlay-session",
 			registry: agents,
 			observers,
@@ -909,6 +908,48 @@ describe("tool path arrays", () => {
 		expect(text).not.toContain("nested");
 		expect(details?.fileCount).toBe(2);
 		expect(details?.scopePath).toBe("alpha.txt, beta.txt");
+		await removeWithRetries(tmp);
+	});
+
+	it("grep keeps directory-prefixed globs out of subdirectories", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		await Bun.write(path.join(tmp, "internal", "awsapi", "client.go"), "depth-needle awsapi-root\n");
+		await Bun.write(path.join(tmp, "internal", "awsapi", "svc", "nested.go"), "depth-needle awsapi-nested\n");
+		await Bun.write(path.join(tmp, "internal", "crypto_util.go"), "depth-needle crypto-root\n");
+		await Bun.write(path.join(tmp, "internal", "services", "kms", "crypto_kms.go"), "depth-needle kms\n");
+		await Bun.write(path.join(tmp, "internal", "roles.go"), "depth-needle roles\n");
+
+		const tools = await createTools(createTestSession(tmp));
+		const tool = tools.find(entry => entry.name === "grep");
+		if (!tool) throw new Error("Missing grep tool");
+
+		const dirGlob = getText(
+			await tool.execute("grep-dir-glob", { pattern: "depth-needle", path: "internal/awsapi/*.go" }),
+		);
+		expect(dirGlob).toContain("awsapi-root");
+		expect(dirGlob).not.toContain("awsapi-nested");
+
+		const list = getText(
+			await tool.execute("grep-dir-glob-list", {
+				pattern: "depth-needle",
+				path: "internal/crypto*; internal/roles.go",
+			}),
+		);
+		expect(list).toContain("crypto-root");
+		expect(list).toContain("roles");
+		expect(list).not.toContain("kms");
+
+		// An explicit `**` under a directory prefix still recurses.
+		const deepGlob = getText(
+			await tool.execute("grep-dir-deep-glob", { pattern: "depth-needle", path: "internal/awsapi/**/*.go" }),
+		);
+		expect(deepGlob).toContain("awsapi-root");
+		expect(deepGlob).toContain("awsapi-nested");
+
+		// A bare glob with no directory prefix still matches at any depth.
+		const bareGlob = getText(await tool.execute("grep-bare-glob", { pattern: "depth-needle", path: "*.go" }));
+		expect(bareGlob).toContain("awsapi-nested");
+		expect(bareGlob).toContain("kms");
 		await removeWithRetries(tmp);
 	});
 

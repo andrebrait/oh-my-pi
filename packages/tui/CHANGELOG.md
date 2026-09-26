@@ -2,6 +2,156 @@
 
 ## [Unreleased]
 
+## [18.3.1] - 2026-09-25
+
+### Breaking Changes
+
+- Replaced the `CustomEditor` space-hold callbacks and `sttHoldEnabled` option with the `spaceHold.handler` API.
+- Removed `Editor.cursorOverrideWidth`; widths for `cursorOverride` glyphs are now measured automatically.
+
+### Added
+
+- Added push-to-talk dictation to `Input`, with live transcription and `cursorOverride` support.
+- Added visual indicators for live-steered user messages and paginated content in read-tool results.
+- Added transcript support for `cfg://` configuration read and write tool calls.
+- Added an Anthropic slow-mode badge to the status-line model segment, showing the priority state, end time, and remaining request percentage when available.
+
+### Changed
+
+- Updated the settings selector so clearing an input field fully unsets the corresponding setting.
+
+### Fixed
+
+- Fixed dimmed blockquote styling after inline code spans.
+- Fixed rendering of tool calls and results for top-level extension and MCP tools invoked through `xd://` links.
+- Fixed file links in pending Read and Write cards so they open the correct local targets, including paths in the home directory, archives, and databases.
+
+## [18.3.0] - 2026-09-24
+
+### Added
+
+- Added proc:// and agent:// URI support for interacting with processes and agents.
+- Added support for xd:// documentation topic URLs.
+- Added rendering for background job state and peer-to-peer messages from the wait tool.
+- Added supervised bash service rendering with status, readiness, and output information.
+- Added a fullscreen annotation overlay for diffs and text, including multi-line notes, editing, deletion, and undo ([#12601](https://github.com/can1357/oh-my-pi/pull/12601) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- Added Daybreak-enabled account listings to the usage dashboard.
+
+### Changed
+
+- Mermaid flowcharts and state diagrams now automatically choose a layout that best fits the available terminal width and reflow when the terminal is resized.
+- Plan Review annotations now support multi-line editing, deletion, and undo ([#12601](https://github.com/can1357/oh-my-pi/pull/12601) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+
+### Fixed
+
+- Fixed AltGr characters, including `[`, `]`, `{`, and `}`, being dropped in Windows Terminal when using the kitty keyboard protocol on Hungarian and other international keyboard layouts ([#12984](https://github.com/can1357/oh-my-pi/pull/12984) by [@H4vC](https://github.com/H4vC)).
+
+## [18.2.11] - 2026-09-23
+
+### Added
+
+- Added a Skills section to the settings.
+- Enabled OSC 8 hyperlinks in rio.
+
+### Fixed
+
+- Fixed scrolling startup release notes without requiring an initial Escape keypress.
+- Improved usage quota display so names remain distinguishable and readable in narrow and multi-column dashboards.
+
+## [18.2.10] - 2026-09-22
+
+### Changed
+
+- Added support for multiple concurrent TUI paint listeners to enable simultaneous session recording and streaming
+- Coalesced status event updates for progress-based operations to reduce TUI render overhead
+
+## [18.2.9] - 2026-09-22
+
+### Added
+
+- Added Claude and Codex saved-reset counts, availability, and expiry to usage views, with provider-specific confirmation and uniquely identified account options.
+- Added terminal detection and capability support for otty and rio, including Kitty graphics and true-color support where available, plus otty hyperlinks and notifications.
+- Added the public `stripTerminalSequences` export for extensions that need to remove terminal control sequences.
+
+### Fixed
+
+- Composer shape previews now use the full available overlay width instead of being clipped at 96 columns.
+- Fixed cursor placement when recalling prompts from history, keeping single-line entries at the end and preserving the appropriate position for multi-line entries.
+- Restored modified-key handling and terminal notifications over SSH sessions running inside tmux.
+- Fixed typed Enter occasionally being interpreted as a literal newline when terminal input events are batched.
+
+## [18.2.8] - 2026-09-21
+
+### Changed
+
+- Improved Bash tool background-task notices by providing completed output as a follow-up and discouraging unnecessary polling.
+
+## [18.2.7] - 2026-09-21
+
+### Breaking Changes
+
+- Removed specialized keyword modules in favor of a centralized registration system
+
+### Added
+
+- Added `find` tool renderer to display search results with hit ranking and score visualization
+- Supported collapsing/expanding search hit details and range snippets
+- Enabled file hyperlinking for navigation to absolute paths in search results
+- Added streaming progress display for incomplete find tool operations
+- Added Glyph Protocol support for rendering icons without requiring patched fonts
+- Added `setMagicKeywords` for dynamic configuration of highlightable magic keywords
+
+### Fixed
+
+- Prevented magic keywords from triggering spelling autocorrect and underlining
+
+## [18.2.5] - 2026-09-17
+
+### Added
+
+- Added the full coding-agent terminal UI to the package, including themed rendering primitives, shared chrome, tool renderers, chat transcripts, overlays and hubs, status lines, prompt and autocomplete controls, setup flows, and standalone utilities such as the Git TUI, process viewer, debug viewers, boards, and pickers.
+- Added reusable terminal UI components for forms, menus, split layouts, disclosures, tree views, tool cards, data widgets, fullscreen hubs, scrollable overlay navigation, and interactive footer chips.
+- Added live viewer counts to the status line and exposed paint observers through `TUIOptions.onPaint` and `TUI.setPaintListener` for hosts that need to track committed scrollback and viewport rows.
+- Added details and notes fields to todo items, plus an interactive task-list renderer for managing subtasks.
+- Added inline summaries for structured task outputs.
+- Added image input validation with automatic conversion of unsupported formats and support for video previews in chat.
+- Added the MCP Add Wizard for streamlined server configuration.
+- Added an `autoresearch` tool renderer for tracking experiments.
+- Added side-by-side diff rendering for merge conflicts and improved presentation of GitHub Actions workflow jobs and runs.
+- Added the `dark-celestial` built-in theme with a twilight palette and pink, coral, purple, cyan, and peach accents.
+
+### Changed
+
+- Overhauled JSON tree visualization with syntax highlighting, item counts, clearer indentation, and a simplified layout.
+- Improved agent task, evaluation, hub, and model displays with clearer layouts, better truncation, and metric support.
+- Standardized form labels, descriptions, and overlay styling, and improved overlay text rendering by collapsing newlines consistently.
+- Updated spinner animations to use theme-consistent frames and refined tool-output notice stripping for more consistent display.
+- Improved performance and responsiveness when rendering long-running Bash streams and large or continuously updating terminal content.
+
+## [18.2.4] - 2026-09-17
+
+### Fixed
+
+- Fixed inline images disappearing or temporarily blanking when resizing the terminal in kitty and Ghostty.
+
+## [18.2.3] - 2026-09-17
+
+### Added
+
+- Editors support whitespace-delimited `^` mention autocomplete and expose registered atoms for host-defined chip rendering.
+
+### Changed
+
+- `fuzzyRank` accepts readonly candidate arrays without copying them.
+
+### Fixed
+
+- Masked inputs no longer expose their text in diagnostic previews.
+
+### Removed
+
+- Removed the internal `fastTailSplices` and `resetFastTailSplices` Markdown instrumentation exports.
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

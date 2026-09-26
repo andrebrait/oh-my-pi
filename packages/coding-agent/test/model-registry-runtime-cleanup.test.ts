@@ -48,13 +48,13 @@ describe("ModelRegistry runtime source cleanup", () => {
 		registry.registerProvider("runtime-provider", config, sourceId);
 
 		expect(registry.find("runtime-provider", "runtime-model")).toBeDefined();
-		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(true);
+		expect(registry.authStorage.keys.source("runtime-provider") !== undefined).toBe(true);
 		expect(getCustomApi("custom-runtime-cleanup-api")).toBeDefined();
 
 		registry.clearSourceRegistrations(sourceId);
 
 		expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
-		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);
+		expect(registry.authStorage.keys.source("runtime-provider") !== undefined).toBe(false);
 		expect(getCustomApi("custom-runtime-cleanup-api")).toBeUndefined();
 	});
 
@@ -74,7 +74,7 @@ describe("ModelRegistry runtime source cleanup", () => {
 			contextWindow: 128_000,
 			maxTokens: 16_384,
 		});
-		authStorage.setRuntimeApiKey(provider, apiKey);
+		authStorage.keys.setRuntime(provider, apiKey);
 		writeModelCache(
 			resolveModelCacheProviderId(provider, { apiKey }),
 			Date.now(),
@@ -124,7 +124,7 @@ describe("ModelRegistry runtime source cleanup", () => {
 			contextWindow: 128_000,
 			maxTokens: 16_384,
 		});
-		authStorage.setRuntimeApiKey(provider, apiKey);
+		authStorage.keys.setRuntime(provider, apiKey);
 		writeModelCache(
 			resolveModelCacheProviderId(provider, { apiKey }),
 			Date.now(),
@@ -257,7 +257,8 @@ describe("ModelRegistry runtime source cleanup", () => {
 		);
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		await registry.refresh("offline");
-		expect(registry.find(provider, modelId)?.headers?.["X-Override"]).toBe("stale");
+		const configured = registry.find(provider, modelId);
+		expect(configured && (await registry.resolveModelHeaders(configured))?.["X-Override"]).toBe("stale");
 		registry.registerProvider(
 			"runtime-provider",
 			{
@@ -273,7 +274,8 @@ describe("ModelRegistry runtime source cleanup", () => {
 		await writeConfig(undefined);
 		registry.clearSourceRegistrations(sourceId);
 
-		expect(registry.find(provider, modelId)?.headers?.["X-Override"]).toBeUndefined();
+		const restored = registry.find(provider, modelId);
+		expect(restored && (await registry.resolveModelHeaders(restored))?.["X-Override"]).toBeUndefined();
 	});
 
 	test("unregisterProvider removes only the named provider and its login entry", () => {
@@ -308,7 +310,7 @@ describe("ModelRegistry runtime source cleanup", () => {
 		registry.unregisterProvider("runtime-provider");
 
 		expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
-		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);
+		expect(registry.authStorage.keys.source("runtime-provider") !== undefined).toBe(false);
 		expect(getOAuthProvider("runtime-provider")).toBeUndefined();
 		expect(registry.find("peer-provider", "peer-model")).toBeDefined();
 	});

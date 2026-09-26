@@ -1,3 +1,4 @@
+import { MCP_TOOL_NAME_PREFIX, type MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 /**
  * MCP to CustomTool bridge.
  *
@@ -15,23 +16,22 @@ import type {
 	CustomToolResult,
 	RenderResultOptions,
 } from "../extensibility/custom-tools/types";
-import { resolveLocalUrlToFile } from "../internal-urls/local-protocol";
-import type { Theme } from "../modes/theme/theme";
-import type { OutputMeta } from "../tools/output-meta";
-import { normalizeLocalScheme } from "../tools/path-utils";
+import { extractUriScheme } from "../internal-urls/parse";
+import { InternalUrlRouter } from "../internal-urls/router";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
 import { formatMCPToolFailure, MCPTransportError } from "./errors";
-import { renderMCPCall, renderMCPResult } from "./render";
+import { renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
 import type {
 	MCPAuthChallenge,
-	MCPContent,
 	MCPServerConnection,
 	MCPToolCallParams,
 	MCPToolCallResult,
 	MCPToolDefinition,
 } from "./types";
+import type { MCPContent } from "@oh-my-pi/pi-tui/tools/mcp";
 
 /** Reconnect callback: tears down a stale connection, optionally authorizing first. */
 export type MCPReconnect = (options?: { authChallenge?: MCPAuthChallenge }) => Promise<MCPServerConnection | null>;
@@ -125,20 +125,24 @@ function stripHarnessIntent(args: MCPToolArgs, inputSchema: MCPToolDefinition["i
 	return rest;
 }
 
-async function resolveOutboundLocalUrlArgs(
+/** Replace string args that are file-backed internal URLs with the local path backing them. */
+async function resolveOutboundUrlArgs(
 	value: unknown,
 	context: CustomToolContext,
 	seen: WeakSet<object> = new WeakSet(),
 ): Promise<unknown> {
 	if (typeof value === "string") {
-		const normalized = normalizeLocalScheme(value);
-		if (!normalized.startsWith("local://")) return value;
-		const localFile = await resolveLocalUrlToFile(normalized, {
+		const router = InternalUrlRouter.instance();
+		const url = router.normalize(value);
+		if (!router.canHandle(url)) return value;
+		const scheme = extractUriScheme(url);
+		if (!scheme || router.spec(scheme)?.backing !== "file") return value;
+		const located = await router.locate(url, {
 			cwd: context.sessionManager?.getCwd?.(),
 			settings: context.settings,
 			localProtocolOptions: context.localProtocolOptions,
 		});
-		return localFile?.path ?? value;
+		return located ?? value;
 	}
 	if (typeof value !== "object" || value === null) return value;
 	if (seen.has(value)) return value;
@@ -148,7 +152,7 @@ async function resolveOutboundLocalUrlArgs(
 		let resolved: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const item = value[index];
-			const next = await resolveOutboundLocalUrlArgs(item, context, seen);
+			const next = await resolveOutboundUrlArgs(item, context, seen);
 			if (next === item && !resolved) continue;
 			resolved ??= value.slice();
 			resolved[index] = next;
@@ -160,7 +164,7 @@ async function resolveOutboundLocalUrlArgs(
 	let resolved: Record<string, unknown> | undefined;
 	for (const key in input) {
 		const item = input[key];
-		const next = await resolveOutboundLocalUrlArgs(item, context, seen);
+		const next = await resolveOutboundUrlArgs(item, context, seen);
 		if (next === item && !resolved) continue;
 		resolved ??= { ...input };
 		resolved[key] = next;
@@ -171,7 +175,7 @@ async function resolveOutboundLocalUrlArgs(
 /**
  * Normalize raw tool params into the outbound `tools/call` arguments: strip
  * the harness intent field, drop optional empty placeholders the server
- * declares but doesn't require, then translate session-local files to paths
+ * declares but doesn't require, then translate file-backed internal URLs to paths
  * external MCP servers can read.
  */
 async function prepareOutboundArgs(
@@ -180,28 +184,9 @@ async function prepareOutboundArgs(
 	context: CustomToolContext,
 ): Promise<MCPToolArgs> {
 	const args = omitUnusedOptionalArgs(stripHarnessIntent(normalizeToolArgs(params), inputSchema), inputSchema);
-	return (await resolveOutboundLocalUrlArgs(args, context)) as MCPToolArgs;
+	return (await resolveOutboundUrlArgs(args, context)) as MCPToolArgs;
 }
 
-/** Details included in MCP tool results for rendering */
-export interface MCPToolDetails {
-	/** Server name */
-	serverName: string;
-	/** Original MCP tool name */
-	mcpToolName: string;
-	/** Whether the call resulted in an error */
-	isError?: boolean;
-	/** Raw content from MCP response */
-	rawContent?: MCPContent[];
-	/** Structured metadata from the MCP response */
-	mcpMeta?: Record<string, unknown>;
-	/** Provider ID (e.g., "claude", "mcp-json") */
-	provider?: string;
-	/** Provider display name (e.g., "Claude Code", "MCP Config") */
-	providerName?: string;
-	/** Structured output metadata (set by the spill wrapper when output is truncated to an artifact). */
-	meta?: OutputMeta;
-}
 /**
  * Convert MCP content to agent content while retaining image payloads.
  */
@@ -413,9 +398,6 @@ function sanitizeMCPToolNamePart(value: string, fallback: string, keepDigits: bo
 
 	return sanitized.length > 0 ? sanitized : fallback;
 }
-
-/** Registry prefix every minted MCP tool name carries. */
-const MCP_TOOL_NAME_PREFIX = "mcp__";
 
 /**
  * Shared mint pipeline. `keepDigits` selects the sanitizer variant: the
@@ -649,25 +631,6 @@ export function deduplicateMCPToolsByName<T extends MCPToolOriginSource>(tools: 
 	}
 
 	return deduplicated;
-}
-
-/**
- * Parse an MCP tool name back to server and tool components.
- *
- * Note: This returns the normalized tool name (with server prefix stripped).
- * The original MCP tool name may have had the server name as a prefix.
- */
-export function parseMCPToolName(name: string): { serverName: string; toolName: string } | null {
-	if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return null;
-
-	const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
-	const underscoreIdx = rest.indexOf("_");
-	if (underscoreIdx === -1) return null;
-
-	return {
-		serverName: rest.slice(0, underscoreIdx),
-		toolName: rest.slice(underscoreIdx + 1),
-	};
 }
 
 /**

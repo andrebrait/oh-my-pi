@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
+import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -12,17 +17,21 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createSessionDefaults } from "../helpers/session-defaults";
+
+import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 
 const tempDirs: TempDir[] = [];
 
@@ -123,7 +132,13 @@ async function createPersistedSession(
 	restrictToolNames?: boolean,
 	modelRole?: string,
 	advisor?: string,
-	contract?: { tools?: string[]; readOnly?: boolean; agent?: string; isolated?: boolean },
+	contract?: {
+		tools?: string[];
+		readOnly?: boolean;
+		agent?: string;
+		isolated?: boolean;
+		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
+	},
 ): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const sessionFile = manager.getSessionFile();
@@ -139,6 +154,9 @@ async function createPersistedSession(
 		readOnly: contract?.readOnly,
 		agent: contract?.agent,
 		isolated: contract?.isolated,
+		...(contract?.compactionThreshold !== undefined
+			? { compactionThreshold: contract.compactionThreshold }
+			: undefined),
 	});
 	manager.appendMessage({
 		role: "assistant",
@@ -161,7 +179,15 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-function createFactory(cwd: string, eventBus?: EventBus) {
+interface ReviveOwnerOptions {
+	extensionRoots?: () => EffectiveExtensionRoots;
+	preparedExtensions?: readonly PreparedExtension[];
+	authStorage?: AuthStorage;
+	modelRegistry?: ModelRegistry;
+	settings?: Settings;
+}
+
+function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptions = {}) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -170,12 +196,25 @@ function createFactory(cwd: string, eventBus?: EventBus) {
 		get sessionFile() {
 			return path.join(cwd, "parent.jsonl");
 		},
+		get effectiveExtensionRoots() {
+			return (
+				owner.extensionRoots?.() ?? {
+					explicit: [],
+					mode: "merge",
+					configured: [],
+					configuredLevel: "user",
+				}
+			);
+		},
+		get preparedExtensions() {
+			return owner.preparedExtensions;
+		},
 	} as unknown as AgentSession;
 	return createPersistedSubagentReviverFactory({
 		session: parentSession,
-		authStorage: {} as never,
-		modelRegistry: { authStorage: {} } as ModelRegistry,
-		settings: Settings.isolated(),
+		authStorage: owner.authStorage ?? ({} as never),
+		modelRegistry: owner.modelRegistry ?? ({ authStorage: {} } as ModelRegistry),
+		settings: owner.settings ?? Settings.isolated(),
 		enableLsp: true,
 		eventBus,
 	});
@@ -208,6 +247,124 @@ describe("persisted subagent revival", () => {
 		expect(initialize).toHaveBeenCalledTimes(1);
 		expect(onError).toHaveBeenCalledTimes(1);
 		expect(emit).toHaveBeenCalledWith({ type: "session_start" });
+	});
+
+	it("loads only extensions allowed by the live owner's root policy", async () => {
+		const cwd = makeTempDir("@pi-revive-owner-roots-");
+		const sessionFile = await createPersistedSession(cwd, false, "default");
+		const ownerExtension = path.join(cwd, "owner-extension.ts");
+		const ambientExtension = path.join(cwd, "ambient-extension.ts");
+		const blockedPath = path.join(cwd, "blocked.txt");
+		const ambientMarker = path.join(cwd, "ambient-ran.txt");
+		await Bun.write(blockedPath, "private fixture");
+		await Bun.write(
+			ownerExtension,
+			`export default function (pi) { pi.on("tool_call", event => {
+				if (event.toolName === "read" && event.input.path === ${JSON.stringify(blockedPath)})
+					return { block: true, reason: "Owner policy denied the read" };
+			}); }\n`,
+		);
+		await Bun.write(
+			ambientExtension,
+			`export default function (pi) { pi.on("session_start", () => Bun.write(${JSON.stringify(ambientMarker)}, "ran")); }\n`,
+		);
+		let extensionRoots: EffectiveExtensionRoots = {
+			explicit: [ambientExtension],
+			mode: "merge",
+			configured: [],
+			configuredLevel: "project",
+		};
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+		MCPManager.setInstance(new MCPManager(cwd));
+		const ref = AgentRegistry.global().register(createRef(sessionFile));
+		const reviver = await createFactory(cwd, undefined, {
+			extensionRoots: () => extensionRoots,
+			authStorage,
+			modelRegistry,
+		})(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+
+		// The policy changes after the durable ref is discovered. Revival must
+		// consult the live owner now, not retain an ambient/transcript snapshot.
+		extensionRoots = {
+			explicit: [ownerExtension],
+			mode: "explicit-only",
+			configured: [ambientExtension],
+			configuredLevel: "project",
+		};
+		let revived: AgentSession | undefined;
+		try {
+			revived = await reviver(ref);
+			const read = revived.getToolByName("read");
+			if (!read) throw new Error("Missing revived read tool");
+			await expect(read.execute("denied", { path: blockedPath })).rejects.toThrow("Owner policy denied the read");
+			expect(await Bun.file(ambientMarker).exists()).toBe(false);
+		} finally {
+			await revived?.dispose();
+			authStorage.close();
+		}
+	});
+
+	it("rebinds owner policy hooks for restricted revival without widening its tools", async () => {
+		const cwd = makeTempDir("@pi-revive-restricted-policy-");
+		const sessionFile = await createPersistedSession(cwd, true, "default");
+		const blockedPath = path.join(cwd, "blocked.txt");
+		await Bun.write(blockedPath, "private fixture");
+		const preparedExtensions: PreparedExtension[] = [
+			{
+				path: "<owner-policy>",
+				resolvedPath: "<owner-policy>",
+				factory: pi => {
+					pi.registerTool({
+						name: "owner_policy_escalation",
+						label: "Owner Policy Escalation",
+						description: "A policy fixture that must not widen the restricted tool set.",
+						parameters: type({}),
+						async execute() {
+							return { content: [{ type: "text", text: "unexpected" }] };
+						},
+					});
+					pi.on("session_start", async () => {
+						await pi.setActiveTools(["read", "bash", "owner_policy_escalation", "yield"]);
+					});
+					pi.on("tool_call", event => {
+						if (event.toolName === "read" && event.input.path === blockedPath) {
+							return { block: true, reason: "Inherited policy denied the read" };
+						}
+					});
+				},
+				error: null,
+			},
+		];
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+		const ref = AgentRegistry.global().register(createRef(sessionFile));
+		const reviver = await createFactory(cwd, undefined, {
+			preparedExtensions,
+			authStorage,
+			modelRegistry,
+		})(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+
+		let revived: AgentSession | undefined;
+		try {
+			revived = await reviver(ref);
+			const read = revived.getToolByName("read");
+			if (!read) throw new Error("Missing restricted read tool");
+			await expect(read.execute("denied", { path: blockedPath })).rejects.toThrow(
+				"Inherited policy denied the read",
+			);
+			expect(revived.getActiveToolNames()).toContain("read");
+			expect(revived.getActiveToolNames()).toContain("yield");
+			expect(revived.getEnabledToolNames()).not.toContain("bash");
+			expect(revived.getEnabledToolNames()).not.toContain("owner_policy_escalation");
+		} finally {
+			await revived?.dispose();
+			authStorage.close();
+		}
 	});
 
 	it("anchors wake-turn artifacts to the revived ref's own dir, not the root session's (#11563)", async () => {
@@ -470,11 +627,11 @@ describe("persisted subagent revival", () => {
 		}
 
 		const [advised, roleAdvised, unadvised] = captured;
-		expect(advised.get("advisor.enabled")).toBe(true);
+		expect(cfgAdvisorEnabled.get(advised)).toBe(true);
 		expect(advised.getModelRole("advisor")).toBe("moonshot/k3");
-		expect(roleAdvised.get("advisor.enabled")).toBe(true);
+		expect(cfgAdvisorEnabled.get(roleAdvised)).toBe(true);
 		expect(roleAdvised.getModelRole("advisor")).toBeUndefined();
-		expect(unadvised.get("advisor.enabled")).toBe(false);
+		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
 	});
 
 	it("restores the persisted custom model role before reopening the session", async () => {
@@ -493,6 +650,36 @@ describe("persisted subagent revival", () => {
 
 		expect(capturedOptions?.modelPattern).toEqual(["@review-fast", "anthropic/claude-sonnet-4-5"]);
 		expect(capturedOptions?.modelPatternAuthFallback).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	it("restores compaction threshold behavior after parent settings change", async () => {
+		const cwd = makeTempDir("@pi-compaction-threshold-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			compactionThreshold: { thresholdPercent: 72, thresholdTokens: -1 },
+		});
+		const parentSettings = Settings.isolated({
+			"compaction.thresholdPercent": 45,
+			"compaction.thresholdTokens": 120_000,
+		});
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { settings: parentSettings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		const revivedSettings = capturedOptions?.settings;
+		if (!revivedSettings) throw new Error("Expected revived child settings");
+		const parentCompaction = cfgCompaction.get(parentSettings);
+		const revivedCompaction = cfgCompaction.get(revivedSettings);
+		expect(shouldCompact(130_000, 200_000, parentCompaction)).toBe(true);
+		expect(resolveThresholdTokens(200_000, revivedCompaction)).toBe(144_000);
+		expect(shouldCompact(130_000, 200_000, revivedCompaction)).toBe(false);
+		expect(shouldCompact(144_001, 200_000, revivedCompaction)).toBe(true);
 	});
 
 	it("pins the persisted concrete model when the default role is revived", async () => {

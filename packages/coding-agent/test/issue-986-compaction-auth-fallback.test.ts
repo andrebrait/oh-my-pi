@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -11,7 +10,10 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 import { assistantMsg, userMsg } from "./utilities";
+
+import { cfgRetryBaseDelayMs, cfgRetryEnabled, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 describe("issue #986 compaction auth fallback", () => {
 	let tempDir: TempDir;
@@ -64,9 +66,9 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "codex-token");
+		authStorage.keys.setRuntime(currentModel.provider, "codex-token");
 		if (options?.configureFallbackAuth !== false) {
-			authStorage.setRuntimeApiKey(fallbackModel.provider, "anthropic-token");
+			authStorage.keys.setRuntime(fallbackModel.provider, "anthropic-token");
 		}
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
@@ -120,8 +122,8 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "openai-token");
-		authStorage.setRuntimeApiKey(crossProviderModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(currentModel.provider, "openai-token");
+		authStorage.keys.setRuntime(crossProviderModel.provider, "anthropic-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		session = new AgentSession({
 			agent,
@@ -270,10 +272,10 @@ describe("issue #986 compaction auth fallback", () => {
 
 	it("retries a transient native compaction failure on the same candidate", async () => {
 		const { currentModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
-		session.settings.set("retry.enabled", true);
-		session.settings.set("retry.baseDelayMs", 1);
-		session.settings.set("retry.maxRetries", 1);
-		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		cfgRetryEnabled.set(session.settings, true);
+		cfgRetryBaseDelayMs.set(session.settings, 1);
+		cfgRetryMaxRetries.set(session.settings, 1);
+		const waitSpy = mockSchedulerWaitWithClock();
 		const attemptedModels: string[] = [];
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);

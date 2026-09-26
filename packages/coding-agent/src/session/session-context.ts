@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { customMessageEntryMessage, isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { getAnthropicCompactionPayload, isTurnStartEntry } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	coerceServiceTierByFamily,
@@ -8,20 +9,15 @@ import {
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import {
-	type CustomMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
-	isCustomMessageContent,
 	isEmptyErrorTurn,
-	isUserTurnInitiator,
-	normalizeCustomMessagePayload,
 	PREWALK_PLAN_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
-import { titleTextFromSkillPrompt } from "./skill-title-input";
 import {
 	type CompactionEntry,
 	type CustomMessageEntry,
@@ -217,69 +213,6 @@ export type TranscriptEntry = SessionMessageEntry | CustomMessageEntry;
 
 export function isTranscriptEntry(entry: SessionEntry): entry is TranscriptEntry {
 	return entry.type === "message" || entry.type === "custom_message";
-}
-
-/** The message a `custom_message` entry replays as; `undefined` when its persisted content is unsendable. */
-export function customMessageEntryMessage(entry: CustomMessageEntry): CustomMessage | undefined {
-	if (!isCustomMessageContent(entry.content)) return undefined;
-	const normalized = normalizeCustomMessagePayload(entry);
-	const attribution = entry.attribution === undefined ? undefined : normalized.attribution;
-	return createCustomMessage(
-		normalized.customType,
-		normalized.content,
-		normalized.display,
-		normalized.details,
-		entry.timestamp,
-		attribution,
-	);
-}
-
-/** The message a transcript entry replays as (see {@link customMessageEntryMessage} for the custom case). */
-export function transcriptEntryMessage(entry: TranscriptEntry): AgentMessage | undefined {
-	return entry.type === "message" ? entry.message : customMessageEntryMessage(entry);
-}
-
-/**
- * True for entries that represent a user-attributed request: an ordinary user
- * message, or a custom message that initiates a user turn per the shared
- * `isUserTurnInitiator` semantics (directly invoked `/skill:` prompts and
- * writable-collab prompts). Drives rewind/copy turn selection and notes-backed
- * rollover retention, so a custom request is treated exactly like an ordinary
- * one everywhere a "user turn" matters.
- */
-export function isUserRequestEntry(entry: SessionEntry): boolean {
-	if (entry.type === "message") {
-		if (entry.message.role === "user") return true;
-		if (entry.message.role === "custom") return isUserTurnInitiator(entry.message as CustomMessage);
-		return false;
-	}
-	if (entry.type === "custom_message") {
-		const message = customMessageEntryMessage(entry);
-		return message !== undefined && isUserTurnInitiator(message);
-	}
-	return false;
-}
-
-/**
- * Editor draft that re-creates a user request when rewinding past it: the
- * prompt's text (attachments ride separately), or for a user-initiated custom
- * message the text the user actually typed — a skill prompt restores its
- * `/skill:<name>` draft, never the expanded SKILL.md body (issue #5374).
- * `undefined` for anything that is not a user request.
- */
-export function userTurnDraft(entry: TranscriptEntry): string | undefined {
-	const message = transcriptEntryMessage(entry);
-	if (!message) return undefined;
-	if (message.role === "user") return textContent(message.content);
-	if (message.role !== "custom" || !isUserTurnInitiator(message)) return undefined;
-	return titleTextFromSkillPrompt(message) ?? textContent(message.content);
-}
-
-function textContent(content: string | ReadonlyArray<{ type: string; text?: string }>): string {
-	if (typeof content === "string") return content;
-	let text = "";
-	for (const block of content) if (block.type === "text" && block.text !== undefined) text += block.text;
-	return text;
 }
 
 export function buildSessionContext(
@@ -542,20 +475,24 @@ export function buildSessionContext(
 		const compactionIdx = path.findIndex(e => e.type === "compaction" && e.id === compaction.id);
 
 		// A natively replayed summary must not invalidate the retained tail's
-		// bound thinking: stamping it with the entry commit timestamp would
-		// expose that as historyRewriteAt newer than the tail and strip its
-		// signatures on the next request. Predate the marker before the first
-		// retained entry instead (other lanes keep the commit timestamp).
-		let summaryTimestamp = compaction.timestamp;
+		// bound thinking: the commit timestamp as historyRewriteAt would be newer
+		// than the tail and strip its signatures on the next request. Predate the
+		// marker before the first retained entry instead (other lanes use the
+		// commit timestamp). The summary itself keeps the commit timestamp, which
+		// still retires the tail's pre-compaction usage reports.
+		let historyRewriteAt: number | undefined;
 		if (anthropicPayload !== undefined) {
 			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+			const snapshotIdx =
+				compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
+					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
+					: -1;
 			const firstRetained =
 				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
+				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
 				path[compactionIdx + 1];
 			const retainedAt = firstRetained ? new Date(firstRetained.timestamp).getTime() : NaN;
-			if (Number.isFinite(retainedAt)) {
-				summaryTimestamp = new Date(retainedAt - 1).toISOString();
-			}
+			if (Number.isFinite(retainedAt)) historyRewriteAt = retainedAt - 1;
 		}
 
 		// Re-attach any archived snapcompact frames so the model can keep
@@ -564,7 +501,7 @@ export function buildSessionContext(
 		const compactionSummaryMsg = createCompactionSummaryMessage(
 			compaction.summary,
 			compaction.tokensBefore,
-			summaryTimestamp,
+			compaction.timestamp,
 			{
 				shortSummary: compaction.shortSummary,
 				providerPayload,
@@ -572,6 +509,7 @@ export function buildSessionContext(
 				warning: compaction.warning,
 				method: compaction.method,
 				tokensAfter: compaction.tokensAfter,
+				historyRewriteAt,
 			},
 		);
 		// Agent context (non-transcript): summary first so the LLM sees the
@@ -611,21 +549,26 @@ export function buildSessionContext(
 			const firstKeptIdx = path.findIndex(
 				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
 			);
-			if (firstKeptIdx >= 0) {
-				let displayStartIdx = firstKeptIdx;
+			const snapshotIdx =
+				anthropicPayload && compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
+					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
+					: -1;
+			const retainedStart = firstKeptIdx >= 0 ? firstKeptIdx : snapshotIdx >= 0 ? snapshotIdx + 1 : -1;
+			if (retainedStart >= 0 && retainedStart < compactionIdx) {
+				let displayStartIdx = retainedStart;
 				if (options?.transcript) {
 					// `findCutPoint` may leave the collapsed display's kept region
 					// mid-turn. Prefer the next turn boundary, but retain the original
 					// suffix when there is no later boundary: the compaction summary
 					// does not include that kept content.
-					for (let i = firstKeptIdx; i < compactionIdx; i++) {
+					for (let i = retainedStart; i < compactionIdx; i++) {
 						if (isTurnStartEntry(path[i])) {
 							displayStartIdx = i;
 							break;
 						}
 					}
 				}
-				for (let i = firstKeptIdx; i < compactionIdx; i++) {
+				for (let i = retainedStart; i < compactionIdx; i++) {
 					const entry = path[i];
 					if (i < displayStartIdx) {
 						// Hidden assistants still consume pending resets and update the

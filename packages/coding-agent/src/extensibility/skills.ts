@@ -8,10 +8,10 @@ import {
 } from "../autolearn/managed-skills";
 import { skillCapability } from "../capability/skill";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
-import type { SkillsSettings } from "../config/settings";
+import type { SkillsSettings } from "./settings";
 import { type Skill as CapabilitySkill, isUserSourceEnabled, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
-import { allowsSkillTokens, SKILL_TOKEN_RE } from "./skill-tokens";
+import { allowsSkillTokens, SKILL_TOKEN_RE } from "@oh-my-pi/pi-tui/prompt/skill-tokens";
 import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text" };
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
 import type { SkillPromptDetails } from "../session/messages";
@@ -124,6 +124,8 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/** Disabled extension ids (`disabledExtensions`); `skill:<name>` entries hide those skills. */
+	disabledExtensions?: string[];
 	/**
 	 * Session-local extension roots. Post-startup reloads pass their live
 	 * session value so explicit roots, discovery mode, and configured

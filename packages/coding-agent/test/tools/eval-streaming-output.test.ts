@@ -5,18 +5,18 @@ import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
-import type { EvalToolDetails } from "@oh-my-pi/pi-coding-agent/eval/types";
-import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
-import { evalToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/eval-render";
-import {
-	formatOutputNotice,
-	stripOutputNotice,
-	wrapToolWithMetaNotice,
-} from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
+import { stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { removeWithRetries, sanitizeText } from "@oh-my-pi/pi-utils";
+
+import { cfgToolsOutputMaxColumns } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 function makeSession(settings = Settings.isolated()): ToolSession {
 	return {
@@ -100,7 +100,7 @@ describe("EvalTool live stdout streaming", () => {
 
 	it("preserves the column-cap notice after rebuilding the final eval summary", async () => {
 		const settings = Settings.isolated();
-		settings.set("tools.outputMaxColumns", 8);
+		cfgToolsOutputMaxColumns.set(settings, 8);
 		vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
 			_code: string,
 			options: { onChunk?: (chunk: string) => void },

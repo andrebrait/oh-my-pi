@@ -1,50 +1,47 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
-import { createAdvisorMessageCard } from "../../modes/components/advisor-message";
-import { AssistantMessageComponent } from "../../modes/components/assistant-message";
-import { createBackgroundTanDispatchBlock } from "../../modes/components/background-tan-message";
-import { BashExecutionComponent } from "../../modes/components/bash-execution";
-import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
-import { ServedModelTracker } from "../../modes/components/served-model-marker";
-import { CollabPromptMessageComponent } from "../../modes/components/collab-prompt-message";
+import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { createBackgroundTanDispatchBlock } from "@oh-my-pi/pi-tui/chat/background-tan-message";
+import { BashExecutionComponent } from "@oh-my-pi/pi-tui/chat/bash-execution";
+import { detectCacheInvalidation } from "@oh-my-pi/pi-tui/chat/cache-invalidation-marker";
+import { ServedModelTracker } from "@oh-my-pi/pi-tui/chat/served-model-marker";
+import { CollabPromptMessageComponent } from "@oh-my-pi/pi-tui/chat/collab-prompt-message";
 import {
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
 	createHandoffSummaryMessageComponent,
-} from "../../modes/components/compaction-summary-message";
-import { CustomMessageComponent } from "../../modes/components/custom-message";
-import { DynamicBorder } from "../../modes/components/dynamic-border";
-import { EvalExecutionComponent } from "../../modes/components/eval-execution";
+} from "@oh-my-pi/pi-tui/chat/compaction-summary-message";
+import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
+import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
+import { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
 import {
 	type LateDiagnosticsFile,
 	LateDiagnosticsMessageComponent,
-} from "../../modes/components/late-diagnostics-message";
+} from "@oh-my-pi/pi-tui/chat/late-diagnostics-message";
 import {
 	groupedReadUsageCallIds,
 	ReadToolGroupComponent,
 	readArgsCollapseIntoGroup,
-} from "../../modes/components/read-tool-group";
-import { SkillMessageComponent } from "../../modes/components/skill-message";
-import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
-import { ToolActivityContainer } from "../../modes/components/tool-activity";
-import {
-	ToolExecutionComponent,
-	type ToolExecutionHandle,
-	toolRenderName,
-} from "../../modes/components/tool-execution";
-import { TranscriptBlock, TranscriptContainer } from "../../modes/components/transcript-container";
-import { createUsageRowBlock, turnElapsedMs } from "../../modes/components/usage-row";
-import { UserMessageComponent } from "../../modes/components/user-message";
+} from "@oh-my-pi/pi-tui/chat/read-tool-group";
+import { SkillMessageComponent } from "@oh-my-pi/pi-tui/chat/skill-message";
+import { StrippedToolCallsPlaceholder } from "@oh-my-pi/pi-tui/chat/stripped-tool-calls-placeholder";
+import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { ToolActivityContainer } from "@oh-my-pi/pi-tui/chrome/tool-activity";
+import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { TranscriptBlock, TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { createUsageRowBlock, turnElapsedMs } from "@oh-my-pi/pi-tui/overlays/usage-row";
+import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
 import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
-import { materializeImageReferenceLinksSync } from "../../modes/image-references";
-import { videoPreviewSource } from "../../utils/video";
-import { theme } from "../../modes/theme/theme";
+import { materializeImageReferenceLinksSync } from "@oh-my-pi/pi-tui/prompt/image-references";
+import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
@@ -56,13 +53,13 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
-import { replaceTabs } from "../../tools/render-utils";
+import { replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import {
 	createAssistantMessageComponent,
 	getAssistantMessageLinkTargets,
 	refreshAssistantMessageLinkTargets,
-} from "./interactive-context-helpers";
+} from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import {
 	assistantHasVisibleContent,
 	assistantUsageIsBilled,
@@ -73,9 +70,18 @@ import {
 	normalizeToolArgs,
 	resolveAssistantErrorPresentation,
 	splitAssistantMessageToolTimeline,
-} from "./transcript-render-helpers";
+} from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 
-type TextBlock = { type: "text"; text: string };
+import {
+	cfgComposerRecallClearedDrafts,
+	cfgDisplayCacheMissMarker,
+	cfgDisplayCollapseCompacted,
+	cfgDisplayShowTokenUsage,
+	cfgDisplayShowTurnTime,
+	cfgTerminalShowImages,
+} from "../settings";
+import { cfgReadToolResultPreview } from "../../tools/settings";
+
 interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
 	clearTerminalHistory?: boolean;
@@ -120,21 +126,11 @@ function imageLinksForMessage(
 			content.type === "image" && typeof content.data === "string" && typeof content.mimeType === "string",
 	);
 	const materialized = materializeImageReferenceLinksSync(images, putBlobSync);
-	return images.map((image, index) => videoPreviewSource(image) ?? materialized?.[index]);
+	return images.map((image, index) => imageAttachmentSource(image)?.path ?? materialized?.[index]);
 }
 
 export class UiHelpers {
 	constructor(private ctx: InteractiveModeContext) {}
-
-	/** Extract text content from a user message */
-	getUserMessageText(message: Message): string {
-		if (message.role !== "user") return "";
-		const textBlocks =
-			typeof message.content === "string"
-				? [{ type: "text", text: message.content }]
-				: message.content.filter((content): content is TextBlock => content.type === "text");
-		return textBlocks.map(block => block.text).join("");
-	}
 
 	/**
 	 * Show a status message in the chat.
@@ -176,7 +172,7 @@ export class UiHelpers {
 					truncation: message.meta?.truncation,
 					artifactError: message.meta?.artifactError,
 					images: message.images,
-					showImages: settings.get("terminal.showImages"),
+					showImages: cfgTerminalShowImages.get(settings),
 				});
 				this.ctx.chatContainer.addChild(component);
 				break;
@@ -284,8 +280,8 @@ export class UiHelpers {
 			}
 			case "user":
 			case "developer": {
-				const textContent = this.ctx.getUserMessageText(message);
-				if (textContent) {
+				const userText = message.role === "user" ? textContent(message.content) : "";
+				if (userText) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
 					const cached = options?.reuseSettledComponent
 						? this.ctx.transcriptMessageComponents.get(message)
@@ -300,7 +296,11 @@ export class UiHelpers {
 								message,
 								this.ctx.viewSession.sessionManager.putBlobSync.bind(this.ctx.viewSession.sessionManager),
 							);
-						userComponent = new UserMessageComponent(textContent, { synthetic: isSynthetic, imageLinks });
+						userComponent = new UserMessageComponent(userText, {
+							synthetic: isSynthetic,
+							imageLinks,
+							liveSteered: message.role === "user" && message.liveSteered === true,
+						});
 						this.ctx.transcriptMessageComponents.set(message, userComponent);
 					}
 					this.ctx.chatContainer.addChild(userComponent);
@@ -439,8 +439,8 @@ export class UiHelpers {
 			pendingUsageTurnElapsed = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
-		// bookkeeping: a `hub` wait that found every watched job still running is
-		// superseded by the next `hub` call, so a rebuilt transcript collapses a
+		// bookkeeping: a `wait` that found every watched job still running is
+		// superseded by the next `wait` call, so a rebuilt transcript collapses a
 		// repeated-poll run to its final snapshot instead of replaying the spam.
 		let waitingPoll: ToolExecutionComponent | null = null;
 		const resolveWaitingPoll = (nextToolName?: string) => {
@@ -448,7 +448,7 @@ export class UiHelpers {
 			if (!previous) return;
 			waitingPoll = null;
 			if (
-				nextToolName === "hub" &&
+				nextToolName === "wait" &&
 				previous.isDisplaceableBlock() &&
 				this.ctx.chatContainer.canRemoveBlock(previous)
 			) {
@@ -505,7 +505,7 @@ export class UiHelpers {
 				if (assistantComponent) {
 					const usage = message.usage;
 					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
-					if (this.ctx.settings.get("display.cacheMissMarker") && !explained) {
+					if (cfgDisplayCacheMissMarker.get(this.ctx.settings) && !explained) {
 						const invalidation = detectCacheInvalidation(this.ctx.lastAssistantUsage, usage);
 						if (invalidation) assistantComponent.setCacheInvalidation(invalidation);
 					}
@@ -552,7 +552,7 @@ export class UiHelpers {
 						if (hasErrorStop && errorMessage) {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
-									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								this.ctx.chatContainer.addChild(readGroup);
@@ -566,7 +566,7 @@ export class UiHelpers {
 						} else if (afterToolSegment) {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
-									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								this.ctx.chatContainer.addChild(readGroup);
@@ -611,7 +611,7 @@ export class UiHelpers {
 						renderArgs,
 						{
 							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
-							showImages: settings.get("terminal.showImages"),
+							showImages: cfgTerminalShowImages.get(settings),
 						},
 						tool,
 						this.ctx.ui,
@@ -644,14 +644,14 @@ export class UiHelpers {
 					);
 				}
 				pendingUsage =
-					this.ctx.settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage)
+					cfgDisplayShowTokenUsage.get(this.ctx.settings) && assistantUsageIsBilled(message.usage)
 						? message.usage
 						: undefined;
 				pendingUsageDuration = message.duration;
 				pendingUsageTtft = message.ttft;
 				pendingUsageTimestamp = message.timestamp;
 				pendingReadUsageCallIds = pendingUsage ? groupedReadUsageCallIds(message) : undefined;
-				pendingUsageTurnElapsed = this.ctx.settings.get("display.showTurnTime")
+				pendingUsageTurnElapsed = cfgDisplayShowTurnTime.get(this.ctx.settings)
 					? turnElapsedMs(turnStartedAt, message)
 					: undefined;
 			} else if (message.role === "toolResult") {
@@ -671,7 +671,7 @@ export class UiHelpers {
 					if (images.length > 0 && assistantComponent) {
 						assistantComponent.setToolResultImages(message.toolCallId, images);
 						const hasText = message.content.some(c => c.type === "text");
-						if (!hasText && settings.get("terminal.showImages")) {
+						if (!hasText && cfgTerminalShowImages.get(settings)) {
 							if (pendingReadComponent) {
 								pendingReadComponent.updateResult(message, false, message.toolCallId);
 								this.ctx.pendingTools.delete(message.toolCallId);
@@ -685,7 +685,7 @@ export class UiHelpers {
 					if (!component) {
 						if (!readGroup) {
 							readGroup = new ReadToolGroupComponent({
-								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+								showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
 							this.ctx.chatContainer.addChild(readGroup);
@@ -725,7 +725,7 @@ export class UiHelpers {
 					} else {
 						this.ctx.pendingTools.delete(message.toolCallId);
 						if (
-							message.toolName === "hub" &&
+							message.toolName === "wait" &&
 							component instanceof ToolExecutionComponent &&
 							component.isDisplaceableBlock()
 						) {
@@ -878,7 +878,7 @@ export class UiHelpers {
 		// means the session was not actually rewound past it — bail before
 		// mutating anything.
 		const context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: settings.get("display.collapseCompacted"),
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 		});
 		for (const remaining of context.messages) {
 			if (remaining === message) return false;
@@ -921,7 +921,7 @@ export class UiHelpers {
 	async renderInitialMessages(options: RenderInitialMessagesOptions = {}): Promise<void> {
 		// Collapsed replay keeps in-flight calls so pending tools remain routable during mid-turn rebuilds.
 		let context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: settings.get("display.collapseCompacted"),
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		let replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
@@ -987,7 +987,7 @@ export class UiHelpers {
 				// discard the stale partial tree and replay the current session once
 				// more instead of letting a reentrant synchronous rebuild interleave.
 				context = this.ctx.viewSession.buildTranscriptSessionContext({
-					collapseCompactedHistory: settings.get("display.collapseCompacted"),
+					collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 					keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 				});
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
@@ -1053,7 +1053,7 @@ export class UiHelpers {
 	}
 
 	clearEditor(): void {
-		if (this.ctx.settings.get("composer.recallClearedDrafts")) this.ctx.editor.clearDraftForRecall();
+		if (cfgComposerRecallClearedDrafts.get(this.ctx.settings)) this.ctx.editor.clearDraftForRecall();
 		else this.ctx.editor.clearDraft();
 		this.ctx.ui.requestRender();
 	}
