@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Developer messages carrying passive tool context now include a persisted presentation marker for host UIs; providers still receive only the message role and content ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+
+## [18.3.2] - 2026-09-25
+
+### Fixed
+
+- Fixed capped Anthropic and Bedrock Claude requests with thinking enabled, including on-demand compaction, ending at `max_tokens` with no answer; every capped request now gets its effort's thinking budget on top of the requested output ([#13300](https://github.com/can1357/oh-my-pi/pull/13300) by [@alphastorm](https://github.com/alphastorm))
+
 ## [18.3.1] - 2026-09-25
 
 ### Added

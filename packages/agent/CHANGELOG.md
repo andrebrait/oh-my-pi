@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Passive tool context developer messages now carry a presentation marker so host UIs can show their provenance without inspecting instruction text ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+
+## [18.3.2] - 2026-09-25
+
+### Fixed
+
+- Fixed tool calls that put their payload in the intent field `i` (for example a file body in `write`) silently running with the leftover arguments; they now fail with an error telling the model to retry ([#13140](https://github.com/can1357/oh-my-pi/issues/13140), [#13141](https://github.com/can1357/oh-my-pi/pull/13141) by [@radkawar](https://github.com/radkawar))
+- Fixed the Anthropic compaction failure log omitting why no compaction block came back; it now names the stop reason ([#13300](https://github.com/can1357/oh-my-pi/pull/13300) by [@alphastorm](https://github.com/alphastorm))
+
 ## [18.3.1] - 2026-09-25
 
 ### Added

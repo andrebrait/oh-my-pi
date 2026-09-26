@@ -233,6 +233,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
 - `getSystemPrompt()`
+- `agent` — the agent this session runs: `{ kind: "main" | "sub", id, name, depth, parentId? }`. Factories are rebound to every subagent session (task tool, eval `agent()`, `/tan` clones), so a handler can check `ctx.agent.kind === "sub"` or the lowercased agent definition `name` (for example `"explore"`) to act only in subagents. Use `kind`, not `depth`: `depth` counts `task` nesting only, so `/tan` clones are subagents at depth 0 and report `name: "sub"`
 - `runEphemeralTurn(...)` (optional; see below)
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
 - `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
@@ -372,6 +373,8 @@ is not requeued, and explicitly cleared or replaced queues are not resurrected.
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications.
+
+Passive tool context is persisted as a marked developer message. The TUI keeps it out of the ordinary transcript and renders one sanitized dim `Context:` line on the batch's final tool card.
 
 ### Subagent lifecycle
 
