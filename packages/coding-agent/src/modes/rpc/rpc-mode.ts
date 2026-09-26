@@ -163,13 +163,14 @@ export function resolveRpcSkillInvocation(session: RpcSkillCommandSession, text:
  * and dispatches it through the full prompt pipeline (usage preflight,
  * compaction checks, provider calls). Resolves once the turn is scheduled.
  * Must not run on the RPC serial queue's response path — register it with
- * watchAndReportLocalOnlyPromptResult and answer the command first.
+ * watchAndReportPromptResult and answer the command once it is admitted.
  */
 export async function runRpcSkillCommand(
 	session: RpcSkillCommandSession,
 	invocation: RpcSkillInvocation,
 	streamingBehavior: "steer" | "followUp" = "steer",
 	prebuilt?: BuiltSkillPromptMessage,
+	onPromptAdmitted?: () => void,
 ): Promise<boolean> {
 	const built = prebuilt ?? (await buildSkillPromptMessage(invocation.skill, invocation, "user"));
 	return session.promptCustomMessage(
@@ -180,17 +181,18 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText },
+		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
 	);
 }
 
 /**
  * Skill branch of the `prompt` command: resolves the invocation cheaply, then
- * registers the slow dispatch with watchAndReportPromptResult and
- * returns immediately. The caller answers the command right away — building
- * the skill prompt and running the prompt pipeline (usage preflight,
- * compaction, provider calls) can outlast any client's prompt timeout under
- * provider stress; the plain-prompt path responds first for the same reason.
+ * registers the slow dispatch with watchAndReportPromptResult and awaits
+ * admission (or completion, for a message that settles without ever being
+ * admitted) before answering. The caller still does not wait for the full
+ * dispatch pipeline — building the skill prompt and running it (usage
+ * preflight, compaction, provider calls) can outlast any client's prompt
+ * timeout under provider stress; only queue admission gates the response.
  */
 export async function dispatchRpcSkillPrompt(input: {
 	ticket: RpcPromptTicket;
@@ -209,9 +211,12 @@ export async function dispatchRpcSkillPrompt(input: {
 	// promptCustomMessage pipeline (usage preflight, compaction, provider
 	// calls) is what moves behind the acknowledgement.
 	const built = await buildSkillPromptMessage(invocation.skill, invocation, "user");
-	watchAndReportPromptResult({
+	// A failure before admission still resolves this wait (without rejecting this
+	// call) — reportPromptResult already routed it to onError and a failed prompt_result.
+	await watchAndReportPromptResult({
 		ticket: input.ticket,
-		startPrompt: () => runRpcSkillCommand(input.session, invocation, input.streamingBehavior ?? "steer", built),
+		startPrompt: onPromptAdmitted =>
+			runRpcSkillCommand(input.session, invocation, input.streamingBehavior ?? "steer", built, onPromptAdmitted),
 		results: input.results,
 		onError: input.onError,
 		extensionUserMessageTracker: input.extensionUserMessageTracker,
@@ -1164,9 +1169,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					});
 					if (builtinResult !== false) {
 						if ("prompt" in builtinResult) {
-							watchAndReportPromptResult({
+							await watchAndReportPromptResult({
 								ticket,
-								startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+								startPrompt: onPromptAdmitted =>
+									session.prompt(builtinResult.prompt, { images: command.images, onPromptAdmitted }),
 								results: promptResults,
 								onError: onPromptError(id, "prompt"),
 								extensionUserMessageTracker,
@@ -1194,15 +1200,22 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
 					}
 
-					// Don't await - events will stream
-					// Extension commands are executed immediately, file prompt templates are expanded
-					// If streaming and streamingBehavior specified, queues via steer/followUp
-					watchAndReportPromptResult({
+					// Await admission only, not the full turn — events still stream after this
+					// response. Extension commands run immediately; file prompt templates expand;
+					// while streaming and a streamingBehavior is given, this queues via steer/followUp.
+					// Acking after admission (not on receipt) is what lets a client act on the
+					// queued message as soon as the ack arrives: `promote_queued_message` or
+					// `remove_queued_message` sent right after it finds the message, instead of
+					// returning false because image normalization or a vision description was
+					// still running. `prompt` is dispatched off the serial command chain, so this
+					// wait never holds up a later `abort`, `steer`, or `get_state`.
+					await watchAndReportPromptResult({
 						ticket,
-						startPrompt: () =>
+						startPrompt: onPromptAdmitted =>
 							session.prompt(command.message, {
 								images: command.images,
 								streamingBehavior: command.streamingBehavior,
+								onPromptAdmitted,
 							}),
 						results: promptResults,
 						onError: onPromptError(id, "prompt"),
