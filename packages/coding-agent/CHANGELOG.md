@@ -39,6 +39,9 @@
 
 - Per-tool TTSR reminders now use the trusted passive-context channel instead of being prepended to untrusted tool output ([#13266](https://github.com/can1357/oh-my-pi/pull/13266) by [@andrebrait](https://github.com/andrebrait)).
 - Added `additionalContext` to extension and hook `tool_result` results, so success- and failure-specific post-tool guidance reaches the model through the trusted developer channel instead of altering tool output ([#13267](https://github.com/can1357/oh-my-pi/pull/13267) by [@andrebrait](https://github.com/andrebrait)).
+### Changed
+
+- Passive context emitted after a tool batch now appears as one dim line on the batch's final tool card instead of remaining invisible or creating a separate transcript row ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.3.2] - 2026-09-25
 
