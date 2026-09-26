@@ -15,6 +15,12 @@ export type AgentSessionEvent =
 	| (Extract<AgentEvent, { type: "agent_end" }> & {
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
+			/**
+			 * True when the agent finished its turn: the end is terminal, or the session resumes
+			 * only for queued input or background-job results. False while the agent continues its
+			 * own work (retry, compaction continuation, stop-time reminders).
+			 */
+			yielded?: boolean;
 	  })
 	| {
 			type: "auto_compaction_start";
@@ -46,7 +52,7 @@ export type AgentSessionEvent =
 			finalError?: string;
 			retryErrors?: RetryErrorUpdate[];
 	  }
-	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
+	| { type: "retry_fallback_applied"; from: string; to: string; role: string; reason?: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
 	| { type: "model_changed" }
 	| { type: "config_warnings_changed" }
@@ -65,7 +71,12 @@ export type AgentSessionEvent =
 			/** The level `auto` resolved to this turn, once classified. */
 			resolved?: Effort;
 	  }
-	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState }
+	// Coalesced snapshot of the displayable steering/follow-up queue: emitted
+	// whenever it differs from the last `queue_update` (enqueue, dequeue on
+	// delivery, remove, clear/restore, or session switch), never on a no-op
+	// mutation. Mirrors `AgentSession.getQueuedMessages()`.
+	| { type: "queue_update"; steering: string[]; followUp: string[] };
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;

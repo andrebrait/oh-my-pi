@@ -40,7 +40,7 @@ import { createUsageRowBlock, turnElapsedMs } from "@oh-my-pi/pi-tui/overlays/us
 import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
 import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
 import { materializeImageReferenceLinksSync } from "@oh-my-pi/pi-tui/prompt/image-references";
-import { videoPreviewSource } from "@oh-my-pi/pi-tui/prompt/video";
+import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
@@ -71,6 +71,16 @@ import {
 	resolveAssistantErrorPresentation,
 	splitAssistantMessageToolTimeline,
 } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
+
+import {
+	cfgComposerRecallClearedDrafts,
+	cfgDisplayCacheMissMarker,
+	cfgDisplayCollapseCompacted,
+	cfgDisplayShowTokenUsage,
+	cfgDisplayShowTurnTime,
+	cfgTerminalShowImages,
+} from "../settings";
+import { cfgReadToolResultPreview } from "../../tools/settings";
 
 interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
@@ -116,7 +126,7 @@ function imageLinksForMessage(
 			content.type === "image" && typeof content.data === "string" && typeof content.mimeType === "string",
 	);
 	const materialized = materializeImageReferenceLinksSync(images, putBlobSync);
-	return images.map((image, index) => videoPreviewSource(image) ?? materialized?.[index]);
+	return images.map((image, index) => imageAttachmentSource(image)?.path ?? materialized?.[index]);
 }
 
 export class UiHelpers {
@@ -162,7 +172,7 @@ export class UiHelpers {
 					truncation: message.meta?.truncation,
 					artifactError: message.meta?.artifactError,
 					images: message.images,
-					showImages: settings.get("terminal.showImages"),
+					showImages: cfgTerminalShowImages.get(settings),
 				});
 				this.ctx.chatContainer.addChild(component);
 				break;
@@ -286,7 +296,11 @@ export class UiHelpers {
 								message,
 								this.ctx.viewSession.sessionManager.putBlobSync.bind(this.ctx.viewSession.sessionManager),
 							);
-						userComponent = new UserMessageComponent(userText, { synthetic: isSynthetic, imageLinks });
+						userComponent = new UserMessageComponent(userText, {
+							synthetic: isSynthetic,
+							imageLinks,
+							liveSteered: message.role === "user" && message.liveSteered === true,
+						});
 						this.ctx.transcriptMessageComponents.set(message, userComponent);
 					}
 					this.ctx.chatContainer.addChild(userComponent);
@@ -425,8 +439,8 @@ export class UiHelpers {
 			pendingUsageTurnElapsed = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
-		// bookkeeping: a `hub` wait that found every watched job still running is
-		// superseded by the next `hub` call, so a rebuilt transcript collapses a
+		// bookkeeping: a `wait` that found every watched job still running is
+		// superseded by the next `wait` call, so a rebuilt transcript collapses a
 		// repeated-poll run to its final snapshot instead of replaying the spam.
 		let waitingPoll: ToolExecutionComponent | null = null;
 		const resolveWaitingPoll = (nextToolName?: string) => {
@@ -434,7 +448,7 @@ export class UiHelpers {
 			if (!previous) return;
 			waitingPoll = null;
 			if (
-				nextToolName === "hub" &&
+				nextToolName === "wait" &&
 				previous.isDisplaceableBlock() &&
 				this.ctx.chatContainer.canRemoveBlock(previous)
 			) {
@@ -491,7 +505,7 @@ export class UiHelpers {
 				if (assistantComponent) {
 					const usage = message.usage;
 					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
-					if (this.ctx.settings.get("display.cacheMissMarker") && !explained) {
+					if (cfgDisplayCacheMissMarker.get(this.ctx.settings) && !explained) {
 						const invalidation = detectCacheInvalidation(this.ctx.lastAssistantUsage, usage);
 						if (invalidation) assistantComponent.setCacheInvalidation(invalidation);
 					}
@@ -538,7 +552,7 @@ export class UiHelpers {
 						if (hasErrorStop && errorMessage) {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
-									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								this.ctx.chatContainer.addChild(readGroup);
@@ -552,7 +566,7 @@ export class UiHelpers {
 						} else if (afterToolSegment) {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
-									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								this.ctx.chatContainer.addChild(readGroup);
@@ -597,7 +611,7 @@ export class UiHelpers {
 						renderArgs,
 						{
 							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
-							showImages: settings.get("terminal.showImages"),
+							showImages: cfgTerminalShowImages.get(settings),
 						},
 						tool,
 						this.ctx.ui,
@@ -630,14 +644,14 @@ export class UiHelpers {
 					);
 				}
 				pendingUsage =
-					this.ctx.settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage)
+					cfgDisplayShowTokenUsage.get(this.ctx.settings) && assistantUsageIsBilled(message.usage)
 						? message.usage
 						: undefined;
 				pendingUsageDuration = message.duration;
 				pendingUsageTtft = message.ttft;
 				pendingUsageTimestamp = message.timestamp;
 				pendingReadUsageCallIds = pendingUsage ? groupedReadUsageCallIds(message) : undefined;
-				pendingUsageTurnElapsed = this.ctx.settings.get("display.showTurnTime")
+				pendingUsageTurnElapsed = cfgDisplayShowTurnTime.get(this.ctx.settings)
 					? turnElapsedMs(turnStartedAt, message)
 					: undefined;
 			} else if (message.role === "toolResult") {
@@ -657,7 +671,7 @@ export class UiHelpers {
 					if (images.length > 0 && assistantComponent) {
 						assistantComponent.setToolResultImages(message.toolCallId, images);
 						const hasText = message.content.some(c => c.type === "text");
-						if (!hasText && settings.get("terminal.showImages")) {
+						if (!hasText && cfgTerminalShowImages.get(settings)) {
 							if (pendingReadComponent) {
 								pendingReadComponent.updateResult(message, false, message.toolCallId);
 								this.ctx.pendingTools.delete(message.toolCallId);
@@ -671,7 +685,7 @@ export class UiHelpers {
 					if (!component) {
 						if (!readGroup) {
 							readGroup = new ReadToolGroupComponent({
-								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+								showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
 							this.ctx.chatContainer.addChild(readGroup);
@@ -711,7 +725,7 @@ export class UiHelpers {
 					} else {
 						this.ctx.pendingTools.delete(message.toolCallId);
 						if (
-							message.toolName === "hub" &&
+							message.toolName === "wait" &&
 							component instanceof ToolExecutionComponent &&
 							component.isDisplaceableBlock()
 						) {
@@ -864,7 +878,7 @@ export class UiHelpers {
 		// means the session was not actually rewound past it — bail before
 		// mutating anything.
 		const context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: settings.get("display.collapseCompacted"),
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 		});
 		for (const remaining of context.messages) {
 			if (remaining === message) return false;
@@ -907,7 +921,7 @@ export class UiHelpers {
 	async renderInitialMessages(options: RenderInitialMessagesOptions = {}): Promise<void> {
 		// Collapsed replay keeps in-flight calls so pending tools remain routable during mid-turn rebuilds.
 		let context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: settings.get("display.collapseCompacted"),
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		let replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
@@ -973,7 +987,7 @@ export class UiHelpers {
 				// discard the stale partial tree and replay the current session once
 				// more instead of letting a reentrant synchronous rebuild interleave.
 				context = this.ctx.viewSession.buildTranscriptSessionContext({
-					collapseCompactedHistory: settings.get("display.collapseCompacted"),
+					collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
 					keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 				});
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
@@ -1039,7 +1053,7 @@ export class UiHelpers {
 	}
 
 	clearEditor(): void {
-		if (this.ctx.settings.get("composer.recallClearedDrafts")) this.ctx.editor.clearDraftForRecall();
+		if (cfgComposerRecallClearedDrafts.get(this.ctx.settings)) this.ctx.editor.clearDraftForRecall();
 		else this.ctx.editor.clearDraft();
 		this.ctx.ui.requestRender();
 	}
@@ -1107,10 +1121,16 @@ export class UiHelpers {
 		this.ctx.ui.requestComponentRender(this.ctx.pendingMessagesContainer);
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {
+	queueCompactionMessage(
+		text: string,
+		mode: "steer" | "followUp",
+		images?: ImageContent[],
+		options?: { preserveDraft?: boolean },
+	): void {
 		const queuedImages = images && images.length > 0 ? images : undefined;
 		this.ctx.compactionQueuedMessages.push({ text, mode, images: queuedImages } as CompactionQueuedMessage);
-		this.ctx.editor.clearDraft(text);
+		if (options?.preserveDraft) this.ctx.editor.addToHistory(text);
+		else this.ctx.editor.clearDraft(text);
 		this.ctx.updatePendingMessagesDisplay();
 		this.ctx.showStatus(
 			queuedImages ? "Queued message with image for after compaction" : "Queued message for after compaction",

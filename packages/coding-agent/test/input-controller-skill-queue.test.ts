@@ -255,6 +255,25 @@ describe("InputController skill queue chip metadata", () => {
 		});
 	});
 
+	it("keeps a draft typed while a Ctrl+Enter skill submission was failing", async () => {
+		const { ctx, editor, promptCustomMessage, showError } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: true,
+		});
+		promptCustomMessage.mockImplementation(async () => {
+			// The user keeps typing while dispatch is in flight.
+			editor.setText("typed while dispatching");
+			throw new Error("dispatch failed");
+		});
+		const controller = new InputController(ctx);
+
+		editor.setText("/skill:test-skill go");
+		await controller.handleFollowUp();
+
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("/skill:test-skill go\n\ntyped while dispatching");
+	});
+
 	it("streaming follow-up applies builtin slash commands instead of queueing them", async () => {
 		const { ctx, editor, prompt, handleGoalModeCommand } = createStubInputControllerContext({
 			skillCommands,
@@ -532,7 +551,7 @@ interface SessionFixture {
 async function createRealSession(): Promise<SessionFixture> {
 	const tempDir = TempDir.createSync("@pi-skill-queue-real-");
 	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected built-in anthropic model to exist");
