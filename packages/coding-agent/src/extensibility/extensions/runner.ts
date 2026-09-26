@@ -2,12 +2,14 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type {
-	AgentMessage,
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
+import {
+	type AgentMessage,
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	isNonBlankContext,
+	joinAdditionalContext,
 } from "@oh-my-pi/pi-agent-core";
 import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import {
@@ -18,12 +20,14 @@ import {
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
+import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
@@ -46,6 +50,7 @@ import type {
 	ContextUsage,
 	Extension,
 	ExtensionActions,
+	ExtensionAgentIdentity,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -444,6 +449,14 @@ interface ToolRegistrationScope {
 	closed: boolean;
 }
 
+/** Identity reported by a session that is not a subagent and received no explicit identity. */
+export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
+	kind: "main",
+	id: MAIN_AGENT_ID,
+	name: MAIN_AGENT_RULE_NAME,
+	depth: 0,
+});
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
@@ -623,6 +636,8 @@ export class ExtensionRunner {
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+		/** Identity of the agent this runner's session runs; defaults to the top-level agent. */
+		private readonly agent: ExtensionAgentIdentity = TOP_LEVEL_AGENT,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -1249,6 +1264,7 @@ export class ExtensionRunner {
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
 			isProjectTrusted: () => true,
+			agent: this.agent,
 			get model() {
 				return getModel();
 			},
@@ -1511,10 +1527,16 @@ export class ExtensionRunner {
 		return result as RunnerEmitResult<TEvent>;
 	}
 
+	/**
+	 * Emit `tool_result` to every subscribed extension. Returns the full
+	 * `content`/`details`/`isError` triple only when a handler modified the
+	 * result; joined `additionalContext` rides along whenever any handler set it.
+	 */
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
+		const contexts: string[] = [];
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("tool_result");
@@ -1542,15 +1564,20 @@ export class ExtensionRunner {
 					currentEvent.isError = handlerResult.isError;
 					modified = true;
 				}
+				if (isNonBlankContext(handlerResult.additionalContext)) {
+					contexts.push(handlerResult.additionalContext);
+				}
 			}
 		}
 
-		if (!modified) return undefined;
+		const additionalContext = joinAdditionalContext(contexts);
+		if (!modified) return additionalContext === undefined ? undefined : { additionalContext };
 
 		return {
 			content: currentEvent.content,
 			details: currentEvent.details,
 			isError: currentEvent.isError,
+			...(additionalContext !== undefined ? { additionalContext } : {}),
 		};
 	}
 
