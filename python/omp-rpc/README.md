@@ -128,9 +128,9 @@ with RpcClient(no_session=True) as client:
 `prompt_and_wait()` waits for its own `prompt_result` rather than the first
 terminal `agent_end`, so a late `agent_end` from an earlier run cannot end it
 early. The returned `PromptTurn.result` holds that `PromptResultEvent`
-(`status` is `"completed"`, `"aborted"`, or `"error"`); it is `None` when the
-server handled the prompt locally (e.g. a slash command) and answered with
-`agentInvoked: false`. `wait_for_idle()` returns once every prompt this client
+(`status` is `"completed"`, `"aborted"`, or `"error"`); it is `None` only when
+an older server answered a local-only prompt (e.g. a slash command) with
+`agentInvoked: false` on its response instead of a `prompt_result`. `wait_for_idle()` returns once every prompt this client
 submitted has received its `prompt_result`.
 
 ### Yielded vs. settled

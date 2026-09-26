@@ -151,10 +151,10 @@ describe("RPC queued-message editing", () => {
 		]);
 	}, 30_000);
 
-	test("acknowledges a queued streaming prompt only once it is admitted, so an immediate promote succeeds", async () => {
+	test("promotes a queued streaming prompt sent immediately after its acknowledgement", async () => {
 		// 1x1 PNG. Below resizeImage's 200px minimum, so normalizeImagesForModel
-		// does real native resize/encode work — the async gap between the old
-		// (pre-fix) immediate ack and actual queue admission.
+		// does real native resize/encode work — the async gap between the prompt's
+		// acknowledgement and its queue admission, which promotion must wait through.
 		const image = {
 			type: "image" as const,
 			mimeType: "image/png",
@@ -180,7 +180,7 @@ describe("RPC queued-message editing", () => {
 			const queuedId = await client.prompt("queued with image", [image], "followUp");
 			expect(await client.promoteQueuedMessage("queued with image")).toEqual({ promoted: true });
 
-			// Admission-gated acknowledgement does not change completion: each accepted
+			// Promotion waiting for admission does not change completion: each accepted
 			// prompt still gets exactly one prompt_result under its own id.
 			await withTimeout(bothReported.promise, 10_000, "Prompts never reported their results");
 			await client.getState();

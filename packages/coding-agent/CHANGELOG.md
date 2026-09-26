@@ -11,16 +11,20 @@
 
 ### Changed
 
-- RPC `prompt` (including a `/skill:` invocation sent through it) now acknowledges only once the message is admitted — queued onto its steer/follow-up/aside queue, an idle turn started for it, or routed to an extension command — so a `promote_queued_message` sent right after the acknowledgement reliably finds a message queued moments earlier ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC `remove_queued_message` and `promote_queued_message` now wait until every earlier accepted input has been queued or otherwise routed, so a queue edit sent right after a `prompt` acknowledgement (including a `/skill:` invocation sent through it) reliably finds a message queued moments earlier ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC `prompt` responses no longer carry `data.agentInvoked`: builtin, skill, and native input-handler routing now runs after the acknowledgement, so every accepted `prompt`/`abort_and_prompt` completes through its `prompt_result`, and input cancelled during interception reports `status: "aborted"` ([#13027](https://github.com/can1357/oh-my-pi/pull/13027) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
 - Cancelling a concurrently queued prompt now preserves the other prompt's hidden keyword context instead of removing it with the cancelled message ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 - Hidden attachment context and its queued prompt are now claimed together in `one-at-a-time` mode, preventing successful cancellation after only the companion has been delivered ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
 - Queued RPC skill commands retain their original invocation for cancellation, and queue editing no longer treats agent-attributed user-role messages as user input ([#11872](https://github.com/can1357/oh-my-pi/pull/11872) by [@andrebrait](https://github.com/andrebrait)).
-- RPC `prompt` admission no longer blocks `abort`, `steer`, `follow_up`, or `get_state` behind slow image normalization or vision-model description, and an `abort` that lands while a prompt is still admitting now drops that prompt instead of starting it afterward ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- RPC `prompt` admission no longer blocks `abort` or `get_state` behind slow input handlers, image normalization, or vision-model description, and an `abort` that lands while a prompt is still admitting now drops that prompt instead of starting it afterward ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - A path-pasted image or video sent as an aside while the agent is busy now reaches the model with its source path ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - Native extension input handlers now intercept main-session Ctrl+Enter, including queued input, with consistent transformations ([#11834](https://github.com/can1357/oh-my-pi/pull/11834) by [@andrebrait](https://github.com/andrebrait)).
+- Native extension input handlers now intercept RPC submissions, including queued input, with consistent transformations, local-only completion, serialized RPC abort cleanup, and cancellation of queued attachments still being prepared ([#13027](https://github.com/can1357/oh-my-pi/pull/13027) by [@andrebrait](https://github.com/andrebrait)).
+- Skill invocations through RPC retain normalized attachments and receive vision descriptions for text-only models, including queued turns ([#13027](https://github.com/can1357/oh-my-pi/pull/13027) by [@andrebrait](https://github.com/andrebrait)).
+- RPC image prompts retain submission order during preparation, and queued prompts keep hidden notices with their user message instead of starting orphaned turns ([#13027](https://github.com/can1357/oh-my-pi/pull/13027) by [@andrebrait](https://github.com/andrebrait)).
 - Ctrl+Enter restores submitted text and attachments alongside newer drafts when a builtin command throws an error ([#13026](https://github.com/can1357/oh-my-pi/pull/13026) by [@andrebrait](https://github.com/andrebrait)).
 ### Changed
 

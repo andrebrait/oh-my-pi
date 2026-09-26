@@ -626,8 +626,7 @@ export class RpcClient {
 
 	/**
 	 * Send a prompt to the agent.
-	 * Returns the request id once the message is admitted (dispatched, queued via
-	 * `streamingBehavior` while the agent is busy, or routed to an extension command);
+	 * Returns the request id once accepted, before input handlers or routing run;
 	 * use onEvent() to receive streaming events and onPromptResult() to observe its
 	 * completion under that id.
 	 */

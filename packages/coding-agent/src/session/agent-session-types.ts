@@ -362,14 +362,13 @@ export interface PromptOptions {
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
 	/**
-	 * Called synchronously once this prompt is admitted: idle, at the start of
-	 * #promptWithMessage's own turn setup (before preflight, image
-	 * normalization, or provider dispatch); while streaming, once the message
-	 * is pushed onto its steer/follow-up/aside queue (after image
-	 * normalization and vision-description preprocessing for that prompt); or
-	 * is routed to an extension command, before its handler runs. Admission is
-	 * not proof that a model call will occur. A prompt dropped, cancelled, or
-	 * failed before admission still only settles through the returned promise.
+	 * Called synchronously once this prompt is admitted: it acquires an idle turn slot
+	 * (before asynchronous preflight or provider dispatch), its message is pushed onto its
+	 * steer/follow-up/aside queue (after that prompt's attachment preparation), or it is
+	 * routed to an extension command (before the command handler runs). Admission is not
+	 * proof that a model call will occur. Otherwise locally handled, cancelled, or failed
+	 * prompts settle without admission; hosts ordering input must also observe the returned
+	 * prompt promise to release their wait.
 	 */
 	onPromptAdmitted?: () => void;
 }

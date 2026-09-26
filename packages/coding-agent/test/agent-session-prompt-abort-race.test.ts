@@ -81,7 +81,7 @@ describe("AgentSession prompt admission racing abort", () => {
 			await session.abort({ reason: USER_INTERRUPT_LABEL });
 			releaseNormalize.resolve();
 
-			expect(await promptPromise).toBe(true);
+			expect(await promptPromise).toBe(false);
 			expect(admitted).toBe(false);
 			expect(dropped).toEqual(["go while normalizing"]);
 			expect(streamCalls).toEqual([]);

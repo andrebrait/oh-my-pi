@@ -2,10 +2,9 @@
  * A prompt routed to a registered extension command is admitted (fires
  * PromptOptions.onPromptAdmitted) once the command is resolved, before its
  * handler runs — not only after the handler finishes. Without this, an RPC
- * `prompt` whose message names a registered extension command would block
- * its acknowledgement on the handler's full duration instead of just routing,
- * reintroducing the "can outlast any client's prompt timeout" problem the
- * admission-gated ack is meant to avoid.
+ * `prompt` whose message names a registered extension command would hold later
+ * RPC input (and queue edits waiting on it) behind the handler's full duration
+ * instead of just routing.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";

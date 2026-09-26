@@ -22,11 +22,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { dispatchRpcSkillPrompt, tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import {
-	RpcExtensionUserMessageTracker,
-	RpcPromptResults,
-} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-prompt-results";
+import { tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { cfgMagicKeyword, cfgMagicKeywordsEnabled } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -795,11 +791,8 @@ describe("AgentSession queued steer delivery", () => {
 			session.agent.setOnBeforeYield(async () => {
 				if (injected) return;
 				injected = true;
-				const queued = Promise.withResolvers<void>();
-				const results = new RpcPromptResults(session, () => {});
-				await dispatchRpcSkillPrompt({
-					ticket: results.begin("queued-skill"),
-					session: {
+				await tryRunRpcSkillCommand(
+					{
 						skillsSettings: { enableSkillCommands: true },
 						skills: [
 							{
@@ -810,19 +803,11 @@ describe("AgentSession queued steer delivery", () => {
 								source: "project",
 							},
 						],
-						async promptCustomMessage(message, options) {
-							const result = await session.promptCustomMessage(message, options);
-							queued.resolve();
-							return result;
-						},
+						promptCustomMessage: session.promptCustomMessage.bind(session),
 					},
-					message: invocation,
-					streamingBehavior: "followUp",
-					results,
-					onError: error => queued.reject(error),
-					extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
-				});
-				await withTimeout(queued.promise, 2_000, "Skill did not reach the native queue");
+					invocation,
+					"followUp",
+				);
 				promoted = session.promoteQueuedMessage(invocation);
 				queueAfterPromotion = session.getQueuedMessages();
 				promotedAgain = session.promoteQueuedMessage(invocation);
