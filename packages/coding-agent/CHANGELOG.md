@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Issue and PR references to other repositories are now written as `owner/repo#N` or full URLs, not as `#N` links that point to the working directory's repository
+- Issue and PR references to other repositories are now written as `owner/repo#N` or full URLs, not as `#N` links that point to the working directory's repository ([#13523](https://github.com/can1357/oh-my-pi/pull/13523) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 

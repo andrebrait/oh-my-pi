@@ -4,7 +4,7 @@
 
 ### Added
 
-- `owner/repo#N` in Markdown prose now links to the GitHub issue or PR
+- `owner/repo#N` in Markdown prose now links to the GitHub issue or PR ([#13523](https://github.com/can1357/oh-my-pi/pull/13523) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.3.5] - 2026-09-27
 
