@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Issue and PR references to other repositories are now written as `owner/repo#N` or full URLs, not as `#N` links that point to the working directory's repository
+
 ### Fixed
 
 - Fixed `omp update` and other one-shot commands on Windows printing "ended before completing" and exiting 1 after they had actually completed ([#13470](https://github.com/can1357/oh-my-pi/issues/13470))

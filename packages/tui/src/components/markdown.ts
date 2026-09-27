@@ -938,11 +938,11 @@ const FAST_SWATCH_SEAM_RE = /#[0-9a-fA-F]{0,2}$/;
 // lead — would normalize to different bytes than the plain concat.
 const FAST_ENTITY_SEAM_RE = /&(?:[A-Za-z0-9#]{0,31}|#[0-9]{1,7};|#[xX][0-9a-fA-F]{1,6};)$/;
 
-// A bare URL/email anywhere in the delta or across the seam (a URL the regex
-// cut at a trailing delimiter can re-link once the delta supplies more chars;
-// a protocol head ending at the seam completes in the delta) makes the full
-// re-lex autolink while the plain concat would not.
-const FAST_URL_ANYWHERE_RE = /(?:https?|ftp):\/\/|www\.[A-Za-z0-9]|[A-Za-z0-9._%+-]+@/i;
+// A bare URL/email/`owner/repo#N` anywhere in the delta or across the seam (a
+// URL the regex cut at a trailing delimiter can re-link once the delta supplies
+// more chars; a protocol head ending at the seam completes in the delta) makes
+// the full re-lex autolink while the plain concat would not.
+const FAST_URL_ANYWHERE_RE = /(?:https?|ftp):\/\/|www\.[A-Za-z0-9]|[A-Za-z0-9._%+-]+@|\/[\w.-]*#\d/i;
 
 // A bare-URL/email PREFIX may end at the seam and complete in the delta
 // (`ht` + `tps://x`, `foo@` + `bar.com`).
@@ -1403,6 +1403,16 @@ function formatHyperlink(text: string, target: string): string {
 	}
 
 	return `\x1b]8;;${safeTarget}\x07${text}\x1b]8;;\x07`;
+}
+
+// `owner/repo#N` in prose links to GitHub, which redirects `/issues/N` to PRs.
+const REPO_REF_REGEX = /(?<![\w./-])([A-Za-z0-9][A-Za-z0-9-]*\/[\w.-]+)#(\d+)(?!\w)/g;
+
+function linkRepoRefs(text: string): string {
+	if (!text.includes("#")) return text;
+	return text.replace(REPO_REF_REGEX, (ref, repo, n) =>
+		formatHyperlink(ref, `https://github.com/${repo}/issues/${n}`),
+	);
 }
 
 function isAsciiTextSizingPayload(text: string): boolean {
@@ -3190,7 +3200,7 @@ export class Markdown implements Component {
 					if (token.tokens && token.tokens.length > 0) {
 						result += this.#renderInlineTokens(token.tokens, resolvedStyleContext);
 					} else {
-						result += renderTextWithSwatches(text, applyTextWithNewlines, swatchGlyph);
+						result += renderTextWithSwatches(text, t => applyTextWithNewlines(linkRepoRefs(t)), swatchGlyph);
 					}
 					break;
 				}
@@ -3224,7 +3234,11 @@ export class Markdown implements Component {
 
 				case "link": {
 					markHtmlItemWhenContent(token.text);
-					const linkText = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
+					// Drop repo-ref links from the label: nested OSC 8 would replace the href.
+					const linkText = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext).replace(
+						/\x1b\]8;;[^\x07]*\x07/g,
+						"",
+					);
 					const styledLinkText = this.#theme.link(this.#theme.underline(linkText));
 					const href = typeof token.href === "string" ? token.href : "";
 					const target = (href && this.#theme.resolveLink?.(href)) || href;

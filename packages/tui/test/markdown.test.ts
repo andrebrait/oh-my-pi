@@ -1429,6 +1429,24 @@ bar`,
 			return { visible, targets };
 		}
 
+		it("links owner/repo#N to the owning GitHub repo, not paths or bare #N", () => {
+			const text = "See can1357/oh-my-pi#12, a/b/c#3, #4 and `x/y#5`";
+			const { visible, targets } = inspectHyperlinks(new Markdown(text, 0, 0, defaultMarkdownTheme).render(80)[0]!);
+			const targetOf = (s: string) => targets[visible.indexOf(s)];
+			expect(targetOf("can1357/oh-my-pi#12")).toBe("https://github.com/can1357/oh-my-pi/issues/12");
+			expect(targetOf("#12")).toBe("https://github.com/can1357/oh-my-pi/issues/12");
+			expect(targetOf("a/b/c#3")).toBeNull();
+			expect(targetOf("b/c#3")).toBeNull();
+			expect(targetOf("#4")).toBeNull();
+			expect(targetOf("x/y#5")).toBeNull();
+		});
+
+		it("keeps an explicit link's href when its label is owner/repo#N", () => {
+			const md = new Markdown("[a/b#1](https://example.com/x)", 0, 0, defaultMarkdownTheme);
+			const { visible, targets } = inspectHyperlinks(md.render(80)[0]!);
+			expect(targets[visible.indexOf("a/b#1")]).toBe("https://example.com/x");
+		});
+
 		it("should not duplicate URL for autolinked emails", () => {
 			const markdown = new Markdown("Contact user@example.com for help", 0, 0, defaultMarkdownTheme);
 

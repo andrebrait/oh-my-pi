@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `owner/repo#N` in Markdown prose now links to the GitHub issue or PR
+
 ## [18.3.5] - 2026-09-27
 
 ### Added
