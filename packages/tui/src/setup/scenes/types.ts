@@ -81,7 +81,6 @@ export interface SetupSceneController extends Component {
 	routeMouse?(event: SgrMouseEvent, line: number, col: number): void;
 }
 
-
 /** Versioned onboarding scene definition. */
 export interface SetupScene {
 	id: string;
