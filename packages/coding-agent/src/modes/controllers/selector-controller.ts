@@ -26,6 +26,13 @@ import { reset as resetCapabilities } from "../../capability";
 import type { AdvisorConfigScope } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { showGitOverlay } from "../../cli/git-tui";
 import { formatLoginIdentity } from "../../cli/oauth-terminal";
+import {
+	addCustomProvider,
+	customProviderContext,
+	getCustomProvider,
+	removeCustomProvider,
+	updateCustomProvider,
+} from "../../config/custom-provider";
 import { acquireModelRoleMutation, modelPresetSavedMessage, saveModelPreset } from "../../config/model-presets";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -988,6 +995,13 @@ export class SelectorController {
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
+				},
+				providerEditor: {
+					get: id => getCustomProvider(id, undefined, this.ctx.session.modelRegistry.authStorage),
+					add: values => addCustomProvider(values, customProviderContext(this.ctx.session.modelRegistry)),
+					update: (id, update) =>
+						updateCustomProvider(id, update, customProviderContext(this.ctx.session.modelRegistry)),
+					remove: id => removeCustomProvider(id, customProviderContext(this.ctx.session.modelRegistry)),
 				},
 				onCancel: () => done(),
 			},
