@@ -215,3 +215,24 @@ describe("collab host compaction → guest sync (#9781)", () => {
 		expect(withFollowup.at(-1)).toMatchObject({ role: "user", content: "after" });
 	});
 });
+
+describe("collab guest replica identity", () => {
+	it("gives the replica its own session id, so a guest never contends for the host's ownership lease", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		const host = new CollabHost(makeHostContext(hostManager));
+		await host.start("ws://localhost:8788");
+		cleanups.push(() => host.stop("test done"));
+		const harness = makeGuestHarness(model, modelRegistry);
+		cleanups.push(harness.dispose);
+
+		await harness.guest.join(host.link);
+		await settleFrames(() => harness.session.messages.length === 1);
+
+		// The lease is keyed by session id: sharing the host's id would make a
+		// guest on the host's machine displace the host (or be displaced).
+		const replica = harness.session.sessionManager;
+		expect(replica.getSessionId()).not.toBe(hostManager.getSessionId());
+		expect(replica.getHeader()?.parentSession).toBe(hostManager.getSessionId());
+	});
+});

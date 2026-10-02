@@ -447,7 +447,17 @@ export class CollabGuestLink {
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
-		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
+		// The replica is a second journal of the host's session. Ownership is
+		// keyed by session id, so it takes its own id (child of the host's, as a
+		// sibling move does): a guest on the host's machine must not contend
+		// with the host for the host's lease.
+		const header = {
+			...pending.header,
+			id: Bun.randomUUIDv7(),
+			parentSession: pending.header.id,
+			providerPromptCacheKey: pending.header.providerPromptCacheKey ?? pending.header.id,
+		};
+		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
 		if (this.#left) return;
 

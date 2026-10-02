@@ -14,6 +14,8 @@
 - Subagent MCP calls now honor the parent transport's configured deadline, including `OMP_MCP_TIMEOUT_MS` and `timeout: 0`, instead of discarding long-running results at an independent 60-second proxy timeout ([#13862](https://github.com/can1357/oh-my-pi/pull/13862) by [@NikkeTryHard](https://github.com/NikkeTryHard)).
 - Fixed a fresh setup with no model configured failing its first turn with "Thinking effort high is not supported" when the auto-picked provider default has no effort levels (e.g. Devin's `swe-1-6`); the default thinking level is now fitted to the picked model ([#13657](https://github.com/can1357/oh-my-pi/pull/13657) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed the `read` tool hanging, and the TUI ignoring every keystroke, when reading `/dev/stdin`, a FIFO, or another non-regular file; such paths are now rejected ([#13585](https://github.com/can1357/oh-my-pi/pull/13585) by [@DrFaustus-vic](https://github.com/DrFaustus-vic))
+- Fixed resuming a session through a symlink or hard link to a file another omp process is writing: the resumed session no longer mixes its turns into that file and continues in a new file next to it ([#13973](https://github.com/can1357/oh-my-pi/pull/13973) by [@andrebrait](https://github.com/andrebrait))
+- Fixed moving a session to another directory replacing a session file there that another omp process is writing, or moving a session another process is writing; the move now stops with an error and leaves both files untouched ([#13973](https://github.com/can1357/oh-my-pi/pull/13973) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.4.10] - 2026-10-02
 

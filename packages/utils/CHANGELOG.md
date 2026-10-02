@@ -5,6 +5,7 @@
 ### Added
 
 - Added `getSkillDescriptionsDbPath()` and `getPredictStateDir()`, XDG-aware paths that adopt legacy data on first XDG resolution ([#13648](https://github.com/can1357/oh-my-pi/pull/13648) by [@Parsifa1](https://github.com/Parsifa1))
+- Added the public `getSessionOwnersDir()` utility, which returns the profile-independent `~/.omp/run/session-owners` directory that names session ownership leases ([#13973](https://github.com/can1357/oh-my-pi/pull/13973) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 
