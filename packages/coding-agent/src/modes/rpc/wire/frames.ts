@@ -183,6 +183,10 @@ export const frameDefs = {
 		{
 			type: "'entry'",
 			entry: JSON_OBJECT,
+			"leafId?": doc(
+				"string | null",
+				"The host's active leaf when the entry was announced; absent from older hosts.",
+			),
 			seq: "number.integer",
 		},
 		"Socket clients: a session-file append.",
@@ -310,7 +314,17 @@ export const frameDefs = {
 		"Extension UI request, discriminated by `method`.",
 	),
 	AskAnswer: doc(
-		{ id: "string", selectedOptions: "string[]", "customInput?": "string" },
+		{
+			id: "string",
+			selectedOptions: "string[]",
+			"customInput?": "string",
+			"customInputImages?": doc(
+				"ImageContent[]",
+				"Images pasted into the free text; their `[Image #N]` markers sit in it.",
+			),
+			"note?": doc("string", "The user's note on the answer."),
+			"noteImages?": "ImageContent[]",
+		},
 		"Answer to one `ask` question: exact option labels, plus optional free text.",
 	),
 	ValueUiResponse: doc(
@@ -329,8 +343,12 @@ export const frameDefs = {
 		{ type: "'extension_ui_response'", id: "string", answers: "AskAnswer[]" },
 		"Answers an `ask` request: one `AskAnswer` per question, in question order.",
 	),
+	ChatUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", chat: "true" },
+		"Declines an `ask` request to discuss it instead; distinct from cancelling.",
+	),
 	ExtensionUiResponse: doc(
-		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse",
+		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse",
 		"Host reply to an extension UI request; variants share `type` and differ by their payload key.",
 	),
 

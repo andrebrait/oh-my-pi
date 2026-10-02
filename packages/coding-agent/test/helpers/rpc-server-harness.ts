@@ -62,6 +62,7 @@ export async function createTestSession(
 	mock: MockModelOptions,
 	gate?: Promise<void>,
 	options: {
+		passiveReplica?: boolean;
 		/** No session file: the host keeps the transcript in memory, so it has no artifacts directory. */
 		inMemory?: boolean;
 		/** A real extension `input` handler (through `ExtensionRunner`): runs for every user input, text as sent. */
@@ -104,6 +105,7 @@ export async function createTestSession(
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry,
 		extensionRunner,
+		passiveReplica: options.passiveReplica,
 	});
 }
 
