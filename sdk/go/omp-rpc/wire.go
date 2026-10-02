@@ -5153,10 +5153,14 @@ func (v CommandOutputEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"command_output"`, nil)
 }
 
-// A builtin slash command changed the session title.
+// The session title changed.
 type SessionInfoUpdateEvent struct {
 	SessionID string  `json:"sessionId"`
 	Title     *string `json:"title,omitempty"`
+	// Socket clients: the session was relocated (`/move`, `/wt`); where it lives now.
+	Origin *SessionOrigin `json:"origin,omitempty"`
+	// Host sequence number; socket clients only.
+	Seq *int64 `json:"seq,omitempty"`
 }
 
 func (v *SessionInfoUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -5169,6 +5173,8 @@ func (v *SessionInfoUpdateEvent) decodeFrom(raw map[string]json.RawMessage) erro
 	d.constant("type", "session_info_update")
 	d.required("sessionId", &out.SessionID)
 	d.optional("title", &out.Title)
+	d.optional("origin", &out.Origin)
+	d.optional("seq", &out.Seq)
 	if d.err != nil {
 		return d.err
 	}
@@ -5181,10 +5187,12 @@ func (v SessionInfoUpdateEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"session_info_update"`, nil)
 }
 
-// A builtin slash command changed the model configuration.
+// The live model or thinking level changed.
 type ConfigUpdateEvent struct {
 	Model         *ModelInfo     `json:"model,omitempty"`
 	ThinkingLevel *ThinkingLevel `json:"thinkingLevel,omitempty"`
+	// Host sequence number; socket clients only.
+	Seq *int64 `json:"seq,omitempty"`
 }
 
 func (v *ConfigUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -5197,6 +5205,7 @@ func (v *ConfigUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "config_update")
 	d.optional("model", &out.Model)
 	d.optional("thinkingLevel", &out.ThinkingLevel)
+	d.optional("seq", &out.Seq)
 	if d.err != nil {
 		return d.err
 	}

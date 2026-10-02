@@ -1141,18 +1141,24 @@ export interface CommandOutputEvent {
 	text: string;
 }
 
-/** A builtin slash command changed the session title. */
+/** The session title changed. */
 export interface SessionInfoUpdateEvent {
 	type: "session_info_update";
 	sessionId: string;
 	title?: string;
+	/** Socket clients: the session was relocated (`/move`, `/wt`); where it lives now. */
+	origin?: SessionOrigin;
+	/** Host sequence number; socket clients only. */
+	seq?: number;
 }
 
-/** A builtin slash command changed the model configuration. */
+/** The live model or thinking level changed. */
 export interface ConfigUpdateEvent {
 	type: "config_update";
 	model?: ModelInfo;
 	thinkingLevel?: ThinkingLevel;
+	/** Host sequence number; socket clients only. */
+	seq?: number;
 }
 
 /** An event could not fit within the transport limits and was dropped. */

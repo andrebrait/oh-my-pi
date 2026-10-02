@@ -1361,18 +1361,24 @@ class CommandOutputEvent:
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class SessionInfoUpdateEvent:
-    """A builtin slash command changed the session title."""
+    """The session title changed."""
     type: Literal["session_info_update"] = "session_info_update"
     session_id: str
     title: str | None = None
+    origin: SessionOrigin | None = None
+    """Socket clients: the session was relocated (`/move`, `/wt`); where it lives now."""
+    seq: int | None = None
+    """Host sequence number; socket clients only."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class ConfigUpdateEvent:
-    """A builtin slash command changed the model configuration."""
+    """The live model or thinking level changed."""
     type: Literal["config_update"] = "config_update"
     model: ModelInfo | None = None
     thinking_level: ThinkingLevel | None = None
+    seq: int | None = None
+    """Host sequence number; socket clients only."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2824,6 +2830,8 @@ def parse_session_info_update_event(value: object, path: str = "SessionInfoUpdat
     return SessionInfoUpdateEvent(
         session_id=required(payload, "sessionId", decode_str, path),
         title=optional(payload, "title", decode_str, path),
+        origin=optional(payload, "origin", parse_session_origin, path),
+        seq=optional(payload, "seq", decode_int, path),
     )
 
 
@@ -2833,6 +2841,7 @@ def parse_config_update_event(value: object, path: str = "ConfigUpdateEvent") ->
     return ConfigUpdateEvent(
         model=optional(payload, "model", parse_model_info, path),
         thinking_level=optional(payload, "thinkingLevel", _decode_thinking_level, path),
+        seq=optional(payload, "seq", decode_int, path),
     )
 
 
@@ -3762,11 +3771,11 @@ class WireClient:
         return self._listen("command_output", listener)
 
     def on_session_info_update(self, listener: Callable[[SessionInfoUpdateEvent], None]) -> Callable[[], None]:
-        """Subscribe to `session_info_update`: A builtin slash command changed the session title."""
+        """Subscribe to `session_info_update`: The session title changed."""
         return self._listen("session_info_update", listener)
 
     def on_config_update(self, listener: Callable[[ConfigUpdateEvent], None]) -> Callable[[], None]:
-        """Subscribe to `config_update`: A builtin slash command changed the model configuration."""
+        """Subscribe to `config_update`: The live model or thinking level changed."""
         return self._listen("config_update", listener)
 
     def on_attached(self, listener: Callable[[AttachedEvent], None]) -> Callable[[], None]:

@@ -76,11 +76,14 @@ import type {
 	RpcClientInfo,
 	RpcClientsChangedFrame,
 	RpcCommand,
+	RpcCommandOutputFrame,
+	RpcConfigUpdateFrame,
 	RpcEntryFrame,
 	RpcExtensionUIRequest,
 	RpcHostToolDefinition,
 	RpcResponse,
 	RpcResumedFrame,
+	RpcSessionInfoUpdateFrame,
 	RpcSessionOrigin,
 	RpcSessionReplacedFrame,
 	RpcSessionState,
@@ -1167,7 +1170,7 @@ export class RpcServer {
 				title: session.sessionName,
 				sessionId: session.sessionId,
 				origin: this.#origin(),
-			},
+			} satisfies Omit<RpcSessionInfoUpdateFrame, "seq">,
 			toSequenced,
 		);
 		this.onSessionRelocated?.(session.sessionManager.getSessionFile(), session.sessionManager.getCwd());
@@ -1267,6 +1270,19 @@ export class RpcServer {
 		this.#broadcast({ type: "available_commands_update", commands: await buildAvailableSlashCommands(this.session) });
 	};
 
+	/** `config_update` with the live model and thinking level, to every connection or only `deliver`'s audience. */
+	#broadcastConfigUpdate(deliver?: (conn: RpcConnection, frame: object) => void): void {
+		const { session } = this;
+		this.#broadcast(
+			{
+				type: "config_update",
+				model: session.model,
+				thinkingLevel: session.thinkingLevel,
+			} satisfies RpcConfigUpdateFrame,
+			deliver,
+		);
+	}
+
 	/**
 	 * Admit one prompt, steer, follow-up or abort_and_prompt in accept order across every connection. Native
 	 * `input` hooks run in submission order and hold later input through skill image preparation, not through
@@ -1325,7 +1341,7 @@ export class RpcServer {
 					settings: session.settings,
 					cwd: session.sessionManager.getCwd(),
 					output: commandOutput =>
-						conn.send({ type: "command_output", text: commandOutput }),
+						conn.send({ type: "command_output", text: commandOutput } satisfies RpcCommandOutputFrame),
 					refreshCommands: this.#emitAvailableCommandsUpdate,
 					reloadPlugins: this.#reloadPluginState,
 					runCommandInBackground: task => this.#shutdownCoordinator.track(task()),
@@ -1334,14 +1350,10 @@ export class RpcServer {
 							type: "session_info_update",
 							title: session.sessionName,
 							sessionId: session.sessionId,
-						});
+						} satisfies RpcSessionInfoUpdateFrame);
 					},
 					notifyConfigChanged: async () => {
-						this.#broadcast({
-							type: "config_update",
-							model: session.model,
-							thinkingLevel: session.thinkingLevel,
-						});
+						this.#broadcastConfigUpdate();
 					},
 				});
 				if (!isCurrent()) return "cancelled";
@@ -1818,6 +1830,7 @@ export class RpcServer {
 					return rpcError(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
 				}
 				await session.setModel(model);
+				this.#broadcastConfigUpdate(toSequenced);
 				return rpcSuccess(id, "set_model", model);
 			}
 
@@ -1826,6 +1839,7 @@ export class RpcServer {
 				if (!result) {
 					return rpcSuccess(id, "cycle_model", null);
 				}
+				this.#broadcastConfigUpdate(toSequenced);
 				return rpcSuccess(id, "cycle_model", result);
 			}
 
@@ -1841,6 +1855,7 @@ export class RpcServer {
 
 			case "set_thinking_level": {
 				session.setThinkingLevel(command.level);
+				this.#broadcastConfigUpdate(toSequenced);
 				return rpcSuccess(id, "set_thinking_level");
 			}
 
@@ -1849,6 +1864,7 @@ export class RpcServer {
 				if (!level) {
 					return rpcSuccess(id, "cycle_thinking_level", null);
 				}
+				this.#broadcastConfigUpdate(toSequenced);
 				return rpcSuccess(id, "cycle_thinking_level", { level });
 			}
 

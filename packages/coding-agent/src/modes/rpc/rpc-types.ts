@@ -417,6 +417,41 @@ export interface RpcClientsChangedFrame {
 	seq: number;
 }
 
+/** Output of a builtin slash command run by this client's `prompt`; sent to that connection only, never stamped with `seq`. */
+export interface RpcCommandOutputFrame {
+	type: "command_output";
+	text: string;
+}
+
+/** The live model or thinking level changed. `seq` is present for sequenced clients only. */
+export interface RpcConfigUpdateFrame {
+	type: "config_update";
+	model?: Model;
+	thinkingLevel?: ThinkingLevel;
+	seq?: number;
+}
+
+/** The session title changed. `seq` is present for sequenced clients only. */
+export interface RpcSessionInfoUpdateFrame {
+	type: "session_info_update";
+	title?: string;
+	sessionId: string;
+	/** Sequenced clients only: the session was relocated (`/move`, `/wt`), so this is where it lives now. */
+	origin?: RpcSessionOrigin;
+	seq?: number;
+}
+
+/** Every frame `RpcClient.onHostFrame` delivers: the session-host handshake, replica updates, and state notices. */
+export type RpcHostFrame =
+	| RpcAttachedFrame
+	| RpcResumedFrame
+	| RpcEntryFrame
+	| RpcSessionReplacedFrame
+	| RpcClientsChangedFrame
+	| RpcCommandOutputFrame
+	| RpcConfigUpdateFrame
+	| RpcSessionInfoUpdateFrame;
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;

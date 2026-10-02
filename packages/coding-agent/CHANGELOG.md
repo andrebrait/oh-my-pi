@@ -265,6 +265,12 @@
 - Added `omp --mode host`: a detached session host that several RPC clients can attach to over a local socket or named pipe, with resume, dialog arbitration, and stale-write protection.
 - Added `omp attach` to list running session hosts (`--json` for scripts).
 - Added `RpcClient.detach()` and `RpcClient.exit()` for session hosts; `RpcCommandError` now carries `epoch`, `leafId`, and `hostId` when the host returns them.
+- Added `RpcClient.onHostFrame()` for typed session-host frames (`RpcHostFrame`: `attached`, `resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`, `config_update`, `session_info_update`; stamped frames keep their `seq`) and `RpcClient.onClose()` for a transport that ended without `stop()`; `prompt`, `steer`, `followUp`, `removeQueuedMessage`, `setModel`, `cycleModel`, `setThinkingLevel`, and `cycleThinkingLevel` accept optional `ifEpoch`/`ifLeaf` preconditions.
+- Session hosts send `config_update` to every attached socket client after `set_model`, `cycle_model`, `set_thinking_level`, or `cycle_thinking_level`, so peers show the live model and thinking level; stdio output is unchanged.
+
+### Changed
+
+- `RpcClient.steer()`, `followUp()`, and `setThinkingLevel()` now reject with `RpcCommandError` when the server reports a failure instead of resolving silently.
 
 ### Fixed
 
