@@ -69,6 +69,12 @@ export interface RpcAgentProcess {
 	peekStderr(): string;
 	kill(signal?: Parameters<ptree.ChildProcess["kill"]>[0], graceMs?: number): void;
 	exited: Promise<number>;
+	/**
+	 * Protocol version the transport already established before `ready` (a
+	 * session host `hello` with `protocolVersion: 2`). Frames may arrive v2
+	 * chunked from the first one, and `start()` skips `negotiate_protocol`.
+	 */
+	protocolVersion?: RpcProtocolVersion;
 }
 
 export interface RpcClientOptions {
@@ -298,13 +304,24 @@ function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): A
 
 /** Failed RPC command; `code` mirrors the server's machine-readable error code when present. */
 export class RpcCommandError extends Error {
+	/** `stale`: the host's current session epoch. */
+	readonly epoch?: number;
+	/** `stale`: the host's current session leaf. */
+	readonly leafId?: string | null;
+	/** `session_hosted`: the host that owns the requested session. */
+	readonly hostId?: string;
+
 	constructor(
 		message: string,
 		readonly command: string,
 		readonly code?: string,
+		details: { epoch?: number; leafId?: string | null; hostId?: string } = {},
 	) {
 		super(message);
 		this.name = "RpcCommandError";
+		this.epoch = details.epoch;
+		this.leafId = details.leafId;
+		this.hostId = details.hostId;
 	}
 }
 
@@ -403,7 +420,8 @@ export class RpcClient {
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
 		let protocolV2Supported = false;
-		let protocolV2Enabled = false;
+		// A transport that established v2 can chunk the frames right behind `ready`.
+		let protocolV2Enabled = "protocolVersion" in child && child.protocolVersion === 2;
 		const frameDecoder = new RpcFrameDecoder();
 
 		const reapAfterOutputFailure = async (error: Error) => {
@@ -506,7 +524,9 @@ export class RpcClient {
 
 		try {
 			await readyPromise;
-			if (protocolV2Supported) {
+			if (protocolV2Enabled) {
+				this.#protocolVersion = 2;
+			} else if (protocolV2Supported) {
 				protocolV2Enabled = true;
 				const response = await this.#send({ type: "negotiate_protocol", protocolVersion: 2 });
 				if (
@@ -739,6 +759,18 @@ export class RpcClient {
 	 */
 	async abort(): Promise<void> {
 		await this.#send({ type: "abort" });
+	}
+
+	/** Session host: leave the session running and close this client. */
+	async detach(): Promise<void> {
+		this.#getData(await this.#send({ type: "detach" }));
+		await this.stop();
+	}
+
+	/** Session host: detach, or stop the host when this is its last client. */
+	async exit(): Promise<void> {
+		this.#getData(await this.#send({ type: "exit" }));
+		await this.stop();
 	}
 
 	/**
@@ -1674,7 +1706,7 @@ export class RpcClient {
 	#getData<T>(response: RpcResponse): T {
 		if (!response.success) {
 			const errorResponse = response as Extract<RpcResponse, { success: false }>;
-			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code);
+			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code, errorResponse);
 		}
 		// Type assertion: we trust response.data matches T based on the command sent.
 		// This is safe because each public method specifies the correct T for its command.
