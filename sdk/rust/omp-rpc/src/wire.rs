@@ -4059,6 +4059,160 @@ pub struct RpcFrameErrorEvent {
 	pub original_type: Option<String>,
 }
 
+/// A connected session-host client, as listed in snapshots and `clients_changed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientInfo {
+	#[serde(rename = "clientId")]
+	pub client_id: String,
+	pub kind: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub label: Option<String>,
+}
+
+/// Where a host session lives, for resolving `local://` URLs and relative paths in what it authored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionOrigin {
+	pub cwd: String,
+	#[serde(rename = "artifactsDir", deserialize_with = "Deserialize::deserialize")]
+	pub artifacts_dir: Option<String>,
+	#[serde(rename = "localRoot")]
+	pub local_root: String,
+	#[serde(rename = "sessionId")]
+	pub session_id: String,
+}
+
+/// The in-flight message of a mid-turn join; later frames for it carry `messageId`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamingMessage {
+	#[serde(rename = "messageId")]
+	pub message_id: String,
+	pub message: AgentMessage,
+}
+
+/// The session as the `entry` frames have announced it: everything a socket client needs to render it from scratch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+	pub state: SessionState,
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub header: Option<Map<String, Value>>,
+	pub entries: Vec<Map<String, Value>>,
+	#[serde(rename = "leafId", deserialize_with = "Deserialize::deserialize")]
+	pub leaf_id: Option<String>,
+	/// Open extension dialogs a late joiner can answer.
+	#[serde(rename = "pendingUi")]
+	pub pending_ui: Vec<ExtensionUiRequest>,
+	pub clients: Vec<ClientInfo>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub streaming: Option<StreamingMessage>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub origin: Option<SessionOrigin>,
+}
+
+/// Socket clients: first frame of a fresh attach; later frames carry a greater `seq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachedEvent {
+	#[serde(rename = "hostId")]
+	pub host_id: String,
+	#[serde(rename = "clientId")]
+	pub client_id: String,
+	pub epoch: i64,
+	pub seq: i64,
+	pub snapshot: SessionSnapshot,
+}
+
+/// Socket clients: first frame of a resume; the `replayed` frames after `lastSeq` follow it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumedEvent {
+	pub epoch: i64,
+	pub replayed: i64,
+}
+
+/// Socket clients: a session-file append.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntryEvent {
+	pub entry: Map<String, Value>,
+	pub seq: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SessionReplacedReason {
+	#[serde(rename = "new")]
+	New,
+	#[serde(rename = "resume")]
+	Resume,
+	#[serde(rename = "fork")]
+	Fork,
+	#[serde(rename = "tree")]
+	Tree,
+}
+
+impl SessionReplacedReason {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::New => "new",
+			Self::Resume => "resume",
+			Self::Fork => "fork",
+			Self::Tree => "tree",
+		}
+	}
+}
+
+/// Socket clients: the host now serves a different session or transcript; `snapshot` replaces the client's view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReplacedEvent {
+	pub epoch: i64,
+	pub reason: SessionReplacedReason,
+	pub snapshot: SessionSnapshot,
+	pub seq: i64,
+	#[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
+	pub session_file: Option<String>,
+}
+
+/// Socket clients: client presence changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientsChangedEvent {
+	pub clients: Vec<ClientInfo>,
+	pub seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientIdentity {
+	pub kind: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+	/// Receive extension UI requests.
+	pub ui: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumePoint {
+	#[serde(rename = "hostId")]
+	pub host_id: String,
+	pub epoch: i64,
+	#[serde(rename = "lastSeq")]
+	pub last_seq: i64,
+}
+
+/// First frame a session-host socket client sends; anything else, or a wrong token, gets `unauthorized` and a close.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelloFrame {
+	pub r#type: LitHello,
+	pub token: String,
+	/// 1 or 2, as `negotiate_protocol` would select.
+	#[serde(rename = "protocolVersion")]
+	pub protocol_version: i64,
+	pub client: ClientIdentity,
+	pub capabilities: ClientCapabilities,
+	/// Ignored, so the client gets `attached`, unless `hostId` names this host.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resume: Option<ResumePoint>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WidgetPlacement {
 	#[serde(rename = "aboveEditor")]
@@ -4611,6 +4765,26 @@ pub struct RpcResponse {
 	/// Machine-readable failure reason, when one applies.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<String>,
+	/// `stale`: the host's current session epoch.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub epoch: Option<i64>,
+	/// `stale`: the session's current leaf.
+	#[serde(rename = "leafId", default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
+	/// `session_hosted`: the host that owns the session.
+	#[serde(rename = "hostId", default, skip_serializing_if = "Option::is_none")]
+	pub host_id: Option<String>,
+}
+
+/// Write preconditions any command may carry beside `id`/`type`, honored for session-host socket clients only; on mismatch the command fails with `code: "stale"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RpcPreconditions {
+	/// Run only while the host's session epoch equals this.
+	#[serde(rename = "ifEpoch", default, skip_serializing_if = "Option::is_none")]
+	pub if_epoch: Option<i64>,
+	/// Run only while the session leaf equals this entry id (`null`: empty session).
+	#[serde(rename = "ifLeaf", default, skip_serializing_if = "Option::is_none")]
+	pub if_leaf: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4690,6 +4864,16 @@ pub enum RpcNotification {
 	SessionInfoUpdate(SessionInfoUpdateEvent),
 	/// A builtin slash command changed the model configuration.
 	ConfigUpdate(ConfigUpdateEvent),
+	/// Socket clients: first frame of a fresh attach; later frames carry a greater `seq`.
+	Attached(AttachedEvent),
+	/// Socket clients: first frame of a resume; the `replayed` frames after `lastSeq` follow it.
+	Resumed(ResumedEvent),
+	/// Socket clients: a session-file append.
+	Entry(EntryEvent),
+	/// Socket clients: the host now serves a different session or transcript; `snapshot` replaces the client's view.
+	SessionReplaced(SessionReplacedEvent),
+	/// Socket clients: client presence changed.
+	ClientsChanged(ClientsChangedEvent),
 	/// An event could not fit within the transport limits and was dropped.
 	RpcFrameError(RpcFrameErrorEvent),
 	/// A session event, discriminated by `type`; `set_event_filter` selects which are sent.
@@ -4718,6 +4902,11 @@ impl RpcNotification {
 			Some("command_output") => |value| serde_json::from_value(value).map(Self::CommandOutput),
 			Some("session_info_update") => |value| serde_json::from_value(value).map(Self::SessionInfoUpdate),
 			Some("config_update") => |value| serde_json::from_value(value).map(Self::ConfigUpdate),
+			Some("attached") => |value| serde_json::from_value(value).map(Self::Attached),
+			Some("resumed") => |value| serde_json::from_value(value).map(Self::Resumed),
+			Some("entry") => |value| serde_json::from_value(value).map(Self::Entry),
+			Some("session_replaced") => |value| serde_json::from_value(value).map(Self::SessionReplaced),
+			Some("clients_changed") => |value| serde_json::from_value(value).map(Self::ClientsChanged),
 			Some("rpc_frame_error") => |value| serde_json::from_value(value).map(Self::RpcFrameError),
 			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
 			_ => |value| Ok(Self::Unknown(value)),
@@ -4745,6 +4934,11 @@ impl Serialize for RpcNotification {
 			Self::CommandOutput(member) => serialize_tagged(member, &[("type", "command_output")], serializer),
 			Self::SessionInfoUpdate(member) => serialize_tagged(member, &[("type", "session_info_update")], serializer),
 			Self::ConfigUpdate(member) => serialize_tagged(member, &[("type", "config_update")], serializer),
+			Self::Attached(member) => serialize_tagged(member, &[("type", "attached")], serializer),
+			Self::Resumed(member) => serialize_tagged(member, &[("type", "resumed")], serializer),
+			Self::Entry(member) => serialize_tagged(member, &[("type", "entry")], serializer),
+			Self::SessionReplaced(member) => serialize_tagged(member, &[("type", "session_replaced")], serializer),
+			Self::ClientsChanged(member) => serialize_tagged(member, &[("type", "clients_changed")], serializer),
 			Self::RpcFrameError(member) => serialize_tagged(member, &[("type", "rpc_frame_error")], serializer),
 			Self::RpcAgentEvent(member) => member.serialize(serializer),
 			Self::Unknown(value) => value.serialize(serializer),
@@ -4777,7 +4971,7 @@ impl RpcServerFrame {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("response") => |value| serde_json::from_value(value).map(Self::Response),
 			Some("host_tool_call" | "host_tool_cancel" | "host_uri_request" | "host_uri_cancel") => |value| serde_json::from_value(value).map(Self::RpcHostRequest),
-			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
+			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "command_output" | "session_info_update" | "config_update" | "attached" | "resumed" | "entry" | "session_replaced" | "clients_changed" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5414,6 +5608,27 @@ impl<'de> Deserialize<'de> for LitCompleted {
 	}
 }
 
+/// The constant `"hello"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitHello;
+
+impl Serialize for LitHello {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str("hello")
+	}
+}
+
+impl<'de> Deserialize<'de> for LitHello {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_str() == Some("hello") {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected \"hello\", got {value}")))
+		}
+	}
+}
+
 /// The constant `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LitTrue;
@@ -5554,6 +5769,36 @@ impl Command for NegotiateProtocolCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<NegotiateProtocolResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Session-host socket clients: leave; the session keeps running. Unknown on stdio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DetachCommand {}
+
+impl Command for DetachCommand {
+	const NAME: &'static str = "detach";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
+	}
+}
+
+/// Session-host socket clients: leave, and stop the host when no other client remains. Unknown on stdio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExitCommand {}
+
+impl Command for ExitCommand {
+	const NAME: &'static str = "exit";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
 	}
 }
 

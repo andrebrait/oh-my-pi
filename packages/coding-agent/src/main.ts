@@ -1742,9 +1742,15 @@ export async function runRootCommand(
 			process.exit(0);
 		}
 
-		if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
+		if (
+			(parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "host") &&
+			parsedArgs.fileArgs.length > 0
+		) {
 			process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 			process.exit(1);
+		}
+		if (parsedArgs.mode === "host" && !parsedArgs.hostId) {
+			throw new CliUsageError("--mode host requires --host-id <16 lowercase hex digits>");
 		}
 		// A pending invalid `--mode` leaves `mode` unset; report it (exit 2) at the
 		// post-extension recheck before judging `--no-ui` against the mode.
@@ -1785,7 +1791,7 @@ export async function runRootCommand(
 		// Classify the host before opening auth or settings storage so every
 		// session-critical database connection picks the right busy timeout.
 		// See getDbBusyTimeoutMs().
-		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp" || mode === "host";
 		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
 		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 		// Without a terminal on stdin the TUI cannot run, so such a launch is always
@@ -1855,7 +1861,7 @@ export async function runRootCommand(
 			// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
 			cfgToolsApprovalMode.override(settingsInstance, "yolo");
 		}
-		if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
+		if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "host") {
 			applyProtocolDefaults("rpc", settingsInstance);
 		} else if (parsedArgs.mode === "acp") {
 			applyProtocolDefaults("acp", settingsInstance);
@@ -1876,14 +1882,15 @@ export async function runRootCommand(
 		const credentialScopedCacheHydration = logger.time("hydrateCredentialScopedModelCaches", () =>
 			modelRegistry.hydrateCredentialScopedModelCaches(),
 		);
-		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
+		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "host") {
 			Bun.env.PI_NO_PTY = "1";
 		}
 		if (
 			parsedArgs.noTitle ||
 			parsedArgs.mode === "rpc" ||
 			parsedArgs.mode === "rpc-ui" ||
-			parsedArgs.mode === "acp"
+			parsedArgs.mode === "acp" ||
+			parsedArgs.mode === "host"
 		) {
 			Bun.env.PI_NO_TITLE = "1";
 		}
@@ -2180,7 +2187,8 @@ export async function runRootCommand(
 		);
 		sessionOptions.authStorage = authStorage;
 		sessionOptions.modelRegistry = modelRegistry;
-		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
+		// A host routes tool UI over the protocol to its UI-capable clients, as `rpc-ui` does.
+		sessionOptions.hasUI = isInteractive || mode === "rpc-ui" || mode === "host";
 		sessionOptions.settingsApproval = isInteractive;
 		sessionOptions.settings = settingsInstance;
 		sessionOptions.onPrewalkWarning = warning => {
@@ -2509,7 +2517,7 @@ export async function runRootCommand(
 				process.exit(1);
 			}
 
-			if (mode === "rpc" || mode === "rpc-ui" || isInteractive) {
+			if (mode === "rpc" || mode === "rpc-ui" || mode === "host" || isInteractive) {
 				// Long-lived hosts apply on-disk config edits (config.yml, project
 				// settings, `--config` overlays) live. No-op unless this is the
 				// persisting process-global instance.
@@ -2527,6 +2535,27 @@ export async function runRootCommand(
 					headless: parsedArgs.noUi === true,
 					subagentEventBus,
 					input: rpcInput,
+				});
+			} else if (mode === "host") {
+				// Branch-only protocol runner: keep session host code out of normal interactive startup.
+				const { exitAfterHostDispose, runSessionHost } = await import("./session-host/host");
+				stopStartupWatchdog();
+				// The host is a long-lived server: stop recording spans, or every later session and subagent
+				// appends to the timing tree for its life.
+				logger.endTiming();
+				// A closed terminal must not end the host (spec D7). postmortem's SIGHUP handler runs its
+				// cleanup and exits 129, so it is replaced rather than joined. SIGTERM/SIGINT keep postmortem's
+				// exit, whose cleanup disposes the session and withdraws the registry entry (runSessionHost
+				// registers both).
+				process.removeAllListeners("SIGHUP");
+				process.on("SIGHUP", () => {});
+				await runSessionHost(session, {
+					hostId: parsedArgs.hostId!,
+					registryDir: parsedArgs.hostRegistryDir,
+					setToolUIContext,
+					headless: false,
+					subagentEventBus,
+					onExit: () => exitAfterHostDispose(session),
 				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);

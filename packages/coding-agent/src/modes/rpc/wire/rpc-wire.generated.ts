@@ -1061,6 +1061,111 @@ export interface RpcFrameErrorEvent {
 	originalType?: string;
 }
 
+/** A connected session-host client, as listed in snapshots and `clients_changed`. */
+export interface ClientInfo {
+	clientId: string;
+	kind: string;
+	label?: string;
+}
+
+/** Where a host session lives, for resolving `local://` URLs and relative paths in what it authored. */
+export interface SessionOrigin {
+	cwd: string;
+	artifactsDir: string | null;
+	localRoot: string;
+	sessionId: string;
+}
+
+/** The in-flight message of a mid-turn join; later frames for it carry `messageId`. */
+export interface StreamingMessage {
+	messageId: string;
+	message: AgentMessage;
+}
+
+/** The session as the `entry` frames have announced it: everything a socket client needs to render it from scratch. */
+export interface SessionSnapshot {
+	state: SessionState;
+	header: Record<string, unknown> | null;
+	entries: Record<string, unknown>[];
+	leafId: string | null;
+	/** Open extension dialogs a late joiner can answer. */
+	pendingUi: ExtensionUiRequest[];
+	clients: ClientInfo[];
+	streaming?: StreamingMessage;
+	origin?: SessionOrigin;
+}
+
+/** Socket clients: first frame of a fresh attach; later frames carry a greater `seq`. */
+export interface AttachedEvent {
+	type: "attached";
+	hostId: string;
+	clientId: string;
+	epoch: number;
+	seq: number;
+	snapshot: SessionSnapshot;
+}
+
+/** Socket clients: first frame of a resume; the `replayed` frames after `lastSeq` follow it. */
+export interface ResumedEvent {
+	type: "resumed";
+	epoch: number;
+	replayed: number;
+}
+
+/** Socket clients: a session-file append. */
+export interface EntryEvent {
+	type: "entry";
+	entry: Record<string, unknown>;
+	seq: number;
+}
+
+export type SessionReplacedReason = "new" | "resume" | "fork" | "tree";
+
+/** Socket clients: the host now serves a different session or transcript; `snapshot` replaces the client's view. */
+export interface SessionReplacedEvent {
+	type: "session_replaced";
+	epoch: number;
+	reason: SessionReplacedReason;
+	snapshot: SessionSnapshot;
+	seq: number;
+	sessionFile?: string;
+}
+
+/** Socket clients: client presence changed. */
+export interface ClientsChangedEvent {
+	type: "clients_changed";
+	clients: ClientInfo[];
+	seq: number;
+}
+
+export interface ClientIdentity {
+	kind: string;
+	label?: string;
+}
+
+export interface ClientCapabilities {
+	/** Receive extension UI requests. */
+	ui: boolean;
+}
+
+export interface ResumePoint {
+	hostId: string;
+	epoch: number;
+	lastSeq: number;
+}
+
+/** First frame a session-host socket client sends; anything else, or a wrong token, gets `unauthorized` and a close. */
+export interface HelloFrame {
+	type: "hello";
+	token: string;
+	/** 1 or 2, as `negotiate_protocol` would select. */
+	protocolVersion: number;
+	client: ClientIdentity;
+	capabilities: ClientCapabilities;
+	/** Ignored, so the client gets `attached`, unless `hostId` names this host. */
+	resume?: ResumePoint;
+}
+
 export type WidgetPlacement = "aboveEditor" | "belowEditor";
 
 /** Presentation metadata aligned positionally with `options`. */
@@ -1317,6 +1422,20 @@ export interface RpcResponse {
 	error?: string;
 	/** Machine-readable failure reason, when one applies. */
 	code?: string;
+	/** `stale`: the host's current session epoch. */
+	epoch?: number;
+	/** `stale`: the session's current leaf. */
+	leafId?: string | null;
+	/** `session_hosted`: the host that owns the session. */
+	hostId?: string;
+}
+
+/** Write preconditions any command may carry beside `id`/`type`, honored for session-host socket clients only; on mismatch the command fails with `code: "stale"`. */
+export interface RpcPreconditions {
+	/** Run only while the host's session epoch equals this. */
+	ifEpoch?: number;
+	/** Run only while the session leaf equals this entry id (`null`: empty session). */
+	ifLeaf?: string | null;
 }
 
 export type ToolLoadMode = "essential" | "discoverable";
@@ -1339,7 +1458,7 @@ export interface HostUriSchemeDefinition {
 }
 
 /** Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`. */
-export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
+export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | AttachedEvent | ResumedEvent | EntryEvent | SessionReplacedEvent | ClientsChangedEvent | RpcFrameErrorEvent | RpcAgentEvent;
 
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
@@ -1631,6 +1750,8 @@ export interface PredictWordFeedbackParams {
 /** Every RPC command's parameters and successful response `data`. */
 export interface RpcWireCommands {
 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
+	detach: { params: undefined; result: undefined };
+	exit: { params: undefined; result: undefined };
 	prompt: { params: PromptParams; result: PromptAck };
 	steer: { params: SteerParams; result: undefined };
 	follow_up: { params: FollowUpParams; result: undefined };

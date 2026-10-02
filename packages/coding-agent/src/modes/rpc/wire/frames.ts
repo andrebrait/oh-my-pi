@@ -117,6 +117,85 @@ export const frameDefs = {
 		"An event could not fit within the transport limits and was dropped.",
 	),
 
+	ClientInfo: doc(
+		{ clientId: "string", kind: "string", "label?": "string" },
+		"A connected session-host client, as listed in snapshots and `clients_changed`.",
+	),
+	SessionOrigin: doc(
+		{ cwd: "string", artifactsDir: "string | null", localRoot: "string", sessionId: "string" },
+		"Where a host session lives, for resolving `local://` URLs and relative paths in what it authored.",
+	),
+	StreamingMessage: doc(
+		{ messageId: "string", message: "AgentMessage" },
+		"The in-flight message of a mid-turn join; later frames for it carry `messageId`.",
+	),
+	SessionSnapshot: doc(
+		{
+			state: "SessionState",
+			header: `${JSON_OBJECT} | null`,
+			entries: `${JSON_OBJECT}[]`,
+			leafId: "string | null",
+			"streaming?": "StreamingMessage",
+			pendingUi: doc("ExtensionUiRequest[]", "Open extension dialogs a late joiner can answer."),
+			clients: "ClientInfo[]",
+			"origin?": "SessionOrigin",
+		},
+		"The session as the `entry` frames have announced it: everything a socket client needs to render it from scratch.",
+	),
+	AttachedEvent: doc(
+		{
+			type: "'attached'",
+			hostId: "string",
+			clientId: "string",
+			epoch: "number.integer",
+			seq: "number.integer",
+			snapshot: "SessionSnapshot",
+		},
+		"Socket clients: first frame of a fresh attach; later frames carry a greater `seq`.",
+	),
+	ResumedEvent: doc(
+		{ type: "'resumed'", epoch: "number.integer", replayed: "number.integer" },
+		"Socket clients: first frame of a resume; the `replayed` frames after `lastSeq` follow it.",
+	),
+	EntryEvent: doc(
+		{
+			type: "'entry'",
+			entry: JSON_OBJECT,
+			seq: "number.integer",
+		},
+		"Socket clients: a session-file append.",
+	),
+	SessionReplacedReason: "'new' | 'resume' | 'fork' | 'tree'",
+	SessionReplacedEvent: doc(
+		{
+			type: "'session_replaced'",
+			epoch: "number.integer",
+			"sessionFile?": "string",
+			reason: "SessionReplacedReason",
+			snapshot: "SessionSnapshot",
+			seq: "number.integer",
+		},
+		"Socket clients: the host now serves a different session or transcript; `snapshot` replaces the client's view.",
+	),
+	ClientsChangedEvent: doc(
+		{ type: "'clients_changed'", clients: "ClientInfo[]", seq: "number.integer" },
+		"Socket clients: client presence changed.",
+	),
+	ClientIdentity: { kind: "string", "label?": "string" },
+	ClientCapabilities: { ui: doc("boolean", "Receive extension UI requests.") },
+	ResumePoint: { hostId: "string", epoch: "number.integer", lastSeq: "number.integer" },
+	HelloFrame: doc(
+		{
+			type: "'hello'",
+			token: "string",
+			protocolVersion: doc("number.integer", "1 or 2, as `negotiate_protocol` would select."),
+			client: "ClientIdentity",
+			capabilities: "ClientCapabilities",
+			"resume?": doc("ResumePoint", "Ignored, so the client gets `attached`, unless `hostId` names this host."),
+		},
+		"First frame a session-host socket client sends; anything else, or a wrong token, gets `unauthorized` and a close.",
+	),
+
 	WidgetPlacement: "'aboveEditor' | 'belowEditor'",
 	SelectOptionDetail: doc({ "description?": "string" }, "Presentation metadata aligned positionally with `options`."),
 	AskOption: { label: "string", "description?": "string", "preview?": "string" },
@@ -298,8 +377,21 @@ export const frameDefs = {
 			"data?": doc("unknown", "Command result on success; its shape is the command's `result`."),
 			"error?": doc("string", "Failure message when `success` is false."),
 			"code?": doc("string", "Machine-readable failure reason, when one applies."),
+			"epoch?": doc("number.integer", "`stale`: the host's current session epoch."),
+			"leafId?": doc("string | null", "`stale`: the session's current leaf."),
+			"hostId?": doc("string", "`session_hosted`: the host that owns the session."),
 		},
 		"Response to a command, correlated by `id`.",
+	),
+	RpcPreconditions: doc(
+		{
+			"ifEpoch?": doc("number.integer", "Run only while the host's session epoch equals this."),
+			"ifLeaf?": doc(
+				"string | null",
+				"Run only while the session leaf equals this entry id (`null`: empty session).",
+			),
+		},
+		'Write preconditions any command may carry beside `id`/`type`, honored for session-host socket clients only; on mismatch the command fails with `code: "stale"`.',
 	),
 	ToolLoadMode: "'essential' | 'discoverable'",
 	HostToolDefinition: {
