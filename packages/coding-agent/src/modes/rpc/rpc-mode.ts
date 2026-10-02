@@ -18,7 +18,6 @@ import { isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import {
 	type ExtensionAskDialogQuestion,
 	type ExtensionAskDialogResult,
-	type ExtensionAskDialogSubmitResult,
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
 	getExtensionUISelectOptionLabel,
@@ -892,16 +891,35 @@ export function requestRpcSelect(
 	);
 }
 
-/** Validates `ask` answers against the questions; any mismatch throws instead of guessing. */
+function isImageContent(value: unknown): value is ImageContent {
+	return (
+		isRecord(value) && value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string"
+	);
+}
+
+/** An optional image list on an `ask` answer; a malformed one throws instead of being dropped. */
+function parseAskAnswerImages(value: unknown, questionId: string, field: string): ImageContent[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || !value.every(isImageContent)) {
+		throw new Error(`Ask dialog answer ${JSON.stringify(questionId)} ${field} must be an array of images`);
+	}
+	return value;
+}
+
+/**
+ * Validates `ask` answers against the questions; any mismatch throws instead of guessing. A `chat` response
+ * ("discuss instead of answering") is its own result, distinct from cancellation.
+ */
 function parseAskDialogResponse(
 	response: RpcExtensionUIResponse,
 	questions: ExtensionAskDialogQuestion[],
 	dialogOptions: ExtensionUIDialogOptions,
-): ExtensionAskDialogSubmitResult | undefined {
+): ExtensionAskDialogResult | undefined {
 	if ("cancelled" in response && response.cancelled) {
 		if (response.timedOut) dialogOptions.onTimeout?.();
 		return undefined;
 	}
+	if ("chat" in response && response.chat === true) return { kind: "chat" };
 	const answers: unknown = "answers" in response ? response.answers : undefined;
 	if (!Array.isArray(answers) || answers.length !== questions.length) {
 		throw new Error(`Ask dialog response must carry ${questions.length} answers in question order`);
@@ -915,7 +933,7 @@ function parseAskDialogResponse(
 			}
 			const labels = question.options.map(option => option.label);
 			const multi = question.multi ?? false;
-			const { selectedOptions, customInput } = answer;
+			const { selectedOptions, customInput, customInputImages, note, noteImages } = answer;
 			if (!Array.isArray(selectedOptions)) {
 				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} must carry a selectedOptions array`);
 			}
@@ -937,6 +955,11 @@ function parseAskDialogResponse(
 				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} customInput must be a string`);
 			}
 			const custom = customInput?.trim() || undefined;
+			if (note !== undefined && typeof note !== "string") {
+				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} note must be a string`);
+			}
+			const customImages = parseAskAnswerImages(customInputImages, question.id, "customInputImages");
+			const noteImageList = parseAskAnswerImages(noteImages, question.id, "noteImages");
 			if (!multi && (selected.length > 1 || (selected.length > 0 && custom !== undefined))) {
 				throw new Error(
 					`Ask dialog answer ${JSON.stringify(question.id)} is single-select but carries more than one answer`,
@@ -949,6 +972,9 @@ function parseAskDialogResponse(
 				multi,
 				selectedOptions: selected,
 				customInput: custom,
+				...(customImages ? { customInputImages: customImages } : {}),
+				...(note !== undefined ? { note } : {}),
+				...(noteImageList ? { noteImages: noteImageList } : {}),
 			};
 		}),
 	};

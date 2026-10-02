@@ -12,6 +12,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
 import { MAX_RPC_FRAME_BYTES, RpcFrameDecoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -560,17 +561,15 @@ describe("session host", () => {
 
 	it("drops a connection that fails after authenticating and keeps serving", async () => {
 		const host = await startHost();
-		const { sessionManager } = host.session;
-		const getHeader = sessionManager.getHeader;
 		// attach()'s snapshot throws, as it can while the session is disposing.
-		sessionManager.getHeader = () => {
+		const snapshot = spyOn(RpcServer.prototype, "snapshot").mockImplementation(() => {
 			throw new Error("snapshot failed");
-		};
+		});
 		try {
 			const broken = await rawClient({});
 			await broken.closed;
 		} finally {
-			sessionManager.getHeader = getHeader;
+			snapshot.mockRestore();
 		}
 		const c = await attachClient(host);
 		expect((await c.getState()).sessionId).toBe(host.session.sessionId);

@@ -19,13 +19,19 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
+import type { HostedClientLink } from "../session-host/hosted-client";
+import type { RpcSessionOrigin } from "./rpc/rpc-types";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
@@ -175,6 +181,22 @@ export interface InteractiveModeContext {
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	/**
+	 * True from before `init()` until this process leaves hosted mode: this UI is (or is about to become) a
+	 * client of a session host, so TUI-owned automation (timers, local model calls, plan/goal/loop machinery)
+	 * must not run. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
+	 */
+	hostedClientMode: boolean;
+	/** The link to the session host once connected; routes input and answers dialogs. Set by the caller of `HostedClientLink.connect`. */
+	hostedClient?: HostedClientLink;
+	/**
+	 * Hosted client only: where the host session on screen keeps its files, as its snapshot (or a relocation notice)
+	 * reported it. Links in the host's transcript resolve here (relative paths against `cwd`, `local://` under the root the
+	 * host itself resolved for it) instead of the terminal's own directory, which keeps the footer, completion, and `@file` to itself.
+	 * Set by the link before each snapshot's transcript is painted (a snapshot without it is refused), so unlike
+	 * {@link hostedClient} it exists for the first repaint; unset when the link ends, and then links resolve locally.
+	 */
+	hostOrigin?: RpcSessionOrigin;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -409,6 +431,12 @@ export interface InteractiveModeContext {
 	): Promise<void>;
 	renderInitialMessages(options?: { preserveExistingChat?: boolean; clearTerminalHistory?: boolean }): Promise<void>;
 	/**
+	 * Re-resolve the links of the transcript on screen against where the view's links resolve now, and give the
+	 * assistant messages already painted their new destinations, without repainting the transcript. For a hosted
+	 * view whose session moved without being replaced; a reply still streaming gets its destinations when it closes.
+	 */
+	refreshTranscriptLinks(): Promise<void>;
+	/**
 	 * In-place transcript rewind: drop the rendered components at/after
 	 * `message` when none of their rows reached native scrollback. Returns
 	 * false when the caller must fall back to a destructive
@@ -510,7 +538,7 @@ export interface InteractiveModeContext {
 	showSessionPinSelector(): Promise<void>;
 	showResetUsageSelector(): Promise<void>;
 	showProviderSetup(): Promise<void>;
-	showHookConfirm(title: string, message: string): Promise<boolean>;
+	showHookConfirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean>;
 	showDebugSelector(): Promise<void>;
 	showAgentHub(options?: AgentHubOpenOptions): void;
 	resetObserverRegistry(): void;
@@ -621,7 +649,11 @@ export interface InteractiveModeContext {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined>;
 	hideHookInput(): void;
 	showHookEditor(
 		title: string,
@@ -631,6 +663,11 @@ export interface InteractiveModeContext {
 	): Promise<string | undefined>;
 	hideHookEditor(): void;
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void;
+	/** Present the rich multi-question ask dialog on the editor surface (queued behind any open dialog). */
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 	showHookCustom<T>(
 		factory: (
 			tui: TUI,
