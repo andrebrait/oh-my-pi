@@ -150,6 +150,15 @@ With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a
 3. Extension UI requests are answered with the existing TUI dialogs (`extension-ui-controller`).
 4. Client-machine inputs: clipboard images travel as prompt images, and `!cmd` uses the `bash` RPC command.
 
+### `/btw` parity and ownership
+
+The stdio RPC prerequisite is tracked in [can1357/oh-my-pi#14110](https://github.com/can1357/oh-my-pi/pull/14110): `btw {question, recordId?}`, `btw_cancel {recordId?}`, and `get_btw_history`, with `btw_delta` and `btw_record` frames. Questions run beside the main turn and persist in the existing BTW sidecar, not the transcript. Follow-ups reuse the topic; copy remains client-local.
+
+A parity follow-up (P3) gives the host one BTW lifecycle owner per session, sharing the headless turn helpers with the in-process TUI. For socket clients, route live answer frames to the requesting connection, and notify other clients when persisted history changes. Reconnect restores history; session replacement cancels the old question and flushes its checkpoints. An unsaved terminal checkpoint must stop a session replacement until storage recovers. Until then `/btw` is unavailable when attached.
+
+The same follow-up adapts `BtwController` into a presenter over these commands and events. Branch promotion remains a separate parity requirement: `branchFromBtw` must execute on the host with the original session and leaf guards; the initial stdio RPC PR does not expose promotion. `/btw` cannot become a view-local command or be considered fully ported until that promotion path is covered.
+
+
 ### Client commands
 
 | Command | Effect |
@@ -164,6 +173,8 @@ With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a
 
 Plan mode, goal mode, loop mode and loop auto-submit, the compaction queue, `#pendingModelSwitch`, and the idle-compaction and idle-recap timers in `event-controller`. They must run with zero clients and must run once regardless of client count. The in-process TUI uses the moved implementations as well, so there is a single implementation.
 
+These moves happen in P3, one state machine per follow-up. The P2 client disables every TUI-owned timer and automation path, and the commands that depend on them report "unavailable when attached"; in-process mode is unchanged.
+
 ### Unavailable in client mode (v1)
 
 - PTY bash overlays need a second stream.
@@ -177,9 +188,9 @@ Estimates are `[INFERENCE]` from code reading.
 | Phase | Delivers | Estimate |
 |---|---|---|
 | P1 | `RpcConnection` and `RpcDispatcher` split; socket/pipe transport; `--mode host`; registry; handshake, snapshot, `seq`, ring, `session_replaced`, `clients_changed`; arbitration; `detach` and `exit`; `omp attach` listing. ompweb can switch to it immediately. | 1–2 weeks |
-| P2 | State machines move to the session or host; `slash_command`; missing read commands. | 1–2 weeks |
-| P3 | TUI client mode: `tui.hosted`, `omp attach`, `/attach`, `/detach`, `/exit`, `--solo`, parity table. | 2–3 weeks |
-| P4 | The parity table has no "not yet ported" rows → default flips. Later, delete the setting and the in-process interactive path. Print mode, ACP, and subagents stay in-process. | about 1 week |
+| P2 | Minimal TUI client behind `tui.hosted`, merged in a working state: spawn or connect a host, render from a local replica fed by snapshot and `entry`/event frames, prompt/abort/steer/queue, model and thinking, extension dialogs, generic `slash_command` for headless builtins, `/detach`, `/exit`, `/attach`, `omp attach <target>`. TUI-owned automation is off in client mode; every other command reports "unavailable when attached". | 2–3 weeks |
+| P3 | Parity follow-ups, each merged separately: plan, goal, loop, idle compaction and recap move to the session or host; tree and fork; `/btw` host ownership (with can1357/oh-my-pi#14110); extension status/widget/title replay; `--solo`; automatic reconnect after an unexpected transport loss, using host identity, epoch, and sequence replay with snapshot fallback. Explicit detach/exit never reconnects; uncertain mutating commands are not silently resent. | 1–2 weeks per group |
+| P4 | The parity table has no "not yet ported" rows and automatic reconnect is implemented → default flips. Later, delete the setting and the in-process interactive path. Print mode, ACP, and subagents stay in-process. | about 1 week |
 
 ## Error contracts
 
