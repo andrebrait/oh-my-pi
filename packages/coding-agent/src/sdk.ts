@@ -730,6 +730,11 @@ export interface CreateAgentSessionOptions {
 	/** Limit the session to explicitly supplied tool names, without discovered extras. */
 	restrictToolNames?: boolean;
 	/**
+	 * Create a passive local replica of a session another process runs (a hosted TUI client): it never releases
+	 * resources scoped by the replicated session id and starts no memory backend. See `AgentSessionConfig.passiveReplica`.
+	 */
+	passiveReplica?: boolean;
+	/**
 	 * Permit only caller-supplied SDK custom tools inside a restricted session.
 	 * They must still be named in {@link toolNames}; discovered extensions, MCP,
 	 * and ambient custom tools remain disabled. Default: false.
@@ -2108,6 +2113,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let hasSession = false;
 	let hasRegistered = false;
 	const restrictToolNames = options.restrictToolNames === true;
+	// A passive replica mirrors a session another process runs: it must not start, read or promote any memory backend.
+	const passiveReplica = options.passiveReplica === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
 	// Only the first top-level session in a process owns an AsyncJobManager.
@@ -3722,7 +3729,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					setActiveRules(nextActiveRules);
 				}
 			}
-			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
+			const memoryBackend = restrictToolNames || passiveReplica ? undefined : await resolveMemoryBackend(settings);
 			const memoryInstructions = memoryBackend
 				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
 				: undefined;
@@ -4510,6 +4517,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				: undefined,
 			memoryEnabled: !restrictToolNames,
+			passiveReplica: options.passiveReplica,
 			memoryAgentDir: agentDir,
 			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
@@ -5129,7 +5137,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// `learn`/`manage_skill` on the same setting, and captures resolve those
 		// tools per run. The subscription lives for the session's lifetime; the
 		// reference is intentionally discarded (the listener retains it).
-		if (!restrictToolNames) {
+		if (session.memoryEnabled) {
 			if (cfgAutolearnEnabled.get(settings) && taskDepth === 0) {
 				await logger.time("startMemoryStartupTask", startMemoryBackend);
 			} else {

@@ -677,6 +677,11 @@ export class AgentSession implements SettingsScope {
 	readonly settings: Settings;
 	/** Session-start policy, independent of the selected project memory backend. */
 	readonly memoryEnabled: boolean;
+	/**
+	 * A passive local replica of a session another process runs: it adopts that session's id but owns none of the
+	 * resources the id scopes, so it never releases them (see {@link AgentSessionConfig.passiveReplica}).
+	 */
+	readonly passiveReplica: boolean;
 	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
@@ -1472,7 +1477,8 @@ export class AgentSession implements SettingsScope {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
-		this.memoryEnabled = config.memoryEnabled ?? true;
+		this.passiveReplica = config.passiveReplica === true;
+		this.memoryEnabled = !this.passiveReplica && (config.memoryEnabled ?? true);
 		this.#modelRegistry = config.modelRegistry;
 		this.#extensionRoots =
 			config.extensionRoots ??
@@ -2235,6 +2241,8 @@ export class AgentSession implements SettingsScope {
 		cfgRatchetEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("ratchet.enabled", enabled));
 		cfgArchiveEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("archive.enabled", enabled));
 		cfgBrowserIdleCloseSec.listen(this, seconds => {
+			// A passive replica carries the owner's session id: arming idle closes under it would reap the owner's tabs.
+			if (this.passiveReplica) return;
 			const ownerId = this.sessionManager.getSessionId() ?? "";
 			// Any change invalidates the armed deadline: cancel first (its
 			// sequence bump stops an in-flight sweep re-arming the old
@@ -2545,7 +2553,7 @@ export class AgentSession implements SettingsScope {
 
 	/**
 	 * Wrap every {@link switchSession} (RPC command, extension action, custom command) in `guard`, so a host can
-	 * refuse a target another process owns before anything changes.
+	 * refuse a target another process owns before anything changes. Not applied to a passive replica.
 	 */
 	setSessionSwitchGuard(guard: SessionSwitchGuard | null): void {
 		this.#sessionSwitchGuard = guard ?? undefined;
@@ -2977,7 +2985,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
-		if (this.#exitRecorded) return;
+		// A passive replica is a view: the owning process records its own exit, and an entry appended here would
+		// recreate the local copy a hosted client deletes when it leaves.
+		if (this.#exitRecorded || this.passiveReplica) return;
 		this.#exitRecorded = true;
 		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
 		if (
@@ -5254,7 +5264,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			const released = await withTimeout(
 				releaseTabsForOwner(ownerId, { kill: true }),
@@ -5280,7 +5290,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #settleOwnedBrowserTabs(): Promise<void> {
 		const ownerId = this.sessionManager.getSessionId();
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			const idleSec = cfgBrowserIdleCloseSec.get(this.settings);
 			if (idleSec > 0) {
@@ -5313,7 +5323,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #releaseOwnedComputerSessions(ownerId: string | undefined): Promise<void> {
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			await withTimeout(
 				releaseComputerSessionsForOwner(ownerId),
@@ -5367,7 +5377,7 @@ export class AgentSession implements SettingsScope {
 		this.#cancelFatalRecoveryHint?.();
 		this.#cancelFatalRecoveryHint = undefined;
 		try {
-			await emitSessionShutdownEvent(this.#extensionRunner);
+			if (!this.passiveReplica) await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
@@ -5401,17 +5411,22 @@ export class AgentSession implements SettingsScope {
 			logger.warn("Session dispose: Sharpshooter release failed", { error: String(error) });
 		}
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
-		releaseShellSessions(this.sessionManager.getSessionId());
+		// A passive replica's id is the host's: the shells it scopes are the host's too.
+		if (!this.passiveReplica) releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
-			shutdownTinyTitleClient(),
+			// Process-wide workers a passive replica never started: shutting one down would stop the worker an ordinary
+			// session of this process is using.
+			this.passiveReplica ? Promise.resolve() : shutdownTinyTitleClient(),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
-			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+			this.passiveReplica
+				? Promise.resolve()
+				: this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
 			sharpshooterFlushed,
 		]);
 		for (const result of results) {
@@ -5794,6 +5809,32 @@ export class AgentSession implements SettingsScope {
 	/** The selector the user configured: `auto` when auto mode is active, else the effective level. */
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined {
 		return this.#models.configuredThinkingLevel();
+	}
+
+	/**
+	 * Passive replica only: mirror the owning session's effective thinking level into the model controls, so every
+	 * reader of {@link thinkingLevel} (composer, editor border, selectors) shows it. Like a transcript restore it
+	 * applies the level to the agent as is: nothing is persisted, clamped to local credentials or emitted.
+	 */
+	setReplicaThinkingLevel(level: ThinkingLevel | undefined): void {
+		if (!this.passiveReplica) throw new Error("Only a passive replica mirrors another session's thinking level");
+		this.#models.restoreThinkingSnapshot(level, false, undefined);
+	}
+
+	/**
+	 * Passive replica only: put the replica on the owning session's active branch. Loading the replica's file selects
+	 * the last journal entry, which is not the owner's branch after it navigated back; this moves the leaf in memory
+	 * (nothing is written) and resynchronizes everything the load derived from the branch it first saw: the agent's
+	 * messages, the todo list and model mentions, and the checkpoint state.
+	 */
+	setReplicaLeaf(leafId: string | null): void {
+		if (!this.passiveReplica) throw new Error("Only a passive replica follows another session's active branch");
+		if (leafId === null) this.sessionManager.resetLeaf();
+		else this.sessionManager.branch(leafId);
+		this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+		this.#rehydrateCheckpointRewindState();
+		this.#todo.syncFromBranch();
+		this.#modelMentions.syncFromBranch();
 	}
 
 	/** True when `auto` thinking mode is active. */
@@ -10690,7 +10731,7 @@ export class AgentSession implements SettingsScope {
 	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
 	async switchSession(sessionPath: string, options?: SwitchSessionOptions): Promise<boolean> {
-		const guard = this.#sessionSwitchGuard;
+		const guard = this.passiveReplica ? undefined : this.#sessionSwitchGuard;
 		const proceed = () => this.#switchSession(sessionPath, options);
 		return guard ? guard(sessionPath, proceed) : proceed();
 	}
