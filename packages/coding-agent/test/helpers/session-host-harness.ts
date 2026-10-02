@@ -56,11 +56,18 @@ export class SessionHostFixture {
 		return new SessionHostFixture(await fs.mkdtemp(path.join(os.tmpdir(), "omp-session-host-")));
 	}
 
-	/** A host serving a fresh session whose mock model answers `ok`. */
-	async startHost(options: Partial<SessionHostOptions> = {}): Promise<TestSessionHost> {
+	/**
+	 * A host serving a fresh session whose mock model answers `ok`; `gate` holds each reply after its first delta until
+	 * it resolves; `inMemory` keeps the transcript in memory, with no session file or artifacts directory.
+	 */
+	async startHost(
+		options: Partial<SessionHostOptions> = {},
+		gate?: Promise<void>,
+		sessionOptions: { inMemory?: boolean } = {},
+	): Promise<TestSessionHost> {
 		const sessionDir = path.join(this.dir, `host-${++this.#hostCount}`);
 		await fs.mkdir(sessionDir, { recursive: true });
-		const session = await createTestSession(sessionDir, { handler: { content: ["ok"] } });
+		const session = await createTestSession(sessionDir, { handler: { content: ["ok"] } }, gate, sessionOptions);
 		const hostId = newHostId();
 		const done = Promise.withResolvers<void>();
 		const host: TestSessionHost = {
