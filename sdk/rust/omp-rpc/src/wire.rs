@@ -4347,6 +4347,9 @@ pub struct ResumedEvent {
 pub struct EntryEvent {
 	pub entry: Map<String, Value>,
 	pub seq: i64,
+	/// The host's active leaf when the entry was announced; absent from older hosts.
+	#[serde(rename = "leafId", default, skip_serializing_if = "Option::is_none")]
+	pub leaf_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4692,6 +4695,14 @@ pub struct AskAnswer {
 	pub selected_options: Vec<String>,
 	#[serde(rename = "customInput", default, skip_serializing_if = "Option::is_none")]
 	pub custom_input: Option<String>,
+	/// Images pasted into the free text; their `[Image #N]` markers sit in it.
+	#[serde(rename = "customInputImages", default, skip_serializing_if = "Option::is_none")]
+	pub custom_input_images: Option<Vec<ImageContent>>,
+	/// The user's note on the answer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<String>,
+	#[serde(rename = "noteImages", default, skip_serializing_if = "Option::is_none")]
+	pub note_images: Option<Vec<ImageContent>>,
 }
 
 /// Answers a `select`, `input`, or `editor` request.
@@ -4724,6 +4735,13 @@ pub struct AnswersUiResponse {
 	pub answers: Vec<AskAnswer>,
 }
 
+/// Declines an `ask` request to discuss it instead; distinct from cancelling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatUiResponse {
+	pub id: String,
+	pub chat: LitTrue,
+}
+
 /// Host reply to an extension UI request; variants share `type` and differ by their payload key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionUiResponse {
@@ -4735,6 +4753,8 @@ pub enum ExtensionUiResponse {
 	CancelUiResponse(CancelUiResponse),
 	/// Answers an `ask` request: one `AskAnswer` per question, in question order.
 	AnswersUiResponse(AnswersUiResponse),
+	/// Declines an `ask` request to discuss it instead; distinct from cancelling.
+	ChatUiResponse(ChatUiResponse),
 }
 
 impl ExtensionUiResponse {
@@ -4752,6 +4772,9 @@ impl ExtensionUiResponse {
 		if let Ok(member) = AnswersUiResponse::deserialize(&value) {
 			return Ok(Self::AnswersUiResponse(member));
 		}
+		if let Ok(member) = ChatUiResponse::deserialize(&value) {
+			return Ok(Self::ChatUiResponse(member));
+		}
 		Err(serde_json::Error::custom("no ExtensionUiResponse variant matches"))
 	}
 }
@@ -4763,6 +4786,7 @@ impl Serialize for ExtensionUiResponse {
 			Self::ConfirmUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::CancelUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::AnswersUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
+			Self::ChatUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 		}
 	}
 }

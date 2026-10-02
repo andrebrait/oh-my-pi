@@ -5000,6 +5000,17 @@
 				},
 				"seq": {
 					"type": "integer"
+				},
+				"leafId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					],
+					"description": "The host's active leaf when the entry was announced; absent from older hosts."
 				}
 			},
 			"required": [
@@ -5614,6 +5625,23 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"customInputImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "Images pasted into the free text; their `[Image #N]` markers sit in it."
+				},
+				"note": {
+					"type": "string",
+					"description": "The user's note on the answer."
+				},
+				"noteImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
 				}
 			},
 			"required": [
@@ -5708,6 +5736,26 @@
 			],
 			"description": "Answers an `ask` request: one `AskAnswer` per question, in question order."
 		},
+		"ChatUiResponse": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "extension_ui_response"
+				},
+				"id": {
+					"type": "string"
+				},
+				"chat": {
+					"const": true
+				}
+			},
+			"required": [
+				"type",
+				"id",
+				"chat"
+			],
+			"description": "Declines an `ask` request to discuss it instead; distinct from cancelling."
+		},
 		"ExtensionUiResponse": {
 			"anyOf": [
 				{
@@ -5721,6 +5769,9 @@
 				},
 				{
 					"$ref": "#/$defs/AnswersUiResponse"
+				},
+				{
+					"$ref": "#/$defs/ChatUiResponse"
 				}
 			],
 			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."

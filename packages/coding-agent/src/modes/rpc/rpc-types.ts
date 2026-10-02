@@ -350,7 +350,11 @@ export interface RpcSessionOrigin {
 	sessionId: string;
 }
 
-/** Everything a client needs to render the session from scratch. */
+/**
+ * Everything a client needs to render the session from scratch. `entries`, `leafId` and the title are the session as
+ * the `entry` frames have announced it: entries of an atomic batch that is still publishing, and entries recorded
+ * meanwhile, are not in it and reach the client once, as entry frames after the commit.
+ */
 export interface RpcSnapshot {
 	state: RpcSessionState;
 	header: SessionHeader | null;
@@ -397,6 +401,14 @@ export interface RpcResumedFrame {
 export interface RpcEntryFrame {
 	type: "entry";
 	entry: SessionEntry;
+	/**
+	 * The host's active leaf at the time the entry was announced (`null`: the session has no entries on its branch).
+	 * It is the entry itself for an append on the active branch, the unchanged leaf for an off-branch append such as a
+	 * retained bash result, and may name an entry announced right after this one. A client that follows the host's
+	 * branch applies it with the entry. Additive: a host that predates it omits the field, and the client then keeps
+	 * its previous behavior (the entry becomes the leaf).
+	 */
+	leafId?: string | null;
 	seq: number;
 }
 
@@ -1021,17 +1033,27 @@ export interface RpcHostUriResult {
 // Extension UI Commands (stdin)
 // ============================================================================
 
+/** One question's answer in an `ask` response. */
+export interface RpcAskDialogAnswer {
+	id: string;
+	selectedOptions: string[];
+	customInput?: string;
+	/** Images pasted into the custom answer; their `[Image #N]` markers sit in `customInput`. */
+	customInputImages?: ImageContent[];
+	/** The user's note on the answer. */
+	note?: string;
+	noteImages?: ImageContent[];
+}
+
 /** Response to an extension UI request */
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean }
 	/** Answers to an `ask` request, one per question in request order. */
-	| {
-			type: "extension_ui_response";
-			id: string;
-			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
-	  };
+	| { type: "extension_ui_response"; id: string; answers: RpcAskDialogAnswer[] }
+	/** The user chose to discuss an `ask` request instead of answering it; distinct from cancelling. */
+	| { type: "extension_ui_response"; id: string; chat: true };
 
 // ============================================================================
 // Helper type for extracting command types

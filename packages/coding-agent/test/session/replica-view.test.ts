@@ -18,6 +18,9 @@ import {
 	resetReplicaEventState,
 } from "@oh-my-pi/pi-coding-agent/session/replica-view";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
@@ -44,12 +47,18 @@ afterEach(async () => {
 });
 
 /** Real local session rooted in a temp cwd, like a TUI that is about to mirror a remote session. */
-function makeLocalSession(): { session: AgentSession; cwd: string } {
+function makeLocalSession(options: { passiveReplica?: boolean } = {}): { session: AgentSession; cwd: string } {
 	const tempDir = TempDir.createSync("@pi-replica-view-");
 	const cwd = tempDir.path();
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
-	const session = new AgentSession({ agent, sessionManager: manager, settings: Settings.isolated(), modelRegistry });
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings: Settings.isolated(),
+		modelRegistry,
+		passiveReplica: options.passiveReplica,
+	});
 	cleanups.push(async () => {
 		await session.dispose().catch(() => {});
 		await tempDir.remove().catch(() => {});
@@ -109,6 +118,37 @@ describe("loadReplica", () => {
 			preserveLocalCwd: true,
 			keepModel: true,
 		});
+	});
+
+	it("puts the replica on the host's leaf, with that branch's messages and todo list, not the journal's last entry", async () => {
+		const { session, cwd } = makeLocalSession({ passiveReplica: true });
+		const host = makeHostManager();
+		const forkPoint = host.getEntries().at(-1)!.id;
+		const todos = (task: string): TodoPhase[] => [{ name: "Work", tasks: [{ content: task, status: "pending" }] }];
+		host.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: todos("task A") });
+		const branchA = host.appendMessage({ role: "user", content: "branch A", timestamp: Date.now() });
+		host.branch(forkPoint);
+		host.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: todos("task B") });
+		host.appendMessage({ role: "user", content: "branch B", timestamp: Date.now() });
+		host.branch(branchA);
+		const { header, entries } = host.snapshotForReplication();
+		const plain = makeLocalSession();
+
+		await loadReplica(session, path.join(cwd, "replica.jsonl"), header, entries, { leafId: host.getLeafId() });
+		await loadReplica(plain.session, path.join(plain.cwd, "replica.jsonl"), header, entries);
+
+		expect(session.sessionManager.getLeafId()).toBe(branchA);
+		expect(session.messages.map(textOf)).toEqual(["first", "assistant", "branch A"]);
+		// The todo list the HUD reloads is the branch's, not the last physical branch's the load restored.
+		expect(session.getTodoPhases()).toEqual(todos("task A"));
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		// Without the option the loader keeps its choice: the last journal entry, on branch B.
+		expect(plain.session.messages.map(textOf)).toEqual(["first", "assistant", "branch B"]);
+		expect(plain.session.getTodoPhases()).toEqual(todos("task B"));
+		// Following the host's branch is only for a passive replica.
+		await expect(
+			loadReplica(plain.session, path.join(plain.cwd, "again.jsonl"), header, entries, { leafId: branchA }),
+		).rejects.toThrow(/passive replica/);
 	});
 
 	it("never exposes a truncated replica while a resync overwrites it", async () => {
@@ -202,6 +242,53 @@ describe("ingestReplicaEntry", () => {
 		expect(session.messages).toHaveLength(2);
 		expect(session.messages[0]).toMatchObject({ role: "compactionSummary", summary: "SUMMARY" });
 		expect(session.messages[1]).toMatchObject({ role: "user", content: "keep" });
+	});
+
+	it("follows the host's final leaf: an off-branch append is journaled without touching the branch", async () => {
+		const { session, cwd } = makeLocalSession({ passiveReplica: true });
+		const host = makeHostManager();
+		const { header, entries } = host.snapshotForReplication();
+		await loadReplica(session, path.join(cwd, "replica.jsonl"), header, entries, { leafId: host.getLeafId() });
+		const frames: Array<{ entry: SessionEntry; leafId: string | null }> = [];
+		host.subscribeEntryAppended((entry, leafId) => frames.push({ entry: structuredClone(entry), leafId }));
+
+		const retained = host.appendMessageToBranch(
+			{ role: "user", content: "retained", timestamp: Date.now() },
+			entries[0].id,
+		);
+		const next = host.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		for (const { entry, leafId } of frames) ingestReplicaEntry(session, entry, { leafId });
+
+		expect(session.sessionManager.getEntries().some(entry => entry.id === retained)).toBe(true);
+		expect(session.sessionManager.getLeafId()).toBe(next);
+		expect(session.messages.map(textOf)).toEqual(["first", "assistant", "continue"]);
+	});
+
+	it("keeps the branch until the leaf the host named arrives, then shows every entry on the way to it, whatever that last entry is", async () => {
+		const { session, cwd } = makeLocalSession({ passiveReplica: true });
+		const host = makeHostManager();
+		const { header, entries } = host.snapshotForReplication();
+		await loadReplica(session, path.join(cwd, "replica.jsonl"), header, entries, { leafId: host.getLeafId() });
+		const frames: Array<{ entry: SessionEntry; leafId: string | null }> = [];
+		host.subscribeEntryAppended(entry => frames.push({ entry: structuredClone(entry), leafId: null }));
+
+		host.appendMessage({ role: "user", content: "batched one", timestamp: Date.now() });
+		host.appendMessage({ role: "user", content: "batched two", timestamp: Date.now() });
+		await host.setSessionName("Named after the batch", "user");
+		// The host announced them once its batch settled, so each frame names the leaf it had by then: the title.
+		const title = host.getLeafId();
+		const [first, second, renamed] = frames.map(frame => ({ entry: frame.entry, leafId: title }));
+
+		ingestReplicaEntry(session, first.entry, first);
+		ingestReplicaEntry(session, second.entry, second);
+		expect(session.sessionManager.getEntries()).toHaveLength(entries.length + 2);
+		expect(session.sessionManager.getLeafId()).toBe(entries.at(-1)!.id);
+		expect(session.messages.map(textOf)).toEqual(["first", "assistant"]);
+
+		ingestReplicaEntry(session, renamed.entry, renamed);
+		expect(session.sessionManager.getLeafId()).toBe(title);
+		expect(session.messages.map(textOf)).toEqual(["first", "assistant", "batched one", "batched two"]);
+		expect(session.sessionManager.getSessionName()).toBe("Named after the batch");
 	});
 });
 
@@ -338,5 +425,23 @@ describe("applyReplicaHostState", () => {
 		applyReplicaHostState(session, { thinkingLevel: ThinkingLevel.Low, disableReasoning: true });
 		expect(session.agent.state.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(session.agent.state.disableReasoning).toBe(true);
+	});
+
+	it("mirrors the thinking level into the model controls of a passive replica only", () => {
+		const passive = makeLocalSession({ passiveReplica: true }).session;
+		const ordinary = makeLocalSession().session;
+		const entriesBefore = passive.sessionManager.getEntries().length;
+
+		applyReplicaHostState(passive, { thinkingLevel: ThinkingLevel.High });
+		applyReplicaHostState(ordinary, { thinkingLevel: ThinkingLevel.High });
+
+		// What the composer, the editor border and the selectors read.
+		expect(passive.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(passive.configuredThinkingLevel()).toBe(ThinkingLevel.High);
+		expect(passive.isAutoThinking).toBe(false);
+		expect(passive.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		// A collab guest's session keeps its previous behavior: the agent mirrors, the model controls do not.
+		expect(ordinary.agent.state.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(ordinary.thinkingLevel).not.toBe(ThinkingLevel.High);
 	});
 });

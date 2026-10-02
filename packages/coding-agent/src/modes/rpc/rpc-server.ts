@@ -651,8 +651,8 @@ export class RpcServer {
 	constructor(session: AgentSession, options: RpcServerOptions) {
 		this.session = session;
 		this.#options = options;
-		this.#unsubscribeEntries = session.sessionManager.subscribeEntryAppended(entry =>
-			this.#broadcast({ type: "entry", entry } satisfies Omit<RpcEntryFrame, "seq">, toSequenced),
+		this.#unsubscribeEntries = session.sessionManager.subscribeEntryAppended((entry, leafId) =>
+			this.#broadcast({ type: "entry", entry, leafId } satisfies Omit<RpcEntryFrame, "seq">, toSequenced),
 		);
 		this.#unsubscribeRelocated = session.sessionManager.subscribeRelocated(() => this.#announceRelocation());
 		// Every switch is held to the host's ownership check, whichever path starts it (extension action, custom
@@ -756,17 +756,25 @@ export class RpcServer {
 		return clients;
 	}
 
-	/** The session as a newly attached client sees it. */
+	/**
+	 * The session as a newly attached client sees it: what the entry frames have announced so far (see
+	 * `SessionManager.snapshotForReplication`'s `announcedOnly`), so an atomic batch that is still publishing shows up
+	 * once, as its announcements after the commit, and not at all if it rolls back.
+	 */
 	snapshot(): RpcSnapshot {
 		const { session } = this;
-		const { sessionManager } = session;
 		const message = session.agent.state.streamMessage;
 		const messageId = this.#messageIds.openMessageId();
+		// The entries are serialized into the frame as they stand: no copy needed.
+		const announced = session.sessionManager.snapshotForReplication(value => value, { announcedOnly: true });
 		return {
-			state: buildRpcSessionState(session, this.#goalTurnScheduled),
-			header: sessionManager.getHeader(),
-			entries: sessionManager.getEntries(),
-			leafId: sessionManager.getLeafId(),
+			state: {
+				...buildRpcSessionState(session, this.#goalTurnScheduled),
+				sessionName: announced.sessionName,
+			},
+			header: announced.header,
+			entries: announced.entries,
+			leafId: announced.leafId,
 			streaming: message && messageId !== undefined ? { messageId, message } : undefined,
 			pendingUi: [...this.#uiPending.values()],
 			clients: this.clients,

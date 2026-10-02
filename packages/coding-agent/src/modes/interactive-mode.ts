@@ -86,7 +86,11 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -149,6 +153,8 @@ import {
 } from "../session/session-worktree";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
+import type { HostedClientLink } from "../session-host/hosted-client";
+import type { RpcSessionOrigin } from "./rpc/rpc-types";
 import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
@@ -1480,6 +1486,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	/** See {@link InteractiveModeContext.hostedClientMode}; the hosted startup sets it before `init()`. */
+	hostedClientMode = false;
+	hostedClient?: HostedClientLink;
+	/** See {@link InteractiveModeContext.hostOrigin}. */
+	hostOrigin?: RpcSessionOrigin;
 	#streamPublisher: StreamPublisher | undefined;
 	#recorder: SessionRecorder | undefined;
 	#recorderStarting = false;
@@ -1578,19 +1589,34 @@ export class InteractiveMode implements InteractiveModeContext {
 	get tableChartsVisible(): boolean {
 		return this.#focusController.target === undefined;
 	}
-	resolveAssistantMessageLinkHrefs(hrefs: readonly string[]): Promise<ReadonlyMap<string, string>> {
-		return resolveMarkdownLinkHrefs(hrefs, this.#linkResolveContext());
+	async resolveAssistantMessageLinkHrefs(hrefs: readonly string[]): Promise<ReadonlyMap<string, string>> {
+		for (;;) {
+			const origin = this.hostOrigin;
+			// A hosted terminal shows the host's transcript, so its links never mean this terminal's own directories:
+			// with no origin to resolve against (between hosts, or after the link ended) they stay as written.
+			if (this.hostedClientMode && !origin) return new Map();
+			const targets = await resolveMarkdownLinkHrefs(hrefs, this.#linkResolveContext(origin));
+			// The lookup is async: if the host's session was replaced or moved meanwhile, these targets name a place the
+			// view no longer reads from, and caching them would revive the old destinations. Resolve again.
+			if (this.hostOrigin === origin) return targets;
+		}
 	}
-	#linkResolveContext(): ResolveContext {
+	#linkResolveContext(origin: RpcSessionOrigin | undefined): ResolveContext {
 		const session = this.viewSession;
 		return {
-			cwd: session.sessionManager.getCwd(),
+			cwd: origin?.cwd ?? session.sessionManager.getCwd(),
 			sessionFile: session.sessionFile,
 			settings: session.settings,
-			localProtocolOptions: {
-				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
-				getSessionId: () => session.sessionManager.getSessionId(),
-			},
+			localProtocolOptions: origin
+				? {
+						getLocalRoot: () => origin.localRoot,
+						getArtifactsDir: () => origin.artifactsDir,
+						getSessionId: () => origin.sessionId,
+					}
+				: {
+						getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+						getSessionId: () => session.sessionManager.getSessionId(),
+					},
 			skills: session.skills,
 			rules: session.ttsrManager?.getRules(),
 		};
@@ -7558,6 +7584,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#uiHelpers.renderInitialMessages(options);
 		this.syncRetryHintRow();
 	}
+
+	/** See {@link InteractiveModeContext.refreshTranscriptLinks}. */
+	refreshTranscriptLinks(): Promise<void> {
+		return this.#uiHelpers.refreshTranscriptLinks();
+	}
+
 	/**
 	 * Reconcile the idle "F5 to Retry" status row with the transcript tail:
 	 * mount it when the last turn died on a tool call (Esc mid-execution,
@@ -8321,8 +8353,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.hideHookSelector();
 	}
 
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined> {
-		return this.#extensionUiController.showHookInput(title, placeholder);
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookInput(title, placeholder, dialogOptions);
 	}
 
 	hideHookInput(): void {
@@ -8344,6 +8380,13 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void {
 		this.#extensionUiController.showHookNotify(message, type);
+	}
+
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined> {
+		return this.#extensionUiController.showAskDialog(questions, dialogOptions);
 	}
 
 	showHookCustom<T>(

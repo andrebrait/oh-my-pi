@@ -1452,6 +1452,8 @@ class EntryEvent:
     type: Literal["entry"] = "entry"
     entry: JsonObject
     seq: int
+    leaf_id: str | None = None
+    """The host's active leaf when the entry was announced; absent from older hosts."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1642,6 +1644,11 @@ class AskAnswer:
     id: str
     selected_options: tuple[str, ...]
     custom_input: str | None = None
+    custom_input_images: tuple[ImageContent, ...] | None = None
+    """Images pasted into the free text; their `[Image #N]` markers sit in it."""
+    note: str | None = None
+    """The user's note on the answer."""
+    note_images: tuple[ImageContent, ...] | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2922,6 +2929,7 @@ def parse_entry_event(value: object, path: str = "EntryEvent") -> EntryEvent:
     return EntryEvent(
         entry=required(payload, "entry", decode_json_object, path),
         seq=required(payload, "seq", decode_int, path),
+        leaf_id=optional(payload, "leafId", nullable(decode_str), path),
     )
 
 
@@ -3138,6 +3146,9 @@ def parse_ask_answer(value: object, path: str = "AskAnswer") -> AskAnswer:
         id=required(payload, "id", decode_str, path),
         selected_options=required(payload, "selectedOptions", array(decode_str), path),
         custom_input=optional(payload, "customInput", decode_str, path),
+        custom_input_images=optional(payload, "customInputImages", array(parse_image_content), path),
+        note=optional(payload, "note", decode_str, path),
+        note_images=optional(payload, "noteImages", array(parse_image_content), path),
     )
 
 

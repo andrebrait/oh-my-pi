@@ -5419,6 +5419,8 @@ func (v ResumedEvent) MarshalJSON() ([]byte, error) {
 type EntryEvent struct {
 	Entry map[string]json.RawMessage `json:"entry"`
 	Seq   int64                      `json:"seq"`
+	// The host's active leaf when the entry was announced; absent from older hosts.
+	LeafID *string `json:"leafId,omitempty"`
 }
 
 func (v *EntryEvent) UnmarshalJSON(data []byte) error {
@@ -5431,6 +5433,7 @@ func (v *EntryEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "entry")
 	d.required("entry", &out.Entry)
 	d.required("seq", &out.Seq)
+	d.optional("leafId", &out.LeafID)
 	if d.err != nil {
 		return d.err
 	}
@@ -6079,6 +6082,11 @@ type AskAnswer struct {
 	ID              string   `json:"id"`
 	SelectedOptions []string `json:"selectedOptions"`
 	CustomInput     *string  `json:"customInput,omitempty"`
+	// Images pasted into the free text; their `[Image #N]` markers sit in it.
+	CustomInputImages []ImageContent `json:"customInputImages,omitempty"`
+	// The user's note on the answer.
+	Note       *string        `json:"note,omitempty"`
+	NoteImages []ImageContent `json:"noteImages,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -6091,6 +6099,9 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("customInputImages", &out.CustomInputImages)
+	d.optional("note", &out.Note)
+	d.optional("noteImages", &out.NoteImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -6211,6 +6222,33 @@ func (v AnswersUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
+// Declines an `ask` request to discuss it instead; distinct from cancelling.
+type ChatUiResponse struct {
+	ID string `json:"id"`
+}
+
+func (v *ChatUiResponse) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ChatUiResponse", v.decodeFrom)
+}
+
+func (v *ChatUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ChatUiResponse
+	d := fieldDecoder{raw: raw, owner: "ChatUiResponse"}
+	d.constant("type", "extension_ui_response")
+	d.required("id", &out.ID)
+	d.constant("chat", true)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ChatUiResponse) MarshalJSON() ([]byte, error) {
+	type plain ChatUiResponse
+	return encodeObject(plain(v), `"type":"extension_ui_response","chat":true`, nil)
+}
+
 // Host reply to an extension UI request; variants share `type` and differ by their payload key.
 type ExtensionUiResponse struct {
 	// Value holds one variant. Encode-only: no discriminator tells the variants apart.
@@ -6226,6 +6264,7 @@ func (ValueUiResponse) isExtensionUiResponse()   {}
 func (ConfirmUiResponse) isExtensionUiResponse() {}
 func (CancelUiResponse) isExtensionUiResponse()  {}
 func (AnswersUiResponse) isExtensionUiResponse() {}
+func (ChatUiResponse) isExtensionUiResponse()    {}
 
 func (v ExtensionUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeVariant("ExtensionUiResponse", v.Value)
@@ -6578,6 +6617,7 @@ func (ValueUiResponse) isRpcInbound()   {}
 func (ConfirmUiResponse) isRpcInbound() {}
 func (CancelUiResponse) isRpcInbound()  {}
 func (AnswersUiResponse) isRpcInbound() {}
+func (ChatUiResponse) isRpcInbound()    {}
 func (HostToolUpdate) isRpcInbound()    {}
 func (HostToolResult) isRpcInbound()    {}
 func (HostUriResult) isRpcInbound()     {}

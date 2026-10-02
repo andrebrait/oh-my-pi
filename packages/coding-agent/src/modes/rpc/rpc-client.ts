@@ -126,6 +126,8 @@ export type RpcSessionSettledListener = () => void;
 export type RpcHostFrameListener = (frame: RpcHostFrame) => void;
 /** Receives the error that ended an established transport; see {@link RpcClient.onClose}. */
 export type RpcCloseListener = (error: Error) => void;
+/** Receives each `extension_ui_request` the host sends; see {@link RpcClient.onExtensionUiRequest}. */
+export type RpcExtensionUiRequestListener = (request: RpcExtensionUIRequest) => void;
 export type RpcLiveListener = (frame: RpcLiveFrame) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
@@ -293,7 +295,11 @@ function isSessionHostFrame(value: unknown): value is RpcHostFrame {
 		case "resumed":
 			return typeof value.epoch === "number" && typeof value.replayed === "number";
 		case "entry":
-			return isRecord(value.entry) && typeof value.seq === "number";
+			return (
+				isRecord(value.entry) &&
+				typeof value.seq === "number" &&
+				(value.leafId === undefined || value.leafId === null || typeof value.leafId === "string")
+			);
 		case "session_replaced":
 			return typeof value.epoch === "number" && typeof value.seq === "number" && isRecord(value.snapshot);
 		case "clients_changed":
@@ -423,7 +429,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners: Set<RpcExtensionUiRequestListener> = new Set();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -794,6 +800,31 @@ export class RpcClient {
 		return () => {
 			this.#closeListeners.delete(listener);
 		};
+	}
+
+	/**
+	 * Subscribe to the host's `extension_ui_request` frames (dialogs, `cancel`, notifications), in arrival order.
+	 * A host sends them only to a client whose hello declared the `ui` capability. Answer a dialog with
+	 * {@link sendExtensionUiResponse}; a `cancel` names a dialog to withdraw and expects no reply.
+	 */
+	onExtensionUiRequest(listener: RpcExtensionUiRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => {
+			this.#extensionUiListeners.delete(listener);
+		};
+	}
+
+	/** Answer an `extension_ui_request` dialog. Throws when the client is not started. */
+	sendExtensionUiResponse(response: RpcExtensionUIResponse): void {
+		this.#writeFrame(response);
+	}
+
+	/**
+	 * Opt in (or out) of the rich `ask` dialog. Every UI client of a host must opt in before the host's
+	 * `ask` tool sends one `ask` request instead of a `select` per question.
+	 */
+	async setAskDialog(enabled: boolean): Promise<void> {
+		this.#getData(await this.#send({ type: "set_ask_dialog", enabled }));
 	}
 
 	/**

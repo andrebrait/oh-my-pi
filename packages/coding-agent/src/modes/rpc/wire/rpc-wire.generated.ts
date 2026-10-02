@@ -1224,6 +1224,8 @@ export interface EntryEvent {
 	type: "entry";
 	entry: Record<string, unknown>;
 	seq: number;
+	/** The host's active leaf when the entry was announced; absent from older hosts. */
+	leafId?: string | null;
 }
 
 export type SessionReplacedReason = "new" | "resume" | "fork" | "tree";
@@ -1408,6 +1410,11 @@ export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	/** Images pasted into the free text; their `[Image #N]` markers sit in it. */
+	customInputImages?: ImageContent[];
+	/** The user's note on the answer. */
+	note?: string;
+	noteImages?: ImageContent[];
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1439,8 +1446,15 @@ export interface AnswersUiResponse {
 	answers: AskAnswer[];
 }
 
+/** Declines an `ask` request to discuss it instead; distinct from cancelling. */
+export interface ChatUiResponse {
+	type: "extension_ui_response";
+	id: string;
+	chat: true;
+}
+
 /** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
-export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
+export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse;
 
 export interface HostToolCallRequest {
 	type: "host_tool_call";
