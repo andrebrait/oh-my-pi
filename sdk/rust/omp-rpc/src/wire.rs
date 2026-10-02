@@ -4033,22 +4033,31 @@ pub struct CommandOutputEvent {
 	pub text: String,
 }
 
-/// A builtin slash command changed the session title.
+/// The session title changed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfoUpdateEvent {
 	#[serde(rename = "sessionId")]
 	pub session_id: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub title: Option<String>,
+	/// Socket clients: the session was relocated (`/move`, `/wt`); where it lives now.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub origin: Option<SessionOrigin>,
+	/// Host sequence number; socket clients only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub seq: Option<i64>,
 }
 
-/// A builtin slash command changed the model configuration.
+/// The live model or thinking level changed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigUpdateEvent {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub model: Option<ModelInfo>,
 	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
 	pub thinking_level: Option<ThinkingLevel>,
+	/// Host sequence number; socket clients only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub seq: Option<i64>,
 }
 
 /// An event could not fit within the transport limits and was dropped.
@@ -4860,9 +4869,9 @@ pub enum RpcNotification {
 	LiveEnd(LiveEndEvent),
 	/// Output of a builtin slash command.
 	CommandOutput(CommandOutputEvent),
-	/// A builtin slash command changed the session title.
+	/// The session title changed.
 	SessionInfoUpdate(SessionInfoUpdateEvent),
-	/// A builtin slash command changed the model configuration.
+	/// The live model or thinking level changed.
 	ConfigUpdate(ConfigUpdateEvent),
 	/// Socket clients: first frame of a fresh attach; later frames carry a greater `seq`.
 	Attached(AttachedEvent),

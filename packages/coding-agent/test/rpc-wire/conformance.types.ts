@@ -27,6 +27,8 @@ import type {
 	RpcClientInfo,
 	RpcClientsChangedFrame,
 	RpcCommand,
+	RpcCommandOutputFrame,
+	RpcConfigUpdateFrame,
 	RpcEntryFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -51,6 +53,7 @@ import type {
 	RpcReadyFrame,
 	RpcResponse,
 	RpcResumedFrame,
+	RpcSessionInfoUpdateFrame,
 	RpcSessionOrigin,
 	RpcSessionReplacedFrame,
 	RpcSessionSettledFrame,
@@ -236,6 +239,9 @@ export type Frames = Assert<
 		uiAnswers: Inbound<Wire.AnswersUiResponse, Extract<RpcExtensionUIResponse, { answers: unknown }>>;
 		responseFailure: Outbound<Extract<RpcResponse, { success: false }>, Wire.RpcResponse>;
 		preconditions: Inbound<Wire.RpcPreconditions, RpcPreconditions>;
+		commandOutput: Outbound<RpcCommandOutputFrame, Wire.CommandOutputEvent>;
+		configUpdate: Outbound<RpcConfigUpdateFrame, Wire.ConfigUpdateEvent>;
+		sessionInfoUpdate: Outbound<RpcSessionInfoUpdateFrame, Wire.SessionInfoUpdateEvent>;
 		attached: Outbound<RpcAttachedFrame, Wire.AttachedEvent>;
 		resumed: Outbound<RpcResumedFrame, Wire.ResumedEvent>;
 		entry: Outbound<RpcEntryFrame, Wire.EntryEvent>;
