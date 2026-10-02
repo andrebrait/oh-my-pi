@@ -1060,7 +1060,7 @@ describe("SessionManager atomic entry batches", () => {
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 		const notifiedIds: string[] = [];
-		manager.onEntryAppended = entry => notifiedIds.push(entry.id);
+		manager.subscribeEntryAppended(entry => notifiedIds.push(entry.id));
 		const failure = storage.failNextAtomicWrite(new Error("batch publish failed"));
 		let stagedId = "";
 		const commit = manager.appendEntriesAtomically(() => {
