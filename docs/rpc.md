@@ -1527,6 +1527,8 @@ A connection sees gaps in `seq`:
 
 `login` sends its `extension_ui_request` frames (`open_url`, `notify`, `input`) only to the requesting connection, without `seq`, whether or not it declared `capabilities.ui`.
 
+`set_model`, `cycle_model`, `set_thinking_level`, and `cycle_thinking_level` each broadcast `config_update` (`model` and `thinkingLevel` as the session reports them after the change) to socket connections only, before the command's response, so every attached client can show the new setting. Stdio receives no frame for these commands; a built-in slash command that changes the model (such as `/model`) still sends `config_update` to stdio as before.
+
 Frames addressed to one connection carry no `seq`: command responses, `prompt_result`, `command_output`, `rpc_chunk`, host tool and host URI requests, and all subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`, which are filtered per connection by `set_subagent_subscription`). The exception is an extension's failed send (`reportSendError`): it is broadcast to every connection as an error `response` without `id`, and carries `seq`. Clients therefore cannot treat a gap as loss; only the `resumed`/`attached` decision depends on `seq`.
 
 `epoch` starts from the host's start time in milliseconds and increases by one on every session replacement. Treat it as opaque; compare it for equality.
@@ -1674,6 +1676,7 @@ Current helper characteristics:
 - `promptAndWait()` waits for that prompt's result (or synchronous local completion); `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
 - `detach()` and `exit()` send the session-host commands of those names, then stop the client. `RpcCommandError` carries `code`, plus `epoch` and `leafId` (`stale`) and `hostId` (`session_hosted`) when the host returns them. A host connection comes from `connectSessionHost` (`src/session-host/client.ts`), which fits the custom `spawn` transport; see [Session hosts](#session-hosts).
+- `onHostFrame()` delivers the session-host frames (`attached`, `resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`, `config_update`, `session_info_update`) as the `RpcHostFrame` union, in arrival order, with any `seq` kept; they reach no other listener, so register before `start()` to see `attached`. `onClose()` reports a transport that ended without `stop()`, `detach()`, or `exit()` (a closed socket says nothing about whether the host process is alive). `prompt`, `steer`, `followUp`, `removeQueuedMessage`, `setModel`, `cycleModel`, `setThinkingLevel`, and `cycleThinkingLevel` take an optional trailing `{ ifEpoch, ifLeaf }`; a stale one rejects with `RpcCommandError` (`code: "stale"`).
 
 ### Python package
 

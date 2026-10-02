@@ -4365,13 +4365,21 @@
 				},
 				"title": {
 					"type": "string"
+				},
+				"origin": {
+					"$ref": "#/$defs/SessionOrigin",
+					"description": "Socket clients: the session was relocated (`/move`, `/wt`); where it lives now."
+				},
+				"seq": {
+					"type": "integer",
+					"description": "Host sequence number; socket clients only."
 				}
 			},
 			"required": [
 				"type",
 				"sessionId"
 			],
-			"description": "A builtin slash command changed the session title."
+			"description": "The session title changed."
 		},
 		"ConfigUpdateEvent": {
 			"type": "object",
@@ -4384,12 +4392,16 @@
 				},
 				"thinkingLevel": {
 					"$ref": "#/$defs/ThinkingLevel"
+				},
+				"seq": {
+					"type": "integer",
+					"description": "Host sequence number; socket clients only."
 				}
 			},
 			"required": [
 				"type"
 			],
-			"description": "A builtin slash command changed the model configuration."
+			"description": "The live model or thinking level changed."
 		},
 		"RpcFrameErrorEvent": {
 			"type": "object",
