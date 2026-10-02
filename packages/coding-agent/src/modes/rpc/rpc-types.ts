@@ -11,7 +11,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
-import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
+import type { FileEntry, SessionEntry, SessionHeader, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
@@ -28,9 +28,23 @@ import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 /** `set_event_filter` projection: `"full"` keeps both accumulated snapshots in `message_update`, `"delta"` sends only the increment. */
 export type RpcMessageUpdates = "full" | "delta";
 
-export type RpcCommand =
+/**
+ * Write preconditions for sequenced (socket) clients. On mismatch the command does not run and
+ * fails with `code: "stale"`; abort, detach, exit, the side-channel setters, and `get_*` reads are exempt.
+ */
+export interface RpcPreconditions {
+	/** Run only while the host's session epoch equals this. */
+	ifEpoch?: number;
+	/** Run only while the session leaf equals this entry id. */
+	ifLeaf?: string | null;
+}
+
+type RpcCommandBody =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	// Session host: leave the host running / end it once no other client remains
+	| { id?: string; type: "detach" }
+	| { id?: string; type: "exit" }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -130,6 +144,8 @@ export type RpcCommand =
 			suggestion: string;
 			accepted: boolean;
 	  };
+
+export type RpcCommand = RpcCommandBody & RpcPreconditions;
 
 // ============================================================================
 // RPC State
@@ -271,6 +287,93 @@ export interface RpcOpenSessionResult {
 	sessionFile?: string;
 }
 
+/** A connected session-host client, as listed in snapshots and `clients_changed`. */
+export interface RpcClientInfo {
+	clientId: string;
+	kind: string;
+	label?: string;
+}
+
+/**
+ * Where the host session lives, for resolving links in what it authored (`local://`, relative file paths): the host's
+ * cwd, artifacts directory (`null`: none, e.g. an in-memory session), the actual directory its `local://` URLs map to
+ * (the host's own resolution, so an in-memory session reports the host's temp root), and its transcript id. Socket
+ * clients only.
+ */
+export interface RpcSessionOrigin {
+	cwd: string;
+	artifactsDir: string | null;
+	localRoot: string;
+	sessionId: string;
+}
+
+/** Everything a client needs to render the session from scratch. */
+export interface RpcSnapshot {
+	state: RpcSessionState;
+	header: SessionHeader | null;
+	entries: SessionEntry[];
+	leafId: string | null;
+	/** The in-flight message of a mid-turn join; later frames for it carry `messageId`. */
+	streaming?: { messageId: string; message: AgentMessage };
+	/** Open extension dialogs a late joiner can answer. */
+	pendingUi: RpcExtensionUIRequest[];
+	clients: RpcClientInfo[];
+	/** Where the host session lives (see {@link RpcSessionOrigin}). Absent from hosts that predate it. */
+	origin?: RpcSessionOrigin;
+}
+
+/** First frame a socket client sends; anything else, or a wrong token, gets `unauthorized` and a close. */
+export interface RpcHelloFrame {
+	type: "hello";
+	token: string;
+	protocolVersion: 1 | 2;
+	client: { kind: string; label?: string };
+	capabilities: { ui: boolean };
+	/** Ignored, so the client gets `attached`, unless `hostId` names this host. */
+	resume?: { hostId: string; epoch: number; lastSeq: number };
+}
+
+/** First frame of a fresh attach: frames after it carry `seq` > this `seq`. */
+export interface RpcAttachedFrame {
+	type: "attached";
+	hostId: string;
+	clientId: string;
+	epoch: number;
+	seq: number;
+	snapshot: RpcSnapshot;
+}
+
+/** First frame of a resume: the `replayed` frames after `lastSeq` follow it. */
+export interface RpcResumedFrame {
+	type: "resumed";
+	epoch: number;
+	replayed: number;
+}
+
+/** A session-file append. Sequenced clients only. */
+export interface RpcEntryFrame {
+	type: "entry";
+	entry: SessionEntry;
+	seq: number;
+}
+
+/** The host now serves a different session (or transcript); `snapshot` replaces the client's view. Sequenced clients only. */
+export interface RpcSessionReplacedFrame {
+	type: "session_replaced";
+	epoch: number;
+	sessionFile: string | undefined;
+	reason: "new" | "resume" | "fork" | "tree";
+	snapshot: RpcSnapshot;
+	seq: number;
+}
+
+/** Client presence changed. Sequenced clients only. */
+export interface RpcClientsChangedFrame {
+	type: "clients_changed";
+	clients: RpcClientInfo[];
+	seq: number;
+}
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
@@ -332,6 +435,9 @@ export type RpcResponse =
 			success: true;
 			data: { protocolVersion: 2 };
 	  }
+	// Session host
+	| { id?: string; type: "response"; command: "detach"; success: true }
+	| { id?: string; type: "response"; command: "exit"; success: true }
 
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
@@ -522,7 +628,18 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "predict_word_feedback"; success: true }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
-	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+	// `stale` carries the current `epoch` or `leafId`; `session_hosted` the owning `hostId`.
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code?: string;
+			epoch?: number;
+			leafId?: string | null;
+			hostId?: string;
+	  };
 
 // ============================================================================
 // Subagent Events (stdout)
