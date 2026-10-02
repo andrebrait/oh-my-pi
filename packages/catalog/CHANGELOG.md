@@ -44,7 +44,7 @@
 ## [18.4.11] - 2026-10-02
 ### Added
 
-- Added the vendor's default reasoning effort to model metadata (`vendorDefaultEffort`): read live from Codex discovery, and taken from the published docs for Claude, GPT and Gemini 3.x models that document one
+- Added the vendor's default reasoning effort to model metadata (`vendorDefaultEffort`): read live from Codex discovery, and taken from the published docs for Claude, GPT and Gemini 3.x models that document one ([#14114](https://github.com/can1357/oh-my-pi/pull/14114) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 
