@@ -5,6 +5,7 @@
 ### Added
 
 - `/dump all` writes a zip to the temp directory with the main transcript, the LLM request JSON, and one file per subagent transcript (nested subagents included, killed ones marked aborted); the TUI copies the archive path to the clipboard. Plain `/dump` is unchanged ([#13908](https://github.com/can1357/oh-my-pi/pull/13908) by [@H4vC](https://github.com/H4vC))
+- Added custom OpenAI-compatible provider management and comment-preserving `models.yml` editing ([#13874](https://github.com/can1357/oh-my-pi/pull/13874) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
@@ -15,7 +16,6 @@
 ### Added
 
 - Added `omp auth-gateway stdio`: a long-lived inference server for other programs speaking JSON lines on stdin/stdout (`{"id", "path": "/v1/chat/completions", "body"}` in, `{"id", "status", "body"}` out) with your own sign-ins; a request's `model` takes any `--model` selector (`@smol`, `sonnet`, `@commit,@smol`) and falls back along `retry.fallbackChains` when an attempt fails.
-- Added custom OpenAI-compatible provider management and comment-preserving `models.yml` editing ([#13874](https://github.com/can1357/oh-my-pi/pull/13874) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 
