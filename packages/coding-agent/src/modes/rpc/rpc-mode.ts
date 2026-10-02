@@ -68,6 +68,7 @@ import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { RpcBtwController } from "./rpc-btw";
 import { RpcGoalController } from "./rpc-goal";
 import { RpcLiveBridge, type RpcLiveSessionFactory } from "./rpc-live";
 import { RpcOutputWriter } from "./rpc-output";
@@ -1264,6 +1265,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 	const wordPredictor = new RpcWordPredictor();
+	const btw = new RpcBtwController(session, output);
 	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
 	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
 	// A scheduled or held goal turn will start a turn: every settle report treats it as busy,
@@ -1496,6 +1498,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			change: () => Promise<T>,
 			{ detachesRun }: { detachesRun: boolean },
 		): Promise<T> => {
+			await btw.close();
 			await goalController.beginSessionChange();
 			let result: T | undefined;
 			try {
@@ -1562,6 +1565,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 */
 	const disposeAndExit = async (): Promise<never> => {
 		try {
+			await btw.close();
 			// Close the realtime call (microphone, socket) before the session it delegates into.
 			await liveBridge.stop();
 			await session.dispose();
@@ -1804,6 +1808,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "switch_session":
 			case "branch":
 			case "fork": {
+				await btw.close();
 				// Fast refusal before the goal controller voids a waiting continuation;
 				// fork() repeats the check after each of its own awaits.
 				if (command.type === "fork" && session.isBusyForSnapshot) {
@@ -1838,6 +1843,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "open_session": {
 				const fileBeforeOpen = session.sessionFile;
+				await btw.close();
 				await goalController.beginSessionChange();
 				let result: RpcOpenSessionResult | undefined;
 				try {
@@ -2376,6 +2382,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "login", err instanceof Error ? err.message : String(err));
 				}
 			}
+
+			// =================================================================
+			// Side questions (/btw)
+			// =================================================================
+
+			case "btw": {
+				const record = await btw.ask(command.question, command.recordId);
+				return success(id, "btw", { record });
+			}
+
+			case "btw_cancel":
+				return success(id, "btw_cancel", { cancelled: btw.cancel(command.recordId) });
+
+			case "get_btw_history":
+				return success(id, "get_btw_history", { records: await btw.history() });
 
 			// =================================================================
 			// Word prediction
