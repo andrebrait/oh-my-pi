@@ -39,6 +39,14 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		result: { protocolVersion: "number.integer" },
 	},
 	{
+		name: "detach",
+		doc: "Session-host socket clients: leave; the session keeps running. Unknown on stdio.",
+	},
+	{
+		name: "exit",
+		doc: "Session-host socket clients: leave, and stop the host when no other client remains. Unknown on stdio.",
+	},
+	{
 		name: "prompt",
 		doc: "Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.",
 		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior" },

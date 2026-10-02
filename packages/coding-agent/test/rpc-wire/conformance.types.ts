@@ -22,13 +22,18 @@ import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcAgentSessionEventFrame,
 	RpcAskDialogQuestion,
+	RpcAttachedFrame,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcBtwDeltaFrame,
 	RpcBtwRecordFrame,
+	RpcClientInfo,
+	RpcClientsChangedFrame,
 	RpcCommand,
+	RpcEntryFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHelloFrame,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
@@ -43,12 +48,17 @@ import type {
 	RpcLivePhaseFrame,
 	RpcLiveTranscriptFrame,
 	RpcOpenSessionResult,
+	RpcPreconditions,
 	RpcPromptError,
 	RpcPromptResultFrame,
 	RpcReadyFrame,
 	RpcResponse,
+	RpcResumedFrame,
+	RpcSessionOrigin,
+	RpcSessionReplacedFrame,
 	RpcSessionSettledFrame,
 	RpcSessionState,
+	RpcSnapshot,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
 	RpcSubagentMessagesResult,
@@ -129,7 +139,11 @@ type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : { left: A; right: 
 // --- Commands -------------------------------------------------------------
 
 type CommandName = RpcCommand["type"];
-type ServerParams<K extends CommandName> = Omit<Extract<RpcCommand, { type: K }>, "id" | "type">;
+/** Preconditions travel with every command beside `id`/`type`; the wire declares them once as `RpcPreconditions`. */
+type ServerParams<K extends CommandName> = Omit<
+	Extract<RpcCommand, { type: K }>,
+	"id" | "type" | keyof RpcPreconditions
+>;
 type ServerResult<K extends CommandName> =
 	Extract<RpcResponse, { command: K; success: true }> extends infer R
 		? R extends { data?: infer D }
@@ -230,6 +244,17 @@ export type Frames = Assert<
 		uiCancel: Inbound<Wire.CancelUiResponse, Extract<RpcExtensionUIResponse, { cancelled: unknown }>>;
 		uiAnswers: Inbound<Wire.AnswersUiResponse, Extract<RpcExtensionUIResponse, { answers: unknown }>>;
 		responseFailure: Outbound<Extract<RpcResponse, { success: false }>, Wire.RpcResponse>;
+		preconditions: Inbound<Wire.RpcPreconditions, RpcPreconditions>;
+		attached: Outbound<RpcAttachedFrame, Wire.AttachedEvent>;
+		resumed: Outbound<RpcResumedFrame, Wire.ResumedEvent>;
+		entry: Outbound<RpcEntryFrame, Wire.EntryEvent>;
+		sessionReplaced: Outbound<RpcSessionReplacedFrame, Wire.SessionReplacedEvent>;
+		clientsChanged: Outbound<RpcClientsChangedFrame, Wire.ClientsChangedEvent>;
+		/** The wire carries `protocolVersion` as an integer: generators take only string enums. */
+		hello: Inbound<Omit<Wire.HelloFrame, "protocolVersion">, Omit<RpcHelloFrame, "protocolVersion">>;
+		helloClient: Inbound<Wire.ClientIdentity, RpcHelloFrame["client"]>;
+		helloCapabilities: Inbound<Wire.ClientCapabilities, RpcHelloFrame["capabilities"]>;
+		helloResume: Inbound<Wire.ResumePoint, NonNullable<RpcHelloFrame["resume"]>>;
 	}>
 >;
 /** Every inbound frame type the server reads is a wire inbound frame. */
@@ -270,6 +295,10 @@ export type State = Assert<
 		slashCommand: Outbound<RpcAvailableSlashCommand, Wire.AvailableSlashCommand>;
 		slashSubcommand: Outbound<NonNullable<RpcAvailableSlashCommand["subcommands"]>[number], Wire.SlashSubcommand>;
 		subagentSnapshot: Outbound<RpcSubagentSnapshot, Wire.SubagentSnapshot>;
+		snapshot: Outbound<RpcSnapshot, Wire.SessionSnapshot>;
+		streamingMessage: Outbound<NonNullable<RpcSnapshot["streaming"]>, Wire.StreamingMessage>;
+		clientInfo: Outbound<RpcClientInfo, Wire.ClientInfo>;
+		sessionOrigin: Outbound<RpcSessionOrigin, Wire.SessionOrigin>;
 		subagentMessages: Outbound<RpcSubagentMessagesResult, Wire.SubagentMessages>;
 		btwHistoryRecord: Outbound<BtwHistoryRecord, Wire.BtwHistoryRecord>;
 		btwHistoryTurn: Outbound<BtwHistoryTurn, Wire.BtwHistoryTurn>;

@@ -895,10 +895,36 @@ export class SessionManager {
 	#draftOnlySessionCleanupArmed = false;
 
 	/**
-	 * Collab replication tap: invoked for every appended entry with the
-	 * in-memory (pre-blob-externalization) entry, so inline images survive.
+	 * Replication taps (collab host, session host): invoked for every appended
+	 * entry with the in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
-	onEntryAppended?: (entry: SessionEntry) => void;
+	readonly #entryListeners = new Set<(entry: SessionEntry) => void>();
+
+	subscribeEntryAppended(listener: (entry: SessionEntry) => void): () => void {
+		this.#entryListeners.add(listener);
+		return () => {
+			this.#entryListeners.delete(listener);
+		};
+	}
+
+	readonly #relocationListeners = new Set<() => void>();
+
+	/**
+	 * `listener()` after this session's location changed: {@link moveTo} (`/move`, `/wt`, and the inverse move of
+	 * {@link rollbackMove}) repointed the session file or the cwd. Read the new location from the manager. Not called
+	 * for a move that changed nothing or was refused; a move that failed after repointing still reports what it did.
+	 * The id never changes, so no entry is appended and no session change is announced.
+	 */
+	subscribeRelocated(listener: () => void): () => void {
+		this.#relocationListeners.add(listener);
+		return () => {
+			this.#relocationListeners.delete(listener);
+		};
+	}
+
+	#notifyRelocated(): void {
+		for (const listener of this.#relocationListeners) this.#invokePersistenceObserver(listener, undefined);
+	}
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -1926,12 +1952,11 @@ export class SessionManager {
 	}
 
 	#notifyEntryAppended(entry: SessionEntry): void {
-		const callback = this.onEntryAppended;
-		if (callback) {
+		for (const listener of this.#entryListeners) {
 			try {
-				callback(entry);
+				listener(entry);
 			} catch (err) {
-				logger.warn("collab entry hook failed", { error: String(err) });
+				logger.warn("entry-appended listener failed", { error: String(err) });
 			}
 		}
 	}
@@ -2499,6 +2524,7 @@ export class SessionManager {
 			this.#sessionFileRelocating = { source, dest };
 		}
 
+		const before = { sessionFile: this.#sessionFile, cwd: this.#cwd };
 		try {
 			if (this.#persist && this.#sessionFile) {
 				this.#storage.ensureDirSync(nextSessionDir);
@@ -2625,6 +2651,7 @@ export class SessionManager {
 			this.#sessionFileRelocating = null;
 			// The destination is ours or untouched now.
 			destination?.release();
+			if (this.#sessionFile !== before.sessionFile || this.#cwd !== before.cwd) this.#notifyRelocated();
 		}
 	}
 

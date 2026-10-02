@@ -568,6 +568,30 @@ export class SessionBusyError extends Error {
 	}
 }
 
+export interface SwitchSessionOptions {
+	onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
+	/** Collab snapshot adoption keeps the guest's process cwd and marks the replica runtime-only. */
+	preserveLocalCwd?: boolean;
+	/**
+	 * Use this model instead of the target's saved one, like an explicit
+	 * `--model` at startup, and record it in the session when it differs.
+	 */
+	model?: Model;
+	/** Keep the current model without restoring the target's (collab replicas mirror the host's model). */
+	keepModel?: boolean;
+	/**
+	 * Receives the model fallback warning after the switch commits, instead of a
+	 * `notice` event; for hosts that re-render the transcript after switching.
+	 */
+	onModelFallback?: (warning: string) => void;
+}
+
+/**
+ * Decides whether a switch to `sessionFile` may start, and runs it via `proceed`. A guard that does not call
+ * `proceed` refuses: nothing changes and the switch reports cancelled, as for an extension veto.
+ */
+export type SessionSwitchGuard = (sessionFile: string, proceed: () => Promise<boolean>) => Promise<boolean>;
+
 const EXPERIMENTAL_CONTEXT_REQUIRED_TOOLS: Record<string, true> = {
 	context_notes: true,
 	new_context: true,
@@ -2738,6 +2762,16 @@ export class AgentSession implements SettingsScope {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	#sessionSwitchGuard: SessionSwitchGuard | undefined;
+
+	/**
+	 * Wrap every {@link switchSession} (RPC command, extension action, custom command) in `guard`, so a host can
+	 * refuse a target another process owns before anything changes.
+	 */
+	setSessionSwitchGuard(guard: SessionSwitchGuard | null): void {
+		this.#sessionSwitchGuard = guard ?? undefined;
 	}
 
 	/**
@@ -11253,30 +11287,18 @@ export class AgentSession implements SettingsScope {
 	 * warning. Reloading the current session keeps the current model.
 	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
-	async switchSession(
-		sessionPath: string,
-		options?: {
-			onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
-			/** Collab snapshot adoption keeps the guest's process cwd and marks the replica runtime-only. */
-			preserveLocalCwd?: boolean;
-			/**
-			 * Use this model instead of the target's saved one, like an explicit
-			 * `--model` at startup, and record it in the session when it differs.
-			 */
-			model?: Model;
-			/** Keep the current model without restoring the target's (collab replicas mirror the host's model). */
-			keepModel?: boolean;
-			/**
-			 * Receives the model fallback warning after the switch commits, instead of a
-			 * `notice` event; for hosts that re-render the transcript after switching.
-			 */
-			onModelFallback?: (warning: string) => void;
-		},
-	): Promise<boolean> {
+	async switchSession(sessionPath: string, options?: SwitchSessionOptions): Promise<boolean> {
 		const explicitModel = options?.model;
 		if (explicitModel && !this.#modelRegistry.hasConfiguredAuth(explicitModel)) {
 			throw new Error(`No API key for ${explicitModel.provider}/${explicitModel.id}`);
 		}
+		const guard = this.#sessionSwitchGuard;
+		const proceed = () => this.#switchSession(sessionPath, options);
+		return guard ? guard(sessionPath, proceed) : proceed();
+	}
+
+	async #switchSession(sessionPath: string, options?: SwitchSessionOptions): Promise<boolean> {
+		const explicitModel = options?.model;
 		using _transition = this.#beginSessionTransition();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
