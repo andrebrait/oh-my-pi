@@ -469,6 +469,44 @@ describe("RpcServer sequencing", () => {
 		expect(back.snapshot).toMatchObject({ state: { goal: { goal: { objective: "ship it" } } } });
 	});
 
+	it("sends config_update after a direct model or thinking change to sequenced clients only, not stdio", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		const stdio = new TestClient(server, { sequenced: false });
+		server.attach(a.conn);
+		server.attach(b.conn);
+		const updates = (c: TestClient): Record<string, unknown>[] => c.frames.filter(f => f.type === "config_update");
+
+		await a.command({ type: "set_model", provider: "anthropic", modelId: "claude-opus-4-5" });
+		const afterModel = await b.next(f => f.type === "config_update");
+		expect(afterModel).toMatchObject({ model: { provider: "anthropic", id: "claude-opus-4-5" } });
+		expect(afterModel.thinkingLevel).toBe(session.thinkingLevel);
+		expect(typeof afterModel.seq).toBe("number");
+
+		await a.command({ type: "set_thinking_level", level: "high" });
+		expect(await a.command({ type: "cycle_thinking_level" })).toMatchObject({
+			success: true,
+			data: { level: expect.any(String) },
+		});
+		expect(await a.command({ type: "cycle_model" })).toMatchObject({ success: true, data: { isScoped: false } });
+		// b's own round-trip is its sync point: its frames arrive in order.
+		await b.command({ type: "get_state" });
+		expect(updates(b)).toHaveLength(4);
+		const last = updates(b).at(-1)!;
+		expect(last).toMatchObject({ model: { id: session.model?.id } });
+		expect(last.thinkingLevel).toBe(session.thinkingLevel);
+
+		// A failed command reports no change.
+		const before = updates(a).length;
+		await a.command({ type: "set_model", provider: "anthropic", modelId: "no-such-model" });
+		expect(updates(a)).toHaveLength(before);
+
+		// Frames arrive in write order: a config_update sent to stdio would precede this response.
+		await stdio.command({ type: "get_state" });
+		expect(stdio.frames.some(f => f.type === "config_update")).toBe(false);
+	});
+
 	it("answers a non-string command type with Unknown command, as stdio does", async () => {
 		await startServer({ handler: { content: ["ok"] } });
 		for (const sequenced of [true, false]) {

@@ -8,7 +8,7 @@ import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
-import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
@@ -34,6 +34,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
+	RpcHostFrame,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
@@ -41,6 +42,7 @@ import type {
 	RpcHostToolUpdate,
 	RpcLiveFrame,
 	RpcOpenSessionResult,
+	RpcPreconditions,
 	RpcPromptResultFrame,
 	RpcRemoveQueuedMessageResult,
 	RpcResponse,
@@ -120,6 +122,10 @@ export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcPromptResultListener = (result: RpcPromptResultFrame) => void;
 export type RpcSessionSettledListener = () => void;
+/** Receives every session-host frame; see {@link RpcClient.onHostFrame}. */
+export type RpcHostFrameListener = (frame: RpcHostFrame) => void;
+/** Receives the error that ended an established transport; see {@link RpcClient.onClose}. */
+export type RpcCloseListener = (error: Error) => void;
 export type RpcLiveListener = (frame: RpcLiveFrame) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
@@ -272,6 +278,49 @@ function isRpcBtwRecordFrame(value: unknown): value is RpcBtwRecordFrame {
 	return isRecord(value) && value.type === "btw_record" && isRecord(value.record);
 }
 
+/** The wire fields a session-host consumer reads; a frame missing one is not delivered rather than half-applied. */
+function isSessionHostFrame(value: unknown): value is RpcHostFrame {
+	if (!isRecord(value)) return false;
+	switch (value.type) {
+		case "attached":
+			return (
+				typeof value.hostId === "string" &&
+				typeof value.clientId === "string" &&
+				typeof value.epoch === "number" &&
+				typeof value.seq === "number" &&
+				isRecord(value.snapshot)
+			);
+		case "resumed":
+			return typeof value.epoch === "number" && typeof value.replayed === "number";
+		case "entry":
+			return isRecord(value.entry) && typeof value.seq === "number";
+		case "session_replaced":
+			return typeof value.epoch === "number" && typeof value.seq === "number" && isRecord(value.snapshot);
+		case "clients_changed":
+			return Array.isArray(value.clients) && typeof value.seq === "number";
+		case "command_output":
+			return typeof value.text === "string";
+		case "config_update":
+			return (
+				(value.model === undefined || isRecord(value.model)) &&
+				(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string")
+			);
+		case "session_info_update":
+			return (
+				typeof value.sessionId === "string" &&
+				(value.title === undefined || typeof value.title === "string") &&
+				(value.origin === undefined ||
+					(isRecord(value.origin) &&
+						typeof value.origin.cwd === "string" &&
+						(value.origin.artifactsDir === null || typeof value.origin.artifactsDir === "string") &&
+						typeof value.origin.localRoot === "string" &&
+						typeof value.origin.sessionId === "string"))
+			);
+		default:
+			return false;
+	}
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -333,6 +382,17 @@ function isPageFallbackError(error: unknown): boolean {
 	return error.message === RPC_MESSAGES_PAGE_BUSY_ERROR || error.message === RPC_MESSAGES_PAGE_STALE_ERROR;
 }
 
+/**
+ * The write guard to put on a command: exactly `ifEpoch`/`ifLeaf`, each only when set. A caller's object may be a
+ * structural subtype with more keys (`type`, `message`, `level`, ...), and those must never reach the command.
+ */
+function writeGuard(preconditions: RpcPreconditions | undefined): RpcPreconditions {
+	const guard: RpcPreconditions = {};
+	if (preconditions?.ifEpoch !== undefined) guard.ifEpoch = preconditions.ifEpoch;
+	if (preconditions?.ifLeaf !== undefined) guard.ifLeaf = preconditions.ifLeaf;
+	return guard;
+}
+
 // ============================================================================
 // RPC Client
 // ============================================================================
@@ -350,6 +410,8 @@ export class RpcClient {
 	#btwRecordListeners = new Set<(record: BtwHistoryRecord) => void>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#sessionSettledListeners = new Set<RpcSessionSettledListener>();
+	#hostFrameListeners = new Set<RpcHostFrameListener>();
+	#closeListeners = new Set<RpcCloseListener>();
 	#liveListeners = new Set<RpcLiveListener>();
 	/** `promptAndWait` completions keyed by request id; registered before the prompt is sent. */
 	#promptResultWaiters = new Map<string, (result: RpcPromptResultFrame) => void>();
@@ -423,9 +485,14 @@ export class RpcClient {
 		// A transport that established v2 can chunk the frames right behind `ready`.
 		let protocolV2Enabled = "protocolVersion" in child && child.protocolVersion === 2;
 		const frameDecoder = new RpcFrameDecoder();
+		// True once start() has completed (ready, protocol negotiation, custom tools). `readySettled` flips earlier
+		// than that, and a transport that fails during the rest of startup makes start() reject instead.
+		let established = false;
 
+		/** Tear down `child`'s client state after its output ended; `onClose` listeners hear of it only for an established session. */
 		const reapAfterOutputFailure = async (error: Error) => {
 			if (this.#process !== child) return;
+			const notifyClose = established;
 
 			this.#process = null;
 			this.#abortController.abort(error);
@@ -441,6 +508,14 @@ export class RpcClient {
 			}
 			await this.#waitForExit(child);
 			for (const request of pendingRequests) request.reject(error);
+			if (!notifyClose) return;
+			for (const listener of this.#closeListeners) {
+				try {
+					listener(error);
+				} catch (listenerError) {
+					logger.warn("RPC close listener failed", { error: String(listenerError) });
+				}
+			}
 		};
 
 		// Process lines in background, intercepting the ready signal.
@@ -541,6 +616,7 @@ export class RpcClient {
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+			established = true;
 		} catch (cause) {
 			// Startup failed after spawning the child. Reap it before returning
 			// so a retry cannot inherit a live worker or its session lock.
@@ -693,6 +769,34 @@ export class RpcClient {
 	}
 
 	/**
+	 * Subscribe to session-host frames, in arrival order (the host's `seq` order for stamped frames; `seq` is
+	 * kept): `attached`/`resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`,
+	 * `config_update` and `session_info_update`. They reach no other listener. Register before {@link start}:
+	 * the host sends `attached` right behind `ready`, and a frame with no listener is dropped.
+	 */
+	onHostFrame(listener: RpcHostFrameListener): () => void {
+		this.#hostFrameListeners.add(listener);
+		return () => {
+			this.#hostFrameListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to the end of an established transport that this client did not close: stdout EOF or a
+	 * failed output reader (a socket the host closed or that broke). Each such close notifies once with
+	 * the error that pending requests also reject with, after the client is already stopped. Not called for
+	 * {@link stop}, {@link detach}, or {@link exit} (the caller ended it), nor for a {@link start} that fails,
+	 * including a transport lost during protocol negotiation or custom-tool registration (`start` rejects).
+	 * Listeners stay registered across restarts. A closed socket proves nothing about the host process: probe it separately.
+	 */
+	onClose(listener: RpcCloseListener): () => void {
+		this.#closeListeners.add(listener);
+		return () => {
+			this.#closeListeners.delete(listener);
+		};
+	}
+
+	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
 	getStderr(): string {
@@ -715,9 +819,24 @@ export class RpcClient {
 	 * `streamingBehavior` while the agent is busy, or routed to an extension command);
 	 * use onEvent() to receive streaming events and onPromptResult() to observe its
 	 * completion under that id.
+	 *
+	 * `preconditions` (here and on the other mutating controls below) are a session-host write guard: when
+	 * the host's epoch or leaf no longer matches, nothing runs and the call rejects with an
+	 * {@link RpcCommandError} (`code: "stale"`, carrying the host's current `epoch`/`leafId`). Stdio hosts ignore them.
 	 */
-	async prompt(message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp"): Promise<string> {
-		const response = await this.#send({ type: "prompt", message, images, streamingBehavior });
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+		preconditions?: RpcPreconditions,
+	): Promise<string> {
+		const response = await this.#send({
+			type: "prompt",
+			message,
+			images,
+			streamingBehavior,
+			...writeGuard(preconditions),
+		});
 		this.#getData(response);
 		return response.id ?? "";
 	}
@@ -725,23 +844,32 @@ export class RpcClient {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[], preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "steer", message, images, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[], preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "follow_up", message, images, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Remove the first matching user message and its companions from one pending queue.
 	 * A removed message's images are returned for restoring it to an editor.
 	 */
-	async removeQueuedMessage(message: string, queue: "steering" | "followUp"): Promise<RpcRemoveQueuedMessageResult> {
-		const response = await this.#send({ type: "remove_queued_message", message, queue });
+	async removeQueuedMessage(
+		message: string,
+		queue: "steering" | "followUp",
+		preconditions?: RpcPreconditions,
+	): Promise<RpcRemoveQueuedMessageResult> {
+		const response = await this.#send({
+			type: "remove_queued_message",
+			message,
+			queue,
+			...writeGuard(preconditions),
+		});
 		return this.#getData(response);
 	}
 
@@ -955,20 +1083,24 @@ export class RpcClient {
 	/**
 	 * Set model by provider and ID.
 	 */
-	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
-		const response = await this.#send({ type: "set_model", provider, modelId });
+	async setModel(
+		provider: string,
+		modelId: string,
+		preconditions?: RpcPreconditions,
+	): Promise<{ provider: string; id: string }> {
+		const response = await this.#send({ type: "set_model", provider, modelId, ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
 	/**
 	 * Cycle to next model.
 	 */
-	async cycleModel(): Promise<{
+	async cycleModel(preconditions?: RpcPreconditions): Promise<{
 		model: { provider: string; id: string };
 		thinkingLevel: ThinkingLevel | undefined;
 		isScoped: boolean;
 	} | null> {
-		const response = await this.#send({ type: "cycle_model" });
+		const response = await this.#send({ type: "cycle_model", ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
@@ -1018,15 +1150,15 @@ export class RpcClient {
 	/**
 	 * Set thinking level.
 	 */
-	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
-		await this.#send({ type: "set_thinking_level", level });
+	async setThinkingLevel(level: ThinkingLevel, preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "set_thinking_level", level, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Cycle thinking level.
 	 */
-	async cycleThinkingLevel(): Promise<{ level: ThinkingLevel } | null> {
-		const response = await this.#send({ type: "cycle_thinking_level" });
+	async cycleThinkingLevel(preconditions?: RpcPreconditions): Promise<{ level: ThinkingLevel } | null> {
+		const response = await this.#send({ type: "cycle_thinking_level", ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
@@ -1557,6 +1689,13 @@ export class RpcClient {
 
 		if (isRpcBtwRecordFrame(data)) {
 			for (const listener of this.#btwRecordListeners) listener(data.record);
+			return;
+		}
+
+		if (isSessionHostFrame(data)) {
+			for (const listener of this.#hostFrameListeners) {
+				listener(data);
+			}
 			return;
 		}
 

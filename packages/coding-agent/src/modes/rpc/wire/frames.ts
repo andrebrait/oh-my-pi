@@ -113,12 +113,26 @@ export const frameDefs = {
 	),
 	CommandOutputEvent: doc({ type: "'command_output'", text: "string" }, "Output of a builtin slash command."),
 	SessionInfoUpdateEvent: doc(
-		{ type: "'session_info_update'", "title?": "string", sessionId: "string" },
-		"A builtin slash command changed the session title.",
+		{
+			type: "'session_info_update'",
+			"title?": "string",
+			sessionId: "string",
+			"origin?": doc(
+				"SessionOrigin",
+				"Socket clients: the session was relocated (`/move`, `/wt`); where it lives now.",
+			),
+			"seq?": doc("number.integer", "Host sequence number; socket clients only."),
+		},
+		"The session title changed.",
 	),
 	ConfigUpdateEvent: doc(
-		{ type: "'config_update'", "model?": "ModelInfo", "thinkingLevel?": "ThinkingLevel" },
-		"A builtin slash command changed the model configuration.",
+		{
+			type: "'config_update'",
+			"model?": "ModelInfo",
+			"thinkingLevel?": "ThinkingLevel",
+			"seq?": doc("number.integer", "Host sequence number; socket clients only."),
+		},
+		"The live model or thinking level changed.",
 	),
 	RpcFrameErrorEvent: doc(
 		{ type: "'rpc_frame_error'", "originalType?": "string", error: "string" },
