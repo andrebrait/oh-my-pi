@@ -142,6 +142,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "set_slow_mode",
+				"doc": "Turn `/slow` on or off for the active model; returns whether it is now on.",
+				"params": "SetSlowModeParams",
+				"result": "SetSlowModeResult",
+				"nullable": false,
+				"unwrap": "enabled",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "goal",
 				"doc": "Read or change goal mode with the lifecycle of the interactive `/goal` command.",
 				"params": "GoalParams",
@@ -2382,7 +2393,15 @@
 			],
 			"description": "Outcome of every `goal` op; both fields are null when the session has no goal."
 		},
-		"AnthropicSlowModeLowPriority": {
+		"SlowModeScope": {
+			"enum": [
+				"session",
+				"global"
+			],
+			"type": "string",
+			"description": "Where `/slow` lives: persisted config shared by every session, or this session's flex tier."
+		},
+		"UsageLimitLowPriority": {
 			"type": "object",
 			"properties": {
 				"stage": {
@@ -2390,20 +2409,20 @@
 				},
 				"resetsAtSec": {
 					"type": "number",
-					"description": "Epoch seconds when the 5-hour usage window resets."
+					"description": "Epoch seconds when the limit that was hit resets."
 				},
 				"allowanceLeftPercent": {
 					"type": "integer",
-					"description": "Percent of the weekly low-priority allowance still available."
+					"description": "Percent of the low-priority allowance still available, when reported."
 				}
 			},
 			"required": [
 				"stage",
 				"resetsAtSec"
 			],
-			"description": "`/slow` low priority serves the Claude account on spare capacity."
+			"description": "Requests are served on the provider's low-priority (slow) lane."
 		},
-		"AnthropicSlowModeWrapUp": {
+		"UsageLimitWrapUp": {
 			"type": "object",
 			"properties": {
 				"stage": {
@@ -2411,29 +2430,29 @@
 				},
 				"extraUsage": {
 					"type": "boolean",
-					"description": "Whether Anthropic extra usage will serve requests after the allowance."
+					"description": "Whether paid extra usage serves requests once the allowance is spent."
 				},
 				"resetsAtSec": {
 					"type": "number",
-					"description": "Epoch seconds when the current usage-limit window resets, if reported."
+					"description": "Epoch seconds when the limit that was hit resets, if reported."
 				}
 			},
 			"required": [
 				"stage",
 				"extraUsage"
 			],
-			"description": "Short wrap-up allowance after the Claude usage limit is reached."
+			"description": "Requests run on a short wrap-up allowance past the limit."
 		},
-		"AnthropicSlowModeState": {
+		"UsageLimitState": {
 			"anyOf": [
 				{
-					"$ref": "#/$defs/AnthropicSlowModeLowPriority"
+					"$ref": "#/$defs/UsageLimitLowPriority"
 				},
 				{
-					"$ref": "#/$defs/AnthropicSlowModeWrapUp"
+					"$ref": "#/$defs/UsageLimitWrapUp"
 				}
 			],
-			"description": "Structured Claude usage-limit stage, discriminated by `stage`."
+			"description": "Provider-neutral state of an account past its usage limit, discriminated by `stage`."
 		},
 		"SessionState": {
 			"type": "object",
@@ -2485,9 +2504,23 @@
 					"type": "boolean",
 					"default": false
 				},
-				"anthropicSlowMode": {
-					"$ref": "#/$defs/AnthropicSlowModeState",
-					"description": "Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority."
+				"slowModeSupported": {
+					"type": "boolean",
+					"description": "`/slow` applies to the active model.",
+					"default": false
+				},
+				"slowModeEnabled": {
+					"type": "boolean",
+					"description": "`/slow` is on for the active model; always `false` when `slowModeSupported` is `false`.",
+					"default": false
+				},
+				"slowModeScope": {
+					"$ref": "#/$defs/SlowModeScope",
+					"description": "Where the active model's `/slow` lives; absent when unsupported."
+				},
+				"usageLimit": {
+					"$ref": "#/$defs/UsageLimitState",
+					"description": "Usage-limit stage of the active model's account; absent outside wrap-up and low priority."
 				},
 				"tokensPerSecond": {
 					"anyOf": [
@@ -5579,6 +5612,28 @@
 			]
 		},
 		"SetFastModeParams": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"enabled"
+			]
+		},
+		"SetSlowModeParams": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"enabled"
+			]
+		},
+		"SetSlowModeResult": {
 			"type": "object",
 			"properties": {
 				"enabled": {

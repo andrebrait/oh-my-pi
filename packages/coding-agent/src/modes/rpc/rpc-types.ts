@@ -10,9 +10,9 @@ import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } 
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import type { AnthropicSlowModeState } from "../../session/anthropic-slow-mode";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
+import type { UsageLimitState } from "../../session/usage-limit";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
@@ -47,6 +47,7 @@ export type RpcCommand =
 	// State
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+	| { id?: string; type: "set_slow_mode"; enabled: boolean }
 	| {
 			id?: string;
 			type: "goal";
@@ -150,8 +151,17 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	fastModeEnabled: boolean;
 	fastModeActive: boolean;
-	/** Structured Claude usage-limit stage; absent off Anthropic models and outside wrap-up/low priority. */
-	anthropicSlowMode?: AnthropicSlowModeState;
+	/** `/slow` applies to the active model (flex tier on OpenAI/Google, low priority on Claude subscriptions). */
+	slowModeSupported: boolean;
+	/** `/slow` is on for the active model; always `false` when `slowModeSupported` is `false`. */
+	slowModeEnabled: boolean;
+	/**
+	 * Where the active model's `/slow` lives: `global` (persisted config shared by every
+	 * session, e.g. Claude low priority) or `session` (this session's flex tier). Absent when unsupported.
+	 */
+	slowModeScope?: "session" | "global";
+	/** Usage-limit stage of the active model's account; absent outside wrap-up and low priority. */
+	usageLimit?: UsageLimitState;
 	tokensPerSecond: number | null;
 	messageCount: number;
 	queuedMessageCount: number;
@@ -356,6 +366,7 @@ export type RpcResponse =
 			success: true;
 			data: { enabled: boolean; active: boolean };
 	  }
+	| { id?: string; type: "response"; command: "set_slow_mode"; success: true; data: { enabled: boolean } }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
 	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
 	| {

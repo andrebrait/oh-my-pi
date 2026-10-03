@@ -129,6 +129,12 @@ _SUBAGENT_STATUS_VALUES: Final[frozenset[str]] = frozenset({"pending", "running"
 _decode_subagent_status = cast("Decoder[SubagentStatus]", literal(_SUBAGENT_STATUS_VALUES))
 
 
+SlowModeScope: TypeAlias = Literal["session", "global"]
+"""Where `/slow` lives: persisted config shared by every session, or this session's flex tier."""
+_SLOW_MODE_SCOPE_VALUES: Final[frozenset[str]] = frozenset({"session", "global"})
+_decode_slow_mode_scope = cast("Decoder[SlowModeScope]", literal(_SLOW_MODE_SCOPE_VALUES))
+
+
 AutoCompactionReason: TypeAlias = Literal["threshold", "overflow", "idle", "incomplete"]
 _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", "overflow", "idle", "incomplete"})
 _decode_auto_compaction_reason = cast("Decoder[AutoCompactionReason]", literal(_AUTO_COMPACTION_REASON_VALUES))
@@ -602,23 +608,23 @@ class GoalResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
-class AnthropicSlowModeLowPriority:
-    """`/slow` low priority serves the Claude account on spare capacity."""
+class UsageLimitLowPriority:
+    """Requests are served on the provider's low-priority (slow) lane."""
     stage: Literal["low_priority"] = "low_priority"
     resets_at_sec: float
-    """Epoch seconds when the 5-hour usage window resets."""
+    """Epoch seconds when the limit that was hit resets."""
     allowance_left_percent: int | None = None
-    """Percent of the weekly low-priority allowance still available."""
+    """Percent of the low-priority allowance still available, when reported."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
-class AnthropicSlowModeWrapUp:
-    """Short wrap-up allowance after the Claude usage limit is reached."""
+class UsageLimitWrapUp:
+    """Requests run on a short wrap-up allowance past the limit."""
     stage: Literal["wrap_up"] = "wrap_up"
     extra_usage: bool
-    """Whether Anthropic extra usage will serve requests after the allowance."""
+    """Whether paid extra usage serves requests once the allowance is spent."""
     resets_at_sec: float | None = None
-    """Epoch seconds when the current usage-limit window resets, if reported."""
+    """Epoch seconds when the limit that was hit resets, if reported."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -636,8 +642,14 @@ class SessionState:
     auto_compaction_enabled: bool = False
     fast_mode_enabled: bool = False
     fast_mode_active: bool = False
-    anthropic_slow_mode: AnthropicSlowModeState | None = None
-    """Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority."""
+    slow_mode_supported: bool = False
+    """`/slow` applies to the active model."""
+    slow_mode_enabled: bool = False
+    """`/slow` is on for the active model; always `false` when `slowModeSupported` is `false`."""
+    slow_mode_scope: SlowModeScope | None = None
+    """Where the active model's `/slow` lives; absent when unsupported."""
+    usage_limit: UsageLimitState | None = None
+    """Usage-limit stage of the active model's account; absent outside wrap-up and low priority."""
     tokens_per_second: float | None = None
     message_count: int = 0
     queued_message_count: int = 0
@@ -1496,8 +1508,8 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
-AnthropicSlowModeState: TypeAlias = AnthropicSlowModeLowPriority | AnthropicSlowModeWrapUp
-"""Structured Claude usage-limit stage, discriminated by `stage`."""
+UsageLimitState: TypeAlias = UsageLimitLowPriority | UsageLimitWrapUp
+"""Provider-neutral state of an account past its usage limit, discriminated by `stage`."""
 
 
 RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
@@ -1795,19 +1807,19 @@ def parse_goal_result(value: object, path: str = "GoalResult") -> GoalResult:
     )
 
 
-def parse_anthropic_slow_mode_low_priority(value: object, path: str = "AnthropicSlowModeLowPriority") -> AnthropicSlowModeLowPriority:
+def parse_usage_limit_low_priority(value: object, path: str = "UsageLimitLowPriority") -> UsageLimitLowPriority:
     payload = expect_object(value, path)
     required(payload, "stage", cast('Decoder[Literal["low_priority"]]', literal(frozenset({"low_priority"}))), path)
-    return AnthropicSlowModeLowPriority(
+    return UsageLimitLowPriority(
         resets_at_sec=required(payload, "resetsAtSec", decode_float, path),
         allowance_left_percent=optional(payload, "allowanceLeftPercent", decode_int, path),
     )
 
 
-def parse_anthropic_slow_mode_wrap_up(value: object, path: str = "AnthropicSlowModeWrapUp") -> AnthropicSlowModeWrapUp:
+def parse_usage_limit_wrap_up(value: object, path: str = "UsageLimitWrapUp") -> UsageLimitWrapUp:
     payload = expect_object(value, path)
     required(payload, "stage", cast('Decoder[Literal["wrap_up"]]', literal(frozenset({"wrap_up"}))), path)
-    return AnthropicSlowModeWrapUp(
+    return UsageLimitWrapUp(
         extra_usage=required(payload, "extraUsage", decode_bool, path),
         resets_at_sec=optional(payload, "resetsAtSec", decode_float, path),
     )
@@ -1829,7 +1841,10 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         auto_compaction_enabled=defaulted(payload, "autoCompactionEnabled", decode_bool, path, False),
         fast_mode_enabled=defaulted(payload, "fastModeEnabled", decode_bool, path, False),
         fast_mode_active=defaulted(payload, "fastModeActive", decode_bool, path, False),
-        anthropic_slow_mode=optional(payload, "anthropicSlowMode", parse_anthropic_slow_mode_state, path),
+        slow_mode_supported=defaulted(payload, "slowModeSupported", decode_bool, path, False),
+        slow_mode_enabled=defaulted(payload, "slowModeEnabled", decode_bool, path, False),
+        slow_mode_scope=optional(payload, "slowModeScope", _decode_slow_mode_scope, path),
+        usage_limit=optional(payload, "usageLimit", parse_usage_limit_state, path),
         tokens_per_second=defaulted(payload, "tokensPerSecond", nullable(decode_float), path, None),
         message_count=defaulted(payload, "messageCount", decode_int, path, 0),
         queued_message_count=defaulted(payload, "queuedMessageCount", decode_int, path, 0),
@@ -2806,8 +2821,8 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
-def parse_anthropic_slow_mode_state(value: object, path: str = "AnthropicSlowModeState") -> AnthropicSlowModeState:
-    return dispatch("stage", _ANTHROPIC_SLOW_MODE_STATE_CASES)(value, path)
+def parse_usage_limit_state(value: object, path: str = "UsageLimitState") -> UsageLimitState:
+    return dispatch("stage", _USAGE_LIMIT_STATE_CASES)(value, path)
 
 
 def parse_rpc_agent_event(value: object, path: str = "RpcAgentEvent") -> RpcAgentEvent:
@@ -2823,9 +2838,9 @@ def parse_notification(value: object, path: str = "notification") -> RpcNotifica
     return _RPC_NOTIFICATION_CASES[tag](payload, tag)
 
 
-_ANTHROPIC_SLOW_MODE_STATE_CASES: Final[dict[str, Decoder[AnthropicSlowModeState]]] = {
-        "low_priority": parse_anthropic_slow_mode_low_priority,
-        "wrap_up": parse_anthropic_slow_mode_wrap_up,
+_USAGE_LIMIT_STATE_CASES: Final[dict[str, Decoder[UsageLimitState]]] = {
+        "low_priority": parse_usage_limit_low_priority,
+        "wrap_up": parse_usage_limit_wrap_up,
 }
 
 
@@ -2984,6 +2999,12 @@ class WireClient:
         params: dict[str, object] = {}
         params["enabled"] = enabled
         return parse_fast_mode_result(self._command("set_fast_mode", params), "set_fast_mode")
+
+    def set_slow_mode(self, enabled: bool) -> bool:
+        """Turn `/slow` on or off for the active model; returns whether it is now on."""
+        params: dict[str, object] = {}
+        params["enabled"] = enabled
+        return required(expect_object(self._command("set_slow_mode", params), "set_slow_mode"), "enabled", decode_bool, "set_slow_mode")
 
     def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None = None) -> GoalResult:
         """Read or change goal mode with the lifecycle of the interactive `/goal` command."""
@@ -3466,9 +3487,6 @@ __all__ = [
     "AgentSource",
     "AgentStartEvent",
     "AnthropicServerToolContent",
-    "AnthropicSlowModeLowPriority",
-    "AnthropicSlowModeState",
-    "AnthropicSlowModeWrapUp",
     "AskAnswer",
     "AskOption",
     "AskQuestion",
@@ -3600,6 +3618,7 @@ __all__ = [
     "SlashCommandInput",
     "SlashCommandSource",
     "SlashSubcommand",
+    "SlowModeScope",
     "StopReason",
     "StreamingBehavior",
     "SubagentEvent",
@@ -3638,6 +3657,9 @@ __all__ = [
     "TurnStartEvent",
     "Usage",
     "UsageCost",
+    "UsageLimitLowPriority",
+    "UsageLimitState",
+    "UsageLimitWrapUp",
     "UserContent",
     "UserMessage",
     "WidgetPlacement",
@@ -3647,9 +3669,6 @@ __all__ = [
     "parse_agent_message",
     "parse_agent_start_event",
     "parse_anthropic_server_tool_content",
-    "parse_anthropic_slow_mode_low_priority",
-    "parse_anthropic_slow_mode_state",
-    "parse_anthropic_slow_mode_wrap_up",
     "parse_ask_answer",
     "parse_ask_option",
     "parse_ask_question",
@@ -3790,6 +3809,9 @@ __all__ = [
     "parse_turn_start_event",
     "parse_usage",
     "parse_usage_cost",
+    "parse_usage_limit_low_priority",
+    "parse_usage_limit_state",
+    "parse_usage_limit_wrap_up",
     "parse_user_content",
     "parse_user_message",
 ]

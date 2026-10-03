@@ -31,6 +31,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AuthStorage } from "./auth-storage";
+import type { UsageLimitState } from "./usage-limit";
 
 /** Why an active slow-mode window ended. */
 export type AnthropicSlowModeEndReason =
@@ -43,23 +44,6 @@ export type AnthropicSlowModeEndReason =
 	| "wall"
 	| "max_wait"
 	| "extra_usage";
-
-/** Structured Claude usage-limit state for RPC and other non-TUI consumers. */
-export type AnthropicSlowModeState =
-	| {
-			stage: "low_priority";
-			/** Epoch seconds when the 5-hour usage window resets. */
-			resetsAtSec: number;
-			/** Percent of the weekly low-priority allowance still available. */
-			allowanceLeftPercent?: number;
-	  }
-	| {
-			stage: "wrap_up";
-			/** Epoch seconds when the current usage-limit window resets, if reported. */
-			resetsAtSec?: number;
-			/** Whether Anthropic extra usage will serve requests after the allowance. */
-			extraUsage: boolean;
-	  };
 
 /** Result of asking for the slow lane now (`/slow on` or auto-accept). */
 export type AnthropicSlowModeAvailability =
@@ -127,11 +111,8 @@ export function formatSlowModeResetClock(resetsAtSec: number, now = Date.now()):
 		: at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-/** TUI label for structured Claude usage-limit state. */
-export function formatAnthropicSlowModeStateLabel(
-	status: AnthropicSlowModeState | undefined,
-	now = Date.now(),
-): string | undefined {
+/** TUI status-line label for a usage-limit state. */
+export function formatUsageLimitLabel(status: UsageLimitState | undefined, now = Date.now()): string | undefined {
 	if (status?.stage === "low_priority") {
 		return `low priority until ${formatSlowModeResetClock(status.resetsAtSec, now)}${
 			status.allowanceLeftPercent === undefined ? "" : ` · ${status.allowanceLeftPercent}% left`
@@ -232,7 +213,7 @@ export class AnthropicSlowModeController {
 	}
 
 	/** Structured usage-limit state, or `undefined` outside wrap-up and low priority. */
-	status(now = Date.now(), lowPriority = true): AnthropicSlowModeState | undefined {
+	status(now = Date.now(), lowPriority = true): UsageLimitState | undefined {
 		const resetsAtSec = lowPriority ? this.activeResetsAtSec(now) : undefined;
 		if (resetsAtSec !== undefined) {
 			const allowanceLeftPercent = this.allowanceLeftPercent();
@@ -256,7 +237,7 @@ export class AnthropicSlowModeController {
 	 * low-priority label shows only when `lowPriority` (this session's `/slow`).
 	 */
 	statusLabel(now = Date.now(), lowPriority = true): string | undefined {
-		return formatAnthropicSlowModeStateLabel(this.status(now, lowPriority), now);
+		return formatUsageLimitLabel(this.status(now, lowPriority), now);
 	}
 
 	/** Whether the slow lane can be entered now, and on which window. */

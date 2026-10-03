@@ -120,7 +120,7 @@ describe("AgentSession Anthropic wrap-up hint", () => {
 		expect(wrapUpCount(contexts[0])).toBe(0);
 		expect(wrapUpCount(contexts[1])).toBe(1);
 		expect(wrapUpCount(contexts[2])).toBe(1);
-		expect(session?.getAnthropicSlowModeState()).toEqual({
+		expect(session?.getUsageLimitState()).toEqual({
 			stage: "wrap_up",
 			resetsAtSec: expect.any(Number),
 			extraUsage: false,

@@ -2369,21 +2369,42 @@ func (v *GoalResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
-// `/slow` low priority serves the Claude account on spare capacity.
-type AnthropicSlowModeLowPriority struct {
-	// Epoch seconds when the 5-hour usage window resets.
+// Where `/slow` lives: persisted config shared by every session, or this session's flex tier.
+type SlowModeScope string
+
+const (
+	SlowModeScopeSession SlowModeScope = "session"
+	SlowModeScopeGlobal  SlowModeScope = "global"
+)
+
+func (v *SlowModeScope) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "SlowModeScope")
+	if err != nil {
+		return err
+	}
+	switch value := SlowModeScope(s); value {
+	case SlowModeScopeSession, SlowModeScopeGlobal:
+		*v = value
+		return nil
+	}
+	return unknownValue("SlowModeScope", s)
+}
+
+// Requests are served on the provider's low-priority (slow) lane.
+type UsageLimitLowPriority struct {
+	// Epoch seconds when the limit that was hit resets.
 	ResetsAtSec float64 `json:"resetsAtSec"`
-	// Percent of the weekly low-priority allowance still available.
+	// Percent of the low-priority allowance still available, when reported.
 	AllowanceLeftPercent *int64 `json:"allowanceLeftPercent,omitempty"`
 }
 
-func (v *AnthropicSlowModeLowPriority) UnmarshalJSON(data []byte) error {
-	return decodeWith(data, "AnthropicSlowModeLowPriority", v.decodeFrom)
+func (v *UsageLimitLowPriority) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "UsageLimitLowPriority", v.decodeFrom)
 }
 
-func (v *AnthropicSlowModeLowPriority) decodeFrom(raw map[string]json.RawMessage) error {
-	var out AnthropicSlowModeLowPriority
-	d := fieldDecoder{raw: raw, owner: "AnthropicSlowModeLowPriority"}
+func (v *UsageLimitLowPriority) decodeFrom(raw map[string]json.RawMessage) error {
+	var out UsageLimitLowPriority
+	d := fieldDecoder{raw: raw, owner: "UsageLimitLowPriority"}
 	d.constant("stage", "low_priority")
 	d.required("resetsAtSec", &out.ResetsAtSec)
 	d.optional("allowanceLeftPercent", &out.AllowanceLeftPercent)
@@ -2394,26 +2415,26 @@ func (v *AnthropicSlowModeLowPriority) decodeFrom(raw map[string]json.RawMessage
 	return nil
 }
 
-func (v AnthropicSlowModeLowPriority) MarshalJSON() ([]byte, error) {
-	type plain AnthropicSlowModeLowPriority
+func (v UsageLimitLowPriority) MarshalJSON() ([]byte, error) {
+	type plain UsageLimitLowPriority
 	return encodeObject(plain(v), `"stage":"low_priority"`, nil)
 }
 
-// Short wrap-up allowance after the Claude usage limit is reached.
-type AnthropicSlowModeWrapUp struct {
-	// Whether Anthropic extra usage will serve requests after the allowance.
+// Requests run on a short wrap-up allowance past the limit.
+type UsageLimitWrapUp struct {
+	// Whether paid extra usage serves requests once the allowance is spent.
 	ExtraUsage bool `json:"extraUsage"`
-	// Epoch seconds when the current usage-limit window resets, if reported.
+	// Epoch seconds when the limit that was hit resets, if reported.
 	ResetsAtSec *float64 `json:"resetsAtSec,omitempty"`
 }
 
-func (v *AnthropicSlowModeWrapUp) UnmarshalJSON(data []byte) error {
-	return decodeWith(data, "AnthropicSlowModeWrapUp", v.decodeFrom)
+func (v *UsageLimitWrapUp) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "UsageLimitWrapUp", v.decodeFrom)
 }
 
-func (v *AnthropicSlowModeWrapUp) decodeFrom(raw map[string]json.RawMessage) error {
-	var out AnthropicSlowModeWrapUp
-	d := fieldDecoder{raw: raw, owner: "AnthropicSlowModeWrapUp"}
+func (v *UsageLimitWrapUp) decodeFrom(raw map[string]json.RawMessage) error {
+	var out UsageLimitWrapUp
+	d := fieldDecoder{raw: raw, owner: "UsageLimitWrapUp"}
 	d.constant("stage", "wrap_up")
 	d.required("extraUsage", &out.ExtraUsage)
 	d.optional("resetsAtSec", &out.ResetsAtSec)
@@ -2424,46 +2445,46 @@ func (v *AnthropicSlowModeWrapUp) decodeFrom(raw map[string]json.RawMessage) err
 	return nil
 }
 
-func (v AnthropicSlowModeWrapUp) MarshalJSON() ([]byte, error) {
-	type plain AnthropicSlowModeWrapUp
+func (v UsageLimitWrapUp) MarshalJSON() ([]byte, error) {
+	type plain UsageLimitWrapUp
 	return encodeObject(plain(v), `"stage":"wrap_up"`, nil)
 }
 
-// Structured Claude usage-limit stage, discriminated by `stage`.
-type AnthropicSlowModeState struct {
+// Provider-neutral state of an account past its usage limit, discriminated by `stage`.
+type UsageLimitState struct {
 	// Value holds one variant, chosen by "stage" on decode.
-	Value AnthropicSlowModeStateVariant
+	Value UsageLimitStateVariant
 }
 
-// AnthropicSlowModeStateVariant is implemented by the types AnthropicSlowModeState can hold.
-type AnthropicSlowModeStateVariant interface {
-	isAnthropicSlowModeState()
+// UsageLimitStateVariant is implemented by the types UsageLimitState can hold.
+type UsageLimitStateVariant interface {
+	isUsageLimitState()
 }
 
-func (AnthropicSlowModeLowPriority) isAnthropicSlowModeState() {}
-func (AnthropicSlowModeWrapUp) isAnthropicSlowModeState()      {}
+func (UsageLimitLowPriority) isUsageLimitState() {}
+func (UsageLimitWrapUp) isUsageLimitState()      {}
 
-func (v AnthropicSlowModeState) MarshalJSON() ([]byte, error) {
-	return encodeVariant("AnthropicSlowModeState", v.Value)
+func (v UsageLimitState) MarshalJSON() ([]byte, error) {
+	return encodeVariant("UsageLimitState", v.Value)
 }
 
-func (v *AnthropicSlowModeState) UnmarshalJSON(data []byte) error {
-	return decodeWith(data, "AnthropicSlowModeState", v.decodeFrom)
+func (v *UsageLimitState) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "UsageLimitState", v.decodeFrom)
 }
 
-func (v *AnthropicSlowModeState) decodeFrom(raw map[string]json.RawMessage) error {
-	tag, err := unionTag(raw, "AnthropicSlowModeState", "stage")
+func (v *UsageLimitState) decodeFrom(raw map[string]json.RawMessage) error {
+	tag, err := unionTag(raw, "UsageLimitState", "stage")
 	if err != nil {
 		return err
 	}
-	var value AnthropicSlowModeStateVariant
+	var value UsageLimitStateVariant
 	switch tag {
 	case "low_priority":
-		value, err = decodeVariant[AnthropicSlowModeLowPriority](raw)
+		value, err = decodeVariant[UsageLimitLowPriority](raw)
 	case "wrap_up":
-		value, err = decodeVariant[AnthropicSlowModeWrapUp](raw)
+		value, err = decodeVariant[UsageLimitWrapUp](raw)
 	default:
-		return unknownValue("AnthropicSlowModeState.stage", tag)
+		return unknownValue("UsageLimitState.stage", tag)
 	}
 	if err != nil {
 		return err
@@ -2486,11 +2507,17 @@ type SessionState struct {
 	AutoCompactionEnabled bool           `json:"autoCompactionEnabled"`
 	FastModeEnabled       bool           `json:"fastModeEnabled"`
 	FastModeActive        bool           `json:"fastModeActive"`
-	// Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority.
-	AnthropicSlowMode  *AnthropicSlowModeState `json:"anthropicSlowMode,omitempty"`
-	TokensPerSecond    *float64                `json:"tokensPerSecond"`
-	MessageCount       int64                   `json:"messageCount"`
-	QueuedMessageCount int64                   `json:"queuedMessageCount"`
+	// `/slow` applies to the active model.
+	SlowModeSupported bool `json:"slowModeSupported"`
+	// `/slow` is on for the active model; always `false` when `slowModeSupported` is `false`.
+	SlowModeEnabled bool `json:"slowModeEnabled"`
+	// Where the active model's `/slow` lives; absent when unsupported.
+	SlowModeScope *SlowModeScope `json:"slowModeScope,omitempty"`
+	// Usage-limit stage of the active model's account; absent outside wrap-up and low priority.
+	UsageLimit         *UsageLimitState `json:"usageLimit,omitempty"`
+	TokensPerSecond    *float64         `json:"tokensPerSecond"`
+	MessageCount       int64            `json:"messageCount"`
+	QueuedMessageCount int64            `json:"queuedMessageCount"`
 	// Background jobs or deliveries can still inject a follow-up and wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
@@ -2525,7 +2552,10 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("autoCompactionEnabled", &out.AutoCompactionEnabled, `false`)
 	d.defaulted("fastModeEnabled", &out.FastModeEnabled, `false`)
 	d.defaulted("fastModeActive", &out.FastModeActive, `false`)
-	d.optional("anthropicSlowMode", &out.AnthropicSlowMode)
+	d.defaulted("slowModeSupported", &out.SlowModeSupported, `false`)
+	d.defaulted("slowModeEnabled", &out.SlowModeEnabled, `false`)
+	d.optional("slowModeScope", &out.SlowModeScope)
+	d.optional("usageLimit", &out.UsageLimit)
 	d.defaulted("tokensPerSecond", &out.TokensPerSecond, `null`)
 	d.defaulted("messageCount", &out.MessageCount, `0`)
 	d.defaulted("queuedMessageCount", &out.QueuedMessageCount, `0`)
@@ -6524,6 +6554,25 @@ func (v *NegotiateProtocolResult) decodeFrom(raw map[string]json.RawMessage) err
 	return nil
 }
 
+type SetSlowModeResult struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (v *SetSlowModeResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SetSlowModeResult", v.decodeFrom)
+}
+
+func (v *SetSlowModeResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SetSlowModeResult
+	d := fieldDecoder{raw: raw, owner: "SetSlowModeResult"}
+	d.required("enabled", &out.Enabled)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type SetAskDialogResult struct {
 	Enabled bool `json:"enabled"`
 }
@@ -7061,6 +7110,18 @@ func (c Commands) SetFastMode(ctx context.Context, p SetFastModeCommand) (FastMo
 	var out FastModeResult
 	err := c.call(ctx, "set_fast_mode", p, 0, &out)
 	return out, err
+}
+
+// SetSlowModeCommand holds the parameters of "set_slow_mode".
+type SetSlowModeCommand struct {
+	Enabled bool `json:"enabled"`
+}
+
+// SetSlowMode sends "set_slow_mode": Turn `/slow` on or off for the active model; returns whether it is now on.
+func (c Commands) SetSlowMode(ctx context.Context, p SetSlowModeCommand) (bool, error) {
+	var out SetSlowModeResult
+	err := c.call(ctx, "set_slow_mode", p, 0, &out)
+	return out.Enabled, err
 }
 
 // GoalCommand holds the parameters of "goal".

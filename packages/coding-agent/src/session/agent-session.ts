@@ -452,12 +452,8 @@ import {
 	cfgTierOpenai,
 	cfgProvidersAnthropicSlowMode,
 } from "./settings";
-import {
-	type AnthropicSlowModeController,
-	anthropicSlowModeLanes,
-	type AnthropicSlowModeState,
-	formatAnthropicSlowModeStateLabel,
-} from "./anthropic-slow-mode";
+import { type AnthropicSlowModeController, anthropicSlowModeLanes, formatUsageLimitLabel } from "./anthropic-slow-mode";
+import type { UsageLimitState } from "./usage-limit";
 import { cfgInterruptMode } from "../modes/settings";
 import { cfgFollowUpMode } from "../modes/settings";
 import { cfgSteeringMode } from "../modes/settings";
@@ -9602,11 +9598,15 @@ export class AgentSession implements SettingsScope {
 	 * off an Anthropic model.
 	 */
 	getAnthropicSlowModeLabel(): string | undefined {
-		return formatAnthropicSlowModeStateLabel(this.getAnthropicSlowModeState());
+		return formatUsageLimitLabel(this.getUsageLimitState());
 	}
 
-	/** Structured counterpart of {@link getAnthropicSlowModeLabel} for RPC clients. */
-	getAnthropicSlowModeState(): AnthropicSlowModeState | undefined {
+	/**
+	 * Usage-limit stage of the active model's account (wrap-up allowance or
+	 * low-priority lane); undefined outside both stages. Claude subscriptions
+	 * are the only producer today.
+	 */
+	getUsageLimitState(): UsageLimitState | undefined {
 		if (this.model?.provider !== "anthropic") return undefined;
 		return this.getAnthropicSlowModeLane()?.status(
 			undefined,
@@ -9676,7 +9676,27 @@ export class AgentSession implements SettingsScope {
 		return family && isServiceTierForFamily(family, "flex") ? { kind: "flex", family } : undefined;
 	}
 
-	/** Reports whether `/slow` is on for the active model. */
+	/** Whether `/slow` applies to the active model (flex tier or Claude low priority). */
+	isSlowModeSupported(): boolean {
+		return this.#slowModeTarget() !== undefined;
+	}
+
+	/**
+	 * Where `/slow` for the active model is stored: `global` for the persisted
+	 * config every session shares (`providers.anthropic.slowMode`), `session`
+	 * for this session's flex service tier; undefined without a slow mode.
+	 */
+	getSlowModeScope(): "session" | "global" | undefined {
+		const target = this.#slowModeTarget();
+		if (!target) return undefined;
+		return target.kind === "anthropic" ? "global" : "session";
+	}
+
+	/**
+	 * Reports whether `/slow` is on for the active model. `false` when the
+	 * active model has no slow mode, even while another provider's persisted
+	 * setting (`providers.anthropic.slowMode`) stays on.
+	 */
 	isSlowModeEnabled(): boolean {
 		const target = this.#slowModeTarget();
 		if (!target) return false;
