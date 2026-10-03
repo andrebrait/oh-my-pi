@@ -21,7 +21,8 @@ export const authGatewayHelp = {
 } satisfies CommandMetadata;
 
 export const attachHelp = {
-	description: "List running session hosts (omp --mode host)",
+	description:
+		"List running session hosts (omp --mode host), or attach to one by host id, session id, or session path",
 } satisfies CommandMetadata;
 
 export const benchHelp = {

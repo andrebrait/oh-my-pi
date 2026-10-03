@@ -97,6 +97,13 @@ export interface InteractiveModeInitOptions {
 	autoStartCollab?: boolean;
 }
 
+export interface ShutdownOptions {
+	/** Process exit status once the terminal is restored. Default 0. */
+	exitCode?: number;
+	/** Written to stderr after the terminal is restored, in place of the resume or detach hint. */
+	farewell?: string;
+}
+
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
 	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
 
@@ -200,6 +207,11 @@ export interface InteractiveModeContext {
 	 * {@link hostedClient} it exists for the first repaint; unset when the link ends, and then links resolve locally.
 	 */
 	hostOrigin?: RpcSessionOrigin;
+	/**
+	 * Hosted client only, set by the hosted startup: replace the connected session host by `target` (a host id, a
+	 * session id, or a session path); with no target a selector over the live hosts opens. Reports its own failures.
+	 */
+	attachHostedSession?: (target?: string) => Promise<void>;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -306,7 +318,7 @@ export interface InteractiveModeContext {
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
-	shutdown(): Promise<void>;
+	shutdown(options?: ShutdownOptions): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */

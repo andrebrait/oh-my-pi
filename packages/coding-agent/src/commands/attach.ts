@@ -1,24 +1,39 @@
 /**
- * List running session hosts (`omp --mode host`) from the local registry.
+ * List running session hosts (`omp --mode host`) from the local registry, or attach this terminal to one:
+ * `omp attach <host id | session id | session path>` opens the TUI as a client of that host, starting a host for a
+ * session none runs.
  */
-import { sanitizeDisplayLine } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
-import { CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { APP_NAME } from "@oh-my-pi/pi-utils";
+import { Args, CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { parseArgs, reportCliUsageError } from "../cli/args";
 import { attachHelp as commandHelp } from "../cli/command-help";
+import { runRootCommand } from "../main";
+import { formatHostRow } from "../session-host/host-row";
 import { listSessionHosts } from "../session-host/registry";
 
 export default class Attach extends Command {
 	static description = commandHelp.description;
 
+	static args = {
+		target: Args.string({
+			description: "Host id, session id, or session path; omit to list running hosts",
+			required: false,
+		}),
+	};
+
 	static flags = {
 		json: Flags.boolean({ description: "Print hosts as JSON" }),
 	};
 
-	static examples = ["omp attach", "omp attach --json"];
+	static examples = ["omp attach", "omp attach --json", "omp attach <hostId>", "omp attach <sessionId>"];
 
 	async run(): Promise<void> {
-		const { argv, flags } = await this.parse(Attach);
-		// The parser passes positionals through; attach targets arrive in a later phase.
-		if (argv.length > 0) throw new CliUsageError("attach accepts no arguments yet (usage: attach [--json])");
+		const { args, flags } = await this.parse(Attach);
+		if (args.target !== undefined) {
+			if (flags.json) throw new CliUsageError("--json lists session hosts and takes no target");
+			await this.#attach(args.target);
+			return;
+		}
 		// The registry token is a bearer credential: never print it.
 		const hosts = (await listSessionHosts()).map(({ token: _token, ...rest }) => rest);
 		if (flags.json) {
@@ -29,11 +44,23 @@ export default class Attach extends Command {
 			process.stdout.write("No session hosts running.\n");
 			return;
 		}
-		for (const h of hosts) {
-			// title, sessionFile, and cwd come from an entry another process wrote: strip control sequences and newlines.
-			const label = sanitizeDisplayLine(h.title ?? h.sessionFile ?? "(new session)");
-			const cwd = sanitizeDisplayLine(h.cwd);
-			process.stdout.write(`${h.hostId}  ${h.clients}  ${h.busy ? "busy" : "idle"}  ${cwd}  ${label}\n`);
+		for (const host of hosts) process.stdout.write(`${formatHostRow(host)}\n`);
+	}
+
+	async #attach(target: string): Promise<void> {
+		if (!process.stdin.isTTY || !process.stdout.isTTY) {
+			process.stderr.write(`${APP_NAME} attach <target> requires an interactive terminal\n`);
+			process.exitCode = 1;
+			return;
+		}
+		const parsed = parseArgs([]);
+		parsed.attach = target;
+		try {
+			await runRootCommand(parsed, []);
+		} catch (error) {
+			// Startup failures may leave live handles (theme watcher, stores): exit instead of draining.
+			if (reportCliUsageError(error)) process.exit(2);
+			throw error;
 		}
 	}
 }
