@@ -66,6 +66,8 @@ export interface Args {
 	fork?: string;
 	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
 	join?: string;
+	/** Session host target (host id, session id, or session path) to attach to (set by the `attach` subcommand; no CLI flag). */
+	attach?: string;
 	models?: string[];
 	tools?: string[];
 	noTools?: boolean;
