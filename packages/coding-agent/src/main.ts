@@ -79,6 +79,7 @@ import type { RpcModeOptions } from "./modes/rpc/rpc-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "@oh-my-pi/pi-tui/setup/setup-version";
 import type * as SetupWizardModule from "./modes/setup";
+import { exitAfterHostDispose, runSessionHost } from "./session-host/host";
 import {
 	assertHostedLaunchSupported,
 	attachHostedUi,
@@ -2715,8 +2716,6 @@ export async function runRootCommand(
 					input: rpcInput,
 				});
 			} else if (mode === "host") {
-				// Branch-only protocol runner: keep session host code out of normal interactive startup.
-				const { exitAfterHostDispose, runSessionHost } = await import("./session-host/host");
 				stopStartupWatchdog();
 				// The host is a long-lived server: stop recording spans, or every later session and subagent
 				// appends to the timing tree for its life.
