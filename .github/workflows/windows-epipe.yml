@@ -19,8 +19,9 @@ jobs:
       - name: Install Windows native addon
         shell: pwsh
         run: |
-          bun add --no-save --ignore-scripts @oh-my-pi/pi-natives-win32-x64@18.5.0
-          Copy-Item node_modules/@oh-my-pi/pi-natives-win32-x64/pi_natives.win32-x64-baseline.node packages/natives/native/
+          npm pack @oh-my-pi/pi-natives-win32-x64@18.5.0
+          tar -xf oh-my-pi-pi-natives-win32-x64-18.5.0.tgz
+          Copy-Item package/pi_natives.win32-x64-baseline.node packages/natives/native/
       - name: Type check coding-agent
         run: bun run --cwd packages/coding-agent check:types
       - name: Test pending pipe write rejection
