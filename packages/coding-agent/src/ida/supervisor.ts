@@ -350,8 +350,11 @@ export class IdaWorker {
 		this.#current = { method, startedAt: Date.now() };
 		try {
 			try {
-				this.#proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
-				await this.#proc.stdin.flush();
+				// write() returns a promise while the pipe write is pending; it rejects (EPIPE) once the worker is gone.
+				await Promise.all([
+					this.#proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`),
+					this.#proc.stdin.flush(),
+				]);
 			} catch (error) {
 				if (this.#exitCode !== null) throw this.#exitError();
 				throw new ToolError(`Failed to send ${method} to the IDA worker for ${this.id}: ${errorMessage(error)}`);

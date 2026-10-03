@@ -1483,13 +1483,11 @@ export class RpcClient {
 			throw new Error("Client not started");
 		}
 		const stdin = this.#process.stdin;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		if (!("flush" in stdin)) return;
-		const flushResult = (stdin as FileSink).flush();
-		if (isPromise(flushResult)) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
+		// write() returns a promise while the pipe write is pending; it rejects (EPIPE) once the server is gone.
+		const results = [stdin.write(`${JSON.stringify(frame)}\n`)];
+		if ("flush" in stdin) results.push((stdin as FileSink).flush());
+		for (const result of results) {
+			if (isPromise(result)) result.catch((err: Error) => onError?.(err));
 		}
 	}
 

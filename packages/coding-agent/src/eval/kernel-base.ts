@@ -500,8 +500,11 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		if (this.#options.traceIpc) {
 			logger.debug(`${this.#options.languageName}Kernel send`, { preview: line.slice(0, 120) });
 		}
-		this.#stdin.write(`${line}\n`);
-		this.#stdin.flush();
+		// write() returns a promise while the pipe write is pending; it rejects (EPIPE) once the kernel is gone.
+		// Not awaited: callers' timeouts start after this returns, and kernel exit already aborts pending work.
+		void Promise.all([this.#stdin.write(`${line}\n`), this.#stdin.flush()]).catch(err => {
+			logger.debug(`${this.#options.languageName} kernel stdin write failed`, { error: String(err) });
+		});
 	}
 
 	#startReader(stream: ReadableStream<Uint8Array>): void {

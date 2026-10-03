@@ -521,12 +521,17 @@ export class DapClient {
 	 */
 	async #writeMessage(message: DapRequestMessage | DapResponseMessage): Promise<void> {
 		const content = JSON.stringify(message);
-		this.#writeSink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
-		this.#writeSink.write(content);
-		const flushResult = this.#writeSink.flush();
-		if (!(flushResult instanceof Promise)) return;
+		// write() returns a promise while the pipe write is pending; it rejects (EPIPE) once the adapter is gone.
+		const pending = [
+			this.#writeSink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`),
+			this.#writeSink.write(content),
+			this.#writeSink.flush(),
+		].filter(result => result instanceof Promise);
+		if (pending.length === 0) return;
+		const flushResult = Promise.all(pending);
 
 		if (this.#adapterExited) {
+			flushResult.catch(() => {});
 			throw new Error(`DAP adapter ${this.adapter.name} exited before write completed`);
 		}
 

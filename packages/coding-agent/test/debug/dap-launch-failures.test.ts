@@ -453,6 +453,44 @@ describe("DAP launch failure handling", () => {
 		}
 	});
 
+	it("rejects the request instead of emitting an unhandled rejection when a pending stdin write fails", async () => {
+		const proc = {
+			exited: new Promise<number>(() => {}),
+			exitCode: null,
+			stdin: { write: () => 0, flush: () => undefined },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			peekStderr: () => "",
+			kill: () => true,
+		} as unknown as DapClientState["proc"];
+		// A pending FileSink write returns a promise; on Windows it rejects with
+		// EPIPE once the adapter's end of the pipe is gone.
+		const writeSink = {
+			write: (_data: string | Uint8Array) => Promise.reject(new Error("EPIPE: broken pipe, write")),
+			flush: () => undefined,
+		};
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink,
+		});
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			// A failed write marks the client broken: it disposes and fails the request instead of waiting out the timeout.
+			await expect(client.sendRequest("evaluate", {}, undefined, 60_000)).rejects.toThrow(/disposed/);
+			// Unhandled rejections are reported once the microtask queue drains; one macrotask turn suffices.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await client.dispose();
+		}
+	});
+
 	it("kills the detached adapter process when the Unix socket never appears (Linux)", async () => {
 		if (process.platform !== "linux") return;
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-unix-leak-"));
