@@ -81,6 +81,7 @@ import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
 import type {
+	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -676,6 +677,51 @@ export class RpcShutdownCoordinator {
 		}
 		return this.#shutdown;
 	}
+}
+
+/**
+ * Build the `abort_and_restore_queue` response within `maxBytes`. The queue is already withdrawn,
+ * so an oversized response must not become a transport-limit error that loses it: images go first
+ * (`imagesDropped`, keeping every text), then the newest entries (`truncated`, keeping an
+ * oldest-first prefix of steering then follow-ups).
+ */
+export function fitAbortAndRestoreQueueResponse(
+	id: string | undefined,
+	restored: RpcAbortAndRestoreQueueResult,
+	maxBytes: number,
+): RpcResponse {
+	const response = (data: RpcAbortAndRestoreQueueResult): RpcResponse => ({
+		id,
+		type: "response",
+		command: "abort_and_restore_queue",
+		success: true,
+		data,
+	});
+	const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
+	const full = response(restored);
+	if (bytes(full) <= maxBytes) return full;
+	const imagesDropped = [...restored.steering, ...restored.followUp].some(entry => entry.images?.length);
+	const flags = imagesDropped ? { imagesDropped: true as const } : {};
+	const textOnly = {
+		steering: restored.steering.map(({ text }) => ({ text })),
+		followUp: restored.followUp.map(({ text }) => ({ text })),
+	};
+	if (imagesDropped) {
+		const withoutImages = response({ ...textOnly, ...flags });
+		if (bytes(withoutImages) <= maxBytes) return withoutImages;
+	}
+	const fitted: RpcAbortAndRestoreQueueResult = { steering: [], followUp: [], ...flags, truncated: true };
+	// Exact: each entry adds its own JSON plus a comma after the first in its array.
+	let remaining = maxBytes - bytes(response(fitted));
+	for (const queue of ["steering", "followUp"] as const) {
+		for (const entry of textOnly[queue]) {
+			const cost = bytes(entry) + (fitted[queue].length > 0 ? 1 : 0);
+			if (cost > remaining) return response(fitted);
+			fitted[queue].push(entry);
+			remaining -= cost;
+		}
+	}
+	return response(fitted);
 }
 
 export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
@@ -1788,7 +1834,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const restored = session.clearQueue({ forInterrupt: true });
 				goalController.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				return success(id, "abort_and_restore_queue", restored);
+				return fitAbortAndRestoreQueueResponse(id, restored, frameEncoder.maxResponseBytes);
 			}
 
 			case "abort_and_prompt": {

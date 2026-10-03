@@ -277,6 +277,10 @@ export interface RpcOpenSessionResult {
 export interface RpcAbortAndRestoreQueueResult {
 	steering: RestoredQueuedMessage[];
 	followUp: RestoredQueuedMessage[];
+	/** Set when the full result exceeded the transport limit and every entry's `images` was omitted. */
+	imagesDropped?: true;
+	/** Set when even the text-only result exceeded the limit: only an oldest-first prefix is listed. */
+	truncated?: true;
 }
 
 export interface RpcReadyFrame {

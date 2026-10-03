@@ -20,7 +20,9 @@ const started: MockResponse = { content: ["Started"], delayMs: 1000 };
 // - "internal-steer": queues a non-user (agent-attributed) steer as the call starts.
 // - "live-steer": the provider claims the first user steer into the streaming response,
 //   as a live-steering provider (Codex `response.steer`) does.
+// - "hold": streams until aborted, for tests whose queueing outlasts the default delay.
 const firstCall: Record<string, MockHandler> = {
+	hold: { content: ["Started"], delayMs: 60_000 },
 	"internal-steer": () => {
 		void session.sendCustomMessage(
 			{ customType: "test-internal-steer", content: "internal steer", display: true, attribution: "agent" },
