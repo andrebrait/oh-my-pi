@@ -1792,6 +1792,15 @@ async function runHostedInteractive(options: {
 		args: hostLaunchArgs(options.rawArgs),
 		sessionDir: parsedArgs.sessionDir,
 	};
+	const processedFiles =
+		parsedArgs.fileArgs.length > 0
+			? await logger.time("processFileArguments", () =>
+					processFileArguments(parsedArgs.fileArgs, {
+						autoResizeImages: cfgImagesAutoResize.get(activeSettings),
+					}),
+				)
+			: undefined;
+
 	let entry: SessionHostEntry;
 	try {
 		validateSessionPersistenceArgs(parsedArgs);
@@ -1804,14 +1813,6 @@ async function runHostedInteractive(options: {
 		process.exit(1);
 	}
 
-	const processedFiles =
-		parsedArgs.fileArgs.length > 0
-			? await logger.time("processFileArguments", () =>
-					processFileArguments(parsedArgs.fileArgs, {
-						autoResizeImages: cfgImagesAutoResize.get(activeSettings),
-					}),
-				)
-			: undefined;
 	const { initialMessage, initialImages } = buildInitialMessage({
 		parsed: parsedArgs,
 		fileText: processedFiles?.text,
