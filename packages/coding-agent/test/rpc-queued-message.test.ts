@@ -194,4 +194,47 @@ describe("RPC queued-message editing", () => {
 			unsubscribe();
 		}
 	}, 30_000);
+
+	test("abort_and_restore_queue returns queued steering and follow-ups and runs none of them after the abort", async () => {
+		await client.start();
+
+		const agentStarted = Promise.withResolvers<void>();
+		const unsubscribe = client.onEvent(event => {
+			if (event.type === "agent_start") agentStarted.resolve();
+		});
+		const reportedIds = new Set<string | undefined>();
+		const afterReported = Promise.withResolvers<void>();
+		let afterId: string | undefined;
+		const unsubscribeResults = client.onPromptResult(result => {
+			reportedIds.add(result.id);
+			if (result.id === afterId) afterReported.resolve();
+		});
+		try {
+			await client.prompt("start a long turn");
+			await withTimeout(agentStarted.promise, 10_000, "First turn never started streaming");
+			await client.steer("queued steer");
+			await client.followUp("queued follow-up");
+
+			expect(await client.abortAndRestoreQueue()).toEqual({
+				steering: [{ text: "queued steer" }],
+				followUp: [{ text: "queued follow-up" }],
+			});
+			expect((await client.getState()).queuedMessageCount).toBe(0);
+
+			// A withdrawn message drained after the abort would start its own turn and be
+			// recorded before (or instead of) this prompt.
+			afterId = await client.prompt("after abort");
+			if (reportedIds.has(afterId)) afterReported.resolve();
+			await withTimeout(afterReported.promise, 10_000, "Post-abort prompt never reported its result");
+		} finally {
+			unsubscribeResults();
+			unsubscribe();
+		}
+
+		const messages = await client.getMessages();
+		expect(messages.filter(message => message.role === "user").map(message => message.content)).toEqual([
+			[{ type: "text", text: "start a long turn" }],
+			[{ type: "text", text: "after abort" }],
+		]);
+	}, 30_000);
 });

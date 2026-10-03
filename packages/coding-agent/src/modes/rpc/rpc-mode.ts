@@ -511,7 +511,8 @@ export class RpcUserInputGate {
 
 	/** Call from {@link RpcInputDispatcher.dispatch} before the handler is queued. */
 	accept(command: RpcCommand): void {
-		const isAbort = command.type === "abort" || command.type === "abort_and_prompt";
+		const isAbort =
+			command.type === "abort" || command.type === "abort_and_prompt" || command.type === "abort_and_restore_queue";
 		if (
 			!isAbort &&
 			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
@@ -1779,6 +1780,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				goalController.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
+			}
+
+			case "abort_and_restore_queue": {
+				// Mirrors the TUI Esc restore: withdraw queued user input (including live-claimed
+				// steers) before aborting, so abort()'s stranded-queue drain cannot run it.
+				const restored = session.clearQueue({ forInterrupt: true });
+				goalController.stopForHostAbort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				return success(id, "abort_and_restore_queue", restored);
 			}
 
 			case "abort_and_prompt": {
