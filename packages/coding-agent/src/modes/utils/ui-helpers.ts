@@ -1203,7 +1203,9 @@ export class UiHelpers {
 
 	updatePendingMessagesDisplay(): void {
 		this.ctx.pendingMessagesContainer.disposeChildren();
-		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
+		// A hosted client's local replica never queues: the host's queue is the one on screen.
+		const queuedMessages = (this.ctx.hostedClient?.queued ??
+			this.ctx.viewSession.getQueuedMessages()) as QueuedMessages;
 
 		const steeringMessages = [...queuedMessages.steering];
 		const followUpMessages = [...queuedMessages.followUp];

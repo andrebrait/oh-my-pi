@@ -53,6 +53,7 @@ import type {
 	RpcPreconditions,
 	RpcPromptError,
 	RpcPromptResultFrame,
+	RpcQueueAttachments,
 	RpcReadyFrame,
 	RpcResponse,
 	RpcResumedFrame,
@@ -306,6 +307,7 @@ export type State = Assert<
 		streamingMessage: Outbound<NonNullable<RpcSnapshot["streaming"]>, Wire.StreamingMessage>;
 		clientInfo: Outbound<RpcClientInfo, Wire.ClientInfo>;
 		sessionOrigin: Outbound<RpcSessionOrigin, Wire.SessionOrigin>;
+		queueAttachments: Outbound<RpcQueueAttachments, Wire.QueueAttachments>;
 		subagentMessages: Outbound<RpcSubagentMessagesResult, Wire.SubagentMessages>;
 		btwHistoryRecord: Outbound<BtwHistoryRecord, Wire.BtwHistoryRecord>;
 		btwHistoryTurn: Outbound<BtwHistoryTurn, Wire.BtwHistoryTurn>;

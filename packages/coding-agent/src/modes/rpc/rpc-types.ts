@@ -54,7 +54,16 @@ type RpcCommandBody =
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "remove_queued_message"; message: string; queue: "steering" | "followUp" }
+	| {
+			id?: string;
+			type: "remove_queued_message";
+			message: string;
+			queue: "steering" | "followUp";
+			/** `"last"`: the newest prompt whose chip text is `message`. Default `"first"` (the raw-text-then-chip match). */
+			match?: "first" | "last";
+			/** Remove nothing, and answer `refused: "attachments"`, when the prompt to remove carries an attachment. */
+			refuseAttachments?: boolean;
+	  }
 	| { id?: string; type: "promote_queued_message"; message: string }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
@@ -318,6 +327,8 @@ export interface RpcRemoveQueuedMessageResult {
 	images?: ImageContent[];
 	/** Set when the images exceeded the transport limit and were omitted; the removal still happened. */
 	imagesDropped?: true;
+	/** Nothing was removed: `refuseAttachments` was set and the prompt carries an attachment. */
+	refused?: "attachments";
 }
 
 /** `abort_and_restore_queue` result: the user-authored queued input withdrawn before the abort, oldest first. */
@@ -328,6 +339,16 @@ export interface RpcAbortAndRestoreQueueResult {
 	imagesDropped?: true;
 	/** Set when even the text-only result exceeded the limit: only an oldest-first prefix is listed. */
 	truncated?: true;
+}
+
+/**
+ * Which of the queued chips carry an attachment (an image, or a companion holding an image's source or description)
+ * that the chip's text does not. Parallel to the chip lists they accompany: entry `i` describes chip `i`, and the two
+ * always travel in the same frame, so their lengths match.
+ */
+export interface RpcQueueAttachments {
+	steering: boolean[];
+	followUp: boolean[];
 }
 
 /** A connected session-host client, as listed in snapshots and `clients_changed`. */
@@ -365,6 +386,11 @@ export interface RpcSnapshot {
 	/** Open extension dialogs a late joiner can answer. */
 	pendingUi: RpcExtensionUIRequest[];
 	clients: RpcClientInfo[];
+	/**
+	 * Which queued chips of `state.queuedMessages` carry an attachment, parallel to them (see {@link RpcQueueAttachments}).
+	 * Absent from hosts that predate it.
+	 */
+	queueAttachments?: RpcQueueAttachments;
 	/** Where the host session lives (see {@link RpcSessionOrigin}). Absent from hosts that predate it. */
 	origin?: RpcSessionOrigin;
 }
@@ -528,7 +554,6 @@ export type RpcResponse =
 	// Session host
 	| { id?: string; type: "response"; command: "detach"; success: true }
 	| { id?: string; type: "response"; command: "exit"; success: true }
-
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
 	| { id?: string; type: "response"; command: "steer"; success: true }
@@ -823,9 +848,19 @@ export type RpcDeltaMessageUpdateFrame = Omit<
 	assistantMessageEvent: WithoutPartial<AssistantMessageEvent>;
 };
 
+/**
+ * `queue_update` as a sequenced (socket) client receives it: the chip lists plus which chips carry an attachment.
+ * Stdio gets the plain event. Absent from hosts that predate it, so a reader that needs it must treat absence as
+ * "unknown", not "none".
+ */
+export type RpcQueueUpdateFrame = Extract<AgentSessionEvent, { type: "queue_update" }> & {
+	attachments?: RpcQueueAttachments;
+};
+
 /** Session event as written to stdout by default: message lifecycle events carry a `messageId`. */
 export type RpcAgentSessionEventFrame =
-	| Exclude<AgentSessionEvent, { type: RpcMessageEventType }>
+	| Exclude<AgentSessionEvent, { type: RpcMessageEventType | "queue_update" }>
+	| RpcQueueUpdateFrame
 	| RpcMessageEventFrame;
 
 /** Every session event shape RPC mode can write, including the opt-in `messageUpdates: "delta"` projection. */

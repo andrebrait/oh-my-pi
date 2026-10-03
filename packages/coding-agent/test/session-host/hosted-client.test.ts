@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
@@ -953,10 +954,112 @@ describe("HostedClientLink", () => {
 		await waitFor(() => a.hostLink.queued.followUp.length === 1 && b.hostLink.queued.followUp.length === 1);
 		expect(b.hostLink.queued).toEqual({ steering: [], followUp: ["later"] });
 
-		expect(await b.hostLink.removeQueued("later", "followUp")).toBe(true);
+		expect(await b.hostLink.takeBackQueued()).toEqual({ outcome: "restored", text: "later" });
 		await waitFor(() => a.hostLink.queued.followUp.length === 0 && b.hostLink.queued.followUp.length === 0);
 		release.resolve();
 		await waitFor(() => a.events.some(isAgentEnd));
+	});
+
+	describe("taking a queued message back", () => {
+		const PIXEL: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+		};
+
+		/** A host held mid-turn by `go` from a first view, plus that view. */
+		async function holdTurn(): Promise<{ host: TestSessionHost; view: View; release: () => void }> {
+			const release = Promise.withResolvers<void>();
+			const host = await fixture.startHost({}, release.promise);
+			const view = await attach(host);
+			await view.hostLink.prompt("go");
+			await waitFor(() => view.hostLink.isStreaming);
+			return { host, view, release: release.resolve };
+		}
+
+		it("restores the newest of equal queued messages and leaves the older ones in their order", async () => {
+			const { host, view, release } = await holdTurn();
+			try {
+				for (const text of ["A", "B", "A"]) await view.hostLink.prompt(text, undefined, "followUp");
+				await waitFor(() => view.hostLink.queued.followUp.length === 3);
+
+				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "restored", text: "A" });
+
+				expect(host.session.getQueuedMessages().followUp).toEqual(["A", "B"]);
+			} finally {
+				release();
+			}
+		});
+
+		it("says there is nothing to take back when nothing is queued", async () => {
+			const { view, release } = await holdTurn();
+			try {
+				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "empty" });
+			} finally {
+				release();
+			}
+		});
+
+		it("leaves a prompt with an attachment queued, whether its text mentions one or not", async () => {
+			const { host, view, release } = await holdTurn();
+			const other = await fixture.client(host);
+			try {
+				await other.start();
+				// A caption and no `[Image #N]` marker, then an image with no text at all (its chip reads `[Image]`).
+				await other.prompt("look at this", [PIXEL], "followUp");
+				await other.prompt("", [PIXEL], "followUp");
+				await waitFor(() => view.hostLink.queued.followUp.length === 2);
+				expect(view.hostLink.queued.followUp).toEqual(["look at this", "[Image]"]);
+
+				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "attachment" });
+				expect(host.session.getQueuedMessages().followUp).toEqual(["look at this", "[Image]"]);
+
+				await other.removeQueuedMessage("[Image]", "followUp");
+				await waitFor(() => view.hostLink.queued.followUp.length === 1);
+				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "attachment" });
+				expect(host.session.getQueuedMessages().followUp).toEqual(["look at this"]);
+				expect(host.session.queuedMessageHasAttachments("look at this", "followUp")).toBe(true);
+			} finally {
+				release();
+			}
+		});
+
+		it("takes nothing back when the host's report of which queued prompts carry attachments does not fit its queue", async () => {
+			const release = Promise.withResolvers<void>();
+			const host = await fixture.startHost({}, release.promise);
+			// What a host that predates the report, or a frame that lost it, looks like to a reader that counts.
+			vi.spyOn(host.session, "getQueuedMessageAttachments").mockReturnValue({ steering: [], followUp: [] });
+			try {
+				const live = await attach(host);
+				await live.hostLink.prompt("go");
+				await waitFor(() => live.hostLink.isStreaming);
+				await live.hostLink.prompt("A", undefined, "followUp");
+				await waitFor(() => live.hostLink.queued.followUp.length === 1);
+				expect(await live.hostLink.takeBackQueued()).toEqual({ outcome: "unreported" });
+
+				// A view that attaches now learns the queue from the snapshot, which has the same fault.
+				const late = await attach(host);
+				expect(late.hostLink.queued.followUp).toEqual(["A"]);
+				expect(await late.hostLink.takeBackQueued()).toEqual({ outcome: "unreported" });
+				expect(host.session.getQueuedMessages().followUp).toEqual(["A"]);
+			} finally {
+				release.resolve();
+			}
+		});
+
+		it("reports a message the host no longer had as delivered", async () => {
+			const { host, view, release } = await holdTurn();
+			try {
+				await view.hostLink.prompt("A", undefined, "followUp");
+				await waitFor(() => view.hostLink.queued.followUp.length === 1);
+				// The host delivers or drops it between the view's last frame and the request.
+				vi.spyOn(host.session, "takeQueuedMessage").mockReturnValue(undefined);
+
+				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "delivered" });
+			} finally {
+				release();
+			}
+		});
 	});
 
 	it("rebuilds the view from a fresh replica file when the host replaces its session", async () => {

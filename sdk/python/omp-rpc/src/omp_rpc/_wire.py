@@ -582,6 +582,13 @@ class QueuedMessagesState:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class QueueAttachments:
+    """Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`."""
+    steering: tuple[bool, ...]
+    follow_up: tuple[bool, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class ToolDescriptor:
     name: str
     description: str
@@ -745,6 +752,8 @@ class RemoveQueuedMessageResult:
     """The removed message's images, so the client can restore them with its text."""
     images_dropped: bool | None = None
     """Only ever `true`: the images exceeded the transport limit and were omitted; the removal still happened."""
+    refused: Literal["attachments"] | None = None
+    """Nothing was removed: `refuseAttachments` was set and the prompt carries one."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1195,6 +1204,8 @@ class QueueUpdateEvent:
     type: Literal["queue_update"] = "queue_update"
     steering: tuple[str, ...]
     follow_up: tuple[str, ...]
+    attachments: QueueAttachments | None = None
+    """Session-host socket clients only; absent means unknown, not that no chip carries one."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1424,6 +1435,8 @@ class SessionSnapshot:
     """Open extension dialogs a late joiner can answer."""
     clients: tuple[ClientInfo, ...]
     streaming: StreamingMessage | None = None
+    queue_attachments: QueueAttachments | None = None
+    """Parallel to `state.queuedMessages`."""
     origin: SessionOrigin | None = None
 
 
@@ -1951,6 +1964,14 @@ def parse_queued_messages_state(value: object, path: str = "QueuedMessagesState"
     )
 
 
+def parse_queue_attachments(value: object, path: str = "QueueAttachments") -> QueueAttachments:
+    payload = expect_object(value, path)
+    return QueueAttachments(
+        steering=required(payload, "steering", array(decode_bool), path),
+        follow_up=required(payload, "followUp", array(decode_bool), path),
+    )
+
+
 def parse_tool_descriptor(value: object, path: str = "ToolDescriptor") -> ToolDescriptor:
     payload = expect_object(value, path)
     return ToolDescriptor(
@@ -2124,6 +2145,7 @@ def parse_remove_queued_message_result(value: object, path: str = "RemoveQueuedM
         removed=required(payload, "removed", decode_bool, path),
         images=optional(payload, "images", array(parse_image_content), path),
         images_dropped=optional(payload, "imagesDropped", decode_bool, path),
+        refused=optional(payload, "refused", cast('Decoder[Literal["attachments"]]', literal(frozenset({"attachments"}))), path),
     )
 
 
@@ -2646,6 +2668,7 @@ def parse_queue_update_event(value: object, path: str = "QueueUpdateEvent") -> Q
     return QueueUpdateEvent(
         steering=required(payload, "steering", array(decode_str), path),
         follow_up=required(payload, "followUp", array(decode_str), path),
+        attachments=optional(payload, "attachments", parse_queue_attachments, path),
     )
 
 
@@ -2898,6 +2921,7 @@ def parse_session_snapshot(value: object, path: str = "SessionSnapshot") -> Sess
         pending_ui=required(payload, "pendingUi", array(parse_extension_ui_request), path),
         clients=required(payload, "clients", array(parse_client_info), path),
         streaming=optional(payload, "streaming", parse_streaming_message, path),
+        queue_attachments=optional(payload, "queueAttachments", parse_queue_attachments, path),
         origin=optional(payload, "origin", parse_session_origin, path),
     )
 
@@ -3343,11 +3367,15 @@ class WireClient:
             params["images"] = list(images)
         self._command("follow_up", params)
 
-    def remove_queued_message(self, message: str, queue: QueuedMessageQueue) -> RemoveQueuedMessageResult:
+    def remove_queued_message(self, message: str, queue: QueuedMessageQueue, *, match: Literal["first", "last"] | None = None, refuse_attachments: bool | None = None) -> RemoveQueuedMessageResult:
         """Remove one pending queued message by its queue-chip text."""
         params: dict[str, object] = {}
         params["message"] = message
         params["queue"] = queue
+        if match is not None:
+            params["match"] = match
+        if refuse_attachments is not None:
+            params["refuseAttachments"] = refuse_attachments
         return parse_remove_queued_message_result(self._command("remove_queued_message", params), "remove_queued_message")
 
     def promote_queued_message(self, message: str) -> PromoteQueuedMessageResult:
@@ -4061,6 +4089,7 @@ __all__ = [
     "PromptResultEvent",
     "PromptStatus",
     "PythonExecutionMessage",
+    "QueueAttachments",
     "QueueMode",
     "QueueUpdateEvent",
     "QueuedMessageQueue",
@@ -4244,6 +4273,7 @@ __all__ = [
     "parse_prompt_error",
     "parse_prompt_result_event",
     "parse_python_execution_message",
+    "parse_queue_attachments",
     "parse_queue_update_event",
     "parse_queued_messages_state",
     "parse_ready_event",

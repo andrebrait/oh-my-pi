@@ -778,6 +778,7 @@ export class RpcServer {
 			streaming: message && messageId !== undefined ? { messageId, message } : undefined,
 			pendingUi: [...this.#uiPending.values()],
 			clients: this.clients,
+			queueAttachments: session.getQueuedMessageAttachments(),
 			origin: this.#origin(),
 		};
 	}
@@ -981,7 +982,17 @@ export class RpcServer {
 
 		// Output all agent events as JSON; prompt results follow the frame that settled them.
 		session.subscribe(event => {
-			this.#broadcast(this.#messageIds.stamp(event), (conn, frame) => conn.events.forward(frame));
+			const frame = this.#messageIds.stamp(event);
+			// Only sequenced clients are told which queued chips carry an attachment, as of the tick the chips were
+			// built in: the stdio line is the event it always was.
+			const attachments = event.type === "queue_update" ? session.getQueuedMessageAttachments() : undefined;
+			this.#broadcast(frame, (conn, all) =>
+				conn.events.forward(
+					attachments !== undefined && conn.options.sequenced && all.type === "queue_update"
+						? { ...all, attachments }
+						: all,
+				),
+			);
 			// Before the prompt-result and settle reports: a goal continuation decided at this
 			// agent_end is scheduled (and reported as pending) before either reads settlement.
 			this.#goal.observe(event);
@@ -1481,9 +1492,22 @@ export class RpcServer {
 				if (command.queue !== "steering" && command.queue !== "followUp") {
 					return rpcError(id, "remove_queued_message", 'queue must be "steering" or "followUp"');
 				}
+				if (command.match !== undefined && command.match !== "first" && command.match !== "last") {
+					return rpcError(id, "remove_queued_message", 'match must be "first" or "last"');
+				}
+				if (command.refuseAttachments !== undefined && typeof command.refuseAttachments !== "boolean") {
+					return rpcError(id, "remove_queued_message", "refuseAttachments must be a boolean");
+				}
+				// The check and the removal share one tick, so nothing can be queued or delivered between them.
+				if (
+					command.refuseAttachments &&
+					session.queuedMessageHasAttachments(command.message, command.queue, { match: command.match })
+				) {
+					return rpcSuccess(id, "remove_queued_message", { removed: false, refused: "attachments" });
+				}
 				return fitRemoveQueuedMessageResponse(
 					id,
-					session.takeQueuedMessage(command.message, command.queue),
+					session.takeQueuedMessage(command.message, command.queue, { match: command.match }),
 					conn.encoder.maxResponseBytes,
 				);
 			}
