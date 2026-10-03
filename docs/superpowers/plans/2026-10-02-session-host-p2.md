@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - Opt-in only: `tui.hosted` defaults to `false`. With it off, and without `omp attach <target>`, nothing changes.
-- The client never writes the host's session file (D9). Its replica lives under `<config root>/session-hosts/replicas/<hostId>.jsonl`, outside the sessions directory, so `/resume` never lists it.
+- The client never writes the host's session file (D9). Its replica is owner-private: a `0700` directory `<config root>/run/hosted-replicas/` holding one `0600` file per client instance and snapshot (`<hostId>-<instance>-<n>.jsonl`), outside the sessions directory, so `/resume` never lists it. Two clients never share a replica, and a client deletes only its own files when it leaves.
 - Client mode runs no automation: idle compaction, idle recap, goal continuation, loop auto-submit, plan-role reconciliation, plan-mode write-through, todo HUD writers, collab auto-host, and title generation are all off.
 - Stdio RPC, ACP, print mode, collab guest and host behavior are unchanged.
 - Repo rules apply: no `any`, no inline imports, `#private`, `Promise.withResolvers`, `logger` in runtime code, behavioral tests, no `mock.module`, `bun check`.
@@ -149,9 +149,9 @@ export class HostedClientLink {
 ```
 
 Frame handling, all serialized through one promise chain as in `CollabGuestLink`:
-- `attached` → `loadReplica` with `replicaDir/<hostId>.jsonl`, `renderInitialMessages()`, apply `snapshot.state` (model, thinking, queue), replay `snapshot.streaming` through `applyReplicaEvent` as `message_start` + `message_update`, present every `snapshot.pendingUi`.
+- `attached` → `loadReplica` with `replicaDir/<hostId>-<instance>-<n>.jsonl` (a fresh per-client, per-snapshot path), `renderInitialMessages()`, apply `snapshot.state` (model, thinking, queue), replay `snapshot.streaming` through `applyReplicaEvent` as `message_start` + `message_update`, present every `snapshot.pendingUi`.
 - `entry` → `ingestReplicaEntry`.
-- every `AgentSessionEvent` (`RpcClient.onEvent`) → `applyReplicaEvent`; `queue_update` also refreshes `queued` and the pending band.
+- every `AgentSessionEvent` (`RpcClient.onSessionEvent`, because `onEvent` filters out `queue_update`) → `applyReplicaEvent`; `queue_update` also refreshes `queued` and the pending band.
 - `session_replaced` → abort local dialogs, `loadReplica` with the inline snapshot, re-render.
 - `config_update` → `applyReplicaHostState`; `session_info_update` → status-line title; `command_output` → `ctx.showStatus(text)`; `clients_changed` → status-line participant count via `statusLine.setCollabStatus` with role `"hosted"`.
 - `extension_ui_request`: `select|confirm|input|editor` → `showHookSelector|showHookConfirm|showHookInput|showHookEditor` with an `AbortSignal` per request id; `ask` → `ExtensionUiController.showAskDialog`; `cancel` aborts the matching request without replying; `notify|setStatus|setWidget|setTitle|set_editor_text|open_url` apply locally. Answers go back as `extension_ui_response`.
