@@ -6,14 +6,19 @@
 ### Breaking Changes
 
 - SDK: removed `SessionManager.onEntryAppended`; use `SessionManager.subscribeEntryAppended(listener)`, which supports several listeners and returns an unsubscribe function
+- SDK: `RpcClient.getAvailableModels()` now returns `Promise<Model[]>` (complete `Model` records, as the host has always sent them) instead of the reduced `ModelInfo[]`; the `ModelInfo` type is no longer exported from the RPC client module
 
 ### Added
 
 - Added `omp --mode host`: a detached session host that several RPC clients can attach to over a local socket or named pipe, with resume, dialog arbitration, and stale-write protection.
-- Added `omp attach` to list running session hosts (`--json` for scripts).
+- Added experimental hosted sessions: with `tui.hosted` (or `OMP_TUI_HOSTED=1`), or with `omp attach <host ID | session ID | session path>`, an interactive terminal runs as a client of a detached session host. Terminals can detach with `/detach`, attach with `/attach [host|session]`, and share one session; `/exit` stops the host only from its last client. `omp attach` with no target still lists running hosts (`--json` for scripts). Unsent editor drafts are not saved, a lost connection exits with status 1 instead of reconnecting, and TUI-only commands (plan, goal, loop, fork, tree, `!`/`$`, settings, panels, and others) report that they are unavailable when attached; see the CLI reference.
 - Added `RpcClient.detach()` and `RpcClient.exit()` for session hosts; `RpcCommandError` now carries `epoch`, `leafId`, and `hostId` when the host returns them.
 - Added `RpcClient.onHostFrame()` for typed session-host frames (`RpcHostFrame`: `attached`, `resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`, `config_update`, `session_info_update`; stamped frames keep their `seq`) and `RpcClient.onClose()` for a transport that ended without `stop()`; `prompt`, `steer`, `followUp`, `removeQueuedMessage`, `setModel`, `cycleModel`, `setThinkingLevel`, and `cycleThinkingLevel` accept optional `ifEpoch`/`ifLeaf` preconditions.
 - Session hosts send `config_update` to every attached socket client after `set_model`, `cycle_model`, `set_thinking_level`, or `cycle_thinking_level`, so peers show the live model and thinking level; stdio output is unchanged.
+- Session hosts: `entry` frames carry the host's active leaf as an optional `leafId`, and attached snapshots show only what `entry` frames have announced, so an entry of a still-publishing atomic batch reaches a client once, after the commit. `queue_update` frames and snapshots (`queueAttachments`) tell socket clients which queued messages carry attachments; stdio is unchanged.
+- `remove_queued_message` accepts optional `match: "first" | "last"` and `refuseAttachments`; with `refuseAttachments` a queued prompt that carries an attachment is left in place and the response is `{ removed: false, refused: "attachments" }`.
+- `ask` extension UI responses accept `chat: true` (discuss instead of answering) and per-answer `note`, `noteImages`, and `customInputImages`.
+- Added `RpcClient.onExtensionUiRequest()`, `RpcClient.sendExtensionUiResponse()`, and `RpcClient.setAskDialog()`.
 
 ### Changed
 
