@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
@@ -532,5 +533,102 @@ describe("RpcServer sequencing", () => {
 			f => f.type === "message_end" && f.messageId === attached.snapshot.streaming!.messageId,
 		);
 		expect(isRecord(end.message) && end.message.role).toBe("assistant");
+	});
+
+	describe("queued prompts", () => {
+		const PIXEL: ImageContent = {
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+		};
+		const sizeOf = (frame: Record<string, unknown>, queue: "steering" | "followUp"): number | undefined => {
+			const chips = frame[queue];
+			return Array.isArray(chips) ? chips.length : undefined;
+		};
+
+		/** A server whose run is held open, with `A`, a captioned image, `B` and `A` queued behind it as follow-ups. */
+		async function startWithQueue(): Promise<{ release: () => void; a: TestClient; stdio: TestClient }> {
+			const release = Promise.withResolvers<void>();
+			session = await createTestSession(dir, { handler: { content: ["ok"] } }, release.promise);
+			server = await RpcServer.start(session, {});
+			const a = new TestClient(server);
+			const stdio = new TestClient(server, { sequenced: false });
+			server.attach(a.conn);
+			await a.command({ type: "prompt", message: "go" });
+			await a.next(f => f.type === "message_update");
+			const prompts: [message: string, images?: ImageContent[]][] = [["A"], ["caption", [PIXEL]], ["B"], ["A"]];
+			for (const [message, images] of prompts) {
+				await a.command({ type: "prompt", message, images, streamingBehavior: "followUp" });
+			}
+			return { release: release.resolve, a, stdio };
+		}
+
+		it("tells sequenced clients which queued chips carry an attachment, and stdio nothing it did not already get", async () => {
+			const { release, a, stdio } = await startWithQueue();
+			try {
+				const live = await a.next(f => f.type === "queue_update" && sizeOf(f, "followUp") === 4);
+				expect(live).toMatchObject({
+					followUp: ["A", "caption", "B", "A"],
+					attachments: { steering: [], followUp: [false, true, false, false] },
+				});
+				const plain = await stdio.next(f => f.type === "queue_update" && sizeOf(f, "followUp") === 4);
+				expect("attachments" in plain).toBe(false);
+
+				const late = new TestClient(server);
+				const attached = server.attach(late.conn) as RpcAttachedFrame;
+				expect(attached.snapshot.state.queuedMessages.followUp).toEqual(["A", "caption", "B", "A"]);
+				expect(attached.snapshot.queueAttachments).toEqual({ steering: [], followUp: [false, true, false, false] });
+			} finally {
+				release();
+			}
+		});
+
+		it("removes the first match by default, the newest on request, and refuses one with an attachment on request", async () => {
+			const { release, a, stdio } = await startWithQueue();
+			try {
+				const remove = (options: Record<string, unknown>) =>
+					a.command({ type: "remove_queued_message", queue: "followUp", ...options });
+
+				// Queued A, caption, B, A: `last` removes the newest A and keeps the older one in front…
+				expect(await remove({ message: "A", match: "last" })).toMatchObject({
+					success: true,
+					data: { removed: true },
+				});
+				expect(session.getQueuedMessages().followUp).toEqual(["A", "caption", "B"]);
+				// …while the default, with a second A queued, removes the oldest and keeps the newer one behind.
+				await a.command({ type: "prompt", message: "A", streamingBehavior: "followUp" });
+				expect(await remove({ message: "A" })).toMatchObject({ data: { removed: true } });
+				expect(session.getQueuedMessages().followUp).toEqual(["caption", "B", "A"]);
+				expect(await remove({ message: "A", match: "last" })).toMatchObject({ data: { removed: true } });
+				expect(session.getQueuedMessages().followUp).toEqual(["caption", "B"]);
+
+				// The captioned image is not text-only: asked to refuse attachments, the host removes nothing.
+				expect(await remove({ message: "caption", refuseAttachments: true })).toMatchObject({
+					data: { removed: false, refused: "attachments" },
+				});
+				expect(session.getQueuedMessages().followUp).toEqual(["caption", "B"]);
+				expect(session.queuedMessageHasAttachments("caption", "followUp")).toBe(true);
+				expect(await remove({ message: "B", refuseAttachments: true })).toMatchObject({ data: { removed: true } });
+
+				expect(await remove({ message: "B", match: "middle" })).toMatchObject({
+					success: false,
+					error: 'match must be "first" or "last"',
+				});
+				expect(await remove({ message: "B", refuseAttachments: "yes" })).toMatchObject({
+					success: false,
+					error: "refuseAttachments must be a boolean",
+				});
+
+				// stdio keeps its exact response: removal reports `removed`, and the images it took, and nothing else.
+				const response = await stdio.command({
+					type: "remove_queued_message",
+					message: "caption",
+					queue: "followUp",
+				});
+				expect(response.data).toEqual({ removed: true, images: [expect.objectContaining({ type: "image" })] });
+			} finally {
+				release();
+			}
+		});
 	});
 });

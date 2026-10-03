@@ -58,7 +58,18 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
-		params: { message: "string", queue: "QueuedMessageQueue" },
+		params: {
+			message: "string",
+			queue: "QueuedMessageQueue",
+			"match?": doc(
+				"'first' | 'last'",
+				"`last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text).",
+			),
+			"refuseAttachments?": doc(
+				"boolean",
+				'Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment.',
+			),
+		},
 		result: "RemoveQueuedMessageResult",
 	},
 	{
