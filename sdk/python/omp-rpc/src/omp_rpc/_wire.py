@@ -616,6 +616,8 @@ class SessionState:
     auto_compaction_enabled: bool = False
     fast_mode_enabled: bool = False
     fast_mode_active: bool = False
+    anthropic_slow_mode_label: str | None = None
+    """Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it."""
     tokens_per_second: float | None = None
     message_count: int = 0
     queued_message_count: int = 0
@@ -1785,6 +1787,7 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         auto_compaction_enabled=defaulted(payload, "autoCompactionEnabled", decode_bool, path, False),
         fast_mode_enabled=defaulted(payload, "fastModeEnabled", decode_bool, path, False),
         fast_mode_active=defaulted(payload, "fastModeActive", decode_bool, path, False),
+        anthropic_slow_mode_label=optional(payload, "anthropicSlowModeLabel", decode_str, path),
         tokens_per_second=defaulted(payload, "tokensPerSecond", nullable(decode_float), path, None),
         message_count=defaulted(payload, "messageCount", decode_int, path, 0),
         queued_message_count=defaulted(payload, "queuedMessageCount", decode_int, path, 0),

@@ -79,6 +79,10 @@ export const stateDefs = {
 		autoCompactionEnabled: absentAs("boolean", false),
 		fastModeEnabled: absentAs("boolean", false),
 		fastModeActive: absentAs("boolean", false),
+		"anthropicSlowModeLabel?": doc(
+			"string",
+			"Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.",
+		),
 		tokensPerSecond: absentAs("number | null", null),
 		messageCount: absentAs("number.integer", 0),
 		queuedMessageCount: absentAs("number.integer", 0),

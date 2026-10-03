@@ -2983,6 +2983,9 @@ pub struct SessionState {
 	pub fast_mode_enabled: bool,
 	#[serde(rename = "fastModeActive", default = "default_session_state_fast_mode_active")]
 	pub fast_mode_active: bool,
+	/// Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.
+	#[serde(rename = "anthropicSlowModeLabel", default, skip_serializing_if = "Option::is_none")]
+	pub anthropic_slow_mode_label: Option<String>,
 	#[serde(rename = "tokensPerSecond", default = "default_session_state_tokens_per_second")]
 	pub tokens_per_second: Option<f64>,
 	#[serde(rename = "messageCount", default = "default_session_state_message_count")]

@@ -396,6 +396,14 @@ remain `true` while `fastModeActive` is `false`. An explicit `set_fast_mode`
 enable expresses retry intent and clears that fallback so the provider attempt
 is re-armed.
 
+`anthropicSlowModeLabel` mirrors the TUI status-line badge for a Claude
+subscription past its usage limit: `limit reached · wrapping up · resets 14:30`
+during the wrap-up allowance, or `low priority until 14:30 · 62% left` once
+`/slow` low priority serves the account. It is absent off Anthropic models and
+outside both stages. No event carries it: it changes as Anthropic responses
+arrive, when its window expires, and when `/slow` toggles, so re-read `get_state`
+while a run is active, after `agent_end`, and after slash commands.
+
 ```json
 {
   "model": { "provider": "...", "id": "..." },
@@ -411,6 +419,7 @@ is re-armed.
   "fastModeEnabled": false,
   "tokensPerSecond": null,
   "fastModeActive": false,
+  "anthropicSlowModeLabel": "low priority until 14:30 · 62% left",
   "autoCompactionEnabled": true,
   "messageCount": 0,
   "queuedMessageCount": 0,

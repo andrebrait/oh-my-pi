@@ -2383,9 +2383,11 @@ type SessionState struct {
 	AutoCompactionEnabled bool           `json:"autoCompactionEnabled"`
 	FastModeEnabled       bool           `json:"fastModeEnabled"`
 	FastModeActive        bool           `json:"fastModeActive"`
-	TokensPerSecond       *float64       `json:"tokensPerSecond"`
-	MessageCount          int64          `json:"messageCount"`
-	QueuedMessageCount    int64          `json:"queuedMessageCount"`
+	// Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.
+	AnthropicSlowModeLabel *string  `json:"anthropicSlowModeLabel,omitempty"`
+	TokensPerSecond        *float64 `json:"tokensPerSecond"`
+	MessageCount           int64    `json:"messageCount"`
+	QueuedMessageCount     int64    `json:"queuedMessageCount"`
 	// Background jobs or deliveries can still inject a follow-up and wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
@@ -2420,6 +2422,7 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("autoCompactionEnabled", &out.AutoCompactionEnabled, `false`)
 	d.defaulted("fastModeEnabled", &out.FastModeEnabled, `false`)
 	d.defaulted("fastModeActive", &out.FastModeActive, `false`)
+	d.optional("anthropicSlowModeLabel", &out.AnthropicSlowModeLabel)
 	d.defaulted("tokensPerSecond", &out.TokensPerSecond, `null`)
 	d.defaulted("messageCount", &out.MessageCount, `0`)
 	d.defaulted("queuedMessageCount", &out.QueuedMessageCount, `0`)

@@ -467,6 +467,8 @@ export interface SessionState {
 	autoCompactionEnabled?: boolean;
 	fastModeEnabled?: boolean;
 	fastModeActive?: boolean;
+	/** Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it. */
+	anthropicSlowModeLabel?: string;
 	tokensPerSecond?: number | null;
 	messageCount?: number;
 	queuedMessageCount?: number;
