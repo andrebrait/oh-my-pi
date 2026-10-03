@@ -10,6 +10,7 @@ import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } 
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { AnthropicSlowModeState } from "../../session/anthropic-slow-mode";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
@@ -149,8 +150,8 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	fastModeEnabled: boolean;
 	fastModeActive: boolean;
-	/** Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it. */
-	anthropicSlowModeLabel?: string;
+	/** Structured Claude usage-limit stage; absent off Anthropic models and outside wrap-up/low priority. */
+	anthropicSlowMode?: AnthropicSlowModeState;
 	tokensPerSecond: number | null;
 	messageCount: number;
 	queuedMessageCount: number;

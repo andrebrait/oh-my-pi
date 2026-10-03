@@ -602,6 +602,26 @@ class GoalResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class AnthropicSlowModeLowPriority:
+    """`/slow` low priority serves the Claude account on spare capacity."""
+    stage: Literal["low_priority"] = "low_priority"
+    resets_at_sec: float
+    """Epoch seconds when the 5-hour usage window resets."""
+    allowance_left_percent: int | None = None
+    """Percent of the weekly low-priority allowance still available."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class AnthropicSlowModeWrapUp:
+    """Short wrap-up allowance after the Claude usage limit is reached."""
+    stage: Literal["wrap_up"] = "wrap_up"
+    extra_usage: bool
+    """Whether Anthropic extra usage will serve requests after the allowance."""
+    resets_at_sec: float | None = None
+    """Epoch seconds when the current usage-limit window resets, if reported."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SessionState:
     session_id: str
     model: ModelInfo | None = None
@@ -616,8 +636,8 @@ class SessionState:
     auto_compaction_enabled: bool = False
     fast_mode_enabled: bool = False
     fast_mode_active: bool = False
-    anthropic_slow_mode_label: str | None = None
-    """Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it."""
+    anthropic_slow_mode: AnthropicSlowModeState | None = None
+    """Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority."""
     tokens_per_second: float | None = None
     message_count: int = 0
     queued_message_count: int = 0
@@ -1476,6 +1496,10 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
+AnthropicSlowModeState: TypeAlias = AnthropicSlowModeLowPriority | AnthropicSlowModeWrapUp
+"""Structured Claude usage-limit stage, discriminated by `stage`."""
+
+
 RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
@@ -1771,6 +1795,24 @@ def parse_goal_result(value: object, path: str = "GoalResult") -> GoalResult:
     )
 
 
+def parse_anthropic_slow_mode_low_priority(value: object, path: str = "AnthropicSlowModeLowPriority") -> AnthropicSlowModeLowPriority:
+    payload = expect_object(value, path)
+    required(payload, "stage", cast('Decoder[Literal["low_priority"]]', literal(frozenset({"low_priority"}))), path)
+    return AnthropicSlowModeLowPriority(
+        resets_at_sec=required(payload, "resetsAtSec", decode_float, path),
+        allowance_left_percent=optional(payload, "allowanceLeftPercent", decode_int, path),
+    )
+
+
+def parse_anthropic_slow_mode_wrap_up(value: object, path: str = "AnthropicSlowModeWrapUp") -> AnthropicSlowModeWrapUp:
+    payload = expect_object(value, path)
+    required(payload, "stage", cast('Decoder[Literal["wrap_up"]]', literal(frozenset({"wrap_up"}))), path)
+    return AnthropicSlowModeWrapUp(
+        extra_usage=required(payload, "extraUsage", decode_bool, path),
+        resets_at_sec=optional(payload, "resetsAtSec", decode_float, path),
+    )
+
+
 def parse_session_state(value: object, path: str = "SessionState") -> SessionState:
     payload = expect_object(value, path)
     return SessionState(
@@ -1787,7 +1829,7 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         auto_compaction_enabled=defaulted(payload, "autoCompactionEnabled", decode_bool, path, False),
         fast_mode_enabled=defaulted(payload, "fastModeEnabled", decode_bool, path, False),
         fast_mode_active=defaulted(payload, "fastModeActive", decode_bool, path, False),
-        anthropic_slow_mode_label=optional(payload, "anthropicSlowModeLabel", decode_str, path),
+        anthropic_slow_mode=optional(payload, "anthropicSlowMode", parse_anthropic_slow_mode_state, path),
         tokens_per_second=defaulted(payload, "tokensPerSecond", nullable(decode_float), path, None),
         message_count=defaulted(payload, "messageCount", decode_int, path, 0),
         queued_message_count=defaulted(payload, "queuedMessageCount", decode_int, path, 0),
@@ -2764,6 +2806,10 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_anthropic_slow_mode_state(value: object, path: str = "AnthropicSlowModeState") -> AnthropicSlowModeState:
+    return dispatch("stage", _ANTHROPIC_SLOW_MODE_STATE_CASES)(value, path)
+
+
 def parse_rpc_agent_event(value: object, path: str = "RpcAgentEvent") -> RpcAgentEvent:
     return dispatch("type", _RPC_AGENT_EVENT_CASES)(value, path)
 
@@ -2775,6 +2821,12 @@ def parse_notification(value: object, path: str = "notification") -> RpcNotifica
     if not isinstance(tag, str) or tag not in _RPC_NOTIFICATION_CASES:
         return UnknownNotification(decode_json_object(payload, path))
     return _RPC_NOTIFICATION_CASES[tag](payload, tag)
+
+
+_ANTHROPIC_SLOW_MODE_STATE_CASES: Final[dict[str, Decoder[AnthropicSlowModeState]]] = {
+        "low_priority": parse_anthropic_slow_mode_low_priority,
+        "wrap_up": parse_anthropic_slow_mode_wrap_up,
+}
 
 
 _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
@@ -3414,6 +3466,9 @@ __all__ = [
     "AgentSource",
     "AgentStartEvent",
     "AnthropicServerToolContent",
+    "AnthropicSlowModeLowPriority",
+    "AnthropicSlowModeState",
+    "AnthropicSlowModeWrapUp",
     "AskAnswer",
     "AskOption",
     "AskQuestion",
@@ -3592,6 +3647,9 @@ __all__ = [
     "parse_agent_message",
     "parse_agent_start_event",
     "parse_anthropic_server_tool_content",
+    "parse_anthropic_slow_mode_low_priority",
+    "parse_anthropic_slow_mode_state",
+    "parse_anthropic_slow_mode_wrap_up",
     "parse_ask_answer",
     "parse_ask_option",
     "parse_ask_question",

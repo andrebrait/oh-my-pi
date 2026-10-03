@@ -2955,6 +2955,66 @@ pub struct GoalResult {
 	pub state: Option<GoalModeState>,
 }
 
+/// `/slow` low priority serves the Claude account on spare capacity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicSlowModeLowPriority {
+	/// Epoch seconds when the 5-hour usage window resets.
+	#[serde(rename = "resetsAtSec")]
+	pub resets_at_sec: f64,
+	/// Percent of the weekly low-priority allowance still available.
+	#[serde(rename = "allowanceLeftPercent", default, skip_serializing_if = "Option::is_none")]
+	pub allowance_left_percent: Option<i64>,
+}
+
+/// Short wrap-up allowance after the Claude usage limit is reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicSlowModeWrapUp {
+	/// Whether Anthropic extra usage will serve requests after the allowance.
+	#[serde(rename = "extraUsage")]
+	pub extra_usage: bool,
+	/// Epoch seconds when the current usage-limit window resets, if reported.
+	#[serde(rename = "resetsAtSec", default, skip_serializing_if = "Option::is_none")]
+	pub resets_at_sec: Option<f64>,
+}
+
+/// Structured Claude usage-limit stage, discriminated by `stage`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnthropicSlowModeState {
+	/// `/slow` low priority serves the Claude account on spare capacity.
+	LowPriority(AnthropicSlowModeLowPriority),
+	/// Short wrap-up allowance after the Claude usage limit is reached.
+	WrapUp(AnthropicSlowModeWrapUp),
+}
+
+impl AnthropicSlowModeState {
+	/// Decodes from JSON, dispatching on `stage`.
+	pub fn from_value(value: Value) -> Result<Self, serde_json::Error> {
+		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("stage").and_then(Value::as_str) {
+			Some("low_priority") => |value| serde_json::from_value(value).map(Self::LowPriority),
+			Some("wrap_up") => |value| serde_json::from_value(value).map(Self::WrapUp),
+			other => {
+				return Err(serde_json::Error::custom(format!("unknown AnthropicSlowModeState stage {other:?}")));
+			}
+		};
+		decode(value)
+	}
+}
+
+impl Serialize for AnthropicSlowModeState {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		match self {
+			Self::LowPriority(member) => serialize_tagged(member, &[("stage", "low_priority")], serializer),
+			Self::WrapUp(member) => serialize_tagged(member, &[("stage", "wrap_up")], serializer),
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for AnthropicSlowModeState {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		Self::from_value(Value::deserialize(deserializer)?).map_err(D::Error::custom)
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
 	#[serde(rename = "sessionId")]
@@ -2983,9 +3043,9 @@ pub struct SessionState {
 	pub fast_mode_enabled: bool,
 	#[serde(rename = "fastModeActive", default = "default_session_state_fast_mode_active")]
 	pub fast_mode_active: bool,
-	/// Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.
-	#[serde(rename = "anthropicSlowModeLabel", default, skip_serializing_if = "Option::is_none")]
-	pub anthropic_slow_mode_label: Option<String>,
+	/// Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority.
+	#[serde(rename = "anthropicSlowMode", default, skip_serializing_if = "Option::is_none")]
+	pub anthropic_slow_mode: Option<AnthropicSlowModeState>,
 	#[serde(rename = "tokensPerSecond", default = "default_session_state_tokens_per_second")]
 	pub tokens_per_second: Option<f64>,
 	#[serde(rename = "messageCount", default = "default_session_state_message_count")]

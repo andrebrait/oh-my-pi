@@ -453,6 +453,27 @@ export interface GoalResult {
 	state: GoalModeState | null;
 }
 
+/** `/slow` low priority serves the Claude account on spare capacity. */
+export interface AnthropicSlowModeLowPriority {
+	stage: "low_priority";
+	/** Epoch seconds when the 5-hour usage window resets. */
+	resetsAtSec: number;
+	/** Percent of the weekly low-priority allowance still available. */
+	allowanceLeftPercent?: number;
+}
+
+/** Short wrap-up allowance after the Claude usage limit is reached. */
+export interface AnthropicSlowModeWrapUp {
+	stage: "wrap_up";
+	/** Whether Anthropic extra usage will serve requests after the allowance. */
+	extraUsage: boolean;
+	/** Epoch seconds when the current usage-limit window resets, if reported. */
+	resetsAtSec?: number;
+}
+
+/** Structured Claude usage-limit stage, discriminated by `stage`. */
+export type AnthropicSlowModeState = AnthropicSlowModeLowPriority | AnthropicSlowModeWrapUp;
+
 export interface SessionState {
 	sessionId: string;
 	model?: ModelInfo;
@@ -467,8 +488,8 @@ export interface SessionState {
 	autoCompactionEnabled?: boolean;
 	fastModeEnabled?: boolean;
 	fastModeActive?: boolean;
-	/** Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it. */
-	anthropicSlowModeLabel?: string;
+	/** Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority. */
+	anthropicSlowMode?: AnthropicSlowModeState;
 	tokensPerSecond?: number | null;
 	messageCount?: number;
 	queuedMessageCount?: number;

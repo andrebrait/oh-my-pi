@@ -44,6 +44,23 @@ export type AnthropicSlowModeEndReason =
 	| "max_wait"
 	| "extra_usage";
 
+/** Structured Claude usage-limit state for RPC and other non-TUI consumers. */
+export type AnthropicSlowModeState =
+	| {
+			stage: "low_priority";
+			/** Epoch seconds when the 5-hour usage window resets. */
+			resetsAtSec: number;
+			/** Percent of the weekly low-priority allowance still available. */
+			allowanceLeftPercent?: number;
+	  }
+	| {
+			stage: "wrap_up";
+			/** Epoch seconds when the current usage-limit window resets, if reported. */
+			resetsAtSec?: number;
+			/** Whether Anthropic extra usage will serve requests after the allowance. */
+			extraUsage: boolean;
+	  };
+
 /** Result of asking for the slow lane now (`/slow on` or auto-accept). */
 export type AnthropicSlowModeAvailability =
 	| { kind: "available"; resetsAtSec: number; resume: boolean }
@@ -108,6 +125,23 @@ export function formatSlowModeResetClock(resetsAtSec: number, now = Date.now()):
 	return resetsAtSec * 1000 - now > SAME_DAY_RESET_MS
 		? at.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })
 		: at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** TUI label for structured Claude usage-limit state. */
+export function formatAnthropicSlowModeStateLabel(
+	status: AnthropicSlowModeState | undefined,
+	now = Date.now(),
+): string | undefined {
+	if (status?.stage === "low_priority") {
+		return `low priority until ${formatSlowModeResetClock(status.resetsAtSec, now)}${
+			status.allowanceLeftPercent === undefined ? "" : ` · ${status.allowanceLeftPercent}% left`
+		}`;
+	}
+	if (!status) return undefined;
+	if (status.extraUsage) return "limit reached · wrap-up, then extra usage";
+	return `limit reached · wrapping up${
+		status.resetsAtSec === undefined ? "" : ` · resets ${formatSlowModeResetClock(status.resetsAtSec, now)}`
+	}`;
 }
 
 const END_NOTICES: Record<AnthropicSlowModeEndReason, { level: NoticeLevel; message: string } | undefined> = {
@@ -197,20 +231,32 @@ export class AnthropicSlowModeController {
 		return wrapUp.epoch;
 	}
 
+	/** Structured usage-limit state, or `undefined` outside wrap-up and low priority. */
+	status(now = Date.now(), lowPriority = true): AnthropicSlowModeState | undefined {
+		const resetsAtSec = lowPriority ? this.activeResetsAtSec(now) : undefined;
+		if (resetsAtSec !== undefined) {
+			const allowanceLeftPercent = this.allowanceLeftPercent();
+			return {
+				stage: "low_priority",
+				resetsAtSec,
+				...(allowanceLeftPercent === undefined ? {} : { allowanceLeftPercent }),
+			};
+		}
+		const wrapUp = this.#currentWrapUp(now);
+		if (!wrapUp) return undefined;
+		return {
+			stage: "wrap_up",
+			...(wrapUp.resetsAtSec === undefined ? {} : { resetsAtSec: wrapUp.resetsAtSec }),
+			extraUsage: wrapUp.extraUsage,
+		};
+	}
+
 	/**
 	 * Compact status-line label, or `undefined` outside both stages. The
 	 * low-priority label shows only when `lowPriority` (this session's `/slow`).
 	 */
 	statusLabel(now = Date.now(), lowPriority = true): string | undefined {
-		const resetsAtSec = lowPriority ? this.activeResetsAtSec(now) : undefined;
-		if (resetsAtSec !== undefined) {
-			const left = this.allowanceLeftPercent();
-			return `low priority until ${formatSlowModeResetClock(resetsAtSec, now)}${left === undefined ? "" : ` · ${left}% left`}`;
-		}
-		const wrapUp = this.#currentWrapUp(now);
-		if (!wrapUp) return undefined;
-		if (wrapUp.extraUsage) return "limit reached · wrap-up, then extra usage";
-		return `limit reached · wrapping up${wrapUp.resetsAtSec === undefined ? "" : ` · resets ${formatSlowModeResetClock(wrapUp.resetsAtSec, now)}`}`;
+		return formatAnthropicSlowModeStateLabel(this.status(now, lowPriority), now);
 	}
 
 	/** Whether the slow lane can be entered now, and on which window. */

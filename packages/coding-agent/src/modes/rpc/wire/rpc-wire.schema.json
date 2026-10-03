@@ -2382,6 +2382,59 @@
 			],
 			"description": "Outcome of every `goal` op; both fields are null when the session has no goal."
 		},
+		"AnthropicSlowModeLowPriority": {
+			"type": "object",
+			"properties": {
+				"stage": {
+					"const": "low_priority"
+				},
+				"resetsAtSec": {
+					"type": "number",
+					"description": "Epoch seconds when the 5-hour usage window resets."
+				},
+				"allowanceLeftPercent": {
+					"type": "integer",
+					"description": "Percent of the weekly low-priority allowance still available."
+				}
+			},
+			"required": [
+				"stage",
+				"resetsAtSec"
+			],
+			"description": "`/slow` low priority serves the Claude account on spare capacity."
+		},
+		"AnthropicSlowModeWrapUp": {
+			"type": "object",
+			"properties": {
+				"stage": {
+					"const": "wrap_up"
+				},
+				"extraUsage": {
+					"type": "boolean",
+					"description": "Whether Anthropic extra usage will serve requests after the allowance."
+				},
+				"resetsAtSec": {
+					"type": "number",
+					"description": "Epoch seconds when the current usage-limit window resets, if reported."
+				}
+			},
+			"required": [
+				"stage",
+				"extraUsage"
+			],
+			"description": "Short wrap-up allowance after the Claude usage limit is reached."
+		},
+		"AnthropicSlowModeState": {
+			"anyOf": [
+				{
+					"$ref": "#/$defs/AnthropicSlowModeLowPriority"
+				},
+				{
+					"$ref": "#/$defs/AnthropicSlowModeWrapUp"
+				}
+			],
+			"description": "Structured Claude usage-limit stage, discriminated by `stage`."
+		},
 		"SessionState": {
 			"type": "object",
 			"properties": {
@@ -2432,9 +2485,9 @@
 					"type": "boolean",
 					"default": false
 				},
-				"anthropicSlowModeLabel": {
-					"type": "string",
-					"description": "Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it."
+				"anthropicSlowMode": {
+					"$ref": "#/$defs/AnthropicSlowModeState",
+					"description": "Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority."
 				},
 				"tokensPerSecond": {
 					"anyOf": [

@@ -65,6 +65,29 @@ export const stateDefs = {
 		{ goal: "Goal | null", state: "GoalModeState | null" },
 		"Outcome of every `goal` op; both fields are null when the session has no goal.",
 	),
+	AnthropicSlowModeLowPriority: doc(
+		{
+			stage: "'low_priority'",
+			resetsAtSec: doc("number", "Epoch seconds when the 5-hour usage window resets."),
+			"allowanceLeftPercent?": doc(
+				"number.integer",
+				"Percent of the weekly low-priority allowance still available.",
+			),
+		},
+		"`/slow` low priority serves the Claude account on spare capacity.",
+	),
+	AnthropicSlowModeWrapUp: doc(
+		{
+			stage: "'wrap_up'",
+			"resetsAtSec?": doc("number", "Epoch seconds when the current usage-limit window resets, if reported."),
+			extraUsage: doc("boolean", "Whether Anthropic extra usage will serve requests after the allowance."),
+		},
+		"Short wrap-up allowance after the Claude usage limit is reached.",
+	),
+	AnthropicSlowModeState: doc(
+		"AnthropicSlowModeLowPriority | AnthropicSlowModeWrapUp",
+		"Structured Claude usage-limit stage, discriminated by `stage`.",
+	),
 	SessionState: {
 		"model?": "ModelInfo",
 		"thinkingLevel?": "ThinkingLevel",
@@ -79,9 +102,9 @@ export const stateDefs = {
 		autoCompactionEnabled: absentAs("boolean", false),
 		fastModeEnabled: absentAs("boolean", false),
 		fastModeActive: absentAs("boolean", false),
-		"anthropicSlowModeLabel?": doc(
-			"string",
-			"Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.",
+		"anthropicSlowMode?": doc(
+			"AnthropicSlowModeState",
+			"Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority.",
 		),
 		tokensPerSecond: absentAs("number | null", null),
 		messageCount: absentAs("number.integer", 0),

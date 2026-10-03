@@ -452,7 +452,12 @@ import {
 	cfgTierOpenai,
 	cfgProvidersAnthropicSlowMode,
 } from "./settings";
-import { type AnthropicSlowModeController, anthropicSlowModeLanes } from "./anthropic-slow-mode";
+import {
+	type AnthropicSlowModeController,
+	anthropicSlowModeLanes,
+	type AnthropicSlowModeState,
+	formatAnthropicSlowModeStateLabel,
+} from "./anthropic-slow-mode";
 import { cfgInterruptMode } from "../modes/settings";
 import { cfgFollowUpMode } from "../modes/settings";
 import { cfgSteeringMode } from "../modes/settings";
@@ -9597,8 +9602,13 @@ export class AgentSession implements SettingsScope {
 	 * off an Anthropic model.
 	 */
 	getAnthropicSlowModeLabel(): string | undefined {
+		return formatAnthropicSlowModeStateLabel(this.getAnthropicSlowModeState());
+	}
+
+	/** Structured counterpart of {@link getAnthropicSlowModeLabel} for RPC clients. */
+	getAnthropicSlowModeState(): AnthropicSlowModeState | undefined {
 		if (this.model?.provider !== "anthropic") return undefined;
-		return this.getAnthropicSlowModeLane()?.statusLabel(
+		return this.getAnthropicSlowModeLane()?.status(
 			undefined,
 			cfgProvidersAnthropicSlowMode.get(this.settings) === "auto",
 		);

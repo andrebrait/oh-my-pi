@@ -2369,6 +2369,109 @@ func (v *GoalResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+// `/slow` low priority serves the Claude account on spare capacity.
+type AnthropicSlowModeLowPriority struct {
+	// Epoch seconds when the 5-hour usage window resets.
+	ResetsAtSec float64 `json:"resetsAtSec"`
+	// Percent of the weekly low-priority allowance still available.
+	AllowanceLeftPercent *int64 `json:"allowanceLeftPercent,omitempty"`
+}
+
+func (v *AnthropicSlowModeLowPriority) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AnthropicSlowModeLowPriority", v.decodeFrom)
+}
+
+func (v *AnthropicSlowModeLowPriority) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AnthropicSlowModeLowPriority
+	d := fieldDecoder{raw: raw, owner: "AnthropicSlowModeLowPriority"}
+	d.constant("stage", "low_priority")
+	d.required("resetsAtSec", &out.ResetsAtSec)
+	d.optional("allowanceLeftPercent", &out.AllowanceLeftPercent)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v AnthropicSlowModeLowPriority) MarshalJSON() ([]byte, error) {
+	type plain AnthropicSlowModeLowPriority
+	return encodeObject(plain(v), `"stage":"low_priority"`, nil)
+}
+
+// Short wrap-up allowance after the Claude usage limit is reached.
+type AnthropicSlowModeWrapUp struct {
+	// Whether Anthropic extra usage will serve requests after the allowance.
+	ExtraUsage bool `json:"extraUsage"`
+	// Epoch seconds when the current usage-limit window resets, if reported.
+	ResetsAtSec *float64 `json:"resetsAtSec,omitempty"`
+}
+
+func (v *AnthropicSlowModeWrapUp) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AnthropicSlowModeWrapUp", v.decodeFrom)
+}
+
+func (v *AnthropicSlowModeWrapUp) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AnthropicSlowModeWrapUp
+	d := fieldDecoder{raw: raw, owner: "AnthropicSlowModeWrapUp"}
+	d.constant("stage", "wrap_up")
+	d.required("extraUsage", &out.ExtraUsage)
+	d.optional("resetsAtSec", &out.ResetsAtSec)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v AnthropicSlowModeWrapUp) MarshalJSON() ([]byte, error) {
+	type plain AnthropicSlowModeWrapUp
+	return encodeObject(plain(v), `"stage":"wrap_up"`, nil)
+}
+
+// Structured Claude usage-limit stage, discriminated by `stage`.
+type AnthropicSlowModeState struct {
+	// Value holds one variant, chosen by "stage" on decode.
+	Value AnthropicSlowModeStateVariant
+}
+
+// AnthropicSlowModeStateVariant is implemented by the types AnthropicSlowModeState can hold.
+type AnthropicSlowModeStateVariant interface {
+	isAnthropicSlowModeState()
+}
+
+func (AnthropicSlowModeLowPriority) isAnthropicSlowModeState() {}
+func (AnthropicSlowModeWrapUp) isAnthropicSlowModeState()      {}
+
+func (v AnthropicSlowModeState) MarshalJSON() ([]byte, error) {
+	return encodeVariant("AnthropicSlowModeState", v.Value)
+}
+
+func (v *AnthropicSlowModeState) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AnthropicSlowModeState", v.decodeFrom)
+}
+
+func (v *AnthropicSlowModeState) decodeFrom(raw map[string]json.RawMessage) error {
+	tag, err := unionTag(raw, "AnthropicSlowModeState", "stage")
+	if err != nil {
+		return err
+	}
+	var value AnthropicSlowModeStateVariant
+	switch tag {
+	case "low_priority":
+		value, err = decodeVariant[AnthropicSlowModeLowPriority](raw)
+	case "wrap_up":
+		value, err = decodeVariant[AnthropicSlowModeWrapUp](raw)
+	default:
+		return unknownValue("AnthropicSlowModeState.stage", tag)
+	}
+	if err != nil {
+		return err
+	}
+	v.Value = value
+	return nil
+}
+
 type SessionState struct {
 	SessionID             string         `json:"sessionId"`
 	Model                 *ModelInfo     `json:"model,omitempty"`
@@ -2383,11 +2486,11 @@ type SessionState struct {
 	AutoCompactionEnabled bool           `json:"autoCompactionEnabled"`
 	FastModeEnabled       bool           `json:"fastModeEnabled"`
 	FastModeActive        bool           `json:"fastModeActive"`
-	// Claude usage-limit stage on Anthropic models, e.g. `low priority until 14:30 · 62% left`; absent outside it.
-	AnthropicSlowModeLabel *string  `json:"anthropicSlowModeLabel,omitempty"`
-	TokensPerSecond        *float64 `json:"tokensPerSecond"`
-	MessageCount           int64    `json:"messageCount"`
-	QueuedMessageCount     int64    `json:"queuedMessageCount"`
+	// Claude usage-limit stage; absent off Anthropic models and outside wrap-up and low priority.
+	AnthropicSlowMode  *AnthropicSlowModeState `json:"anthropicSlowMode,omitempty"`
+	TokensPerSecond    *float64                `json:"tokensPerSecond"`
+	MessageCount       int64                   `json:"messageCount"`
+	QueuedMessageCount int64                   `json:"queuedMessageCount"`
 	// Background jobs or deliveries can still inject a follow-up and wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
@@ -2422,7 +2525,7 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("autoCompactionEnabled", &out.AutoCompactionEnabled, `false`)
 	d.defaulted("fastModeEnabled", &out.FastModeEnabled, `false`)
 	d.defaulted("fastModeActive", &out.FastModeActive, `false`)
-	d.optional("anthropicSlowModeLabel", &out.AnthropicSlowModeLabel)
+	d.optional("anthropicSlowMode", &out.AnthropicSlowMode)
 	d.defaulted("tokensPerSecond", &out.TokensPerSecond, `null`)
 	d.defaulted("messageCount", &out.MessageCount, `0`)
 	d.defaulted("queuedMessageCount", &out.QueuedMessageCount, `0`)
