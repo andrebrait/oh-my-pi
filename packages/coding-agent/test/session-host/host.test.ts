@@ -20,6 +20,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { tryAcquireSessionLease } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
 import { runSessionHost, type SessionHostOptions } from "@oh-my-pi/pi-coding-agent/session-host/host";
+import { resolveAttachTarget } from "@oh-my-pi/pi-coding-agent/session-host/hosted-startup";
 import {
 	findHostForSession,
 	listSessionHosts,
@@ -647,6 +648,11 @@ describe("session host", () => {
 		await waitFor(async () => (await findHostForSession(newFile, registryDir))?.hostId === host.hostId, 3_000);
 		expect(await findHostForSession(oldFile, registryDir)).toBeUndefined();
 		expect(await onlyEntry()).toMatchObject({ hostId: host.hostId, cwd: moved, sessionFile: newFile });
+		// `omp attach <new path>`. The lookup above already found the host, so this cannot start a second one.
+		expect(await resolveAttachTarget(newFile, { cwd: moved, args: [], registryDir })).toMatchObject({
+			hostId: host.hostId,
+			sessionFile: newFile,
+		});
 		// The same logical session: its lease is still held, whichever path it is looked up by.
 		expect(manager.getSessionId()).toBe(id);
 		expect(await leaseFreeInAnotherProcess(newFile, id)).toBe(false);
