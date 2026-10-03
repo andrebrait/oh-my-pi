@@ -37,12 +37,13 @@ import { cfgTasksTodoClearDelay } from "@oh-my-pi/pi-coding-agent/tools/settings
 import { TempDir } from "@oh-my-pi/pi-utils";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 import { createTestSession } from "../helpers/rpc-server-harness";
-import { SessionHostFixture, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
+import { listTree, SessionHostFixture, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
 
 const CTRL_ENTER = "\x1b[13;5u";
 const PIXEL: ImageContent = {
@@ -218,6 +219,7 @@ class HostedInput {
 		this.ctx.showSessionSelector = source => void selector.showSessionSelector(source);
 		this.ctx.showDebugSelector = () => selector.showDebugSelector();
 		this.ctx.showSettingsSelector = () => selector.showSettingsSelector();
+		this.ctx.showAgentHub = options => selector.showAgentHub(new SessionObserverRegistry(), options);
 		this.ctx.showModelSelector = options => selector.showModelSelector(options);
 		const focus = new SessionFocusController(this.ctx, this.registry, () => this.lifecycle);
 		this.ctx.focusAgentSession = id => focus.focusAgent(id);
@@ -767,6 +769,7 @@ describe("a hosted client's controls", () => {
 		["session switcher", input => input.ctx.showSessionSelector(), "Switching sessions is unavailable when attached"],
 		["debug panel", input => void input.ctx.showDebugSelector(), "The debug panel is unavailable when attached"],
 		["settings", input => input.ctx.showSettingsSelector(), "Settings is unavailable when attached"],
+		["agent hub", input => input.ctx.showAgentHub(), "The agent hub is unavailable when attached"],
 	];
 	it.each(gestures)("says %s is unavailable instead of changing the replica", async (_name, trigger, status) => {
 		const host = await fixture.startHost();
@@ -798,6 +801,23 @@ describe("a hosted client's controls", () => {
 		await input.controller.presentLargePasteMenu("one\ntwo\nthree", 3);
 
 		expect(input.selectors).toEqual([["Attach as a wrapped block", "Paste inline"]]);
+	});
+
+	it("sends a pasted clipboard image to the host as bytes, with no file in the local copy's directory", async () => {
+		const host = await fixture.startHost();
+		const input = await HostedInput.open(host);
+		const copy = await listTree(input.replicaDir);
+		const clipboard = new InputController(input.ctx, {
+			readImage: async () => ({ data: Buffer.from(PIXEL.data, "base64"), mimeType: "image/png" }),
+			readText: async () => "",
+		});
+
+		expect(await clipboard.handleImagePaste()).toBe(true);
+
+		expect(input.editor.pendingImages).toHaveLength(1);
+		// The host cannot open a `local://` file in the copy's artifact directory, and the copy is deleted on leaving.
+		expect(input.editor.pendingImageLinks.filter(link => link?.startsWith("local://"))).toEqual([]);
+		expect(await listTree(input.replicaDir)).toEqual(copy);
 	});
 });
 

@@ -263,6 +263,8 @@ omp config set tui.hosted true
 
 The terminal keeps the directory it was launched in and uses it only locally: it resolves `@file` arguments and appears in the footer with its git state. Tools, shell commands, and edits run in the host's directory, which `omp attach` lists. A host started by the launch runs in the resolved launch directory, and stays there unless `/move` or `/wt` moves the host's session to another directory. Attaching never moves the host to the terminal's directory or the terminal to the host's.
 
+Editor completion is local as well. `@` file suggestions list the terminal's directory, but an `@path` in a sent prompt is resolved by the host, in the host's directory, so the two differ when you attach from another directory. The slash-command menu offers the terminal's built-in commands only: it does not suggest the host's skills, prompt templates, or extension commands, which still work when typed.
+
 Links in the host's replies follow the host, not the terminal. A Markdown link to a relative path opens that file in the host's directory, and a `local://` link opens the file in the host session's own `local://` directory (under its artifact directory, or in the host's temp directory when its session is in memory), so a report the host wrote can be opened from the terminal; none of it is copied here. The links follow the host's session when it is replaced (the transcript is redrawn) or moved (the replies on screen are re-linked in place, without a redraw; rows already in your terminal's scrollback keep the link they had), and the terminal's own temp directory is never consulted. The footer, completion, and `@file` above stay local. A host that does not report where its session lives (one started by an older build) is refused with an error telling you to stop it and attach again, instead of showing links that would open the wrong files. While no host is attached, its links are left as written.
 
 #### Leaving and moving
@@ -277,7 +279,7 @@ Outside a hosted terminal, `/detach` and `/attach` only report that they need a 
 
 Unsent editor text is not saved when a hosted terminal detaches or exits, and attaching never restores a saved draft. In-process sessions still keep their Ctrl+D draft.
 
-Each terminal keeps its own copy of the host's transcript for rendering, in `<config root>/run/hosted-replicas/` (directory mode `0700`, files `0600`). Copies are not sessions: `/resume` never lists them, and the terminal deletes its own when it leaves.
+Each terminal keeps its own copy of the host's transcript for rendering, in `<config root>/run/hosted-replicas/` (directory mode `0700`, files `0600`). Copies are not sessions: `/resume` never lists them, and the terminal deletes its own when it leaves. A terminal that dies without running its exit path (`SIGKILL`, an out-of-memory kill, power loss) leaves its copy behind, and nothing removes it: the copies include the transcript and any images, so delete leftover files in that directory by hand.
 
 #### Connection loss
 

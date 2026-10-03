@@ -7,6 +7,7 @@
 
 - SDK: removed `SessionManager.onEntryAppended`; use `SessionManager.subscribeEntryAppended(listener)`, which supports several listeners and returns an unsubscribe function
 - SDK: `RpcClient.getAvailableModels()` now returns `Promise<Model[]>` (complete `Model` records, as the host has always sent them) instead of the reduced `ModelInfo[]`; the `ModelInfo` type is no longer exported from the RPC client module
+- SDK deep imports: replaced `ACP_BUILTIN_RESERVED_NAMES` with `acpBuiltinReservedNames()` and removed the unused `ACP_BUILTIN_SLASH_COMMANDS` export from `slash-commands/acp-builtins`.
 
 ### Added
 
