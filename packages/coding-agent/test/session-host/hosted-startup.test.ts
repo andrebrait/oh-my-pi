@@ -266,4 +266,54 @@ describe("the opt-in gate", () => {
 			authStorage.close();
 		}
 	});
+	it("rejects a missing attachment without leaving a detached host", async () => {
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		const settings = Settings.isolated({ "tui.hosted": true, "startup.checkUpdate": false });
+		const missing = path.join(dir, "missing-attachment.txt");
+		const rawArgs = [...MODEL_ARGS, "--no-session", "--cwd", dir, `@${missing}`];
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const exit = new Error("CLI exited");
+		const stderr: string[] = [];
+		let exitCode: string | number | null | undefined;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		vi.spyOn(process, "exit").mockImplementation(code => {
+			exitCode = code;
+			throw exit;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+			stderr.push(args.map(String).join(" "));
+		});
+		try {
+			await expect(
+				runRootCommand(parseArgs(rawArgs), rawArgs, {
+					settings,
+					discoverAuthStorage: async () => authStorage,
+				}),
+			).rejects.toBe(exit);
+			expect(exitCode).toBe(1);
+			expect(stderr.join("")).toContain("missing-attachment.txt");
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			expect(hosts).toEqual([]);
+		} finally {
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			vi.restoreAllMocks();
+			if (stdinTTY) Object.defineProperty(process.stdin, "isTTY", stdinTTY);
+			else Reflect.deleteProperty(process.stdin, "isTTY");
+			if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			authStorage.close();
+		}
+	}, 30_000);
 });
