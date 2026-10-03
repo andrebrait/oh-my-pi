@@ -1055,6 +1055,25 @@ describe("a hosted client's automation", () => {
 			expect(hosted.enabled).toBe(false);
 		});
 
+		it("mounts no welcome header in a hosted client, without changing the startup.quiet setting", async () => {
+			const previous = cfgStartupQuiet.get(Settings.instance);
+			const welcomeAfterInit = async (hostedClientMode: boolean): Promise<boolean> => {
+				cfgStartupQuiet.set(Settings.instance, false);
+				const { mode, dispose } = await openMode(hostedClientMode);
+				await mode.init({ suppressWelcomeIntro: true });
+				const mounted = mode.composer.welcome !== undefined;
+				await dispose();
+				return mounted;
+			};
+			try {
+				expect(await welcomeAfterInit(false)).toBe(true);
+				expect(await welcomeAfterInit(true)).toBe(false);
+				expect(cfgStartupQuiet.get(Settings.instance)).toBe(false);
+			} finally {
+				cfgStartupQuiet.set(Settings.instance, previous);
+			}
+		});
+
 		it("keeps a passive replica's session switches from its local extensions", async () => {
 			const switches = async (passiveReplica: boolean): Promise<{ before: number; after: number }> => {
 				const seen = { before: 0, after: 0 };

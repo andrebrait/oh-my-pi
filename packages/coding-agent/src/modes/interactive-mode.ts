@@ -200,7 +200,7 @@ import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { openPath } from "../utils/open";
-import { resumeCommand } from "../utils/resume-command";
+import { attachCommand, resumeCommand } from "../utils/resume-command";
 import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/theme/session-color";
 import { messageHasDisplayableThinking } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { TokenRateMeter } from "../utils/token-rate";
@@ -322,6 +322,7 @@ import type {
 	InteractiveModeInitOptions,
 	InteractiveSelectorDialogOptions,
 	RenderSessionContextOptions,
+	ShutdownOptions,
 	SubmittedUserInput,
 } from "./types";
 import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -1502,6 +1503,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	hostedClient?: HostedClientLink;
 	/** See {@link InteractiveModeContext.hostOrigin}. */
 	hostOrigin?: RpcSessionOrigin;
+	attachHostedSession?: (target?: string) => Promise<void>;
 	#streamPublisher: StreamPublisher | undefined;
 	#recorder: SessionRecorder | undefined;
 	#recorderStarting = false;
@@ -2074,6 +2076,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// A hosted replica is a disposable copy the link deletes on leaving: saving a draft would recreate its file.
 			saveDraft: text => (this.hostedClientMode ? Promise.resolve() : this.sessionManager.saveDraft(text)),
 			disposeSession: async reason => {
+				await this.#detachHostedClient();
 				await this.#btwController.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
@@ -2116,7 +2119,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.session.slashCommands,
 		);
 
-		const startupQuiet = cfgStartupQuiet.get(settings);
+		// A hosted terminal only mirrors another process's session: it shows no welcome or changelog of its own. Quiet
+		// is applied in memory only; the persistent `startup.quiet` setting is untouched.
+		const startupQuiet = this.hostedClientMode || cfgStartupQuiet.get(settings);
 		this.composer.setPreferences({ quiet: startupQuiet });
 		this.composer.updateWelcome({ version: this.#version });
 		const headerBefore = this.#buildConfigWarningComponents();
@@ -6787,7 +6792,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = false;
 	}
 
-	async shutdown(): Promise<void> {
+	async shutdown(options: ShutdownOptions = {}): Promise<void> {
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
@@ -6806,6 +6811,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#isShuttingDown = true;
+		// The teardown detaches a connected hosted client; the host it leaves keeps running.
+		const detachedFrom = this.hostedClient?.hostId;
 		try {
 			await this.#teardown();
 		} catch (error) {
@@ -6815,14 +6822,20 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Print resumption hint only if the session was actually materialized to
 		// durable storage — `--resume <id>` fails on a never-written file (see
-		// #resumableSessionId).
+		// #resumableSessionId). A hosted client has no session of its own to resume: it names the host it left.
 		const sessionId = this.#resumableSessionId();
-		if (sessionId) {
+		if (options.farewell !== undefined) {
+			process.stderr.write(`\n${sanitizeStatusText(options.farewell)}\n`);
+		} else if (detachedFrom !== undefined) {
+			process.stderr.write(
+				`\n${chalk.dim("Detached; the session host keeps running. Attach again with")}\n${chalk.dim(attachCommand(detachedFrom))}\n`,
+			);
+		} else if (sessionId) {
 			// Command on its own line so triple-click selects just the command (#11001).
 			process.stderr.write(`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId))}\n`);
 		}
 
-		await postmortem.quit(0);
+		await postmortem.quit(options.exitCode ?? 0);
 	}
 
 	#handleTeardownError(action: "close" | "restart", error: unknown): void {
@@ -6899,6 +6912,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		return sessionId && sessionFile && this.sessionManager.isSessionOnDisk() ? sessionId : undefined;
 	}
 
+	/**
+	 * A hosted client leaves its session host (which keeps running) before its local replica is disposed, on every
+	 * exit path: keypress, `/exit`, and signals such as SIGHUP when the terminal goes away. A failed detach is logged
+	 * and never keeps the process alive: the host drops a connection that closes without it.
+	 */
+	async #detachHostedClient(): Promise<void> {
+		try {
+			await this.hostedClient?.detach();
+		} catch (error) {
+			logger.warn("Failed to detach from the session host", { error: String(error) });
+		}
+	}
+
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
 	async #teardown(): Promise<void> {
 		// An in-flight loop condition (or a deferred auto-submit timer) must not
@@ -6938,6 +6964,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#signalTeardown) {
 				await this.#signalTeardown();
 			} else {
+				await this.#detachHostedClient();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 				});
