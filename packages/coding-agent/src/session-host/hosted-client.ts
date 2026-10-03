@@ -28,7 +28,7 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { sanitizeDisplayLine, sanitizeDisplayText } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import { clearAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
@@ -41,6 +41,7 @@ import type {
 	RpcExtensionUIResponse,
 	RpcHostFrame,
 	RpcPreconditions,
+	RpcQueueAttachments,
 	RpcSessionOrigin,
 	RpcSnapshot,
 } from "../modes/rpc/rpc-types";
@@ -98,6 +99,38 @@ function isDialogRequest(request: RpcExtensionUIRequest): request is DialogReque
 	}
 }
 
+/** What taking the newest queued message back from the host did; see {@link HostedClientLink.takeBackQueued}. */
+export type QueuedTakeBack =
+	/** Removed from the host's queue: its text is for the editor. */
+	| { outcome: "restored"; text: string }
+	/** Nothing was queued. */
+	| { outcome: "empty" }
+	/** The host no longer had it: it was delivered, or removed by someone else. */
+	| { outcome: "delivered" }
+	/** It carries an attachment that text alone would lose; left queued. */
+	| { outcome: "attachment" }
+	/** The host did not report which queued prompts carry attachments, so none can be told apart; left queued. */
+	| { outcome: "unreported" };
+
+function isFlagList(value: unknown, length: number): value is boolean[] {
+	return Array.isArray(value) && value.length === length && value.every(flag => typeof flag === "boolean");
+}
+
+/**
+ * The host's attachment flags for `queued`, or undefined when it sent none (a host that predates them) or they are not
+ * parallel to the chips they came with. Flags are read by position, so a list of another length is never trusted.
+ */
+function readQueueAttachments(
+	value: unknown,
+	queued: { readonly steering: readonly string[]; readonly followUp: readonly string[] },
+): RpcQueueAttachments | undefined {
+	if (typeof value !== "object" || value === null || !("steering" in value) || !("followUp" in value))
+		return undefined;
+	const { steering, followUp } = value;
+	if (!isFlagList(steering, queued.steering.length) || !isFlagList(followUp, queued.followUp.length)) return undefined;
+	return { steering: [...steering], followUp: [...followUp] };
+}
+
 function toError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
 }
@@ -143,6 +176,8 @@ export class HostedClientLink {
 	#isStreaming = false;
 	#isCompacting = false;
 	#queued: { steering: readonly string[]; followUp: readonly string[] } = { steering: [], followUp: [] };
+	/** Which of {@link #queued} carry an attachment, as the host reported it with them; undefined when it did not. */
+	#queuedAttachments: RpcQueueAttachments | undefined;
 	/** Attached clients, as the status line shows them. */
 	#clientCount = 0;
 	/** The host's context usage as last read; the idle local replica cannot estimate it the way the host does. */
@@ -247,9 +282,27 @@ export class HostedClientLink {
 		await this.#client.abort();
 	}
 
-	async removeQueued(text: string, queue: "steering" | "followUp"): Promise<boolean> {
-		const { removed } = await this.#client.removeQueuedMessage(text, queue, this.#guard());
-		return removed;
+	/**
+	 * Take the newest queued message back from the host (steering before follow-ups, as the local queue pops), so the
+	 * caller can put its text in the editor. Only a message that is text and nothing else can be: the host lists
+	 * queued chips as text, so taking back a prompt that carries an image would lose the image. That is decided
+	 * from the host's own report of which queued prompts carry attachments, and checked again by the host when it
+	 * removes (it refuses a prompt that gained one meanwhile). Without that report (a host that predates it, or one
+	 * frame that did not match its queue) nothing is removed. Everything but `restored` leaves the host's queue as it was.
+	 */
+	async takeBackQueued(): Promise<QueuedTakeBack> {
+		const queue = this.#queued.steering.length > 0 ? "steering" : "followUp";
+		const text = this.#queued[queue].at(-1);
+		if (text === undefined) return { outcome: "empty" };
+		const attached = this.#queuedAttachments?.[queue].at(-1);
+		if (attached === undefined) return { outcome: "unreported" };
+		if (attached) return { outcome: "attachment" };
+		const { removed, refused } = await this.#client.removeQueuedMessage(text, queue, this.#guard(), {
+			match: "last",
+			refuseAttachments: true,
+		});
+		if (refused === "attachments") return { outcome: "attachment" };
+		return removed ? { outcome: "restored", text } : { outcome: "delivered" };
 	}
 
 	/** The new model reaches this view (and every peer) as the host's `config_update`, not as a local change. */
@@ -257,16 +310,23 @@ export class HostedClientLink {
 		await this.#client.setModel(provider, modelId, this.#guard());
 	}
 
-	async cycleModel(): Promise<void> {
-		await this.#client.cycleModel(this.#guard());
+	/** Cycle the host's model. `false`: the host has no other model to cycle to, so nothing changed. */
+	async cycleModel(): Promise<boolean> {
+		return (await this.#client.cycleModel(this.#guard())) !== null;
+	}
+
+	/** The models the host can switch to: its own credentials and custom models, not this client's. */
+	availableModels(): Promise<Model[]> {
+		return this.#client.getAvailableModels();
 	}
 
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		await this.#client.setThinkingLevel(level, this.#guard());
 	}
 
-	async cycleThinkingLevel(): Promise<void> {
-		await this.#client.cycleThinkingLevel(this.#guard());
+	/** Cycle the host's thinking level. `false`: the host's model has no thinking levels, so nothing changed. */
+	async cycleThinkingLevel(): Promise<boolean> {
+		return (await this.#client.cycleThinkingLevel(this.#guard())) !== null;
 	}
 
 	/** Leave the session running and close this client. The caller exits or re-attaches; there is no reconnect. */
@@ -439,6 +499,10 @@ export class HostedClientLink {
 				break;
 			case "queue_update":
 				this.#queued = { steering: [...event.steering], followUp: [...event.followUp] };
+				this.#queuedAttachments = readQueueAttachments(
+					"attachments" in event ? event.attachments : undefined,
+					this.#queued,
+				);
 				break;
 			case "thinking_level_changed":
 				// Before the handler runs: it restyles the editor and thinking blocks from the session's level,
@@ -500,6 +564,7 @@ export class HostedClientLink {
 		this.#isCompacting = state.isCompacting;
 		this.#hostContext = state.contextUsage;
 		this.#queued = { steering: [...state.queuedMessages.steering], followUp: [...state.queuedMessages.followUp] };
+		this.#queuedAttachments = readQueueAttachments(snapshot.queueAttachments, this.#queued);
 		applyReplicaHostState(ctx.session, { model: state.model, thinkingLevel: state.thinkingLevel });
 		setSessionTerminalTitle(state.sessionName ?? header.title, ctx.sessionManager.getCwd());
 		this.#clientCount = snapshot.clients.length;

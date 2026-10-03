@@ -2911,6 +2911,14 @@ pub struct QueuedMessagesState {
 	pub live_steered: i64,
 }
 
+/// Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueAttachments {
+	pub steering: Vec<bool>,
+	#[serde(rename = "followUp")]
+	pub follow_up: Vec<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
 	pub name: String,
@@ -3196,6 +3204,9 @@ pub struct RemoveQueuedMessageResult {
 	/// Only ever `true`: the images exceeded the transport limit and were omitted; the removal still happened.
 	#[serde(rename = "imagesDropped", default, skip_serializing_if = "Option::is_none")]
 	pub images_dropped: Option<bool>,
+	/// Nothing was removed: `refuseAttachments` was set and the prompt carries one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refused: Option<LitAttachments>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3854,6 +3865,9 @@ pub struct QueueUpdateEvent {
 	/// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
 	#[serde(rename = "liveSteered", default = "default_queue_update_event_live_steered")]
 	pub live_steered: i64,
+	/// Session-host socket clients only; absent means unknown, not that no chip carries one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attachments: Option<QueueAttachments>,
 }
 
 /// A session event, discriminated by `type`; `set_event_filter` selects which are sent.
@@ -4327,6 +4341,9 @@ pub struct SessionSnapshot {
 	pub clients: Vec<ClientInfo>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub streaming: Option<StreamingMessage>,
+	/// Parallel to `state.queuedMessages`.
+	#[serde(rename = "queueAttachments", default, skip_serializing_if = "Option::is_none")]
+	pub queue_attachments: Option<QueueAttachments>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub origin: Option<SessionOrigin>,
 }
@@ -5292,6 +5309,12 @@ pub struct FollowUpParams {
 pub struct RemoveQueuedMessageParams {
 	pub message: String,
 	pub queue: QueuedMessageQueue,
+	/// `last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub r#match: Option<RemoveQueuedMessageParamsMatch>,
+	/// Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment.
+	#[serde(rename = "refuseAttachments", default, skip_serializing_if = "Option::is_none")]
+	pub refuse_attachments: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5934,6 +5957,27 @@ impl<'de> Deserialize<'de> for LitCompleted {
 	}
 }
 
+/// The constant `"attachments"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitAttachments;
+
+impl Serialize for LitAttachments {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str("attachments")
+	}
+}
+
+impl<'de> Deserialize<'de> for LitAttachments {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_str() == Some("attachments") {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected \"attachments\", got {value}")))
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogoutAccountType {
 	#[serde(rename = "api_key")]
@@ -6011,6 +6055,24 @@ impl HostUriResultContentType {
 			Self::TextMarkdown => "text/markdown",
 			Self::ApplicationJson => "application/json",
 			Self::TextPlain => "text/plain",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RemoveQueuedMessageParamsMatch {
+	#[serde(rename = "first")]
+	First,
+	#[serde(rename = "last")]
+	Last,
+}
+
+impl RemoveQueuedMessageParamsMatch {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::First => "first",
+			Self::Last => "last",
 		}
 	}
 }
@@ -6231,6 +6293,12 @@ impl Command for FollowUpCommand {
 pub struct RemoveQueuedMessageCommand {
 	pub message: String,
 	pub queue: QueuedMessageQueue,
+	/// `last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub r#match: Option<RemoveQueuedMessageParamsMatch>,
+	/// Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment.
+	#[serde(rename = "refuseAttachments", default, skip_serializing_if = "Option::is_none")]
+	pub refuse_attachments: Option<bool>,
 }
 
 impl Command for RemoveQueuedMessageCommand {

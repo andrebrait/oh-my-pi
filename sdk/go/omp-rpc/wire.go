@@ -2226,6 +2226,28 @@ func (v *QueuedMessagesState) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+// Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`.
+type QueueAttachments struct {
+	Steering []bool `json:"steering"`
+	FollowUp []bool `json:"followUp"`
+}
+
+func (v *QueueAttachments) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QueueAttachments", v.decodeFrom)
+}
+
+func (v *QueueAttachments) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QueueAttachments
+	d := fieldDecoder{raw: raw, owner: "QueueAttachments"}
+	d.required("steering", &out.Steering)
+	d.required("followUp", &out.FollowUp)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type ToolDescriptor struct {
 	Name        string            `json:"name"`
 	Description string            `json:"description"`
@@ -2768,6 +2790,8 @@ type RemoveQueuedMessageResult struct {
 	Images []ImageContent `json:"images,omitempty"`
 	// Only ever `true`: the images exceeded the transport limit and were omitted; the removal still happened.
 	ImagesDropped *bool `json:"imagesDropped,omitempty"`
+	// Nothing was removed: `refuseAttachments` was set and the prompt carries one.
+	Refused *RemoveQueuedMessageResultRefused `json:"refused,omitempty"`
 }
 
 func (v *RemoveQueuedMessageResult) UnmarshalJSON(data []byte) error {
@@ -2780,11 +2804,31 @@ func (v *RemoveQueuedMessageResult) decodeFrom(raw map[string]json.RawMessage) e
 	d.required("removed", &out.Removed)
 	d.optional("images", &out.Images)
 	d.optional("imagesDropped", &out.ImagesDropped)
+	d.optional("refused", &out.Refused)
 	if d.err != nil {
 		return d.err
 	}
 	*v = out
 	return nil
+}
+
+type RemoveQueuedMessageResultRefused string
+
+const (
+	RemoveQueuedMessageResultRefusedAttachments RemoveQueuedMessageResultRefused = "attachments"
+)
+
+func (v *RemoveQueuedMessageResultRefused) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "RemoveQueuedMessageResultRefused")
+	if err != nil {
+		return err
+	}
+	switch value := RemoveQueuedMessageResultRefused(s); value {
+	case RemoveQueuedMessageResultRefusedAttachments:
+		*v = value
+		return nil
+	}
+	return unknownValue("RemoveQueuedMessageResultRefused", s)
 }
 
 type PromoteQueuedMessageResult struct {
@@ -4377,6 +4421,8 @@ type QueueUpdateEvent struct {
 	FollowUp []string `json:"followUp"`
 	// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
 	LiveSteered int64 `json:"liveSteered"`
+	// Session-host socket clients only; absent means unknown, not that no chip carries one.
+	Attachments *QueueAttachments `json:"attachments,omitempty"`
 }
 
 func (v *QueueUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -4390,6 +4436,7 @@ func (v *QueueUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("steering", &out.Steering)
 	d.required("followUp", &out.FollowUp)
 	d.defaulted("liveSteered", &out.LiveSteered, `0`)
+	d.optional("attachments", &out.Attachments)
 	if d.err != nil {
 		return d.err
 	}
@@ -5336,7 +5383,9 @@ type SessionSnapshot struct {
 	PendingUI []ExtensionUiRequest `json:"pendingUi"`
 	Clients   []ClientInfo         `json:"clients"`
 	Streaming *StreamingMessage    `json:"streaming,omitempty"`
-	Origin    *SessionOrigin       `json:"origin,omitempty"`
+	// Parallel to `state.queuedMessages`.
+	QueueAttachments *QueueAttachments `json:"queueAttachments,omitempty"`
+	Origin           *SessionOrigin    `json:"origin,omitempty"`
 }
 
 func (v *SessionSnapshot) UnmarshalJSON(data []byte) error {
@@ -5353,6 +5402,7 @@ func (v *SessionSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("pendingUi", &out.PendingUI)
 	d.required("clients", &out.Clients)
 	d.optional("streaming", &out.Streaming)
+	d.optional("queueAttachments", &out.QueueAttachments)
 	d.optional("origin", &out.Origin)
 	if d.err != nil {
 		return d.err
@@ -7774,6 +7824,10 @@ func (c Commands) FollowUp(ctx context.Context, p FollowUpCommand) error {
 type RemoveQueuedMessageCommand struct {
 	Message string             `json:"message"`
 	Queue   QueuedMessageQueue `json:"queue"`
+	// `last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text).
+	Match *RemoveQueuedMessageCommandMatch `json:"match,omitempty"`
+	// Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment.
+	RefuseAttachments *bool `json:"refuseAttachments,omitempty"`
 }
 
 // RemoveQueuedMessage sends "remove_queued_message": Remove one pending queued message by its queue-chip text.
@@ -7781,6 +7835,26 @@ func (c Commands) RemoveQueuedMessage(ctx context.Context, p RemoveQueuedMessage
 	var out RemoveQueuedMessageResult
 	err := c.call(ctx, "remove_queued_message", p, 0, &out)
 	return out, err
+}
+
+type RemoveQueuedMessageCommandMatch string
+
+const (
+	RemoveQueuedMessageCommandMatchFirst RemoveQueuedMessageCommandMatch = "first"
+	RemoveQueuedMessageCommandMatchLast  RemoveQueuedMessageCommandMatch = "last"
+)
+
+func (v *RemoveQueuedMessageCommandMatch) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "RemoveQueuedMessageCommandMatch")
+	if err != nil {
+		return err
+	}
+	switch value := RemoveQueuedMessageCommandMatch(s); value {
+	case RemoveQueuedMessageCommandMatchFirst, RemoveQueuedMessageCommandMatchLast:
+		*v = value
+		return nil
+	}
+	return unknownValue("RemoveQueuedMessageCommandMatch", s)
 }
 
 // PromoteQueuedMessageCommand holds the parameters of "promote_queued_message".
