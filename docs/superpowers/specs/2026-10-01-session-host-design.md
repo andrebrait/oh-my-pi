@@ -49,8 +49,8 @@ flowchart LR
 | Socket/pipe listener | N connections, token-authenticated `hello` | New, using the `node:net` convention from D3 |
 | Host registry | Owner-only JSON per host `{hostId, pid, endpoint, token, cwd, sessionFile, title, startedAt}` in the per-user agent dir | `collab/registry.ts` pattern, including socket path-length fallback |
 | `omp --mode host` | Headless detached host entry point | New mode in `main.ts` |
-| `RemoteSession` | Client-side RPC-over-socket object exposing the `AgentSession` slice the TUI uses | New, built on `RpcClient` with a socket `RpcAgentProcess` transport |
-| Replica `SessionManager` | In-memory mirror of the session tree for transcript and tree views, seeded by the snapshot and fed by `entry` frames | Collab-guest replica idea, without a disk file |
+| `HostedClientLink` | Client-side link that owns an `RpcClient` over `connectSessionHost`, applies the host's snapshot, `entry`, event, and dialog frames to the idle local replica session the TUI renders, and sends input to the host over RPC. Replaces the planned `RemoteSession` object: the TUI keeps a local passive `AgentSession` and reads host state through the link | `session-host/hosted-client.ts`, built on `RpcClient` with a socket transport |
+| Replica `SessionManager` | Client-local mirror of the session tree for transcript and tree views, seeded by the snapshot and fed by `entry` frames. It lives in an owner-private replica file (directory `0700`, file `0600`) with a unique name per client and snapshot, outside the sessions listing. On leaving, the client deletes its own files once in-flight frame application has settled | Collab-guest replica mechanics, shared in `session/replica-view.ts` |
 
 ### Invariants
 
@@ -138,7 +138,7 @@ Stopping an orphaned host is `omp attach <id>`, then `/exit`.
 
 ### Shape
 
-With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a `RemoteSession` and the replica `SessionManager` instead of an in-process `AgentSession`. User messages render from events only; there is no optimistic echo in client mode.
+With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a permanently idle local replica session instead of an in-process `AgentSession`. The replica is a passive `AgentSession` over the replica file above, never the host's session file (D9), and `HostedClientLink` feeds it from the host's snapshot, `entry`, and event frames. User messages render from events only; there is no optimistic echo in client mode.
 
 ### Command routing
 
