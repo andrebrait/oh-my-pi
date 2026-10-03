@@ -117,10 +117,17 @@ describe("omp attach", () => {
 		expect(stdout).toBe("No session hosts running.\n");
 	});
 
-	it("rejects a positional argument", async () => {
+	it("accepts a target but requires a terminal to open its TUI", async () => {
 		home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-"));
 		const { exitCode, stderr } = await attach("some-target");
 		expect(exitCode).toBe(1);
-		expect(stderr).toContain("accepts no arguments");
+		expect(stderr).toContain("attach <target> requires an interactive terminal");
+	});
+
+	it("keeps --json as a listing-only option", async () => {
+		home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-"));
+		const { exitCode, stderr } = await attach("--json", "some-target");
+		expect(exitCode).not.toBe(0);
+		expect(stderr).toContain("--json lists session hosts and takes no target");
 	});
 });
