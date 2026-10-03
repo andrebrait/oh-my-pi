@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
@@ -6,7 +7,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
 import { runSessionHost, type SessionHostOptions } from "@oh-my-pi/pi-coding-agent/session-host/host";
 import { listSessionHosts, newHostId, type SessionHostEntry } from "@oh-my-pi/pi-coding-agent/session-host/registry";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { isEnoent, removeWithRetries } from "@oh-my-pi/pi-utils";
 import { createTestSession, isolateAgentDir } from "./rpc-server-harness";
 
 /** Polls a condition, not a guessed delay: the registry file is the host's only observable readiness and presence signal. */
@@ -138,4 +139,116 @@ export class SessionHostFixture {
 	async #findEntry(hostId: string): Promise<SessionHostEntry | undefined> {
 		return (await listSessionHosts(this.registryDir)).find(entry => entry.hostId === hostId);
 	}
+}
+
+export interface IsolatedConfigRoot {
+	/** The directory `getBaseConfigRoot()` names while isolated. */
+	root: string;
+	/** Put the environment back and delete the directory. */
+	restore(): Promise<void>;
+}
+
+/**
+ * Give the process a base config root of its own for one test. omp's run state (the default host registry, the
+ * hosted replica directory) lives under it, so the test never reads, prunes, or fills the developer's `~/.omp`.
+ * `PI_CONFIG_DIR` is the one in-process seam: `os.homedir()` ignores a `HOME` changed after startup. Call `restore`
+ * before disposing the {@link SessionHostFixture}: that teardown re-reads the directory environment.
+ */
+export function isolateConfigRoot(): IsolatedConfigRoot {
+	const saved = process.env.PI_CONFIG_DIR;
+	const name = `.omp-test-${crypto.randomUUID()}`;
+	const root = path.join(os.homedir(), name);
+	process.env.PI_CONFIG_DIR = name;
+	return {
+		root,
+		restore: async () => {
+			if (saved === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = saved;
+			await removeWithRetries(root);
+		},
+	};
+}
+
+/** Everything under `dir` (relative, sorted), without dotfile lock sidecars; empty when `dir` does not exist. */
+export async function listTree(dir: string): Promise<string[]> {
+	try {
+		const names = await fs.readdir(dir, { recursive: true });
+		return names.filter(name => !path.basename(name).startsWith(".")).sort();
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+}
+
+export interface HostProxy {
+	/** The host's entry with its endpoint redirected through the proxy. */
+	entry: SessionHostEntry;
+	/** Send `frame` to every connected client as if the host had. */
+	inject(frame: object): void;
+	/** Cut every client's connection, like a network failure. */
+	drop(): void;
+	close(): void;
+}
+
+/**
+ * A unix socket in front of a host's endpoint: the test can cut the link, add a frame the host would not send, or
+ * (`refuseExit`) have the proxy answer a client's `exit` request with that error instead of passing it on.
+ */
+export async function startProxy(
+	entry: SessionHostEntry,
+	dir: string,
+	options: { refuseExit?: string } = {},
+): Promise<HostProxy> {
+	const socketPath = path.join(dir, "proxy.sock");
+	const clients = new Set<net.Socket>();
+	const server = net.createServer(client => {
+		const upstream = net.connect(entry.endpoint);
+		clients.add(client);
+		if (options.refuseExit === undefined) client.pipe(upstream);
+		else forwardRefusingExit(client, upstream, options.refuseExit);
+		upstream.pipe(client);
+		// A reset ends the pair; `close` always follows.
+		for (const socket of [client, upstream]) {
+			socket.on("error", () => {});
+			socket.on("close", () => {
+				clients.delete(client);
+				client.destroy();
+				upstream.destroy();
+			});
+		}
+	});
+	const listening = Promise.withResolvers<void>();
+	server.listen(socketPath, listening.resolve);
+	await listening.promise;
+	return {
+		entry: { ...entry, endpoint: socketPath },
+		inject: (frame: object): void => {
+			for (const client of clients) client.write(`${JSON.stringify(frame)}\n`);
+		},
+		drop: (): void => {
+			for (const client of clients) client.destroy();
+		},
+		close: (): void => void server.close(),
+	};
+}
+
+/** Pass `client`'s request lines to `upstream`, except `exit`: that one is answered here with `error`. */
+function forwardRefusingExit(client: net.Socket, upstream: net.Socket, error: string): void {
+	let pending = "";
+	client.setEncoding("utf8");
+	client.on("data", chunk => {
+		pending += String(chunk);
+		for (let end = pending.indexOf("\n"); end >= 0; end = pending.indexOf("\n")) {
+			const line = pending.slice(0, end + 1);
+			pending = pending.slice(end + 1);
+			const request = JSON.parse(line) as { id?: string; type?: string };
+			if (request.type === "exit") {
+				const refusal = { id: request.id, type: "response", command: "exit", success: false, error };
+				client.write(`${JSON.stringify(refusal)}\n`);
+			} else {
+				upstream.write(line);
+			}
+		}
+	});
+	client.once("end", () => upstream.end());
 }

@@ -148,6 +148,26 @@ export default function (pi) {
 		150_000,
 	);
 
+	itPosix(
+		"keeps its session and keeps serving clients when a hangup reaches it",
+		async () => {
+			const entry = await spawnHost();
+			process.kill(entry.pid, "SIGHUP");
+			// A host that honored the hangup (the default handler disposes and exits) would be gone within a beat.
+			// The claim is an absence, which has no event to await: the host must still be there when the window ends.
+			await expect(waitFor(() => !pidAlive(entry.pid), 500)).rejects.toThrow("waitFor timed out");
+			expect(await listSessionHosts(registryDir)).toHaveLength(1);
+			const a = new RpcClient({ spawn: () => connectSessionHost({ entry, client: { kind: "test" }, ui: false }) });
+			await a.start();
+			expect((await a.getState()).sessionFile).toBe(entry.sessionFile);
+			// Only a client's exit stops it.
+			await a.exit();
+			await waitFor(() => !pidAlive(entry.pid), 10_000);
+			expect(artifactsLeft(entry)).toEqual([]);
+		},
+		150_000,
+	);
+
 	it("registers in a relative registry dir resolved by the spawner, leaving other files there alone", async () => {
 		// A registry directory shared with a file that is not an entry.
 		await fs.promises.mkdir(registryDir, { mode: 0o700 });

@@ -1,6 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -42,7 +41,7 @@ import { createInteractiveModeContext } from "../helpers/interactive-mode-contex
 import { createTestSession, isolateAgentDir } from "../helpers/rpc-server-harness";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
-import { SessionHostFixture, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
+import { SessionHostFixture, startProxy, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
 
 /** What the TUI's dialog presenter does: show, then settle with the user's answer or `undefined` when aborted. */
 interface FakeDialog {
@@ -1457,40 +1456,6 @@ describe("HostedClientLink with the real EventController and status line", () =>
 		expect(late.statusText()).toContain("Renamed again");
 	});
 });
-
-/** A unix socket in front of a host's endpoint: the test can cut the link or add a frame the host would not send. */
-async function startProxy(entry: SessionHostEntry, dir: string) {
-	const socketPath = path.join(dir, "proxy.sock");
-	const clients = new Set<net.Socket>();
-	const server = net.createServer(client => {
-		const upstream = net.connect(entry.endpoint);
-		clients.add(client);
-		client.pipe(upstream);
-		upstream.pipe(client);
-		// A reset ends the pair; `close` always follows.
-		for (const socket of [client, upstream]) {
-			socket.on("error", () => {});
-			socket.on("close", () => {
-				clients.delete(client);
-				client.destroy();
-				upstream.destroy();
-			});
-		}
-	});
-	const listening = Promise.withResolvers<void>();
-	server.listen(socketPath, listening.resolve);
-	await listening.promise;
-	return {
-		entry: { ...entry, endpoint: socketPath },
-		inject: (frame: object): void => {
-			for (const client of clients) client.write(`${JSON.stringify(frame)}\n`);
-		},
-		drop: (): void => {
-			for (const client of clients) client.destroy();
-		},
-		close: (): void => void server.close(),
-	};
-}
 
 // The proxy is a unix socket in front of the host's endpoint; Windows hosts listen on named pipes.
 const itPosix = it.skipIf(process.platform === "win32");

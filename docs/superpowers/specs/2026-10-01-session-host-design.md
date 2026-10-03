@@ -50,7 +50,7 @@ flowchart LR
 | Host registry | Owner-only JSON per host `{hostId, pid, endpoint, token, cwd, sessionFile, title, startedAt}` in the per-user agent dir | `collab/registry.ts` pattern, including socket path-length fallback |
 | `omp --mode host` | Headless detached host entry point | New mode in `main.ts` |
 | `HostedClientLink` | Client-side link that owns an `RpcClient` over `connectSessionHost`, applies the host's snapshot, `entry`, event, and dialog frames to the idle local replica session the TUI renders, and sends input to the host over RPC. Replaces the planned `RemoteSession` object: the TUI keeps a local passive `AgentSession` and reads host state through the link | `session-host/hosted-client.ts`, built on `RpcClient` with a socket transport |
-| Replica `SessionManager` | Client-local mirror of the session tree for transcript and tree views, seeded by the snapshot and fed by `entry` frames. It lives in an owner-private replica file (directory `0700`, file `0600`) with a unique name per client and snapshot, outside the sessions listing. On leaving, the client deletes its own files once in-flight frame application has settled | Collab-guest replica mechanics, shared in `session/replica-view.ts` |
+| Replica `SessionManager` | Client-local mirror of the session tree for transcript and tree views, seeded by the snapshot and fed by `entry` frames. It lives in an owner-private replica file (directory `0700`, file `0600`) with a unique name per client and snapshot, outside the sessions listing. On leaving, the client deletes its own files once in-flight frame application has settled. A client that dies without running that path (`SIGKILL`, an out-of-memory kill, power loss) leaves its files behind: nothing sweeps the directory, so they are removed by hand. A client pid in the file name, with dead ones dropped on the next connect, would automate it; P2 does not build that | Collab-guest replica mechanics, shared in `session/replica-view.ts` |
 
 ### Invariants
 
@@ -98,7 +98,7 @@ flowchart LR
 |---|---|
 | `detach` | The host closes this connection. The session continues. |
 | `exit` | `detach` if other connections remain; from the last connection, dispose and exit 0 (exit 1 on a latched persistence failure, as in RPC mode today). |
-| `slash_command{text}` | Runs a built-in slash command's headless `handle` (`SlashCommandSpec`) on the host. |
+| `slash_command{text}` | Runs a built-in slash command's headless `handle` (`SlashCommandSpec`) on the host. **Not implemented in P2:** until P3, a client sends `/name args` to the host as the text of an ordinary `prompt`, whose handler already runs a built-in that has a headless `handle`. Clients built against this spec, such as ompweb, must do the same until the command exists. |
 | Read commands | Queued message text, plan and goal state, cwd, jobs and MCP status: the reads RPC currently lacks. The P2 plan fixes the exact list. |
 
 `new_session`, `switch_session`, and `branch` act on the host. Switching to a file another host owns returns `error{code:"session_hosted", hostId}`.
@@ -130,7 +130,7 @@ Triggered by plain `omp` with `tui.hosted: true`, `omp --resume <session>` with 
 | `/exit` from the last client | disposes the session, removes its registry entry, exits |
 | SIGTERM/SIGINT to the host | clean dispose, then exit |
 | SIGHUP to the host | ignored |
-| Host crash | clients receive EOF, show "host exited (code/signal)", and offer to reopen the session in a new host. The lease died with the host, so the file is reusable. |
+| Host crash | P2: the client shows "host exited" (or the connection-loss reason) and exits with status 1. Showing the exit code or signal, and offering to reopen the session in a new host, belong to the P3 automatic-reconnect work. The lease died with the host, so the file is reusable. |
 
 Stopping an orphaned host is `omp attach <id>`, then `/exit`.
 
@@ -142,7 +142,7 @@ With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a
 
 ### Command routing
 
-1. Built-in slash commands with a headless `handle` → `slash_command` on the host.
+1. Built-in slash commands with a headless `handle` are sent to the host as the submitted text of a `prompt` (P2). A dedicated `slash_command` command is not implemented; see New commands.
 2. `handleTui` commands are triaged once into a parity table:
    - **view-local** (theme, hotkeys, copy, and similar): run in the client unchanged;
    - **session-mutating** (tree, fork, `/move`, settings, MCP, jobs, plan, goal, loop): split into a headless `handle` on the host plus a client-side presenter;
@@ -175,6 +175,12 @@ Plan mode, goal mode, loop mode and loop auto-submit, the compaction queue, `#pe
 
 These moves happen in P3, one state machine per follow-up. The P2 client disables every TUI-owned timer and automation path, and the commands that depend on them report "unavailable when attached"; in-process mode is unchanged.
 
+### Stream volume
+
+The P2 client keeps the default `message_update` projection: each frame carries the whole accumulated message and `assistantMessageEvent.partial`, so the bytes sent grow quadratically with the size of a message. A burst probe (a mock stream with no pacing, one 100 KB message in 2000 blocks) produced 6000 `message_update` frames and about 1.8 GB serialized, roughly 18,000 times the payload. Real providers pace their deltas, so steady-state load is lower `[INFERENCE: not measured]`, but large tool-call arguments cost CPU on both ends, a slow or suspended terminal can reach the 64 MiB per-connection spool cap and be dropped as "connection lost", and the 4096-frame replay ring retains the large frames.
+
+P3 adds a delta projection for socket clients, with the accumulation done in the client, and measures the volume again. The default must not flip (P4) before it lands.
+
 ### Unavailable in client mode (v1)
 
 - PTY bash overlays need a second stream.
@@ -188,9 +194,9 @@ Estimates are `[INFERENCE]` from code reading.
 | Phase | Delivers | Estimate |
 |---|---|---|
 | P1 | `RpcConnection` and `RpcDispatcher` split; socket/pipe transport; `--mode host`; registry; handshake, snapshot, `seq`, ring, `session_replaced`, `clients_changed`; arbitration; `detach` and `exit`; `omp attach` listing. ompweb can switch to it immediately. | 1–2 weeks |
-| P2 | Minimal TUI client behind `tui.hosted`, merged in a working state: spawn or connect a host, render from a local replica fed by snapshot and `entry`/event frames, prompt/abort/steer/queue, model and thinking, extension dialogs, generic `slash_command` for headless builtins, `/detach`, `/exit`, `/attach`, `omp attach <target>`. TUI-owned automation is off in client mode; every other command reports "unavailable when attached". | 2–3 weeks |
-| P3 | Parity follow-ups, each merged separately: plan, goal, loop, idle compaction and recap move to the session or host; tree and fork; `/btw` host ownership (with can1357/oh-my-pi#14110); extension status/widget/title replay; `--solo`; automatic reconnect after an unexpected transport loss, using host identity, epoch, and sequence replay with snapshot fallback. Explicit detach/exit never reconnects; uncertain mutating commands are not silently resent. | 1–2 weeks per group |
-| P4 | The parity table has no "not yet ported" rows and automatic reconnect is implemented → default flips. Later, delete the setting and the in-process interactive path. Print mode, ACP, and subagents stay in-process. | about 1 week |
+| P2 | Minimal TUI client behind `tui.hosted`, merged in a working state: spawn or connect a host, render from a local replica fed by snapshot and `entry`/event frames, prompt/abort/steer/queue, model and thinking, extension dialogs, headless builtins forwarded to the host as `prompt` text (there is no `slash_command` command until P3), `/detach`, `/exit`, `/attach`, `omp attach <target>`. TUI-owned automation is off in client mode; every other command reports "unavailable when attached". A lost connection ends the client with status 1. | 2–3 weeks |
+| P3 | Parity follow-ups, each merged separately: plan, goal, loop, idle compaction and recap move to the session or host; tree and fork; `/btw` host ownership (with can1357/oh-my-pi#14110); extension status/widget/title replay; `--solo`; a delta `message_update` projection with client-side accumulation (see Stream volume); automatic reconnect after an unexpected transport loss, using host identity, epoch, and sequence replay with snapshot fallback, which is also where "offer to reopen the session in a new host" after a host crash lands. Explicit detach/exit never reconnects; uncertain mutating commands are not silently resent. | 1–2 weeks per group |
+| P4 | The parity table has no "not yet ported" rows, automatic reconnect is implemented, and the delta projection has landed → default flips. Later, delete the setting and the in-process interactive path. Print mode, ACP, and subagents stay in-process. | about 1 week |
 
 ## Error contracts
 
@@ -199,7 +205,7 @@ Estimates are `[INFERENCE]` from code reading.
 | Host fails to start | Client exits non-zero and prints the host log path |
 | Bad or missing token | `error{code:"unauthorized"}`, then close |
 | Resume outside the ring or with a stale epoch | Full `attached` snapshot |
-| Host dies mid-turn | "host exited" with an offer to reopen in a new host |
+| Host dies mid-turn | P2: "host exited" and exit status 1. The offer to reopen in a new host is part of the P3 reconnect work |
 | Switch to a hosted file | `session_hosted{hostId}`; the client offers `/attach` |
 | Late UI answer | Ignored; that client already received `cancel` |
 | Stale `ifEpoch` or `ifLeaf` | `error{code:"stale"}`; command not executed; client keeps the input for resend |

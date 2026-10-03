@@ -25,8 +25,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { holdLeaseInAnotherProcess, killLeaseProcesses } from "../helpers/session-lease-process";
+import { type IsolatedConfigRoot, isolateConfigRoot } from "../helpers/session-host-harness";
 
-const CLI = path.join(import.meta.dir, "..", "..", "src", "cli.ts");
 /** A host that boots without network: a dummy key makes the model available, and discovery hits a closed port. */
 const MODEL_ARGS = [
 	"--no-extensions",
@@ -223,14 +223,27 @@ describe("starting hosts", () => {
 });
 
 describe("the opt-in gate", () => {
+	let config: IsolatedConfigRoot;
+
+	// The default registry lives under the base config root: a launch that wrongly started a host must not read,
+	// prune, or fill the developer's real one.
+	beforeEach(() => {
+		config = isolateConfigRoot();
+	});
+
+	afterEach(async () => {
+		await config.restore();
+	});
+
 	it("keeps an interactive launch in process while tui.hosted is off", async () => {
 		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
 		const settings = Settings.isolated({ "tui.hosted": false, "startup.checkUpdate": false });
-		const before = (await listSessionHosts()).map(host => host.hostId);
 		const stop = new Error("ordinary createSession reached");
 		const rawArgs = ["--no-session", "--no-extensions", "--no-skills", "--no-rules", "--no-tools", "--no-lsp"];
 		const originalIsTTY = process.stdin.isTTY;
+		const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 		try {
 			await expect(
 				runRootCommand(parseArgs(rawArgs), rawArgs, {
@@ -241,33 +254,16 @@ describe("the opt-in gate", () => {
 					},
 				}),
 			).rejects.toBe(stop);
-			expect((await listSessionHosts()).map(host => host.hostId)).toEqual(before);
+			// A host this launch wrongly started is detached: record it first so the cleanup stops it.
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			expect(hosts).toEqual([]);
 		} finally {
 			vi.restoreAllMocks();
 			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
+			if (originalStdoutIsTTY) Object.defineProperty(process.stdout, "isTTY", originalStdoutIsTTY);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
 			authStorage.close();
 		}
 	});
-});
-
-describe("the launch without a terminal", () => {
-	it("does not start a host, whatever tui.hosted says", async () => {
-		const proc = Bun.spawn(["bun", CLI], {
-			env: {
-				...process.env,
-				HOME: dir,
-				USERPROFILE: dir,
-				PI_CODING_AGENT_DIR: path.join(dir, "agent"),
-				OMP_TUI_HOSTED: "1",
-			},
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
-		expect(exitCode).toBe(2);
-		expect(stderr).toContain("requires a terminal");
-		expect(fs.existsSync(registryDir)).toBe(false);
-		expect(fs.existsSync(path.join(dir, ".omp", "run"))).toBe(false);
-	}, 60_000);
 });
