@@ -377,6 +377,7 @@ import {
 	isUserAuthoredQueuedMessage,
 	isUserQueuedMessage,
 	queueChipText,
+	queuedGroupHasAttachments,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
@@ -8684,6 +8685,24 @@ export class AgentSession implements SettingsScope {
 		return this.queuedMessageCount > 0 || this.agent.peekUndeliveredQueuedMessages().some(isDisplayableQueuedMessage);
 	}
 
+	/**
+	 * Which of the {@link getQueuedMessages} chips stand for a prompt with an attachment its chip text does not carry
+	 * (see {@link queuedGroupHasAttachments}). Parallel to the chip lists: entry `i` describes chip `i`, and both are
+	 * built from the same queues in one synchronous pass, so they cannot disagree.
+	 */
+	getQueuedMessageAttachments(): { steering: boolean[]; followUp: boolean[] } {
+		const flags = (queue: readonly AgentMessage[]): boolean[] =>
+			queue.flatMap((message, index) =>
+				isUserAuthoredQueuedMessage(message)
+					? [queuedGroupHasAttachments(queue.slice(this.#queuedUserGroupStart(queue, index), index + 1))]
+					: [],
+			);
+		return {
+			steering: [...flags(this.agent.peekLiveSteeredMessages()), ...flags(this.agent.peekSteeringQueue())],
+			followUp: flags(this.agent.peekFollowUpQueue()),
+		};
+	}
+
 	/** Chip texts for the queue display. Steering live steering took for the streaming response
 	 *  stays listed until the transcript records it, when the model actually switches to it. */
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
@@ -8728,15 +8747,33 @@ export class AgentSession implements SettingsScope {
 	 * skill invocation's `__queueChipText`, or untransformed text). A missing or
 	 * already delivered target changes nothing; repeated calls may remove further
 	 * duplicates.
+	 *
+	 * `match: "last"` removes the newest prompt whose chip text (see {@link getQueuedMessages}) is `text`,
+	 * for a caller that picked the newest chip of a queue it only sees as chip text.
 	 */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
+	removeQueuedMessage(text: string, queue: "steering" | "followUp", options?: { match?: "first" | "last" }): boolean {
 		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
-		const index = this.#findQueuedUserMessage(selected, text);
+		const index = this.#findQueuedUserMessage(selected, text, options?.match);
 		if (index < 0) return false;
 
 		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
 		this.#reconcileQueuedMessageDrain();
 		return true;
+	}
+
+	/**
+	 * Whether the prompt `removeQueuedMessage(text, queue, options)` would remove carries an attachment (an image, or
+	 * a companion holding one's source or description) that its chip text does not. False when nothing matches.
+	 */
+	queuedMessageHasAttachments(
+		text: string,
+		queue: "steering" | "followUp",
+		options?: { match?: "first" | "last" },
+	): boolean {
+		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
+		const index = this.#findQueuedUserMessage(selected, text, options?.match);
+		if (index < 0) return false;
+		return queuedGroupHasAttachments(selected.slice(this.#queuedUserGroupStart(selected, index), index + 1));
 	}
 
 	/**
@@ -8769,9 +8806,14 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Queue-editing matcher shared by removal and promotion (see {@link removeQueuedMessage});
 	 * matches the raw text the caller originally submitted first, then the queued chip text
-	 * itself (exact); -1 when nothing matches.
+	 * itself (exact); -1 when nothing matches. `match: "last"` instead picks the LAST user prompt
+	 * whose chip text is `text`: the chip list is what a remote view shows, so the newest chip
+	 * resolves to the newest queued prompt even when an older one was typed as the same raw text.
 	 */
-	#findQueuedUserMessage(queue: readonly AgentMessage[], text: string): number {
+	#findQueuedUserMessage(queue: readonly AgentMessage[], text: string, match: "first" | "last" = "first"): number {
+		if (match === "last") {
+			return queue.findLastIndex(message => isUserAuthoredQueuedMessage(message) && queueChipText(message) === text);
+		}
 		let index = queue.findIndex(
 			message => isUserAuthoredQueuedMessage(message) && this.#queuedMessageRawText.get(message) === text,
 		);
@@ -10744,7 +10786,7 @@ export class AgentSession implements SettingsScope {
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+		if (!this.passiveReplica && this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
 				reason: "resume",
@@ -10867,7 +10909,8 @@ export class AgentSession implements SettingsScope {
 			this.#rehydrateCheckpointRewindState();
 
 			// Emit session_switch event to hooks
-			if (this.#extensionRunner) {
+			// A passive replica's runner belongs to no session of this process, so its extensions are not told.
+			if (this.#extensionRunner && !this.passiveReplica) {
 				await this.#extensionRunner.emit({
 					type: "session_switch",
 					reason: "resume",

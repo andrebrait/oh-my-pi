@@ -152,6 +152,7 @@ export const frameDefs = {
 			"streaming?": "StreamingMessage",
 			pendingUi: doc("ExtensionUiRequest[]", "Open extension dialogs a late joiner can answer."),
 			clients: "ClientInfo[]",
+			"queueAttachments?": doc("QueueAttachments", "Parallel to `state.queuedMessages`."),
 			"origin?": "SessionOrigin",
 		},
 		"The session as the `entry` frames have announced it: everything a socket client needs to render it from scratch.",

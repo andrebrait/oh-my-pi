@@ -2074,7 +2074,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
 			beginDispose: () => this.session.beginDispose(),
-			saveDraft: text => this.sessionManager.saveDraft(text),
+			// A hosted replica is a disposable copy the link deletes on leaving: saving a draft would recreate its file.
+			saveDraft: text => (this.hostedClientMode ? Promise.resolve() : this.sessionManager.saveDraft(text)),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
 				await this.session.dispose({
@@ -2356,7 +2357,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// block, bash command preview, or file diff does not stall the render thread.
 		setImmediate(() => {
 			void warmHighlighter();
-			if (!$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
+			if (!this.hostedClientMode && !$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
 				this.#inputController.prewarmTinyTitleModel();
 			}
 		});
@@ -2366,7 +2367,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// The relay connection proceeds in the background and never blocks init.
 		// The owning caller keeps guest mutations gated through its full outer
 		// startup; early dialog answers do not require that readiness signal.
-		if (options.autoStartCollab === true) this.collabController.autoStart();
+		if (options.autoStartCollab === true && !this.hostedClientMode) this.collabController.autoStart();
 
 		// Initialize hooks with TUI-based UI context
 		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
@@ -2392,15 +2393,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution handoff clear never get dragged back into plan mode. #enterPlanMode
 		// is idempotent and self-guards against an already-active plan/goal mode; it
 		// does not check plan.enabled itself.
-		if (shouldEnterPlanModeOnStartup(this.sessionManager, this.session.settings)) {
+		if (!this.hostedClientMode && shouldEnterPlanModeOnStartup(this.sessionManager, this.session.settings)) {
 			await this.#enterPlanMode();
 		}
 
 		// Restore unsent editor draft from previous session shutdown (Ctrl+D).
 		// One-shot: consumeDraft removes the sidecar after read so the next
-		// resume does not re-restore the same text.
+		// resume does not re-restore the same text. A hosted client never saves a draft (see the teardown's
+		// `saveDraft`), so any sidecar next to its local session is someone else's: left where it is, not consumed.
 		try {
-			const draft = await logger.time("InteractiveMode.init:draft", () => this.sessionManager.consumeDraft());
+			const draft = this.hostedClientMode
+				? null
+				: await logger.time("InteractiveMode.init:draft", () => this.sessionManager.consumeDraft());
 			if (draft && !this.editor.getText()) {
 				this.editor.setText(draft);
 				this.updateEditorBorderColor();
@@ -2796,7 +2800,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
-		if (this.session.getGoalModeState()?.mode === "exiting") {
+		if (!this.hostedClientMode && this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
 		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
@@ -2813,6 +2817,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleLoopAutoSubmit(): void {
 		this.#cancelLoopAutoSubmit();
+		if (this.hostedClientMode) return;
 		if (!this.loopModeEnabled || !this.loopPrompt) return;
 		const prompt = this.loopPrompt;
 		const loopAction = cfgLoopMode.get(settings);
@@ -2839,6 +2844,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleGoalContinuation(): void {
 		this.#cancelGoalContinuation();
+		if (this.hostedClientMode) return;
 		if (this.loopModeEnabled) return;
 		if (!this.onInputCallback) return;
 		if (!cfgGoalContinuationModes.get(this.session.settings).includes("interactive")) return;
@@ -3982,6 +3988,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Idempotent: only flips open tasks, never re-touches completed ones.
 	 */
 	#reconcileTodosWithSubagents(): void {
+		// A hosted client's todos belong to the host session: auto-completing one would journal an edit into the replica.
+		if (this.hostedClientMode) return;
 		const completedDescs: string[] = [];
 		for (const session of this.#observerRegistry.getSessions()) {
 			if (session.kind !== "subagent") continue;
@@ -4037,6 +4045,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		const persisted = getTodoHudVisibility(owner.sessionManager.getBranch(), phases);
 		this.#todoHudHidden = persisted === "dismissed";
 		if (persisted || phases.length === 0) return;
+		// The auto-clear timer journals a dismissal into the session: never into a hosted replica.
+		if (this.hostedClientMode) return;
 		const tasks = phases.flatMap(phase => phase.tasks);
 		if (tasks.length === 0 || tasks.some(task => !isClosedTodo(task))) return;
 		const delaySeconds = cfgTasksTodoClearDelay.get(owner.settings);
@@ -4653,7 +4663,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * settings.
 	 */
 	async #reapplyPlanModeModelOnRoleChange(): Promise<void> {
-		if (!this.planModeEnabled) return;
+		if (this.hostedClientMode || !this.planModeEnabled) return;
 		const resolved = this.session.resolveRoleModelWithThinking("plan");
 		if (!resolved.model) {
 			this.#clearPendingPlanModelSwitch();
@@ -4710,7 +4720,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		const pending = this.#pendingModelSwitch;
 		this.#pendingModelSwitch = undefined;
 		this.#pendingPlanModelSwitch = false;
-		if (!pending) return;
+		// The host owns the model: a switch queued by local mode machinery must not touch the replica.
+		if (!pending || this.hostedClientMode) return;
 		try {
 			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
 		} catch (error) {
@@ -4784,6 +4795,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Reconcile mode state from session entries on resume/switch. */
 	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
+		// The host's mode entries already ran there; replaying them here would switch models and tools locally.
+		if (this.hostedClientMode) return;
 		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
 		this.#vibeScopeSuspendedForSwitch = false;
 		this.#guidedGoalInterviewActive = false;
@@ -6884,6 +6897,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * is allocated but the file does not exist (issue #8860).
 	 */
 	#resumableSessionId(): string | undefined {
+		// The replica is a copy of the host's session, not something this process can resume.
+		if (this.hostedClientMode) return undefined;
 		const sessionId = this.sessionManager.getSessionId();
 		const sessionFile = this.sessionManager.getSessionFile();
 		return sessionId && sessionFile && this.sessionManager.isSessionOnDisk() ? sessionId : undefined;
@@ -7504,7 +7519,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * dispatched by the editor to `InputController.handleRetry`.
 	 */
 	syncRetryHintRow(): void {
-		const show = !this.collabGuest && !this.viewSession.isStreaming && this.viewSession.hasAbortedToolCallTail;
+		const show =
+			!this.collabGuest &&
+			!this.hostedClientMode &&
+			!this.viewSession.isStreaming &&
+			this.viewSession.hasAbortedToolCallTail;
 		if (this.#retryHintRow) {
 			const mounted = this.statusContainer.children.includes(this.#retryHintRow);
 			if (mounted && show) return;
