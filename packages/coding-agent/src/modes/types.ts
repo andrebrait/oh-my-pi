@@ -175,8 +175,10 @@ export interface InteractiveModeContext {
 	collabGuest?: CollabGuestLink;
 	/**
 	 * True from before `init()` until this process leaves hosted mode: this UI is (or is about to become) a
-	 * client of a session host, so TUI-owned automation (timers, local model calls, plan/goal/loop machinery)
-	 * must not run. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
+	 * client of a session host. TUI-owned automation (timers, local model calls, plan/goal/loop machinery) must
+	 * not run, and input (submit, slash commands, keys, selectors) goes to the host through {@link hostedClient}
+	 * or is refused: it never falls through to the local replica session, also while the link is still
+	 * connecting. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
 	 */
 	hostedClientMode: boolean;
 	/** The link to the session host once connected; routes input and answers dialogs. Set by the caller of `HostedClientLink.connect`. */

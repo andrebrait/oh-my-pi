@@ -2288,6 +2288,28 @@
 			],
 			"description": "Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`."
 		},
+		"QueueAttachments": {
+			"type": "object",
+			"properties": {
+				"steering": {
+					"type": "array",
+					"items": {
+						"type": "boolean"
+					}
+				},
+				"followUp": {
+					"type": "array",
+					"items": {
+						"type": "boolean"
+					}
+				}
+			},
+			"required": [
+				"steering",
+				"followUp"
+			],
+			"description": "Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`."
+		},
 		"ToolDescriptor": {
 			"type": "object",
 			"properties": {
@@ -2705,6 +2727,10 @@
 			"properties": {
 				"removed": {
 					"type": "boolean"
+				},
+				"refused": {
+					"const": "attachments",
+					"description": "Nothing was removed: `refuseAttachments` was set and the prompt carries one."
 				}
 			},
 			"required": [
@@ -3834,6 +3860,10 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"attachments": {
+					"$ref": "#/$defs/QueueAttachments",
+					"description": "Session-host socket clients only; absent means unknown, not that no chip carries one."
 				}
 			},
 			"required": [
@@ -4539,6 +4569,10 @@
 				},
 				"streaming": {
 					"$ref": "#/$defs/StreamingMessage"
+				},
+				"queueAttachments": {
+					"$ref": "#/$defs/QueueAttachments",
+					"description": "Parallel to `state.queuedMessages`."
 				},
 				"origin": {
 					"$ref": "#/$defs/SessionOrigin"
@@ -5953,6 +5987,18 @@
 				},
 				"queue": {
 					"$ref": "#/$defs/QueuedMessageQueue"
+				},
+				"match": {
+					"enum": [
+						"first",
+						"last"
+					],
+					"type": "string",
+					"description": "`last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text)."
+				},
+				"refuseAttachments": {
+					"type": "boolean",
+					"description": "Remove nothing, answering `refused: \"attachments\"`, when the prompt carries an attachment."
 				}
 			},
 			"required": [

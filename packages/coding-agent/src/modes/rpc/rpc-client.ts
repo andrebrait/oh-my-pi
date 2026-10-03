@@ -106,8 +106,6 @@ export interface RpcClientOptions {
 	customTools?: RpcClientCustomTool[];
 }
 
-export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
-
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
@@ -855,16 +853,23 @@ export class RpcClient {
 
 	/**
 	 * Remove the first matching user message and its companions from one pending queue.
+	 * `options.match: "last"` removes the newest message whose queue-chip text is `message` instead, and
+	 * `options.refuseAttachments` makes the host remove nothing (answering `refused: "attachments"`) when that message
+	 * carries an image or other attachment that its chip text does not. A host that predates the options ignores
+	 * them and removes the first match, so only send them to a host that reports `queueAttachments`.
 	 */
 	async removeQueuedMessage(
 		message: string,
 		queue: "steering" | "followUp",
 		preconditions?: RpcPreconditions,
-	): Promise<{ removed: boolean }> {
+		options?: { match?: "first" | "last"; refuseAttachments?: boolean },
+	): Promise<{ removed: boolean; refused?: "attachments" }> {
 		const response = await this.#send({
 			type: "remove_queued_message",
 			message,
 			queue,
+			...(options?.match !== undefined ? { match: options.match } : {}),
+			...(options?.refuseAttachments !== undefined ? { refuseAttachments: options.refuseAttachments } : {}),
 			...writeGuard(preconditions),
 		});
 		return this.#getData(response);
@@ -1079,11 +1084,11 @@ export class RpcClient {
 	}
 
 	/**
-	 * Get list of available models.
+	 * Get list of available models. The host sends complete `Model` records (the same shape `set_model` returns).
 	 */
-	async getAvailableModels(): Promise<ModelInfo[]> {
+	async getAvailableModels(): Promise<Model[]> {
 		const response = await this.#send({ type: "get_available_models" });
-		return this.#getData<{ models: ModelInfo[] }>(response).models;
+		return this.#getData<{ models: Model[] }>(response).models;
 	}
 
 	/**

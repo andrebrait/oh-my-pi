@@ -420,6 +420,12 @@ export interface QueuedMessagesState {
 	followUp: string[];
 }
 
+/** Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`. */
+export interface QueueAttachments {
+	steering: boolean[];
+	followUp: boolean[];
+}
+
 export interface ToolDescriptor {
 	name: string;
 	description: string;
@@ -539,6 +545,8 @@ export interface OpenSessionResult {
 
 export interface RemoveQueuedMessageResult {
 	removed: boolean;
+	/** Nothing was removed: `refuseAttachments` was set and the prompt carries one. */
+	refused?: "attachments";
 }
 
 export interface PromoteQueuedMessageResult {
@@ -897,6 +905,8 @@ export interface QueueUpdateEvent {
 	type: "queue_update";
 	steering: string[];
 	followUp: string[];
+	/** Session-host socket clients only; absent means unknown, not that no chip carries one. */
+	attachments?: QueueAttachments;
 }
 
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */
@@ -1098,6 +1108,8 @@ export interface SessionSnapshot {
 	pendingUi: ExtensionUiRequest[];
 	clients: ClientInfo[];
 	streaming?: StreamingMessage;
+	/** Parallel to `state.queuedMessages`. */
+	queueAttachments?: QueueAttachments;
 	origin?: SessionOrigin;
 }
 
@@ -1513,6 +1525,10 @@ export interface FollowUpParams {
 export interface RemoveQueuedMessageParams {
 	message: string;
 	queue: QueuedMessageQueue;
+	/** `last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text). */
+	match?: "first" | "last";
+	/** Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment. */
+	refuseAttachments?: boolean;
 }
 
 export interface PromoteQueuedMessageParams {
