@@ -1,0 +1,26 @@
+name: Windows EPIPE regression (pre-fix)
+
+on:
+  pull_request:
+    branches: [fix/dap-write-epipe]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Windows x64 EPIPE regression (pre-fix)
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      - name: Install Windows native addon
+        shell: pwsh
+        run: |
+          npm pack @oh-my-pi/pi-natives-win32-x64@18.5.0
+          tar -xf oh-my-pi-pi-natives-win32-x64-18.5.0.tgz
+          Copy-Item package/pi_natives.win32-x64-baseline.node packages/natives/native/
+      - name: Test pending pipe write rejection
+        run: bun test packages/coding-agent/test/debug/dap-launch-failures.test.ts -t "pending stdin write"
