@@ -175,6 +175,82 @@ await runRpcMode(session, {
 		expect(requests[0]).toMatchObject({ title: "Tool choice", options: ["Keep", "Deploy"] });
 	}, 30_000);
 
+	it("answers a dialog session_start awaits, running commands sent meanwhile only after startup", async () => {
+		await using temp = await TempDir.create("@rpc-startup-dialog-");
+		const fixturePath = temp.join("runtime.ts");
+		const sourceDir = path.resolve(import.meta.dir, "../src");
+		await Bun.write(
+			fixturePath,
+			`
+import { createAgentSession, Settings } from ${JSON.stringify(path.join(sourceDir, "sdk.ts"))};
+import { runRpcMode } from ${JSON.stringify(path.join(sourceDir, "modes/rpc/rpc-mode.ts"))};
+globalThis.fetch = async () => { throw new Error("Offline UI fixture refuses network"); };
+const { session } = await createAgentSession({
+  cwd: process.cwd(),
+  toolNames: [],
+  enableMCP: false,
+  enableLsp: false,
+  disableExtensionDiscovery: true,
+  settings: Settings.isolated({ "compaction.enabled": false }),
+  extensions: [pi => {
+    pi.on("session_start", async (_event, ctx) => {
+      ctx.ui.notify(String(await ctx.ui.confirm("Trust?", "startup")));
+    });
+  }],
+});
+await runRpcMode(session);
+`,
+		);
+		const child = Bun.spawn([process.execPath, fixturePath], {
+			cwd: temp.path(),
+			env: {
+				PATH: Bun.env.PATH,
+				HOME: temp.join("home"),
+				PI_CODING_AGENT_DIR: temp.join("agent"),
+				XDG_CONFIG_HOME: temp.join("config"),
+				XDG_DATA_HOME: temp.join("data"),
+				XDG_CACHE_HOME: temp.join("cache"),
+				CI: "true",
+				PI_NO_TITLE: "1",
+			},
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 20_000,
+		});
+		const stderr = new Response(child.stderr).text();
+		const seen: unknown[] = [];
+		let confirmId: unknown;
+		try {
+			for await (const frame of readJsonl<unknown>(child.stdout)) {
+				if (!isRecord(frame)) continue;
+				if (frame.type === "extension_ui_request" && frame.method === "confirm") {
+					confirmId = frame.id;
+					// Held until startup finishes. `set_ask_dialog` is served during startup, through the same command
+					// queue: had get_state not been held, its response would come before that one.
+					child.stdin.write(`${JSON.stringify({ id: "state", type: "get_state" })}\n`);
+					child.stdin.write(`${JSON.stringify({ id: "ask", type: "set_ask_dialog", enabled: true })}\n`);
+					await child.stdin.flush();
+				} else if (frame.type === "response" && frame.id === "ask") {
+					seen.push("ask");
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`,
+					);
+					await child.stdin.flush();
+				} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
+					seen.push(frame.message);
+				} else if (frame.type === "response" && frame.id === "state") {
+					seen.push(frame.success);
+					break;
+				}
+			}
+		} finally {
+			child.stdin.end();
+			await child.exited;
+		}
+		expect(seen, await stderr).toEqual(["ask", "true", true]);
+	}, 30_000);
+
 	it("keeps the label-only wire shape for bare options", async () => {
 		const pendingRequests = new Map<string, PendingExtensionRequest>();
 		const output = vi.fn<(frame: object) => void>();

@@ -55,7 +55,7 @@ flowchart LR
 ### Invariants
 
 1. `--mode rpc` over stdio is byte-for-byte compatible. All new frames are opt-in and appear only after `hello` on socket transports.
-2. The host claims the owner lease before opening its listener, and writes its registry entry last. A registry entry therefore implies a ready host that owns its file.
+2. The host claims the owner lease before opening its listener, and writes its registry entry before starting extensions. A registry entry therefore implies a reachable host that owns its file. Extension startup runs after that, so a client can answer a dialog `session_start` awaits; until startup ends the host handles only dialog answers and `set_ask_dialog`, and every other frame waits.
 3. Snapshot construction and connection registration happen in the same tick, so no frame can fall between them.
 
 ## Protocol additions
