@@ -62,6 +62,7 @@ import type {
 import type * as Wire from "@oh-my-pi/pi-coding-agent/modes/rpc/wire/rpc-wire.generated";
 import type { SessionStats } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { BtwHistoryRecord, BtwHistoryTurn } from "@oh-my-pi/pi-coding-agent/session/btw-history";
+import type { UsageLimitState } from "@oh-my-pi/pi-coding-agent/session/usage-limit";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -257,6 +258,9 @@ export type State = Assert<
 		goal: Outbound<Goal, Wire.Goal>;
 		goalModeState: Outbound<GoalModeState, Wire.GoalModeState>;
 		goalResult: Outbound<RpcGoalResult, Wire.GoalResult>;
+		usageLimitLowPriority: Outbound<Extract<UsageLimitState, { stage: "low_priority" }>, Wire.UsageLimitLowPriority>;
+		usageLimitWrapUp: Outbound<Extract<UsageLimitState, { stage: "wrap_up" }>, Wire.UsageLimitWrapUp>;
+		usageLimitStages: Same<UsageLimitState["stage"], Wire.UsageLimitState["stage"]>;
 		bashResult: Outbound<BashResult, Wire.BashResult>;
 		compactionResult: Outbound<CompactionResult, Wire.CompactionResult>;
 		sessionStats: Outbound<SessionStats, Wire.SessionStats>;
