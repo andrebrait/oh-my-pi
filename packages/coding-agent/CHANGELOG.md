@@ -273,6 +273,7 @@
 - `remove_queued_message` accepts optional `match: "first" | "last"` and `refuseAttachments`; with `refuseAttachments` a queued prompt that carries an attachment is left in place and the response is `{ removed: false, refused: "attachments" }` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - `ask` extension UI responses accept `chat: true` (discuss instead of answering) and per-answer `note`, `noteImages`, and `customInputImages` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Added `RpcClient.onExtensionUiRequest()`, `RpcClient.sendExtensionUiResponse()`, and `RpcClient.setAskDialog()` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+- Added `RpcClient.promptToCompletion()`: sends a prompt (with optional steering mode and preconditions) and resolves once its work has settled ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 
@@ -312,6 +313,8 @@
 - Fixed logging in through an alias login such as `openai-codex-device` (`/login` or RPC `login`) not refreshing the logged-in provider's models, and RPC `get_login_providers` reporting alias logins as unauthenticated ([#14588](https://github.com/can1357/oh-my-pi/pull/14588) by [@andrebrait](https://github.com/andrebrait))
 - Fixed model speed aggregates blending an OpenAI or Codex fast service tier's throughput into the standard average; turns served on a non-default tier keep their own row, and `/models` shows that tier's numbers, labeled, for the tier the live session would send ([#14471](https://github.com/can1357/oh-my-pi/pull/14471) by [@eggpeat](https://github.com/eggpeat)).
 - Hosted launches reject invalid file attachments before starting a detached session host, avoiding orphaned background sessions ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+- RPC mode: an extension dialog opened during `session_start` can be answered instead of hanging startup; other commands still wait for startup to finish ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+- Session hosts publish before extension startup, so an attached terminal can answer a startup dialog instead of the launch timing out, and hosted launches with several CLI messages run each as its own turn ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.6.3] - 2026-10-06
 
