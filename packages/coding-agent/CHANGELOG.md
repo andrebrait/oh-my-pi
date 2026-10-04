@@ -10,6 +10,8 @@
 
 ### Added
 
+- Added startup notices for conflicting skill variants and redundant installations, with `/skills diagnostics` for resolution details and `skills.showStartupDiagnostics` to disable the notices ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
+- RPC hosts can inspect skill conflicts and redundant installations through typed diagnostics snapshots, receive startup and live updates, and persist the startup-notice preference ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
 - The `/models` Roles view shows which saved model preset is in effect, and Ctrl+←/→ (or `p`/`P` on the role rows, for macOS where Ctrl+←/→ switches Spaces) switches to the next or previous one, in Tern and text mode ([#14210](https://github.com/can1357/oh-my-pi/pull/14210) by [@H4vC](https://github.com/H4vC))
 
 ### Changed
