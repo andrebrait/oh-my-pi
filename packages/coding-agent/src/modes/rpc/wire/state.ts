@@ -205,6 +205,25 @@ export const stateDefs = {
 		"refused?": doc("'attachments'", "Nothing was removed: `refuseAttachments` was set and the prompt carries one."),
 	},
 	PromoteQueuedMessageResult: { promoted: "boolean" },
+	RestoredQueuedMessage: doc(
+		{ text: "string", "images?": "ImageContent[]" },
+		"Queued user content withdrawn from the queue, as the editor would restore it.",
+	),
+	AbortAndRestoreQueueResult: doc(
+		{
+			steering: "RestoredQueuedMessage[]",
+			followUp: "RestoredQueuedMessage[]",
+			"imagesDropped?": doc(
+				"boolean",
+				"Only ever `true`: the full result exceeded the transport limit and every `images` was omitted.",
+			),
+			"truncated?": doc(
+				"boolean",
+				"Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed.",
+			),
+		},
+		"User-authored queued input withdrawn before the abort, oldest first.",
+	),
 	BranchMessage: { entryId: "string", text: "string" },
 	BranchResult: { text: "string", cancelled: "boolean" },
 	TokenUsage: {

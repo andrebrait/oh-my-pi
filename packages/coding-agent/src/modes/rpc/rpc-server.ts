@@ -37,6 +37,7 @@ import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } f
 import {
 	applyRpcQueueModeCommand,
 	dispatchRpcSkillPrompt,
+	fitAbortAndRestoreQueueResponse,
 	handleRpcCancelSubagent,
 	handleRpcSessionChange,
 	handleRpcSteerSubagent,
@@ -134,6 +135,7 @@ const PRECONDITION_EXEMPT: ReadonlySet<string> = new Set([
 	"abort",
 	"abort_bash",
 	"abort_retry",
+	"abort_and_restore_queue",
 	"btw_cancel",
 	"detach",
 	"exit",
@@ -1502,6 +1504,16 @@ export class RpcServer {
 				this.#goal.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return rpcSuccess(id, "abort");
+			}
+
+			case "abort_and_restore_queue": {
+				// Mirrors the TUI Esc restore: withdraw queued user input (including live-claimed
+				// steers) before aborting, so abort()'s stranded-queue drain cannot run it.
+				const restored = session.clearQueue({ forInterrupt: true });
+				this.#goal.stopForHostAbort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
+				// Sized for this connection's negotiated protocol: the withdrawn queue must not be lost to a transport-limit error.
+				return fitAbortAndRestoreQueueResponse(id, restored, conn.encoder.maxResponseBytes);
 			}
 
 			case "abort_and_prompt": {

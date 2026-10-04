@@ -11,6 +11,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { SkillDiagnosticsSnapshot } from "../../extensibility/skill-diagnostics";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionHeader, SessionTreeNode } from "../../session/session-entries";
 import type { UsageLimitState } from "../../session/usage-limit";
@@ -73,6 +74,7 @@ type RpcCommandBody =
 	| { id?: string; type: "promote_queued_message"; message: string }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort_and_restore_queue" }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "open_session"; sessionDir: string }
 
@@ -481,6 +483,16 @@ export type RpcHostFrame =
 	| RpcConfigUpdateFrame
 	| RpcSessionInfoUpdateFrame;
 
+/** `abort_and_restore_queue` result: the user-authored queued input withdrawn before the abort, oldest first. */
+export interface RpcAbortAndRestoreQueueResult {
+	steering: RestoredQueuedMessage[];
+	followUp: RestoredQueuedMessage[];
+	/** Set when the full result exceeded the transport limit and every entry's `images` was omitted. */
+	imagesDropped?: true;
+	/** Set when even the text-only result exceeded the limit: only an oldest-first prefix is listed. */
+	truncated?: true;
+}
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
@@ -559,6 +571,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "promote_queued_message"; success: true; data: { promoted: boolean } }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "abort_and_restore_queue";
+			success: true;
+			data: RpcAbortAndRestoreQueueResult;
+	  }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "open_session"; success: true; data: RpcOpenSessionResult }
 
