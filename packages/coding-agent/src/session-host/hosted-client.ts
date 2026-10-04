@@ -287,6 +287,14 @@ export class HostedClientLink {
 		await this.#client.prompt(text, images, streamingBehavior, this.#guard());
 	}
 
+	/**
+	 * {@link prompt} with `steer`, resolving once all work it caused has settled, as a local `session.prompt` does.
+	 * Startup messages use it so each runs as its own turn instead of steering the last.
+	 */
+	async promptToCompletion(text: string, images?: ImageContent[]): Promise<void> {
+		await this.#client.promptToCompletion(text, { images, streamingBehavior: "steer", preconditions: this.#guard() });
+	}
+
 	/** Abort the host's current run. Never guarded: an abort must reach the session the host runs now. */
 	async abort(): Promise<void> {
 		await this.#client.abort();

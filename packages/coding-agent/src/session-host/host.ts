@@ -99,8 +99,9 @@ async function readHello(
 
 /**
  * Serve `session` until the last client exits or an extension calls
- * `pi.shutdown()`. Claims the session's owner lease, listens, then publishes
- * the registry entry. Rejects if the lease is held or the listener fails.
+ * `pi.shutdown()`. Claims the session's owner lease, listens, publishes the
+ * registry entry, then starts extensions, so a client can answer a dialog their
+ * startup opens. Rejects if the lease is held, the listener fails, or startup fails.
  */
 export async function runSessionHost(session: AgentSession, options: SessionHostOptions): Promise<never> {
 	const {
@@ -213,15 +214,15 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	};
 	/** A no-op until the host is published and registers {@link withdraw}. */
 	let unregisterWithdraw = (): void => {};
+	let unregisterTeardown = (): void => {};
 
-	const server = await RpcServer.start(session, {
+	// Initialized only once the host is reachable (below): an extension's `session_start` may await a dialog that
+	// only an attached client can answer.
+	const server = new RpcServer(session, {
 		...serverOptions,
 		hostId,
 		// `pi.shutdown()`: the server already disposed the session and wrote every owed response.
 		onShutdown: async () => lifetime.resolve(stop()),
-	}).catch(error => {
-		owned?.release();
-		throw error;
 	});
 	server.onBeforeSwitch = async target => {
 		if (target === owned?.file) return undefined;
@@ -413,22 +414,29 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		entryWritten = true;
 		lastEntry = JSON.stringify(first);
 		published = true;
+		unregisterWithdraw = postmortem.register(`session-host-${hostId}`, withdraw, { exitOnly: true });
+		// Signal and fatal exits end the process from postmortem's cleanup, so the session is disposed there; from
+		// here on, as a client can now keep startup waiting on a dialog.
+		unregisterTeardown = postmortem.register(
+			`session-host-teardown-${hostId}`,
+			reason => session.dispose({ reason, mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS }),
+			{ exitOnly: true },
+		);
+		logger.debug("Session host listening", { hostId, endpoint, sessionFile: session.sessionFile });
+		await server.init();
 	} catch (error) {
+		published = false;
+		unregisterWithdraw();
+		unregisterTeardown();
 		unsubscribeEvents();
 		unsubscribeEntries();
 		listener.close();
+		for (const socket of sockets) socket.destroy();
+		await writes;
 		removeArtifactsSync();
 		owned?.release();
 		throw error;
 	}
-	unregisterWithdraw = postmortem.register(`session-host-${hostId}`, withdraw, { exitOnly: true });
-	// Signal and fatal exits end the process from postmortem's cleanup, so the session is disposed there.
-	postmortem.register(
-		`session-host-teardown-${hostId}`,
-		reason => session.dispose({ reason, mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS }),
-		{ exitOnly: true },
-	);
-	logger.debug("Session host listening", { hostId, endpoint, sessionFile: session.sessionFile });
 	return lifetime.promise;
 }
 

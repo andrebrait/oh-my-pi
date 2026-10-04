@@ -1075,11 +1075,11 @@ describe("a hosted client's automation", () => {
 			expect(hosted.enabled).toBe(false);
 		});
 
-		it("mounts no welcome header in a hosted client, without changing the startup.quiet setting", async () => {
+		it("mounts the welcome header in a hosted client exactly as startup.quiet says", async () => {
 			const previous = cfgStartupQuiet.get(Settings.instance);
-			const welcomeAfterInit = async (hostedClientMode: boolean): Promise<boolean> => {
-				cfgStartupQuiet.set(Settings.instance, false);
-				const { mode, dispose } = await openMode(hostedClientMode);
+			const welcomeAfterInit = async (quiet: boolean): Promise<boolean> => {
+				cfgStartupQuiet.set(Settings.instance, quiet);
+				const { mode, dispose } = await openMode(true);
 				await mode.init({ suppressWelcomeIntro: true });
 				const mounted = mode.composer.welcome !== undefined;
 				await dispose();
@@ -1088,7 +1088,6 @@ describe("a hosted client's automation", () => {
 			try {
 				expect(await welcomeAfterInit(false)).toBe(true);
 				expect(await welcomeAfterInit(true)).toBe(false);
-				expect(cfgStartupQuiet.get(Settings.instance)).toBe(false);
 			} finally {
 				cfgStartupQuiet.set(Settings.instance, previous);
 			}

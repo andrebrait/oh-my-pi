@@ -16,7 +16,7 @@
 
 - Stdio `--mode rpc` / `rpc-ui` output stays byte-for-byte identical. New frames appear only on socket connections after `hello`.
 - Every platform: Unix socket on POSIX, `\\.\pipe\omp-host-<id>` on Windows. Token is mandatory everywhere and compared with `crypto.timingSafeEqual`.
-- Only the host process writes the session file (D9). The host claims the owner lease before listening and writes its registry entry last.
+- Only the host process writes the session file (D9). The host claims the owner lease before listening and writes its registry entry before starting extensions (see spec invariant 2).
 - Use `logger` from `@oh-my-pi/pi-utils`, never `console.*`, in host code.
 - ES `#private` fields; no `private`/`public` keywords except constructor parameter properties. No `ReturnType<>`. No inline imports. `Promise.withResolvers()` over `new Promise`.
 - Tests: behavioral, real host over a real socket where a transport is involved; isolated `PI_CODING_AGENT_DIR` and temp dirs per test; no `mock.module()`.

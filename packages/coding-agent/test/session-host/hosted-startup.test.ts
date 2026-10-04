@@ -23,7 +23,7 @@ import {
 	type SessionHostEntry,
 	writeHostEntry,
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 import { holdLeaseInAnotherProcess, killLeaseProcesses } from "../helpers/session-lease-process";
 import { type IsolatedConfigRoot, isolateConfigRoot } from "../helpers/session-host-harness";
 
@@ -272,6 +272,8 @@ describe("the opt-in gate", () => {
 		const missing = path.join(dir, "missing-attachment.txt");
 		const rawArgs = [...MODEL_ARGS, "--no-session", "--cwd", dir, `@${missing}`];
 		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		// `--cwd` moves the whole process into `dir`, which `afterEach` deletes.
+		const originalProjectDir = getProjectDir();
 		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 		const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		const exit = new Error("CLI exited");
@@ -313,6 +315,7 @@ describe("the opt-in gate", () => {
 			else Reflect.deleteProperty(process.stdout, "isTTY");
 			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			setProjectDir(originalProjectDir);
 			authStorage.close();
 		}
 	}, 30_000);
