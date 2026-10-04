@@ -288,11 +288,12 @@ export async function attachHostedUi(ctx: InteractiveModeContext, hosted: Hosted
 	let current = hosted.entry;
 	let switching = false;
 
-	const connect = async (entry: SessionHostEntry): Promise<void> => {
+	const connect = async (entry: SessionHostEntry, keepStartupFrame = false): Promise<void> => {
 		const link = await HostedClientLink.connect({
 			ctx,
 			entry,
 			replicaDir: hostedReplicaDir(),
+			keepStartupFrame,
 			onClosed: reason => {
 				void ctx.shutdown({ exitCode: 1, farewell: reason.message });
 			},
@@ -376,5 +377,5 @@ export async function attachHostedUi(ctx: InteractiveModeContext, hosted: Hosted
 		}
 	};
 
-	await connect(hosted.entry);
+	await connect(hosted.entry, true);
 }
