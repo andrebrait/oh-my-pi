@@ -8,7 +8,7 @@ import { Args, CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { parseArgs, reportCliUsageError } from "../cli/args";
 import { attachHelp as commandHelp } from "../cli/command-help";
 import { runRootCommand } from "../main";
-import { formatHostRow } from "../session-host/host-row";
+import { formatHostTable } from "../session-host/host-row";
 import { listSessionHosts } from "../session-host/registry";
 
 export default class Attach extends Command {
@@ -44,7 +44,7 @@ export default class Attach extends Command {
 			process.stdout.write("No session hosts running.\n");
 			return;
 		}
-		for (const host of hosts) process.stdout.write(`${formatHostRow(host)}\n`);
+		for (const line of formatHostTable(hosts)) process.stdout.write(`${line}\n`);
 	}
 
 	async #attach(target: string): Promise<void> {
