@@ -4127,6 +4127,9 @@ pub struct SessionSnapshot {
 	pub clients: Vec<ClientInfo>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub streaming: Option<StreamingMessage>,
+	/// Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key.
+	#[serde(rename = "uiState", default, skip_serializing_if = "Option::is_none")]
+	pub ui_state: Option<Vec<ExtensionUiRequest>>,
 	/// Parallel to `state.queuedMessages`.
 	#[serde(rename = "queueAttachments", default, skip_serializing_if = "Option::is_none")]
 	pub queue_attachments: Option<QueueAttachments>,

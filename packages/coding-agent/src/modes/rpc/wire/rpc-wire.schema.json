@@ -4570,6 +4570,13 @@
 				"streaming": {
 					"$ref": "#/$defs/StreamingMessage"
 				},
+				"uiState": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ExtensionUiRequest"
+					},
+					"description": "Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key."
+				},
 				"queueAttachments": {
 					"$ref": "#/$defs/QueueAttachments",
 					"description": "Parallel to `state.queuedMessages`."

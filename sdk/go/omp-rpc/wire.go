@@ -4989,6 +4989,8 @@ type SessionSnapshot struct {
 	PendingUI []ExtensionUiRequest `json:"pendingUi"`
 	Clients   []ClientInfo         `json:"clients"`
 	Streaming *StreamingMessage    `json:"streaming,omitempty"`
+	// Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key.
+	UIState []ExtensionUiRequest `json:"uiState,omitempty"`
 	// Parallel to `state.queuedMessages`.
 	QueueAttachments *QueueAttachments `json:"queueAttachments,omitempty"`
 	Origin           *SessionOrigin    `json:"origin,omitempty"`
@@ -5008,6 +5010,7 @@ func (v *SessionSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("pendingUi", &out.PendingUI)
 	d.required("clients", &out.Clients)
 	d.optional("streaming", &out.Streaming)
+	d.optional("uiState", &out.UIState)
 	d.optional("queueAttachments", &out.QueueAttachments)
 	d.optional("origin", &out.Origin)
 	if d.err != nil {

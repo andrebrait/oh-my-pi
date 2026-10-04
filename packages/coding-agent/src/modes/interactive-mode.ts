@@ -2122,9 +2122,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.session.slashCommands,
 		);
 
-		// A hosted terminal only mirrors another process's session: it shows no welcome or changelog of its own. Quiet
-		// is applied in memory only; the persistent `startup.quiet` setting is untouched.
-		const startupQuiet = this.hostedClientMode || cfgStartupQuiet.get(settings);
+		const startupQuiet = cfgStartupQuiet.get(settings);
 		this.composer.setPreferences({ quiet: startupQuiet });
 		this.composer.updateWelcome({ version: this.#version });
 		const headerBefore = this.#buildConfigWarningComponents();

@@ -1322,6 +1322,8 @@ class SessionSnapshot:
     """Open extension dialogs a late joiner can answer."""
     clients: tuple[ClientInfo, ...]
     streaming: StreamingMessage | None = None
+    ui_state: tuple[ExtensionUiRequest, ...] | None = None
+    """Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key."""
     queue_attachments: QueueAttachments | None = None
     """Parallel to `state.queuedMessages`."""
     origin: SessionOrigin | None = None
@@ -2701,6 +2703,7 @@ def parse_session_snapshot(value: object, path: str = "SessionSnapshot") -> Sess
         pending_ui=required(payload, "pendingUi", array(parse_extension_ui_request), path),
         clients=required(payload, "clients", array(parse_client_info), path),
         streaming=optional(payload, "streaming", parse_streaming_message, path),
+        ui_state=optional(payload, "uiState", array(parse_extension_ui_request), path),
         queue_attachments=optional(payload, "queueAttachments", parse_queue_attachments, path),
         origin=optional(payload, "origin", parse_session_origin, path),
     )

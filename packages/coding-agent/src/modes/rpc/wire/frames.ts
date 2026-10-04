@@ -151,6 +151,10 @@ export const frameDefs = {
 			leafId: "string | null",
 			"streaming?": "StreamingMessage",
 			pendingUi: doc("ExtensionUiRequest[]", "Open extension dialogs a late joiner can answer."),
+			"uiState?": doc(
+				"ExtensionUiRequest[]",
+				"Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key.",
+			),
 			clients: "ClientInfo[]",
 			"queueAttachments?": doc("QueueAttachments", "Parallel to `state.queuedMessages`."),
 			"origin?": "SessionOrigin",

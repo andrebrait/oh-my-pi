@@ -549,6 +549,11 @@ export class RpcServer {
 	readonly #subagentRegistry: RpcSubagentRegistry | undefined;
 	/** Open extension dialogs by request id; the first answer from any connection settles one. */
 	readonly #uiPending = new Map<string, RpcExtensionUIRequest>();
+	/**
+	 * The latest `setStatus`/`setWidget` per key that still shows something. They are fire-and-forget, so a client that
+	 * attaches later (extensions set most statuses at boot, before any client) gets them from its snapshot.
+	 */
+	readonly #uiState = new Map<string, RpcExtensionUIRequest>();
 	/** Each connection's `set_host_tools` adapters, oldest registration first. */
 	#hostToolSets = new Map<RpcConnection, AgentTool[]>();
 	/** The host's one live voice session; its frames go to the connection that started it, bypassing event filters. */
@@ -735,6 +740,7 @@ export class RpcServer {
 			leafId: announced.leafId,
 			streaming: message && messageId !== undefined ? { messageId, message } : undefined,
 			pendingUi: [...this.#uiPending.values()],
+			uiState: [...this.#uiState.values()],
 			clients: this.clients,
 			queueAttachments: session.getQueuedMessageAttachments(),
 			origin: this.#origin(),
@@ -1205,6 +1211,14 @@ export class RpcServer {
 				break;
 			case "cancel":
 				this.#uiPending.delete(frame.targetId);
+				break;
+			case "setStatus":
+				if (frame.statusText === undefined) this.#uiState.delete(`status:${frame.statusKey}`);
+				else this.#uiState.set(`status:${frame.statusKey}`, frame);
+				break;
+			case "setWidget":
+				if (frame.widgetLines === undefined) this.#uiState.delete(`widget:${frame.widgetKey}`);
+				else this.#uiState.set(`widget:${frame.widgetKey}`, frame);
 				break;
 		}
 		this.#broadcast(frame, toUi);

@@ -1503,13 +1503,14 @@ Commands may be pipelined behind `hello`.
     "leafId": null,
     "streaming": { "messageId": "…", "message": {} },
     "pendingUi": [],
+    "uiState": [],
     "clients": [{ "clientId": "…", "kind": "tui", "label": "…" }],
     "origin": { "cwd": "/srv/project", "artifactsDir": "/srv/sessions/…/01a0…", "localRoot": "/srv/sessions/…/01a0…/local", "sessionId": "01a0…" }
   }
 }
 ```
 
-- `state` is the `get_state` payload. `streaming` is present only while an assistant message is in flight; later frames for it carry its `messageId`. `pendingUi` lists open dialogs (`select`, `confirm`, `input`, `editor`, `ask`) that a late joiner can answer.
+- `state` is the `get_state` payload. `streaming` is present only while an assistant message is in flight; later frames for it carry its `messageId`. `pendingUi` lists open dialogs (`select`, `confirm`, `input`, `editor`, `ask`) that a late joiner can answer. `uiState` (optional; absent from hosts that predate it) lists the `setStatus` and `setWidget` requests showing now, the latest per key, so a late joiner shows the statuses and widgets set before it attached. A client that replaces its view with a snapshot should drop the statuses and widgets of the previous view first.
 - `entries`, `leafId`, and the title (`state.sessionName`, `header.title`) are the session as the `entry` frames have announced it, which is not always the host's in-memory state. Entries of an atomic batch that is still publishing, entries recorded meanwhile (titles included), and entries still waiting for announcement are left out; they reach the client once, as `entry` frames after the batch commits, and a batch that rolls back never reaches it. `leafId` is the live leaf, or its nearest announced ancestor while the leaf itself is not announced. Each entry is therefore delivered exactly once, in the snapshot or as a later `entry` frame. A `session_replaced` snapshot follows the same rule.
 - `queueAttachments` (optional; absent from hosts that predate it) has the shape of `attachments` in [`queue_update`](#queue_update-event) and describes `state.queuedMessages` as of the snapshot.
 - `origin` (optional; absent from hosts that predate it) is where the host session lives: its `cwd`, its `artifactsDir` (`null` when it has none, as for an in-memory session), `localRoot` (the directory the host's own `local://` URLs map to: under `artifactsDir` when there is one, otherwise a directory under the host's temp dir) and its transcript `sessionId`. Resolve links in host-authored text (`local://`, relative file paths) against it, not against the client's own cwd, temp dir or local copy of the transcript. It is read when the snapshot is built, so a `session_replaced` snapshot describes the new session; a relocation of the same session is announced by `session_info_update` (see below). Never sent on stdio.
