@@ -93,7 +93,13 @@ describe("omp attach", () => {
 
 		const human = await attach();
 		expect(human.exitCode).toBe(0);
-		expect(human.stdout).toBe(`${LIVE_ID}  2  busy  ${home}  demo\n`);
+		const [header, row, end] = human.stdout.split("\n");
+		expect(header).toMatch(/^HOST ID\s+CLIENTS\s+STATE\s+DIRECTORY\s+SESSION$/);
+		expect(row.trim().split(/\s+/)).toEqual([LIVE_ID, "2", "busy", home, "demo"]);
+		// Columns line up under their headings.
+		expect(row.indexOf("demo")).toBe(header.indexOf("SESSION"));
+		expect(row.indexOf(home)).toBe(header.indexOf("DIRECTORY"));
+		expect(end).toBe("");
 	});
 
 	it("strips control sequences and newlines from registry text so a hostile entry cannot forge rows", async () => {
@@ -107,7 +113,11 @@ describe("omp attach", () => {
 		expect(exitCode).toBe(0);
 		expect(stdout).not.toContain("\x1b");
 		expect(stdout).not.toContain("\x07");
-		expect(stdout.split("\n")).toEqual([expect.stringMatching(new RegExp(`^${LIVE_ID}  0  idle  `)), ""]);
+		expect(stdout.split("\n")).toEqual([
+			expect.stringMatching(/^HOST ID/),
+			expect.stringMatching(new RegExp(`^${LIVE_ID}\\s+0  idle\\s`)),
+			"",
+		]);
 	});
 
 	it("reports an empty registry", async () => {
