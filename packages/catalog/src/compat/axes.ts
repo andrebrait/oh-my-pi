@@ -293,7 +293,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"stream-idle-timeout-ms": wire("streamIdleTimeoutMs", [...OAI, "anthropic", "bedrock", "google"]),
 	"strip-image-input": wire("stripImageInput", [...OAI, "anthropic", "google"]),
 	"supports-forced-tool-choice": wire("supportsForcedToolChoice", [...OAI, "anthropic", "bedrock"]),
-	"supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic"]),
+	"supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic", "bedrock", "devin", "google"]),
 	"thinking-loop-guard": wire("thinkingLoopGuard", [...OAI, "anthropic", "google"], "scalar", [
 		"gemini",
 		"deepseek",
@@ -304,7 +304,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"thinking-default-level": { key: "defaultLevel", set: "thinking", shape: "scalar", values: EFFORTS },
 	"thinking-effort-budgets": { key: "effortBudgets", set: "thinking", shape: "object" },
 	"thinking-effort-map": { key: "effortMap", set: "thinking", shape: "object" },
-	"thinking-efforts": { key: "efforts", set: "thinking", shape: "array", values: EFFORTS },
+	"thinking-efforts": { key: "efforts", set: "thinking", shape: "array", values: EFFORTS, emptyArray: true },
 	"thinking-mode": {
 		key: "mode",
 		set: "thinking",
@@ -428,6 +428,13 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	priority: { key: "priority", set: "catalog", shape: "scalar" },
 	"service-tier-cost": { key: "serviceTierCost", set: "catalog", shape: "object" },
 	"time-based-cost": { key: "timeBased", set: "catalog", shape: "object" },
+	/**
+	 * Effort the vendor applies when a request omits it, per the vendor's
+	 * published docs. Read only by the `vendor` auto-thinking backend; unlike
+	 * `thinking-default-level` it never overrides the user's default level.
+	 * Discovery-reported values win over rules.
+	 */
+	"vendor-default-effort": { key: "vendorDefaultEffort", set: "catalog", shape: "scalar", values: EFFORTS },
 
 	// ── catalog: routed-subscription registry ──
 	// A gateway whose proxy fans one model out to several upstreams (Factory

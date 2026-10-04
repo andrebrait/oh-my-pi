@@ -347,6 +347,40 @@ describe("model thinking derivation", () => {
 		expect(getSupportedEfforts(pro)).toEqual([Effort.Low, Effort.High, Effort.Max]);
 	});
 
+	it("keeps Go LongCat reasoning without inventing an effort selector", () => {
+		const longcat = createModel({
+			id: "longcat-2.5-preview-free",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+
+		expect(longcat.reasoning).toBe(true);
+		expect(getSupportedEfforts(longcat)).toEqual([]);
+		expect(clampThinkingLevelForModel(longcat, Effort.High)).toBeUndefined();
+	});
+
+	it("offers Go Space Bunny only its published effort tiers through max", () => {
+		const spaceBunny = createModel({
+			id: "space-bunny-free",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+
+		expect(getSupportedEfforts(spaceBunny)).toEqual([
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+			Effort.Max,
+		]);
+		expect(requireSupportedEffort(spaceBunny, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(spaceBunny, Effort.Minimal)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+	});
+
 	it("grants the low/high/max ladder to OpenRouter deepseek-v4-pro-0813 but not the undated route (issue #8517)", () => {
 		// OpenRouter's /models advertises reasoning.supported_efforts
 		// [low, high, max] for the dated SKU; the discovered ladder is baked
@@ -1164,6 +1198,31 @@ describe("model thinking derivation", () => {
 		expect(model.thinking?.mode).toBe("anthropic-budget-effort");
 		expect(getSupportedEfforts(model)).toEqual([Effort.High, Effort.Max]);
 		expect(model.thinking?.effortMap).toBeUndefined();
+	});
+});
+
+describe("vendor default effort rules", () => {
+	const vendorDefault = (provider: Provider, id: string, api: Api = "anthropic-messages") =>
+		createModel({ id, api, provider }).vendorDefaultEffort;
+
+	it("pins documented per-revision defaults, including the Opus 5.5 step down", () => {
+		expect(vendorDefault("anthropic", "claude-opus-5")).toBe(Effort.High);
+		expect(vendorDefault("anthropic", "claude-opus-5-5")).toBe(Effort.Medium);
+		expect(vendorDefault("openrouter", "anthropic/claude-opus-5.5", "openai-completions")).toBe(Effort.Medium);
+		expect(vendorDefault("openai", "gpt-5.5", "openai-responses")).toBe(Effort.Medium);
+		expect(vendorDefault("openai", "gpt-5.5-pro", "openai-responses")).toBe(Effort.High);
+		// A route suffix must not drop the pro tier to the revision-wide default.
+		expect(vendorDefault("openrouter", "openai/gpt-5.5-pro:batch", "openai-completions")).toBe(Effort.High);
+		expect(vendorDefault("anthropic", "claude-sonnet-5-5")).toBe(Effort.High);
+		expect(vendorDefault("google", "gemini-3.5-flash-lite", "google-generative-ai")).toBe(Effort.Minimal);
+	});
+
+	it("leaves undocumented and none-default models unset", () => {
+		expect(vendorDefault("anthropic", "claude-haiku-4-5")).toBeUndefined();
+		expect(vendorDefault("openai", "gpt-5.4", "openai-responses")).toBeUndefined();
+		expect(vendorDefault("openai", "gpt-6-astra", "openai-responses")).toBeUndefined();
+		// The id pins its effort, so the lineage default does not apply.
+		expect(vendorDefault("cursor", "claude-opus-4-8-low", "cursor-agent")).toBeUndefined();
 	});
 });
 
