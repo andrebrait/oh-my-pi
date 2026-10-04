@@ -1,0 +1,445 @@
+/**
+ * Wire definitions for non-command frames: unsolicited server notifications,
+ * the extension UI sub-protocol, and the host tool/URI sub-protocols.
+ */
+import { absentAs, doc, type WireDefs } from "./dsl";
+
+const JSON_OBJECT = "Record<string, unknown>";
+const UI = "'extension_ui_request'";
+
+export const frameDefs = {
+	ReadyEvent: doc(
+		{
+			type: "'ready'",
+			"protocolVersion?": "number.integer",
+			"supportedProtocolVersions?": "number.integer[]",
+			"maxFrameBytes?": "number.integer",
+			"maxReassembledFrameBytes?": "number.integer",
+		},
+		"First frame after startup; transport fields are absent on servers without protocol v2.",
+	),
+	PromptStatus: "'completed' | 'aborted' | 'error'",
+	PromptError: doc(
+		{
+			message: "string",
+			"provider?": "string",
+			"model?": "string",
+			"httpStatus?": "number.integer",
+			retryable: doc("boolean", "Transient: resubmitting later may succeed (omp's own retries are exhausted)."),
+		},
+		'Failure detail of a `prompt_result` with `status: "error"`.',
+	),
+	PromptResultEvent: doc(
+		{
+			type: "'prompt_result'",
+			"id?": "string",
+			agentInvoked: "boolean",
+			status: "PromptStatus",
+			"error?": "PromptError",
+			sessionSettled: doc(
+				"boolean",
+				"Nothing will wake the session again; when false a `session_settled` follows once background work drains.",
+			),
+		},
+		"Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`.",
+	),
+	SessionSettledEvent: doc(
+		{ type: "'session_settled'" },
+		"The session went quiet: the last run yielded and no background work can wake it.",
+	),
+	ExtensionError: { type: "'extension_error'", extensionPath: "string", event: "string", error: "string" },
+	AvailableCommandsUpdateEvent: doc(
+		{ type: "'available_commands_update'", commands: "AvailableSlashCommand[]" },
+		"Slash-command catalog, pushed at startup and whenever command metadata changes.",
+	),
+	SubagentLifecycleStatus: "'started' | 'completed' | 'failed' | 'aborted'",
+	SubagentLifecyclePayload: {
+		id: "string",
+		agent: "string",
+		agentSource: "AgentSource",
+		"description?": "string",
+		status: "SubagentLifecycleStatus",
+		"sessionFile?": "string",
+		"parentToolCallId?": "string",
+		index: "number.integer",
+		"detached?": doc("boolean", "The subagent runs as a detached background job."),
+	},
+	SubagentProgressPayload: {
+		index: "number.integer",
+		agent: "string",
+		agentSource: "AgentSource",
+		task: "string",
+		"parentToolCallId?": "string",
+		"assignment?": "string",
+		progress: doc(JSON_OBJECT, "Raw `AgentProgress` record."),
+		"sessionFile?": "string",
+		"detached?": "boolean",
+	},
+	SubagentEventPayload: { id: "string", event: "RpcAgentEvent" },
+	SubagentLifecycleEvent: doc(
+		{ type: "'subagent_lifecycle'", payload: "SubagentLifecyclePayload" },
+		'A subagent started or ended; sent at subscription level "progress" or "events".',
+	),
+	SubagentProgressEvent: doc(
+		{ type: "'subagent_progress'", payload: "SubagentProgressPayload" },
+		'Aggregated subagent progress; sent at subscription level "progress" or "events".',
+	),
+	SubagentEvent: doc(
+		{ type: "'subagent_event'", payload: "SubagentEventPayload" },
+		'A subagent\'s own session event; sent only at subscription level "events".',
+	),
+	LivePhase: "'connecting' | 'listening' | 'working' | 'speaking' | 'muted' | 'error'",
+	LiveRole: "'user' | 'assistant'",
+	LivePhaseEvent: { type: "'live_phase'", phase: "LivePhase" },
+	LiveLevelsEvent: doc(
+		{ type: "'live_levels'", input: "number", output: "number" },
+		"Microphone (`input`) and speaker (`output`) RMS in [0, 1], at most every 100 ms.",
+	),
+	LiveTranscriptEvent: doc(
+		{ type: "'live_transcript'", role: "LiveRole", turn: "number.integer", text: "string", final: "boolean" },
+		"Accumulated text of one realtime turn; replaces earlier frames with the same `role` and `turn`.",
+	),
+	LiveEndEvent: doc(
+		{ type: "'live_end'", "error?": "string" },
+		"Sent exactly once when a live session ends; `error` carries the failure cause.",
+	),
+	CommandOutputEvent: doc({ type: "'command_output'", text: "string" }, "Output of a builtin slash command."),
+	SessionInfoUpdateEvent: doc(
+		{
+			type: "'session_info_update'",
+			"title?": "string",
+			sessionId: "string",
+			"origin?": doc(
+				"SessionOrigin",
+				"Socket clients: the session was relocated (`/move`, `/wt`); where it lives now.",
+			),
+			"seq?": doc("number.integer", "Host sequence number; socket clients only."),
+		},
+		"The session title changed.",
+	),
+	ConfigUpdateEvent: doc(
+		{
+			type: "'config_update'",
+			"model?": "ModelInfo",
+			"thinkingLevel?": "ThinkingLevel",
+			"seq?": doc("number.integer", "Host sequence number; socket clients only."),
+		},
+		"The live model or thinking level changed.",
+	),
+	RpcFrameErrorEvent: doc(
+		{ type: "'rpc_frame_error'", "originalType?": "string", error: "string" },
+		"An event could not fit within the transport limits and was dropped.",
+	),
+
+	ClientInfo: doc(
+		{ clientId: "string", kind: "string", "label?": "string" },
+		"A connected session-host client, as listed in snapshots and `clients_changed`.",
+	),
+	SessionOrigin: doc(
+		{ cwd: "string", artifactsDir: "string | null", localRoot: "string", sessionId: "string" },
+		"Where a host session lives, for resolving `local://` URLs and relative paths in what it authored.",
+	),
+	StreamingMessage: doc(
+		{ messageId: "string", message: "AgentMessage" },
+		"The in-flight message of a mid-turn join; later frames for it carry `messageId`.",
+	),
+	SessionSnapshot: doc(
+		{
+			state: "SessionState",
+			header: `${JSON_OBJECT} | null`,
+			entries: `${JSON_OBJECT}[]`,
+			leafId: "string | null",
+			"streaming?": "StreamingMessage",
+			pendingUi: doc("ExtensionUiRequest[]", "Open extension dialogs a late joiner can answer."),
+			clients: "ClientInfo[]",
+			"queueAttachments?": doc("QueueAttachments", "Parallel to `state.queuedMessages`."),
+			"origin?": "SessionOrigin",
+		},
+		"The session as the `entry` frames have announced it: everything a socket client needs to render it from scratch.",
+	),
+	AttachedEvent: doc(
+		{
+			type: "'attached'",
+			hostId: "string",
+			clientId: "string",
+			epoch: "number.integer",
+			seq: "number.integer",
+			snapshot: "SessionSnapshot",
+		},
+		"Socket clients: first frame of a fresh attach; later frames carry a greater `seq`.",
+	),
+	ResumedEvent: doc(
+		{ type: "'resumed'", epoch: "number.integer", replayed: "number.integer" },
+		"Socket clients: first frame of a resume; the `replayed` frames after `lastSeq` follow it.",
+	),
+	EntryEvent: doc(
+		{
+			type: "'entry'",
+			entry: JSON_OBJECT,
+			"leafId?": doc(
+				"string | null",
+				"The host's active leaf when the entry was announced; absent from older hosts.",
+			),
+			seq: "number.integer",
+		},
+		"Socket clients: a session-file append.",
+	),
+	SessionReplacedReason: "'new' | 'resume' | 'fork' | 'tree'",
+	SessionReplacedEvent: doc(
+		{
+			type: "'session_replaced'",
+			epoch: "number.integer",
+			"sessionFile?": "string",
+			reason: "SessionReplacedReason",
+			snapshot: "SessionSnapshot",
+			seq: "number.integer",
+		},
+		"Socket clients: the host now serves a different session or transcript; `snapshot` replaces the client's view.",
+	),
+	ClientsChangedEvent: doc(
+		{ type: "'clients_changed'", clients: "ClientInfo[]", seq: "number.integer" },
+		"Socket clients: client presence changed.",
+	),
+	ClientIdentity: { kind: "string", "label?": "string" },
+	ClientCapabilities: { ui: doc("boolean", "Receive extension UI requests.") },
+	ResumePoint: { hostId: "string", epoch: "number.integer", lastSeq: "number.integer" },
+	HelloFrame: doc(
+		{
+			type: "'hello'",
+			token: "string",
+			protocolVersion: doc("number.integer", "1 or 2, as `negotiate_protocol` would select."),
+			client: "ClientIdentity",
+			capabilities: "ClientCapabilities",
+			"resume?": doc("ResumePoint", "Ignored, so the client gets `attached`, unless `hostId` names this host."),
+		},
+		"First frame a session-host socket client sends; anything else, or a wrong token, gets `unauthorized` and a close.",
+	),
+
+	WidgetPlacement: "'aboveEditor' | 'belowEditor'",
+	SelectOptionDetail: doc({ "description?": "string" }, "Presentation metadata aligned positionally with `options`."),
+	AskOption: { label: "string", "description?": "string", "preview?": "string" },
+	AskQuestion: doc(
+		{
+			id: "string",
+			question: "string",
+			"header?": "string",
+			options: "AskOption[]",
+			multi: absentAs("boolean", false),
+			"recommended?": doc("number.integer", "Index into `options` of the recommended choice."),
+		},
+		"One question of an `ask` request; hosts always offer free text besides `options`.",
+	),
+	SelectUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'select'",
+		title: "string",
+		options: "string[]",
+		"optionDetails?": "SelectOptionDetail[]",
+		"timeout?": "number.integer",
+	},
+	ConfirmUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'confirm'",
+		title: "string",
+		message: "string",
+		"timeout?": "number.integer",
+	},
+	InputUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'input'",
+		title: "string",
+		"placeholder?": "string",
+		"timeout?": "number.integer",
+	},
+	EditorUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'editor'",
+		title: "string",
+		"prefill?": "string",
+		"promptStyle?": "boolean",
+	},
+	AskUiRequest: doc(
+		{ type: UI, id: "string", method: "'ask'", questions: "AskQuestion[]", "timeout?": "number.integer" },
+		"Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.",
+	),
+	CancelUiRequest: doc(
+		{ type: UI, id: "string", method: "'cancel'", targetId: "string" },
+		"Close the dialog opened by request `targetId`; a later answer to it is ignored.",
+	),
+	NotifyUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'notify'",
+		message: "string",
+		"notifyType?": "NotifyType",
+	},
+	SetStatusUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'setStatus'",
+		statusKey: "string",
+		"statusText?": "string",
+	},
+	SetWidgetUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'setWidget'",
+		widgetKey: "string",
+		"widgetLines?": "string[]",
+		"widgetPlacement?": "WidgetPlacement",
+	},
+	SetTitleUiRequest: { type: UI, id: "string", method: "'setTitle'", title: "string" },
+	SetEditorTextUiRequest: { type: UI, id: "string", method: "'set_editor_text'", text: "string" },
+	OpenUrlUiRequest: {
+		type: UI,
+		id: "string",
+		method: "'open_url'",
+		url: "string",
+		"launchUrl?": doc("string", "Short loopback redirect to `url`; the truncation-safe copy target."),
+		"instructions?": "string",
+	},
+	ExtensionUiRequest: doc(
+		"SelectUiRequest | ConfirmUiRequest | InputUiRequest | EditorUiRequest | AskUiRequest | CancelUiRequest | NotifyUiRequest | SetStatusUiRequest | SetWidgetUiRequest | SetTitleUiRequest | SetEditorTextUiRequest | OpenUrlUiRequest",
+		"Extension UI request, discriminated by `method`.",
+	),
+	AskAnswer: doc(
+		{
+			id: "string",
+			selectedOptions: "string[]",
+			"customInput?": "string",
+			"customInputImages?": doc(
+				"ImageContent[]",
+				"Images pasted into the free text; their `[Image #N]` markers sit in it.",
+			),
+			"note?": doc("string", "The user's note on the answer."),
+			"noteImages?": "ImageContent[]",
+		},
+		"Answer to one `ask` question: exact option labels, plus optional free text.",
+	),
+	ValueUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", value: "string" },
+		"Answers a `select`, `input`, or `editor` request.",
+	),
+	ConfirmUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", confirmed: "boolean" },
+		"Answers a `confirm` request.",
+	),
+	CancelUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", cancelled: "true", "timedOut?": "boolean" },
+		"Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers).",
+	),
+	AnswersUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", answers: "AskAnswer[]" },
+		"Answers an `ask` request: one `AskAnswer` per question, in question order.",
+	),
+	ChatUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", chat: "true" },
+		"Declines an `ask` request to discuss it instead; distinct from cancelling.",
+	),
+	ExtensionUiResponse: doc(
+		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse",
+		"Host reply to an extension UI request; variants share `type` and differ by their payload key.",
+	),
+
+	HostToolCallRequest: {
+		type: "'host_tool_call'",
+		id: "string",
+		toolCallId: "string",
+		toolName: "string",
+		arguments: JSON_OBJECT,
+	},
+	HostToolCancelRequest: { type: "'host_tool_cancel'", id: "string", targetId: "string" },
+	HostToolResultPayload: doc(
+		{
+			content: "UserContent[]",
+			"details?": "unknown",
+			"isError?": "boolean",
+			"useless?": "boolean",
+			"providerMetadata?": JSON_OBJECT,
+		},
+		"Tool output: content blocks plus optional details.",
+	),
+	HostToolUpdate: doc(
+		{ type: "'host_tool_update'", id: "string", partialResult: "HostToolResultPayload" },
+		"Streams partial output of a pending host tool call.",
+	),
+	HostToolResult: doc(
+		{ type: "'host_tool_result'", id: "string", result: "HostToolResultPayload", "isError?": "boolean" },
+		"Completes a pending host tool call; `isError` surfaces the content as a tool error.",
+	),
+	HostUriOperation: "'read' | 'write'",
+	HostUriRequest: {
+		type: "'host_uri_request'",
+		id: "string",
+		operation: "HostUriOperation",
+		url: "string",
+		"content?": doc("string", "Present for write operations."),
+	},
+	HostUriCancelRequest: { type: "'host_uri_cancel'", id: "string", targetId: "string" },
+	HostUriResult: doc(
+		{
+			type: "'host_uri_result'",
+			id: "string",
+			"content?": doc("string", "Required for a successful read."),
+			"contentType?": "'text/markdown' | 'application/json' | 'text/plain'",
+			"notes?": "string[]",
+			"immutable?": "boolean",
+			"isError?": "boolean",
+			"error?": "string",
+		},
+		"Completes a pending host URI request.",
+	),
+	RpcHostRequest: doc(
+		"HostToolCallRequest | HostToolCancelRequest | HostUriRequest | HostUriCancelRequest",
+		"Server request for host-owned tools and URI schemes, discriminated by `type`.",
+	),
+	RpcInbound: doc(
+		"ExtensionUiResponse | HostToolUpdate | HostToolResult | HostUriResult",
+		"Non-command frame the host sends, discriminated by `type`.",
+	),
+	RpcResponse: doc(
+		{
+			type: "'response'",
+			"id?": doc("string", "The command's `id`; absent for failures the server could not correlate."),
+			command: "string",
+			success: "boolean",
+			"data?": doc("unknown", "Command result on success; its shape is the command's `result`."),
+			"error?": doc("string", "Failure message when `success` is false."),
+			"code?": doc("string", "Machine-readable failure reason, when one applies."),
+			"epoch?": doc("number.integer", "`stale`: the host's current session epoch."),
+			"leafId?": doc("string | null", "`stale`: the session's current leaf."),
+			"hostId?": doc("string", "`session_hosted`: the host that owns the session."),
+		},
+		"Response to a command, correlated by `id`.",
+	),
+	RpcPreconditions: doc(
+		{
+			"ifEpoch?": doc("number.integer", "Run only while the host's session epoch equals this."),
+			"ifLeaf?": doc(
+				"string | null",
+				"Run only while the session leaf equals this entry id (`null`: empty session).",
+			),
+		},
+		'Write preconditions any command may carry beside `id`/`type`, honored for session-host socket clients only; on mismatch the command fails with `code: "stale"`.',
+	),
+	ToolLoadMode: "'essential' | 'discoverable'",
+	HostToolDefinition: {
+		name: "string",
+		"label?": "string",
+		description: "string",
+		parameters: JSON_OBJECT,
+		"hidden?": "boolean",
+		"loadMode?": "ToolLoadMode",
+		"readsSkillUris?": "boolean",
+	},
+	HostUriSchemeDefinition: {
+		scheme: "string",
+		"description?": "string",
+		"writable?": "boolean",
+		"immutable?": "boolean",
+	},
+} satisfies WireDefs;

@@ -210,7 +210,7 @@ import {
 	shouldDisableReasoning,
 	toReasoningEffort,
 } from "@oh-my-pi/pi-tui/thinking";
-import { isLowSignalTitleInput } from "../tiny/text";
+import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
 import { resolveApproval } from "../tools/approval";
@@ -351,7 +351,7 @@ import {
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	type InterruptedThinkingDetails,
 	isEmptyErrorTurn,
-	isTitleContextReply,
+	titleContextWordCount,
 	isUserInterruptAbort,
 	isUserInvokedSkillPrompt,
 	logProviderTurnError,
@@ -377,6 +377,7 @@ import {
 	isUserAuthoredQueuedMessage,
 	isUserQueuedMessage,
 	queueChipText,
+	queuedGroupHasAttachments,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
@@ -420,6 +421,8 @@ export * from "./agent-session-types";
 export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
 
 const SESSION_STOP_CONTINUATION_CAP = 8;
+/** Assistant thinking+reply words a deferred auto-title waits for before retitling from context. */
+const DEFERRED_TITLE_MIN_WORDS = 40;
 
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
@@ -472,6 +475,7 @@ import {
 } from "./context-settings";
 import { cfgTitleRefreshOnReplan } from "../goals/settings";
 import {
+	cfgArchiveEnabled,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
 	cfgDevAutoqa,
@@ -532,6 +536,18 @@ export class SessionBusyError extends Error {
 		this.name = "SessionBusyError";
 	}
 }
+
+export interface SwitchSessionOptions {
+	onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
+	/** Collab snapshot adoption keeps the guest's process cwd and marks the replica runtime-only. */
+	preserveLocalCwd?: boolean;
+}
+
+/**
+ * Decides whether a switch to `sessionFile` may start, and runs it via `proceed`. A guard that does not call
+ * `proceed` refuses: nothing changes and the switch reports cancelled, as for an extension veto.
+ */
+export type SessionSwitchGuard = (sessionFile: string, proceed: () => Promise<boolean>) => Promise<boolean>;
 
 const EXPERIMENTAL_CONTEXT_REQUIRED_TOOLS: Record<string, true> = {
 	context_notes: true,
@@ -621,6 +637,7 @@ type PromptDispatchOutcome = { sessionClaimed: boolean };
 
 type ActiveAgentContinue = {
 	schedulerToken: number;
+	turnEnded: boolean;
 	source: string;
 	coalescedSources: Set<string>;
 	promise: Promise<AgentContinueOutcome>;
@@ -661,6 +678,11 @@ export class AgentSession implements SettingsScope {
 	readonly settings: Settings;
 	/** Session-start policy, independent of the selected project memory backend. */
 	readonly memoryEnabled: boolean;
+	/**
+	 * A passive local replica of a session another process runs: it adopts that session's id but owns none of the
+	 * resources the id scopes, so it never releases them (see {@link AgentSessionConfig.passiveReplica}).
+	 */
+	readonly passiveReplica: boolean;
 	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
@@ -806,7 +828,7 @@ export class AgentSession implements SettingsScope {
 	 *  Once the title model declines the message (greeting-like or too ambiguous,
 	 *  e.g. a pasted image plus "help") AND the assistant has replied, the title is
 	 *  regenerated once from the recent user/assistant/thinking turns. */
-	#deferredTitle: { sessionId: string; declined: boolean; replied: boolean } | undefined;
+	#deferredTitle: { sessionId: string; declined: boolean; replied: boolean; words: number } | undefined;
 	#titleProviderSessionId: string | undefined;
 	#titleProviderParentSessionId: string | undefined;
 	/** Host hook invoked when a typed user prompt is dropped before dispatch;
@@ -1294,13 +1316,29 @@ export class AgentSession implements SettingsScope {
 					);
 					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
 				}
-				this.#endInFlight(async () => {
-					try {
-						await finishObservation?.(turnError);
-					} catch (error) {
-						logger.warn("IRC wake turn observer failed to finish", { error: String(error) });
-					}
-				});
+				// Release the in-flight bracket BEFORE settling owned async work:
+				// the bracket holds the prompt-in-flight count up, which withholds
+				// the yield-queue's idle flush, so waiting inside it would deadlock
+				// the very delivery the settle awaits (robomp review on #13703).
+				this.#endInFlight();
+				// Owner-scoped background work continues past the wake turn: the
+				// async-result continuation is where the agent may finally yield.
+				// Keep the observer attached across that pause (settle = jobs →
+				// deliveries → idle) so the monitor still sees the eventual yield —
+				// finishing here would unsubscribe it first and the completion
+				// would dead-letter with no parent-owned job and no refreshed
+				// artifact (#11564). Settles immediately when nothing is pending;
+				// an interrupt cancels the jobs and settles the wait normally.
+				try {
+					await this.settleAsyncWork();
+				} catch (error) {
+					logger.warn("IRC wake async-work settle failed", { error: String(error) });
+				}
+				try {
+					await finishObservation?.(turnError);
+				} catch (error) {
+					logger.warn("IRC wake turn observer failed to finish", { error: String(error) });
+				}
 			});
 	}
 
@@ -1440,7 +1478,8 @@ export class AgentSession implements SettingsScope {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
-		this.memoryEnabled = config.memoryEnabled ?? true;
+		this.passiveReplica = config.passiveReplica === true;
+		this.memoryEnabled = !this.passiveReplica && (config.memoryEnabled ?? true);
 		this.#modelRegistry = config.modelRegistry;
 		this.#extensionRoots =
 			config.extensionRoots ??
@@ -1617,8 +1656,8 @@ export class AgentSession implements SettingsScope {
 			syncAfterModelChange: previousEditMode => this.#tools.syncAfterModelChange(previousEditMode),
 			resetCurrentResponsesProviderSession: reason => this.#resetCurrentResponsesProviderSession(reason),
 			maybeAutoRedeemReset: activeBlockUnblockAtMs => this.#maybeAutoRedeemReset(activeBlockUnblockAtMs),
-			runAutoCompaction: (reason, willRetry, deferred, allowDefer, options) =>
-				this.#maintenance.runAutoCompaction(reason, willRetry, deferred, allowDefer, options),
+			runAutoCompaction: (reason, willRetry, options) =>
+				this.#maintenance.runAutoCompaction(reason, willRetry, options),
 			shakeForRequestBodyReadTimeout: generation => this.#maintenance.shakeForRequestBodyReadTimeout(generation),
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
@@ -2116,7 +2155,6 @@ export class AgentSession implements SettingsScope {
 			memoryBackendSession: () => this,
 			emitSessionEvent: (event, options) => this.#emitSessionEvent(event, options),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
-			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
@@ -2153,8 +2191,8 @@ export class AgentSession implements SettingsScope {
 			retainTerminalFailure: message => {
 				this.#prunedTerminalFailure = message;
 			},
-			runRecoveryCompactionWithRollback: (reason, message, allowDefer, options) =>
-				this.#recovery.runRecoveryCompactionWithRollback(reason, message, allowDefer, options),
+			runRecoveryCompactionWithRollback: (reason, message, options) =>
+				this.#recovery.runRecoveryCompactionWithRollback(reason, message, options),
 			parseRetryAfterMsFromError: errorMessage => this.#recovery.parseRetryAfterMsFromError(errorMessage),
 			setModelTemporary: (model, thinkingLevel, options) => this.setModelTemporary(model, thinkingLevel, options),
 			abort: options => this.abort(options),
@@ -2202,7 +2240,10 @@ export class AgentSession implements SettingsScope {
 		cfgBrowserEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("browser.enabled", enabled));
 		cfgComputerEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("computer.enabled", enabled));
 		cfgRatchetEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("ratchet.enabled", enabled));
+		cfgArchiveEnabled.listen(this, enabled => this.#reconcileEvalPreludeSetting("archive.enabled", enabled));
 		cfgBrowserIdleCloseSec.listen(this, seconds => {
+			// A passive replica carries the owner's session id: arming idle closes under it would reap the owner's tabs.
+			if (this.passiveReplica) return;
 			const ownerId = this.sessionManager.getSessionId() ?? "";
 			// Any change invalidates the armed deadline: cancel first (its
 			// sequence bump stops an in-flight sweep re-arming the old
@@ -2241,14 +2282,14 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * `browser.enabled` / `computer.enabled` / `ratchet.enabled` change the live eval preludes; the browser toggle also
+	 * `browser.enabled` / `computer.enabled` / `ratchet.enabled` / `archive.enabled` change the live eval preludes; the browser toggle also
 	 * re-filters its MCP tools first. An empty transcript rebuilds the system prompt to advertise
 	 * them; mid-session the cached prompt stays byte-stable and the next user prompt carries a
 	 * hidden prelude notice instead (see {@link SessionTools.takeEvalPreludeNotice}).
 	 * A failed browser switch-on reverts to off.
 	 */
 	async #reconcileEvalPreludeSetting(
-		path: "browser.enabled" | "computer.enabled" | "ratchet.enabled",
+		path: "browser.enabled" | "computer.enabled" | "ratchet.enabled" | "archive.enabled",
 		enabled: boolean,
 	): Promise<void> {
 		try {
@@ -2507,6 +2548,16 @@ export class AgentSession implements SettingsScope {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	#sessionSwitchGuard: SessionSwitchGuard | undefined;
+
+	/**
+	 * Wrap every {@link switchSession} (RPC command, extension action, custom command) in `guard`, so a host can
+	 * refuse a target another process owns before anything changes. Not applied to a passive replica.
+	 */
+	setSessionSwitchGuard(guard: SessionSwitchGuard | null): void {
+		this.#sessionSwitchGuard = guard ?? undefined;
 	}
 
 	/**
@@ -2935,7 +2986,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
-		if (this.#exitRecorded) return;
+		// A passive replica is a view: the owning process records its own exit, and an entry appended here would
+		// recreate the local copy a hosted client deletes when it leaves.
+		if (this.#exitRecorded || this.passiveReplica) return;
 		this.#exitRecorded = true;
 		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
 		if (
@@ -3109,12 +3162,12 @@ export class AgentSession implements SettingsScope {
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
 	 * `agent_end` handling schedules deferred post-prompt recovery work
-	 * (compaction/handoff, context-promotion continuations). It is invoked
+	 * (retries, compaction continuations, context promotion). It is invoked
 	 * fire-and-forget by the agent's synchronous `#emit`, and only reaches
 	 * `#checkCompaction` after several internal awaits. `prompt()` runs
 	 * `#waitForPostPromptRecovery()` the instant `agent.prompt()` resolves — which
 	 * can land BEFORE the handler registers its tasks, so the wait would observe an
-	 * empty task set and return early, letting a deferred handoff/promotion race
+	 * empty task set and return early, letting a deferred continuation/promotion race
 	 * prompt completion. Tracking the `agent_end` handler as a post-prompt task
 	 * that is registered SYNCHRONOUSLY (before the first await) closes that window:
 	 * `#postPromptTasksPromise` is set the moment `#emit` invokes this handler, so
@@ -3479,6 +3532,9 @@ export class AgentSession implements SettingsScope {
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		const eventPromptGeneration = this.#promptGeneration;
+		if (event.type === "agent_end" && this.#activeAgentContinue) {
+			this.#activeAgentContinue.turnEnded = true;
+		}
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -3513,7 +3569,11 @@ export class AgentSession implements SettingsScope {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#cacheWarmer?.onResponse(event.message);
-			if (this.#deferredTitle && isTitleContextReply(event.message)) this.#advanceDeferredTitle("replied");
+			const deferred = this.#deferredTitle;
+			if (deferred && !deferred.replied) {
+				deferred.words += titleContextWordCount(event.message);
+				if (deferred.words >= DEFERRED_TITLE_MIN_WORDS) this.#advanceDeferredTitle("replied");
+			}
 		}
 		// Expected internal transitions stamp a structural suppression flag on the
 		// persisted message BEFORE the obfuscator's display-side copy below, so the
@@ -4030,8 +4090,7 @@ export class AgentSession implements SettingsScope {
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 				checkedCompaction = true;
-				const compactionContinues = compactionResult.deferredHandoff || compactionResult.continuationScheduled;
-				if (compactionContinues || compactionResult.automaticContinuationBlocked) {
+				if (compactionResult.continuationScheduled || compactionResult.automaticContinuationBlocked) {
 					// Early return skips the error tail; persist the terminal 413 so the JSONL records why the goal stopped (#9235).
 					if (
 						compactionResult.automaticContinuationBlocked &&
@@ -4040,7 +4099,6 @@ export class AgentSession implements SettingsScope {
 						await this.#recovery.persistTerminalEmptyErrorTurn(msg);
 					}
 					maintenanceRoute("active-goal-pre-empt-compaction-handled", {
-						deferredHandoff: compactionResult.deferredHandoff,
 						continuationScheduled: compactionResult.continuationScheduled,
 						automaticContinuationBlocked: compactionResult.automaticContinuationBlocked === true,
 					});
@@ -4179,13 +4237,9 @@ export class AgentSession implements SettingsScope {
 			}
 			// When compaction queued recovery or hit a deliberate dead-end, skip the
 			// rewind/todo/session_stop passes: any reminder or hook continuation we append
-			// here would race the handoff, retry, auto-continue prompt, queued-message
-			// drain, or the explicit pause that is preventing a compaction loop.
-			if (
-				compactionResult.deferredHandoff ||
-				compactionResult.continuationScheduled ||
-				compactionResult.automaticContinuationBlocked
-			) {
+			// here would race the retry, auto-continue prompt, queued-message drain, or
+			// the explicit pause that is preventing a compaction loop.
+			if (compactionResult.continuationScheduled || compactionResult.automaticContinuationBlocked) {
 				await emitAgentEndNotification(compactionResult.continuationScheduled ? { willContinue: true } : undefined);
 				return;
 			}
@@ -4383,17 +4437,36 @@ export class AgentSession implements SettingsScope {
 					return;
 				}
 
-				const active = this.#activeAgentContinue;
-				if (active) {
-					active.coalescedSources.add(options.source);
-					logger.debug("agent.continue coalesced after scheduling", {
-						source: options.source,
-						schedulerToken: request.schedulerToken,
-						activeSource: active.source,
-						activeSchedulerToken: active.schedulerToken,
-					});
-					this.#handleAgentContinueOutcome(await active.promise, request);
-					return;
+				for (;;) {
+					const active = this.#activeAgentContinue;
+					if (!active) break;
+					if (!active.turnEnded) {
+						active.coalescedSources.add(options.source);
+						logger.debug("agent.continue coalesced after scheduling", {
+							source: options.source,
+							schedulerToken: request.schedulerToken,
+							activeSource: active.source,
+							activeSchedulerToken: active.schedulerToken,
+						});
+						this.#handleAgentContinueOutcome(await active.promise, request);
+						return;
+					}
+
+					// A request made by the active turn's agent_end is its next step,
+					// not a duplicate of that turn. Wait until it settles before starting.
+					await active.promise;
+					if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
+						this.#skipAgentContinue("session-unavailable", request);
+						return;
+					}
+					if (options.generation !== undefined && this.#promptGeneration !== options.generation) {
+						this.#skipAgentContinue("stale-generation", request);
+						return;
+					}
+					if (options.shouldContinue && !options.shouldContinue()) {
+						this.#skipAgentContinue("should-continue-false", request);
+						return;
+					}
 				}
 
 				this.#beginInFlight();
@@ -4401,6 +4474,7 @@ export class AgentSession implements SettingsScope {
 				const promise = this.#runAgentContinue(signal, request, coalescedSources);
 				const attempt: ActiveAgentContinue = {
 					schedulerToken: request.schedulerToken,
+					turnEnded: false,
 					source: options.source,
 					coalescedSources,
 					promise,
@@ -5191,7 +5265,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			const released = await withTimeout(
 				releaseTabsForOwner(ownerId, { kill: true }),
@@ -5217,7 +5291,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #settleOwnedBrowserTabs(): Promise<void> {
 		const ownerId = this.sessionManager.getSessionId();
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			const idleSec = cfgBrowserIdleCloseSec.get(this.settings);
 			if (idleSec > 0) {
@@ -5250,7 +5324,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #releaseOwnedComputerSessions(ownerId: string | undefined): Promise<void> {
-		if (!ownerId) return;
+		if (!ownerId || this.passiveReplica) return;
 		try {
 			await withTimeout(
 				releaseComputerSessionsForOwner(ownerId),
@@ -5304,7 +5378,7 @@ export class AgentSession implements SettingsScope {
 		this.#cancelFatalRecoveryHint?.();
 		this.#cancelFatalRecoveryHint = undefined;
 		try {
-			await emitSessionShutdownEvent(this.#extensionRunner);
+			if (!this.passiveReplica) await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
@@ -5338,17 +5412,22 @@ export class AgentSession implements SettingsScope {
 			logger.warn("Session dispose: Sharpshooter release failed", { error: String(error) });
 		}
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
-		releaseShellSessions(this.sessionManager.getSessionId());
+		// A passive replica's id is the host's: the shells it scopes are the host's too.
+		if (!this.passiveReplica) releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
-			shutdownTinyTitleClient(),
+			// Process-wide workers a passive replica never started: shutting one down would stop the worker an ordinary
+			// session of this process is using.
+			this.passiveReplica ? Promise.resolve() : shutdownTinyTitleClient(),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
-			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+			this.passiveReplica
+				? Promise.resolve()
+				: this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
 			sharpshooterFlushed,
 		]);
 		for (const result of results) {
@@ -5733,6 +5812,32 @@ export class AgentSession implements SettingsScope {
 		return this.#models.configuredThinkingLevel();
 	}
 
+	/**
+	 * Passive replica only: mirror the owning session's effective thinking level into the model controls, so every
+	 * reader of {@link thinkingLevel} (composer, editor border, selectors) shows it. Like a transcript restore it
+	 * applies the level to the agent as is: nothing is persisted, clamped to local credentials or emitted.
+	 */
+	setReplicaThinkingLevel(level: ThinkingLevel | undefined): void {
+		if (!this.passiveReplica) throw new Error("Only a passive replica mirrors another session's thinking level");
+		this.#models.restoreThinkingSnapshot(level, false, undefined);
+	}
+
+	/**
+	 * Passive replica only: put the replica on the owning session's active branch. Loading the replica's file selects
+	 * the last journal entry, which is not the owner's branch after it navigated back; this moves the leaf in memory
+	 * (nothing is written) and resynchronizes everything the load derived from the branch it first saw: the agent's
+	 * messages, the todo list and model mentions, and the checkpoint state.
+	 */
+	setReplicaLeaf(leafId: string | null): void {
+		if (!this.passiveReplica) throw new Error("Only a passive replica follows another session's active branch");
+		if (leafId === null) this.sessionManager.resetLeaf();
+		else this.sessionManager.branch(leafId);
+		this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+		this.#rehydrateCheckpointRewindState();
+		this.#todo.syncFromBranch();
+		this.#modelMentions.syncFromBranch();
+	}
+
 	/** True when `auto` thinking mode is active. */
 	get isAutoThinking(): boolean {
 		return this.#models.isAutoThinking;
@@ -6087,7 +6192,7 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.refreshRpcHostTools(rpcTools);
 	}
 
-	/** Whether auto-compaction is currently running */
+	/** Whether compaction or manual handoff is active, for prompt admission and UI queuing. */
 	get isCompacting(): boolean {
 		return this.#maintenance.isCompacting;
 	}
@@ -6758,6 +6863,7 @@ export class AgentSession implements SettingsScope {
 				role: "custom",
 				customType: notice.customType,
 				content: notice.content,
+				details: notice.details,
 				display: false,
 				attribution: "user",
 				timestamp,
@@ -6852,18 +6958,12 @@ export class AgentSession implements SettingsScope {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
-		// A manual `/compact` runs with the agent subscription disconnected until its
-		// cleanup finally re-drains the preserved queues. Starting a turn before then
-		// would neither persist nor forward its events and could race the in-flight
-		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
-		// here, and a waiting prompt supersedes the interrupted-turn resume the
-		// compaction would otherwise schedule — but only once it actually claims the
-		// session (a turn dispatched or queued, or one already running). A locally
-		// handled command, a pre-dispatch throw, or a prompt dropped by the
-		// abort/preflight race hands the resume back via `release(false)`. A prompt
-		// arriving after the cleanup while an earlier parked prompt is still settling
-		// takes part in the same decision. No-op otherwise.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
+		// A manual `/compact` disconnects the agent until its cleanup re-drains
+		// preserved queues; `/handoff` commits a new history after its side request.
+		// Neither may overlap an ordinary turn. A prompt parked by `/compact`
+		// supersedes its interrupted-turn resume only if it claims the session;
+		// locally handled commands and failed dispatches release that claim.
+		const release = await this.#maintenance.waitForManualMaintenanceCleanup();
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
 		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
 		try {
@@ -7131,10 +7231,9 @@ export class AgentSession implements SettingsScope {
 		},
 	): Promise<boolean> {
 		// Same barrier/claim protocol as prompt(): skill invocations, collab peer
-		// prompts and the CLI initial message arrive here and must neither start a
-		// turn against the disconnected session nor lose the session to the
-		// interrupted-turn resume once compaction ends.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
+		// prompts and the CLI initial message must not start during manual
+		// compaction or before a handoff commits its history.
+		const release = await this.#maintenance.waitForManualMaintenanceCleanup();
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
 		if (!release) return this.#dispatchCustomPrompt(message, options, outcome);
 		try {
@@ -7450,7 +7549,7 @@ export class AgentSession implements SettingsScope {
 				!options?.skipCompactionCheck &&
 				(lastAssistant.stopReason === "error" || lastAssistant.stopReason === "length")
 			) {
-				await this.#maintenance.checkCompaction(lastAssistant, false, false, false);
+				await this.#maintenance.checkCompaction(lastAssistant, false, false);
 			}
 
 			await this.#prewalk.armPlanYoloIfNeeded();
@@ -8586,6 +8685,24 @@ export class AgentSession implements SettingsScope {
 		return this.queuedMessageCount > 0 || this.agent.peekUndeliveredQueuedMessages().some(isDisplayableQueuedMessage);
 	}
 
+	/**
+	 * Which of the {@link getQueuedMessages} chips stand for a prompt with an attachment its chip text does not carry
+	 * (see {@link queuedGroupHasAttachments}). Parallel to the chip lists: entry `i` describes chip `i`, and both are
+	 * built from the same queues in one synchronous pass, so they cannot disagree.
+	 */
+	getQueuedMessageAttachments(): { steering: boolean[]; followUp: boolean[] } {
+		const flags = (queue: readonly AgentMessage[]): boolean[] =>
+			queue.flatMap((message, index) =>
+				isUserAuthoredQueuedMessage(message)
+					? [queuedGroupHasAttachments(queue.slice(this.#queuedUserGroupStart(queue, index), index + 1))]
+					: [],
+			);
+		return {
+			steering: [...flags(this.agent.peekLiveSteeredMessages()), ...flags(this.agent.peekSteeringQueue())],
+			followUp: flags(this.agent.peekFollowUpQueue()),
+		};
+	}
+
 	/** Chip texts for the queue display. Steering live steering took for the streaming response
 	 *  stays listed until the transcript records it, when the model actually switches to it. */
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
@@ -8630,15 +8747,33 @@ export class AgentSession implements SettingsScope {
 	 * skill invocation's `__queueChipText`, or untransformed text). A missing or
 	 * already delivered target changes nothing; repeated calls may remove further
 	 * duplicates.
+	 *
+	 * `match: "last"` removes the newest prompt whose chip text (see {@link getQueuedMessages}) is `text`,
+	 * for a caller that picked the newest chip of a queue it only sees as chip text.
 	 */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
+	removeQueuedMessage(text: string, queue: "steering" | "followUp", options?: { match?: "first" | "last" }): boolean {
 		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
-		const index = this.#findQueuedUserMessage(selected, text);
+		const index = this.#findQueuedUserMessage(selected, text, options?.match);
 		if (index < 0) return false;
 
 		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
 		this.#reconcileQueuedMessageDrain();
 		return true;
+	}
+
+	/**
+	 * Whether the prompt `removeQueuedMessage(text, queue, options)` would remove carries an attachment (an image, or
+	 * a companion holding one's source or description) that its chip text does not. False when nothing matches.
+	 */
+	queuedMessageHasAttachments(
+		text: string,
+		queue: "steering" | "followUp",
+		options?: { match?: "first" | "last" },
+	): boolean {
+		const selected = queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue();
+		const index = this.#findQueuedUserMessage(selected, text, options?.match);
+		if (index < 0) return false;
+		return queuedGroupHasAttachments(selected.slice(this.#queuedUserGroupStart(selected, index), index + 1));
 	}
 
 	/**
@@ -8671,9 +8806,14 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Queue-editing matcher shared by removal and promotion (see {@link removeQueuedMessage});
 	 * matches the raw text the caller originally submitted first, then the queued chip text
-	 * itself (exact); -1 when nothing matches.
+	 * itself (exact); -1 when nothing matches. `match: "last"` instead picks the LAST user prompt
+	 * whose chip text is `text`: the chip list is what a remote view shows, so the newest chip
+	 * resolves to the newest queued prompt even when an older one was typed as the same raw text.
 	 */
-	#findQueuedUserMessage(queue: readonly AgentMessage[], text: string): number {
+	#findQueuedUserMessage(queue: readonly AgentMessage[], text: string, match: "first" | "last" = "first"): number {
+		if (match === "last") {
+			return queue.findLastIndex(message => isUserAuthoredQueuedMessage(message) && queueChipText(message) === text);
+		}
 		let index = queue.findIndex(
 			message => isUserAuthoredQueuedMessage(message) && this.#queuedMessageRawText.get(message) === text,
 		);
@@ -8906,7 +9046,14 @@ export class AgentSession implements SettingsScope {
 		) {
 			return;
 		}
-		this.#deferredTitle = { sessionId, declined: false, replied: false };
+		// A request that only points at an attachment ("fix [Image #1]") names no
+		// task the text-only title model can see; skip straight to retitling from
+		// the assistant's own description of it.
+		if (isAttachmentOnlyTitleInput(firstMessage)) {
+			this.#deferredTitle = { sessionId, declined: true, replied: false, words: 0 };
+			return;
+		}
+		this.#deferredTitle = { sessionId, declined: false, replied: false, words: 0 };
 		this.#startAutoTitle(firstMessage, sessionId);
 	}
 
@@ -10625,21 +10772,20 @@ export class AgentSession implements SettingsScope {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
-	async switchSession(
-		sessionPath: string,
-		options?: {
-			onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean>;
-			/** Collab snapshot adoption keeps the guest's process cwd and marks the replica runtime-only. */
-			preserveLocalCwd?: boolean;
-		},
-	): Promise<boolean> {
+	async switchSession(sessionPath: string, options?: SwitchSessionOptions): Promise<boolean> {
+		const guard = this.passiveReplica ? undefined : this.#sessionSwitchGuard;
+		const proceed = () => this.#switchSession(sessionPath, options);
+		return guard ? guard(sessionPath, proceed) : proceed();
+	}
+
+	async #switchSession(sessionPath: string, options?: SwitchSessionOptions): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+		if (!this.passiveReplica && this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
 				reason: "resume",
@@ -10762,7 +10908,8 @@ export class AgentSession implements SettingsScope {
 			this.#rehydrateCheckpointRewindState();
 
 			// Emit session_switch event to hooks
-			if (this.#extensionRunner) {
+			// A passive replica's runner belongs to no session of this process, so its extensions are not told.
+			if (this.#extensionRunner && !this.passiveReplica) {
 				await this.#extensionRunner.emit({
 					type: "session_switch",
 					reason: "resume",
@@ -12547,7 +12694,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #retryInactiveAdvisorAfterModelDiscovery(): Promise<void> {
 		if (this.#isDisposed || !this.#advisors.hasInactiveNoModelAdvisor()) return;
-		await this.#modelRegistry.awaitBackgroundRefresh();
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
 		if (this.#isDisposed) return;
 		if (this.#advisors.retryAfterModelDiscovery()) this.#emit({ type: "model_changed" });
 	}

@@ -8,7 +8,7 @@ import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
-import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -29,12 +29,15 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
+	RpcHostFrame,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcLiveFrame,
 	RpcOpenSessionResult,
+	RpcPreconditions,
 	RpcPromptResultFrame,
 	RpcResponse,
 	RpcSessionSettledFrame,
@@ -62,6 +65,12 @@ export interface RpcAgentProcess {
 	peekStderr(): string;
 	kill(signal?: Parameters<ptree.ChildProcess["kill"]>[0], graceMs?: number): void;
 	exited: Promise<number>;
+	/**
+	 * Protocol version the transport already established before `ready` (a
+	 * session host `hello` with `protocolVersion: 2`). Frames may arrive v2
+	 * chunked from the first one, and `start()` skips `negotiate_protocol`.
+	 */
+	protocolVersion?: RpcProtocolVersion;
 }
 
 export interface RpcClientOptions {
@@ -97,8 +106,6 @@ export interface RpcClientOptions {
 	customTools?: RpcClientCustomTool[];
 }
 
-export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
-
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
@@ -107,6 +114,13 @@ export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcPromptResultListener = (result: RpcPromptResultFrame) => void;
 export type RpcSessionSettledListener = () => void;
+/** Receives every session-host frame; see {@link RpcClient.onHostFrame}. */
+export type RpcHostFrameListener = (frame: RpcHostFrame) => void;
+/** Receives the error that ended an established transport; see {@link RpcClient.onClose}. */
+export type RpcCloseListener = (error: Error) => void;
+/** Receives each `extension_ui_request` the host sends; see {@link RpcClient.onExtensionUiRequest}. */
+export type RpcExtensionUiRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcLiveListener = (frame: RpcLiveFrame) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -229,9 +243,67 @@ function isRpcSessionSettledFrame(value: unknown): value is RpcSessionSettledFra
 	return isRecord(value) && value.type === "session_settled";
 }
 
+const LIVE_FRAME_TYPES: Record<string, true> = {
+	live_phase: true,
+	live_levels: true,
+	live_transcript: true,
+	live_end: true,
+};
+
+function isRpcLiveFrame(value: unknown): value is RpcLiveFrame {
+	return isRecord(value) && typeof value.type === "string" && Object.hasOwn(LIVE_FRAME_TYPES, value.type);
+}
+
 function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailableCommandsUpdateFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
+}
+
+/** The wire fields a session-host consumer reads; a frame missing one is not delivered rather than half-applied. */
+function isSessionHostFrame(value: unknown): value is RpcHostFrame {
+	if (!isRecord(value)) return false;
+	switch (value.type) {
+		case "attached":
+			return (
+				typeof value.hostId === "string" &&
+				typeof value.clientId === "string" &&
+				typeof value.epoch === "number" &&
+				typeof value.seq === "number" &&
+				isRecord(value.snapshot)
+			);
+		case "resumed":
+			return typeof value.epoch === "number" && typeof value.replayed === "number";
+		case "entry":
+			return (
+				isRecord(value.entry) &&
+				typeof value.seq === "number" &&
+				(value.leafId === undefined || value.leafId === null || typeof value.leafId === "string")
+			);
+		case "session_replaced":
+			return typeof value.epoch === "number" && typeof value.seq === "number" && isRecord(value.snapshot);
+		case "clients_changed":
+			return Array.isArray(value.clients) && typeof value.seq === "number";
+		case "command_output":
+			return typeof value.text === "string";
+		case "config_update":
+			return (
+				(value.model === undefined || isRecord(value.model)) &&
+				(value.thinkingLevel === undefined || typeof value.thinkingLevel === "string")
+			);
+		case "session_info_update":
+			return (
+				typeof value.sessionId === "string" &&
+				(value.title === undefined || typeof value.title === "string") &&
+				(value.origin === undefined ||
+					(isRecord(value.origin) &&
+						typeof value.origin.cwd === "string" &&
+						(value.origin.artifactsDir === null || typeof value.origin.artifactsDir === "string") &&
+						typeof value.origin.localRoot === "string" &&
+						typeof value.origin.sessionId === "string"))
+			);
+		default:
+			return false;
+	}
 }
 
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
@@ -266,13 +338,24 @@ function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): A
 
 /** Failed RPC command; `code` mirrors the server's machine-readable error code when present. */
 export class RpcCommandError extends Error {
+	/** `stale`: the host's current session epoch. */
+	readonly epoch?: number;
+	/** `stale`: the host's current session leaf. */
+	readonly leafId?: string | null;
+	/** `session_hosted`: the host that owns the requested session. */
+	readonly hostId?: string;
+
 	constructor(
 		message: string,
 		readonly command: string,
 		readonly code?: string,
+		details: { epoch?: number; leafId?: string | null; hostId?: string } = {},
 	) {
 		super(message);
 		this.name = "RpcCommandError";
+		this.epoch = details.epoch;
+		this.leafId = details.leafId;
+		this.hostId = details.hostId;
 	}
 }
 
@@ -282,6 +365,17 @@ function isPageFallbackError(error: unknown): boolean {
 	if (error instanceof RpcCommandError && (error.code === "session_busy" || error.code === "stale_cursor"))
 		return true;
 	return error.message === RPC_MESSAGES_PAGE_BUSY_ERROR || error.message === RPC_MESSAGES_PAGE_STALE_ERROR;
+}
+
+/**
+ * The write guard to put on a command: exactly `ifEpoch`/`ifLeaf`, each only when set. A caller's object may be a
+ * structural subtype with more keys (`type`, `message`, `level`, ...), and those must never reach the command.
+ */
+function writeGuard(preconditions: RpcPreconditions | undefined): RpcPreconditions {
+	const guard: RpcPreconditions = {};
+	if (preconditions?.ifEpoch !== undefined) guard.ifEpoch = preconditions.ifEpoch;
+	if (preconditions?.ifLeaf !== undefined) guard.ifLeaf = preconditions.ifLeaf;
+	return guard;
 }
 
 // ============================================================================
@@ -299,6 +393,9 @@ export class RpcClient {
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#sessionSettledListeners = new Set<RpcSessionSettledListener>();
+	#hostFrameListeners = new Set<RpcHostFrameListener>();
+	#closeListeners = new Set<RpcCloseListener>();
+	#liveListeners = new Set<RpcLiveListener>();
 	/** `promptAndWait` completions keyed by request id; registered before the prompt is sent. */
 	#promptResultWaiters = new Map<string, (result: RpcPromptResultFrame) => void>();
 	/** Same-id failures that arrive after the success ack removed the pending request. */
@@ -309,7 +406,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners: Set<RpcExtensionUiRequestListener> = new Set();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
@@ -368,11 +465,17 @@ export class RpcClient {
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
 		let protocolV2Supported = false;
-		let protocolV2Enabled = false;
+		// A transport that established v2 can chunk the frames right behind `ready`.
+		let protocolV2Enabled = "protocolVersion" in child && child.protocolVersion === 2;
 		const frameDecoder = new RpcFrameDecoder();
+		// True once start() has completed (ready, protocol negotiation, custom tools). `readySettled` flips earlier
+		// than that, and a transport that fails during the rest of startup makes start() reject instead.
+		let established = false;
 
+		/** Tear down `child`'s client state after its output ended; `onClose` listeners hear of it only for an established session. */
 		const reapAfterOutputFailure = async (error: Error) => {
 			if (this.#process !== child) return;
+			const notifyClose = established;
 
 			this.#process = null;
 			this.#abortController.abort(error);
@@ -388,6 +491,14 @@ export class RpcClient {
 			}
 			await this.#waitForExit(child);
 			for (const request of pendingRequests) request.reject(error);
+			if (!notifyClose) return;
+			for (const listener of this.#closeListeners) {
+				try {
+					listener(error);
+				} catch (listenerError) {
+					logger.warn("RPC close listener failed", { error: String(listenerError) });
+				}
+			}
 		};
 
 		// Process lines in background, intercepting the ready signal.
@@ -471,7 +582,9 @@ export class RpcClient {
 
 		try {
 			await readyPromise;
-			if (protocolV2Supported) {
+			if (protocolV2Enabled) {
+				this.#protocolVersion = 2;
+			} else if (protocolV2Supported) {
 				protocolV2Enabled = true;
 				const response = await this.#send({ type: "negotiate_protocol", protocolVersion: 2 });
 				if (
@@ -486,6 +599,7 @@ export class RpcClient {
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+			established = true;
 		} catch (cause) {
 			// Startup failed after spawning the child. Reap it before returning
 			// so a retry cannot inherit a live worker or its session lock.
@@ -505,7 +619,11 @@ export class RpcClient {
 
 		const error = new Error("Client stopped");
 		const child = this.#process;
-		child.kill(undefined, this.options.terminationGraceMs);
+		try {
+			child.kill(undefined, this.options.terminationGraceMs);
+		} catch {
+			// The process may already have exited; client state below must still be cleared.
+		}
 		this.#abortController.abort(error);
 		this.#process = null;
 		for (const request of this.#pendingRequests.values()) request.reject(error);
@@ -613,6 +731,67 @@ export class RpcClient {
 		};
 	}
 
+	/** Subscribe to live voice frames: `live_phase`, `live_levels`, `live_transcript`, `live_end`. */
+	onLive(listener: RpcLiveListener): () => void {
+		this.#liveListeners.add(listener);
+		return () => {
+			this.#liveListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to session-host frames, in arrival order (the host's `seq` order for stamped frames; `seq` is
+	 * kept): `attached`/`resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`,
+	 * `config_update` and `session_info_update`. They reach no other listener. Register before {@link start}:
+	 * the host sends `attached` right behind `ready`, and a frame with no listener is dropped.
+	 */
+	onHostFrame(listener: RpcHostFrameListener): () => void {
+		this.#hostFrameListeners.add(listener);
+		return () => {
+			this.#hostFrameListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to the end of an established transport that this client did not close: stdout EOF or a
+	 * failed output reader (a socket the host closed or that broke). Each such close notifies once with
+	 * the error that pending requests also reject with, after the client is already stopped. Not called for
+	 * {@link stop}, {@link detach}, or {@link exit} (the caller ended it), nor for a {@link start} that fails,
+	 * including a transport lost during protocol negotiation or custom-tool registration (`start` rejects).
+	 * Listeners stay registered across restarts. A closed socket proves nothing about the host process: probe it separately.
+	 */
+	onClose(listener: RpcCloseListener): () => void {
+		this.#closeListeners.add(listener);
+		return () => {
+			this.#closeListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to the host's `extension_ui_request` frames (dialogs, `cancel`, notifications), in arrival order.
+	 * A host sends them only to a client whose hello declared the `ui` capability. Answer a dialog with
+	 * {@link sendExtensionUiResponse}; a `cancel` names a dialog to withdraw and expects no reply.
+	 */
+	onExtensionUiRequest(listener: RpcExtensionUiRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => {
+			this.#extensionUiListeners.delete(listener);
+		};
+	}
+
+	/** Answer an `extension_ui_request` dialog. Throws when the client is not started. */
+	sendExtensionUiResponse(response: RpcExtensionUIResponse): void {
+		this.#writeFrame(response);
+	}
+
+	/**
+	 * Opt in (or out) of the rich `ask` dialog. Every UI client of a host must opt in before the host's
+	 * `ask` tool sends one `ask` request instead of a `select` per question.
+	 */
+	async setAskDialog(enabled: boolean): Promise<void> {
+		this.#getData(await this.#send({ type: "set_ask_dialog", enabled }));
+	}
+
 	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
@@ -636,9 +815,24 @@ export class RpcClient {
 	 * `streamingBehavior` while the agent is busy, or routed to an extension command);
 	 * use onEvent() to receive streaming events and onPromptResult() to observe its
 	 * completion under that id.
+	 *
+	 * `preconditions` (here and on the other mutating controls below) are a session-host write guard: when
+	 * the host's epoch or leaf no longer matches, nothing runs and the call rejects with an
+	 * {@link RpcCommandError} (`code: "stale"`, carrying the host's current `epoch`/`leafId`). Stdio hosts ignore them.
 	 */
-	async prompt(message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp"): Promise<string> {
-		const response = await this.#send({ type: "prompt", message, images, streamingBehavior });
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+		preconditions?: RpcPreconditions,
+	): Promise<string> {
+		const response = await this.#send({
+			type: "prompt",
+			message,
+			images,
+			streamingBehavior,
+			...writeGuard(preconditions),
+		});
 		this.#getData(response);
 		return response.id ?? "";
 	}
@@ -646,22 +840,38 @@ export class RpcClient {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[], preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "steer", message, images, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[], preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "follow_up", message, images, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Remove the first matching user message and its companions from one pending queue.
+	 * `options.match: "last"` removes the newest message whose queue-chip text is `message` instead, and
+	 * `options.refuseAttachments` makes the host remove nothing (answering `refused: "attachments"`) when that message
+	 * carries an image or other attachment that its chip text does not. A host that predates the options ignores
+	 * them and removes the first match, so only send them to a host that reports `queueAttachments`.
 	 */
-	async removeQueuedMessage(message: string, queue: "steering" | "followUp"): Promise<{ removed: boolean }> {
-		const response = await this.#send({ type: "remove_queued_message", message, queue });
+	async removeQueuedMessage(
+		message: string,
+		queue: "steering" | "followUp",
+		preconditions?: RpcPreconditions,
+		options?: { match?: "first" | "last"; refuseAttachments?: boolean },
+	): Promise<{ removed: boolean; refused?: "attachments" }> {
+		const response = await this.#send({
+			type: "remove_queued_message",
+			message,
+			queue,
+			...(options?.match !== undefined ? { match: options.match } : {}),
+			...(options?.refuseAttachments !== undefined ? { refuseAttachments: options.refuseAttachments } : {}),
+			...writeGuard(preconditions),
+		});
 		return this.#getData(response);
 	}
 
@@ -679,6 +889,18 @@ export class RpcClient {
 	 */
 	async abort(): Promise<void> {
 		await this.#send({ type: "abort" });
+	}
+
+	/** Session host: leave the session running and close this client. */
+	async detach(): Promise<void> {
+		this.#getData(await this.#send({ type: "detach" }));
+		await this.stop();
+	}
+
+	/** Session host: detach, or stop the host when this is its last client. */
+	async exit(): Promise<void> {
+		this.#getData(await this.#send({ type: "exit" }));
+		await this.stop();
 	}
 
 	/**
@@ -757,6 +979,32 @@ export class RpcClient {
 	}
 
 	/**
+	 * Start a GPT live voice session bound to this session; resolves once it is connected
+	 * and recording. `instructions` replaces the bundled live prompt (Handlebars:
+	 * `{{username}}`, `{{firstName}}`). Frames arrive through {@link onLive}.
+	 */
+	async liveStart(options?: { voice?: string; instructions?: string }): Promise<{ voice: string }> {
+		const response = await this.#send({
+			type: "live_start",
+			voice: options?.voice,
+			instructions: options?.instructions,
+		});
+		return this.#getData(response);
+	}
+
+	/** Stop the live voice session, if any; resolves once it has stopped. */
+	async liveStop(): Promise<void> {
+		const response = await this.#send({ type: "live_stop" });
+		this.#getData(response);
+	}
+
+	/** Set microphone mute, or toggle it when `muted` is omitted. Fails without an active session. */
+	async liveMute(muted?: boolean): Promise<{ muted: boolean }> {
+		const response = await this.#send({ type: "live_mute", muted });
+		return this.#getData(response);
+	}
+
+	/**
 	 * Configure subagent frames emitted by the RPC server. Servers default to "off".
 	 * "progress" emits lifecycle/progress frames; "events" additionally emits raw subagent session events.
 	 */
@@ -814,29 +1062,33 @@ export class RpcClient {
 	/**
 	 * Set model by provider and ID.
 	 */
-	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
-		const response = await this.#send({ type: "set_model", provider, modelId });
+	async setModel(
+		provider: string,
+		modelId: string,
+		preconditions?: RpcPreconditions,
+	): Promise<{ provider: string; id: string }> {
+		const response = await this.#send({ type: "set_model", provider, modelId, ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
 	/**
 	 * Cycle to next model.
 	 */
-	async cycleModel(): Promise<{
+	async cycleModel(preconditions?: RpcPreconditions): Promise<{
 		model: { provider: string; id: string };
 		thinkingLevel: ThinkingLevel | undefined;
 		isScoped: boolean;
 	} | null> {
-		const response = await this.#send({ type: "cycle_model" });
+		const response = await this.#send({ type: "cycle_model", ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
 	/**
-	 * Get list of available models.
+	 * Get list of available models. The host sends complete `Model` records (the same shape `set_model` returns).
 	 */
-	async getAvailableModels(): Promise<ModelInfo[]> {
+	async getAvailableModels(): Promise<Model[]> {
 		const response = await this.#send({ type: "get_available_models" });
-		return this.#getData<{ models: ModelInfo[] }>(response).models;
+		return this.#getData<{ models: Model[] }>(response).models;
 	}
 
 	/**
@@ -877,15 +1129,15 @@ export class RpcClient {
 	/**
 	 * Set thinking level.
 	 */
-	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
-		await this.#send({ type: "set_thinking_level", level });
+	async setThinkingLevel(level: ThinkingLevel, preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "set_thinking_level", level, ...writeGuard(preconditions) }));
 	}
 
 	/**
 	 * Cycle thinking level.
 	 */
-	async cycleThinkingLevel(): Promise<{ level: ThinkingLevel } | null> {
-		const response = await this.#send({ type: "cycle_thinking_level" });
+	async cycleThinkingLevel(preconditions?: RpcPreconditions): Promise<{ level: ThinkingLevel } | null> {
+		const response = await this.#send({ type: "cycle_thinking_level", ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
@@ -1122,21 +1374,18 @@ export class RpcClient {
 							return;
 						}
 						if (req.method !== "input" || !onManualCodeInput) return;
-						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder }))
-							.then(value => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									value,
-								});
-							})
-							.catch(() => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									cancelled: true,
-								});
-							});
+						// The prompt can outlive the agent (e.g. a broken stdin pipe stops the client); drop the reply
+						// instead of throwing "Client not started" out of a detached promise chain.
+						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder })).then(
+							value => {
+								if (this.#process) this.#writeFrame({ type: "extension_ui_response", id: req.id, value });
+							},
+							() => {
+								if (this.#process) {
+									this.#writeFrame({ type: "extension_ui_response", id: req.id, cancelled: true });
+								}
+							},
+						);
 					}
 				: undefined;
 		if (listener) this.#extensionUiListeners.add(listener);
@@ -1344,6 +1593,13 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcLiveFrame(data)) {
+			for (const listener of this.#liveListeners) {
+				listener(data);
+			}
+			return;
+		}
+
 		if (isRpcSessionSettledFrame(data)) {
 			for (const listener of this.#sessionSettledListeners) {
 				listener();
@@ -1362,6 +1618,13 @@ export class RpcClient {
 		if (isRpcAvailableCommandsUpdateFrame(data)) {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
+			}
+			return;
+		}
+
+		if (isSessionHostFrame(data)) {
+			for (const listener of this.#hostFrameListeners) {
+				listener(data);
 			}
 			return;
 		}
@@ -1410,13 +1673,20 @@ export class RpcClient {
 			},
 		});
 
-		this.#writeFrame(fullCommand, err => {
+		const fail = (err: Error) => {
 			this.#pendingRequests.delete(id);
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeoutId);
 			reject(err);
-		});
+		};
+		// Settle this promise on a synchronous throw too (e.g. a non-serializable command): the caller only
+		// receives `promise`, so a later rejection routed through `fail` would otherwise be unhandled.
+		try {
+			this.#writeFrame(fullCommand, fail);
+		} catch (err) {
+			fail(err instanceof Error ? err : new Error(String(err)));
+		}
 		return promise;
 	}
 
@@ -1482,21 +1752,30 @@ export class RpcClient {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
-		const stdin = this.#process.stdin;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		if (!("flush" in stdin)) return;
-		const flushResult = (stdin as FileSink).flush();
-		if (isPromise(flushResult)) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
+		const child = this.#process;
+		const stdin = child.stdin;
+		// Serialize first: a non-serializable frame is the caller's error, not a pipe failure.
+		const line = `${JSON.stringify(frame)}\n`;
+		// A broken stdin pipe is terminal: fail this frame's request, then stop so start() can relaunch.
+		const failed = (err: unknown) => {
+			onError?.(err instanceof Error ? err : new Error(String(err)));
+			if (this.#process === child) void this.stop();
+		};
+		try {
+			const write = stdin.write(line);
+			if (isPromise(write)) write.catch(failed);
+			if (!("flush" in stdin)) return;
+			const flushResult = (stdin as FileSink).flush();
+			if (isPromise(flushResult)) flushResult.catch(failed);
+		} catch (err) {
+			failed(err);
 		}
 	}
 
 	#getData<T>(response: RpcResponse): T {
 		if (!response.success) {
 			const errorResponse = response as Extract<RpcResponse, { success: false }>;
-			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code);
+			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code, errorResponse);
 		}
 		// Type assertion: we trust response.data matches T based on the command sent.
 		// This is safe because each public method specifies the correct T for its command.

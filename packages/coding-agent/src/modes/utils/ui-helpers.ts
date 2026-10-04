@@ -46,6 +46,7 @@ import { materializeImageReferenceLinksSync } from "@oh-my-pi/pi-tui/prompt/imag
 import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
+import { extractVisibleAssistantText } from "../rpc/rpc-live";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
@@ -56,6 +57,8 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
+import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import {
 	createAssistantMessageComponent,
@@ -1055,6 +1058,32 @@ export class UiHelpers {
 		}
 	}
 
+	/**
+	 * Point the links of the transcript already on screen at where the view resolves them now. The cache is rebuilt
+	 * the way {@link renderInitialMessages} fills it, and the assistant components painted from the old one take the
+	 * new destinations in place: no repaint, so the scrollback and live blocks stay. A reply still streaming keeps
+	 * what it has until it closes, as it does for a first resolution.
+	 */
+	async refreshTranscriptLinks(): Promise<void> {
+		const { viewSession } = this.ctx;
+		const context = viewSession.buildTranscriptSessionContext({
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+			keepDanglingToolCalls: viewSession.isStreaming,
+		});
+		await refreshAssistantMessageLinkTargets(
+			this.ctx,
+			context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
+		);
+		// Read after the lookup: it is async, and the transcript may have been rebuilt meanwhile.
+		const targets = getAssistantMessageLinkTargets(this.ctx);
+		for (const child of this.ctx.chatContainer.children) {
+			if (!(child instanceof AssistantMessageComponent)) continue;
+			if (child === this.ctx.streamingComponent && !child.isTranscriptBlockFinalized()) continue;
+			child.setLinkTargets(targets);
+		}
+		this.ctx.ui.requestRender();
+	}
+
 	clearEditor(): void {
 		if (cfgComposerRecallClearedDrafts.get(this.ctx.settings)) this.ctx.editor.clearDraftForRecall();
 		else this.ctx.editor.clearDraft();
@@ -1090,7 +1119,9 @@ export class UiHelpers {
 
 	updatePendingMessagesDisplay(): void {
 		this.ctx.pendingMessagesContainer.disposeChildren();
-		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
+		// A hosted client's local replica never queues: the host's queue is the one on screen.
+		const queuedMessages = (this.ctx.hostedClient?.queued ??
+			this.ctx.viewSession.getQueuedMessages()) as QueuedMessages;
 
 		const steeringMessages = [...queuedMessages.steering];
 		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
@@ -1141,6 +1172,22 @@ export class UiHelpers {
 	}
 
 	async #deliverQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
+		const builtin = await executeBuiltinSlashCommand(message.text, {
+			ctx: this.ctx,
+			input: message.images ? { images: message.images } : undefined,
+		});
+		if (builtin === true) {
+			this.#parkLoopOnLocalConsume(message.text, false);
+			return;
+		}
+		if (typeof builtin === "string") {
+			const forwarded = await this.ctx.session.prompt(builtin, {
+				streamingBehavior: message.mode,
+				images: message.images,
+			});
+			this.#parkLoopOnLocalConsume(message.text, forwarded);
+			return;
+		}
 		if (
 			await invokeSkillCommandFromText(this.ctx, message.text, message.mode, {
 				propagateErrors: true,
@@ -1167,6 +1214,9 @@ export class UiHelpers {
 
 	isKnownSlashCommand(text: string): boolean {
 		if (!text.startsWith("/")) return false;
+		const parsed = parseSlashCommand(text);
+		const builtin = parsed && lookupBuiltinSlashCommand(parsed.name);
+		if (builtin && (builtin.allowArgs || !parsed.args)) return true;
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		if (!commandName) return false;
@@ -1222,8 +1272,7 @@ export class UiHelpers {
 			}
 			if (firstPromptIndex === -1) {
 				for (const message of queuedMessages) {
-					const forwarded = await this.ctx.session.prompt(message.text);
-					this.#parkLoopOnLocalConsume(message.text, forwarded);
+					await this.#deliverQueuedMessage(message);
 				}
 				return;
 			}
@@ -1309,12 +1358,6 @@ export class UiHelpers {
 	}
 
 	extractAssistantText(message: AssistantMessage): string {
-		let text = "";
-		for (const content of message.content) {
-			if (content.type === "text") {
-				text += content.text;
-			}
-		}
-		return text.trim();
+		return extractVisibleAssistantText(message);
 	}
 }

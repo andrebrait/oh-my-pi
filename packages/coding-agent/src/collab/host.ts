@@ -182,6 +182,18 @@ export class CollabHostStoppedError extends Error {
 	}
 }
 
+/**
+ * `start()` rejects with this when the relay never opened the room: the first
+ * connection closed or timed out. The room was never joinable or published, so
+ * an owner may retry it without guests or the registry having seen it.
+ */
+export class CollabRelayUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CollabRelayUnavailableError";
+	}
+}
+
 export class CollabHost {
 	#ctx: InteractiveModeContext;
 	#socket: CollabSocket | null = null;
@@ -206,6 +218,7 @@ export class CollabHost {
 	/** Rejects the in-flight first-open wait when `stop()` overtakes `start()`. */
 	#abortStart: ((reason: Error) => void) | null = null;
 	#unsubscribe?: () => void;
+	#entryUnsubscribe: (() => void) | undefined;
 	/**
 	 * Guest identity and permission, keyed by relay peer id. Drives the
 	 * participant list, notices, the status segment and the writable-peer fan-out.
@@ -399,7 +412,9 @@ export class CollabHost {
 			this.#relayConnected = false;
 			if (this.#stopping || this.#stopped) return;
 			if (!opened) {
-				firstOpen.reject(new Error(reason));
+				// A close the socket would retry (unreachable relay, dropped handshake)
+				// means the relay is unavailable; a fatal one means it refused the room.
+				firstOpen.reject(willReconnect ? new CollabRelayUnavailableError(reason) : new Error(reason));
 				return;
 			}
 			if (willReconnect) {
@@ -413,7 +428,7 @@ export class CollabHost {
 		socket.connect();
 
 		const timeout = setTimeout(
-			() => firstOpen.reject(new Error("timed out connecting to relay")),
+			() => firstOpen.reject(new CollabRelayUnavailableError("timed out connecting to relay")),
 			CONNECT_TIMEOUT_MS,
 		);
 		try {
@@ -451,7 +466,7 @@ export class CollabHost {
 			}
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
-		this.#ctx.sessionManager.onEntryAppended = entry => {
+		this.#entryUnsubscribe = this.#ctx.sessionManager.subscribeEntryAppended(entry => {
 			if (isWireSessionEntry(entry)) {
 				const shrunk = shrinkReplicatedEntry(entry);
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
@@ -466,7 +481,7 @@ export class CollabHost {
 			// Model/thinking/title changes land as entries while idle; refresh
 			// guest state promptly (debounce + JSON diff dedupe).
 			this.#scheduleStateBroadcast();
-		};
+		});
 		this.#updateStatusSegment();
 
 		// Publish to the local host registry only after the relay connection
@@ -553,7 +568,8 @@ export class CollabHost {
 				.close()
 				.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
 		}
-		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#entryUnsubscribe?.();
+		this.#entryUnsubscribe = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
