@@ -68,7 +68,7 @@ After the success response, oversized stdout objects use an uninterrupted sequen
 }
 ```
 
-Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
+Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations and the Rust and Go clients negotiate v2 automatically when the ready frame advertises it.
 
 For an oversized `agent_end` in either version, the encoder first removes the leading messages already delivered unchanged in `message_end` frames and adds `messageCount` with the original count. Hosts must retain streamed messages rather than treating `agent_end.messages` as a complete transcript.
 
@@ -93,6 +93,7 @@ Clients MUST continue reading stdout after closing stdin. Normal EOF and extensi
 11. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
 12. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 13. Transport overflow notifications (`rpc_frame_error`), when an event cannot fit within the transport limits
+14. Live voice frames (`live_phase`, `live_levels`, `live_transcript`, `live_end`); see [Live Voice Sub-Protocol](#live-voice-sub-protocol)
 
 Protocol v2 may wrap oversized logical frames from these categories in `rpc_chunk` frames.
 
@@ -130,6 +131,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "promote_queued_message", message: string }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "abort_and_restore_queue" }`
 - `{ id?, type: "new_session", parentSession?: string }`
 - `{ id?, type: "open_session", sessionDir: string }`
 
@@ -379,6 +381,21 @@ The command moves the existing queued message, including its attachments and con
 Since `prompt` acknowledges only once the message is admitted (see above), a `promote_queued_message` sent immediately after a queued `prompt`'s acknowledgement reliably observes it. Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate. The TypeScript client exposes `promoteQueuedMessage(message): Promise<{ promoted: boolean }>`, and its `prompt(message, images?, streamingBehavior?)` accepts `"steer"` or `"followUp"` to queue a prompt sent while the agent is busy.
 
 The official Python client exposes `promote_queued_message(message) -> PromoteQueuedMessageResult`; inspect its `.promoted` boolean rather than the result object's truthiness.
+
+### `abort_and_restore_queue` payload
+
+Take queued user input back and abort, atomically — the RPC equivalent of pressing Esc in the TUI:
+
+```json
+{"id":"req_4","type":"abort_and_restore_queue"}
+{"id":"req_4","type":"response","command":"abort_and_restore_queue","success":true,"data":{"steering":[{"text":"Use the existing parser"}],"followUp":[{"text":"Then run the tests","images":[{"type":"image","mimeType":"image/png","data":"..."}]}]}}
+```
+
+Before aborting, the server withdraws every user-authored steering and follow-up message, including steering the aborted response already claimed but never recorded in the transcript. Non-user internal steers (goal/plan/budget notices, IRC and extension asides) are dropped, except advisor cards, which the abort keeps as visible advice. Nothing withdrawn runs after the abort, so no new turn starts from the old queue. A plain `abort` instead requeues stranded steers and drains them into a fresh turn; withdrawing them first with `remove_queued_message` races the agent loop.
+
+`data.steering` and `data.followUp` list the withdrawn messages oldest first, as `{ text, images? }` with `text` being the queue-chip text, so a client can put them back in its editor. The command otherwise behaves like `abort`: it stops goal continuation, cancels input received before it that is not yet admitted (that input is dropped, not returned), and responds after the abort completes. Older runtimes reject this command. The TypeScript client exposes `abortAndRestoreQueue(): Promise<{ steering, followUp }>`.
+
+The response always succeeds, even when the withdrawn input is too large for one response under the negotiated protocol (1 MiB per frame on v1, 64 MiB reassembled on v2). Instead of failing with a transport-limit error, which would lose the already-withdrawn input, the server first omits every entry's `images` and sets `data.imagesDropped: true`, keeping all texts. If the texts alone still do not fit, it returns only the oldest entries that fit (steering first, then follow-ups) and sets `data.truncated: true`; entries after the last one listed are gone. Neither flag is present when the full result fits.
 
 ### `get_state` payload
 
@@ -1181,6 +1198,50 @@ Completion uses:
 
 Set top-level `isError: true` on `host_tool_result` to reject the pending host tool call and surface the returned text content as a tool error.
 
+## Live Voice Sub-Protocol
+
+RPC hosts can run a GPT live voice session (the realtime surface behind the
+terminal's `/live`) bound to the RPC session. The realtime model talks to the
+user through the machine's microphone and speakers and delegates work into the
+RPC session as ordinary turns, so delegated work runs with the session's model
+and any host tools registered through `set_host_tools`. At most one live
+session runs per RPC server.
+
+### Commands
+
+- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice: string }`
+- `{ id?, type: "live_stop" }`
+- `{ id?, type: "live_mute", muted?: boolean }` → `data: { muted: boolean }`
+
+`live_start` responds once the session is connected and recording, so it is
+dispatched concurrently like `bash`; `live_stop` sent meanwhile cancels the
+connection and the pending `live_start` then fails. `voice` defaults to the
+`live.voice` setting and the response reports the voice used. `instructions`
+replaces the bundled live prompt; it is rendered as a Handlebars template with
+`{{username}}` and `{{firstName}}` of the local OS account. Starting while a
+session is connecting, active, or closing fails.
+
+`live_stop` responds after the session has stopped and succeeds when none is
+active. `live_mute` sets the microphone mute, or toggles it when `muted` is
+omitted, and fails when no session is active.
+
+```json
+{ "id": "l1", "type": "live_start", "instructions": "You are Carly. Greet {{firstName}}." }
+{ "id": "l1", "type": "response", "command": "live_start", "success": true, "data": { "voice": "sol" } }
+```
+
+### Frames
+
+Live frames are not session events: `set_event_filter` never drops them.
+
+- `{ type: "live_phase", phase }` on every phase change; `phase` is one of `connecting`, `listening`, `working`, `speaking`, `muted`, `error`.
+- `{ type: "live_levels", input: number, output: number }` — microphone and speaker RMS in `[0, 1]`, at most one frame per 100 ms. Intermediate values are dropped; the latest values are always delivered.
+- `{ type: "live_transcript", role: "user" | "assistant", turn: number, text: string, final: boolean }` — the accumulated text of one turn; later frames for the same `role` and `turn` replace earlier ones until `final: true`.
+- `{ type: "live_end", error?: string }` — exactly once per session when it ends, carrying the failure when it ended on one (including a failed `live_start`).
+
+Closing stdin, or `pi.shutdown()`, stops an active live session before the
+process exits.
+
 ## Host URI Sub-Protocol
 
 RPC hosts can also own custom URL schemes (virtual files). After
@@ -1352,6 +1413,46 @@ stdin:
 
 ## Client libraries
 
+### Wire schema and generated clients
+
+`packages/coding-agent/src/modes/rpc/wire` describes every command (parameters,
+success `data`, nullability, timeouts), every unsolicited frame, and every shared
+type as omptype schemas. `bun run gen:rpc` emits:
+
+- `rpc-wire.schema.json`: a JSON Schema 2020-12 bundle plus an `x-rpc` section:
+  the command table, the stdout frame union (`serverFrame`: responses, host
+  requests, notifications), the notification and session-event unions, and the
+  host-to-server frame union (`inbound`). It is the language-neutral input for
+  client generators, with these decoder rules:
+  - objects marked `"x-open": true` are open records (messages, content, usage,
+    assistant streaming events): decoders check the `role`/`type` discriminator
+    and keep every key, so persisted messages missing newer fields still decode;
+  - a property `default` is the value decoders substitute when an older server
+    omits the field;
+  - string enums are closed: an unknown value fails the frame, which clients then
+    surface as an unknown notification instead of stopping;
+  - `x-unknown-fallback` on a property (a subagent's forwarded event) degrades a
+    value that fails to decode to an unknown notification without failing its
+    frame, and `x-scalar-or-array` marks an array older servers sent as a bare
+    scalar.
+- `rpc-wire.generated.ts`: the wire types in TypeScript.
+- `sdk/python/omp-rpc/src/omp_rpc/_wire.py`: Python types, decoders, command methods,
+  and frame listeners for the `omp-rpc` package.
+- `sdk/rust/omp-rpc/src/wire.rs`: Rust serde types, frame decoders, and a `Command`
+  trait implemented by one params struct per command (crate `omp-rpc`).
+- `sdk/go/omp-rpc/wire.go`: Go types, frame decoders, and one `Commands` method per
+  command (module `github.com/can1357/oh-my-pi/sdk/go/omp-rpc`).
+
+The Rust and Go packages ship hand-written process transports on top of the
+generated types: they negotiate v2 and reassemble chunks, page message history,
+wait for a prompt's `prompt_result` (`prompt_and_wait` / `PromptAndWait`), and serve
+host-owned tools and URI schemes. Their READMEs cover the APIs.
+
+`packages/coding-agent/test/rpc-wire` fails when a committed output is stale, and
+type-checks the generated TypeScript against `rpc-types.ts` and the internal types
+behind it: a new command, command parameter, event, event field, or enum value on
+the server breaks `bun check` until the schema covers it.
+
 ### TypeScript helper
 
 `packages/coding-agent/src/modes/rpc/rpc-client.ts` is a convenience wrapper, not the protocol definition.
@@ -1363,12 +1464,13 @@ Current helper characteristics:
 - Dispatches recognized core `AgentEvent` types through `onEvent()` and recognized session events through `onSessionEvent()`; the raw server stream can include additional event types
 - Exposes `onPromptResult()`, `onSessionSettled()`, command-availability and subagent listeners, plus extension UI requests
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
+- Drives live voice sessions with `liveStart()`, `liveStop()`, `liveMute()`, and delivers live frames through `onLive()`
 - `promptAndWait()` waits for that prompt's result (or synchronous local completion); `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
 
 ### Python package
 
-The bundled [`omp-rpc`](../python/omp-rpc/pyproject.toml) distribution provides the process-backed Python client. Its import package is `omp_rpc`; the package API, typed commands and events, host-tool/host-URI helpers, and orchestration examples are maintained in the [`omp-rpc` README](../python/omp-rpc/README.md).
+The bundled [`omp-rpc`](../sdk/python/omp-rpc/pyproject.toml) distribution provides the process-backed Python client. Its import package is `omp_rpc`; the package API, typed commands and events, host-tool/host-URI helpers, and orchestration examples are maintained in the [`omp-rpc` README](../sdk/python/omp-rpc/README.md).
 
 ```python
 from omp_rpc import RpcClient
@@ -1379,4 +1481,4 @@ with RpcClient(provider="anthropic", model="claude-sonnet-4-5") as client:
     print(turn.require_assistant_text())
 ```
 
-By default, `RpcClient` starts `omp --mode rpc`; pass `command=[...]` to own the exact child command. It handles request correlation, typed notifications, v2 negotiation and chunk reassembly, message pagination, extension UI, and host-owned tools and URI schemes. The Python package owns that client API and process lifecycle; this document and `rpc-types.ts` remain the canonical wire contract. Use raw protocol frames when a client library does not wrap the surface you need.
+By default, `RpcClient` starts `omp --mode rpc`; pass `command=[...]` to own the exact child command. It handles request correlation, typed notifications, v2 negotiation and chunk reassembly, message pagination, extension UI (including the opt-in `ask` dialog), and host-owned tools and URI schemes. Its command methods and `on_<frame type>` listeners are generated from the wire schema, so it wraps every command above; the `messageUpdates: "delta"` projection stays raw-protocol only. The Python package owns that client API and process lifecycle; this document and `rpc-types.ts` remain the canonical wire contract. Use raw protocol frames when a client library does not wrap the surface you need.
