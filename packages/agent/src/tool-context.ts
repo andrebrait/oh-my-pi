@@ -24,26 +24,43 @@ export function isNonBlankContext(value: unknown): value is string {
 }
 
 /**
- * Join passive context values in order, dropping blanks. Returns undefined
- * when nothing remains.
+ * Join passive context values in order, dropping blanks and repeats of an
+ * earlier value (compared without surrounding whitespace; the first original
+ * is kept). Returns undefined when nothing remains.
  */
 export function joinAdditionalContext(values: Iterable<string | undefined>): string | undefined {
+	const seen = new Set<string>();
 	const kept: string[] = [];
 	for (const value of values) {
-		if (isNonBlankContext(value)) kept.push(value);
+		if (!isNonBlankContext(value)) continue;
+		const key = value.trim();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		kept.push(value);
 	}
 	return kept.length > 0 ? kept.join("\n\n") : undefined;
+}
+
+/** Developer message emitted specifically for passive tool context. */
+export type PassiveToolContextMessage = Extract<AgentMessage, { role: "developer" }> & {
+	passiveToolContext: true;
+};
+
+/** Narrow an agent message to passive tool context without inspecting its text. */
+export function isPassiveToolContextMessage(message: AgentMessage): message is PassiveToolContextMessage {
+	return message.role === "developer" && message.passiveToolContext === true;
 }
 
 /**
  * Build the developer message that carries passive tool context to the next
  * provider request. Emitted after the tool results it belongs to.
  */
-export function createAdditionalContextMessage(text: string): AgentMessage {
+export function createAdditionalContextMessage(text: string): PassiveToolContextMessage {
 	return {
 		role: "developer",
 		content: [{ type: "text", text }],
 		attribution: "agent",
+		passiveToolContext: true,
 		timestamp: Date.now(),
 	};
 }

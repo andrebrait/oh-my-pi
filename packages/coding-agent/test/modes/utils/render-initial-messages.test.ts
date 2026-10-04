@@ -73,6 +73,7 @@ function makeCtx(): RenderInitialMessagesTestContext {
 	const ctx = {
 		chatContainer,
 		pendingMessagesContainer: { clear: vi.fn(), disposeChildren: vi.fn() },
+		updatePendingMessagesDisplay: vi.fn(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		transcriptMessageComponents: new WeakMap<AgentMessage, Component>(),
@@ -155,6 +156,9 @@ function makeRenderCtx(
 	const ctx = {
 		chatContainer,
 		pendingMessagesContainer: new Container(),
+		updatePendingMessagesDisplay: () => helpers.updatePendingMessagesDisplay(),
+		compactionQueuedMessages: [],
+		keybindings: { getKeys: () => [] },
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		transcriptMessageComponents: new WeakMap<AgentMessage, Component>(),
@@ -185,6 +189,7 @@ function makeRenderCtx(
 		focusedAgentId: undefined,
 		editor: { addToHistory: vi.fn() },
 		viewSession: {
+			getQueuedMessages: () => ({ steering: [], followUp: [] }),
 			buildTranscriptSessionContext: () => transcript,
 			getToolByName: () => undefined,
 			hasBuiltInTool: () => true,
@@ -243,13 +248,6 @@ describe("UiHelpers.renderInitialMessages — transcript source", () => {
 });
 
 describe("UiHelpers.renderInitialMessages — clearTerminalHistory", () => {
-	it("requests a scrollback-clearing repaint when clearTerminalHistory is set", async () => {
-		await Settings.init({ inMemory: true });
-		const { ctx } = makeCtx();
-		await new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
-		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
-	});
-
 	it("never clears scrollback when clearTerminalHistory is unset", async () => {
 		await Settings.init({ inMemory: true });
 		const { ctx } = makeCtx();
@@ -258,6 +256,23 @@ describe("UiHelpers.renderInitialMessages — clearTerminalHistory", () => {
 			([force, opts]) => force === true && (opts as { clearScrollback?: boolean } | undefined)?.clearScrollback,
 		);
 		expect(clearedCall).toBeUndefined();
+	});
+});
+
+describe("UiHelpers.renderInitialMessages — queued messages", () => {
+	it("keeps the queued-message bar after a mid-turn rebuild such as rewind (#13680)", async () => {
+		const { ctx } = makeRenderCtx(makeEmptyContext());
+		vi.spyOn(ctx.viewSession, "getQueuedMessages").mockReturnValue({
+			steering: ["steer now"],
+			followUp: ["queued one", "queued two"],
+		});
+
+		await new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
+
+		const pending = Bun.stripANSI(ctx.pendingMessagesContainer.render(100).join("\n"));
+		expect(pending).toContain("steer now");
+		expect(pending).toContain("queued one");
+		expect(pending).toContain("queued two");
 	});
 });
 
@@ -359,28 +374,6 @@ describe("UiHelpers.renderInitialMessages — responsiveness", () => {
 });
 
 describe("UiHelpers.renderInitialMessages — image replay", () => {
-	it("restores read tool image blocks onto the rebuilt assistant transcript", async () => {
-		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
-		setTerminalImageProtocol(ImageProtocol.Sixel);
-		const transcript = transcriptWith([
-			assistantToolCall("read-image", "read", { path: "sample.png" }),
-			{
-				role: "toolResult",
-				toolCallId: "read-image",
-				toolName: "read",
-				content: [{ type: "text", text: "Read image: sample.png" }, pngImage],
-				isError: false,
-				timestamp: 2,
-			},
-		]);
-		const { ctx, chatContainer } = makeRenderCtx(transcript);
-
-		await new UiHelpers(ctx).renderInitialMessages();
-
-		expect(hasImageComponent(chatContainer)).toBe(true);
-		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read sample.png");
-	});
-
 	it("restores eval display image blocks onto rebuilt tool output", async () => {
 		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
 		setTerminalImageProtocol(ImageProtocol.Sixel);
@@ -525,6 +518,90 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read reopened.png");
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
 	});
+});
+
+describe("UiHelpers.renderInitialMessages — passive tool context", () => {
+	it("attaches one dim context line to the last tool card in the batch", async () => {
+		const firstId = "context-first";
+		const secondId = "context-second";
+		const firstResult = "FIRST RESULT";
+		const secondResult = "SECOND RESULT";
+		const transcript = transcriptWith([
+			{
+				...assistantToolCall(firstId, "contract_probe", { value: "first" }),
+				content: [
+					{ type: "toolCall", id: firstId, name: "contract_probe", arguments: { value: "first" } },
+					{ type: "toolCall", id: secondId, name: "contract_probe", arguments: { value: "second" } },
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: firstId,
+				toolName: "contract_probe",
+				content: [{ type: "text", text: firstResult }],
+				isError: false,
+				timestamp: 2,
+			},
+			{
+				role: "toolResult",
+				toolCallId: secondId,
+				toolName: "contract_probe",
+				content: [{ type: "text", text: secondResult }],
+				isError: false,
+				timestamp: 3,
+			},
+			{
+				role: "developer",
+				content: [{ type: "text", text: "Use\tboth results\nbefore continuing." }],
+				attribution: "agent",
+				passiveToolContext: true,
+				timestamp: 4,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		await new UiHelpers(ctx).renderInitialMessages();
+
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain(firstResult);
+		expect(rendered).toContain(secondResult);
+		expect(rendered.match(/Context:/g)).toHaveLength(1);
+		expect(rendered).toContain("Context: Use both results before continuing.");
+		expect(rendered.indexOf("Context:")).toBeGreaterThan(rendered.indexOf(secondResult));
+	});
+});
+
+it("does not attach orphaned passive context across a non-tool boundary", async () => {
+	const toolCallId = "old-tool";
+	const transcript = transcriptWith([
+		assistantToolCall(toolCallId, "contract_probe", {}),
+		{
+			role: "toolResult",
+			toolCallId,
+			toolName: "contract_probe",
+			content: [{ type: "text", text: "old result" }],
+			isError: false,
+			timestamp: 2,
+		},
+		{
+			role: "user",
+			content: [{ type: "text", text: "new turn" }],
+			attribution: "user",
+			timestamp: 3,
+		},
+		{
+			role: "developer",
+			content: [{ type: "text", text: "orphaned context" }],
+			attribution: "agent",
+			passiveToolContext: true,
+			timestamp: 4,
+		},
+	]);
+	const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+	await new UiHelpers(ctx).renderInitialMessages();
+
+	expect(Bun.stripANSI(chatContainer.render(120).join("\n"))).not.toContain("Context:");
 });
 
 describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
