@@ -385,6 +385,11 @@ export interface RpcSnapshot {
 	streaming?: { messageId: string; message: AgentMessage };
 	/** Open extension dialogs a late joiner can answer. */
 	pendingUi: RpcExtensionUIRequest[];
+	/**
+	 * Extension statuses and widgets showing now (the latest `setStatus`/`setWidget` per key), for a client that attached
+	 * after they were set. Absent from hosts that predate it.
+	 */
+	uiState?: RpcExtensionUIRequest[];
 	clients: RpcClientInfo[];
 	/**
 	 * Which queued chips of `state.queuedMessages` carry an attachment, parallel to them (see {@link RpcQueueAttachments}).

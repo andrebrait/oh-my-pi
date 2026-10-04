@@ -1164,6 +1164,25 @@ describe("HostedClientLink", () => {
 		expect(a.setEditorText).toHaveBeenCalledWith("drafted by an extension");
 	});
 
+	it("shows a late attacher the statuses and widgets set before it attached, and removes them when it leaves", async () => {
+		let ui: ExtensionUIContext | undefined;
+		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });
+		// Extensions set these at boot, before any client is attached.
+		ui!.setStatus("build", "ok");
+		ui!.setStatus("gone", "soon");
+		ui!.setStatus("gone", undefined);
+		ui!.setWidget("todo", ["one"], { placement: "belowEditor" });
+
+		const a = await attach(host);
+		expect(a.setHookStatus).toHaveBeenCalledWith("build", "ok");
+		expect(a.setHookStatus.mock.calls.some(([key, text]) => key === "gone" && text !== undefined)).toBe(false);
+		expect(a.setHookWidget).toHaveBeenCalledWith("todo", ["one"], { placement: "belowEditor" });
+
+		await a.hostLink.detach();
+		expect(a.setHookStatus).toHaveBeenLastCalledWith("build", undefined);
+		expect(a.setHookWidget).toHaveBeenLastCalledWith("todo", undefined);
+	});
+
 	it("refuses to attach outside hosted client mode, to another host, or to a malformed host id", async () => {
 		const host = await fixture.startHost();
 		const entry = await fixture.entry(host);

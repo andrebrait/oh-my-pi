@@ -1209,6 +1209,8 @@ export interface SessionSnapshot {
 	pendingUi: ExtensionUiRequest[];
 	clients: ClientInfo[];
 	streaming?: StreamingMessage;
+	/** Extension statuses and widgets showing now: the latest `setStatus`/`setWidget` per key. */
+	uiState?: ExtensionUiRequest[];
 	/** Parallel to `state.queuedMessages`. */
 	queueAttachments?: QueueAttachments;
 	origin?: SessionOrigin;

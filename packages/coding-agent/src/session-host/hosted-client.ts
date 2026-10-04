@@ -74,6 +74,11 @@ export interface HostedClientOptions {
 	 * The link does not reconnect.
 	 */
 	onClosed: (reason: { hostAlive: boolean; message: string }) => void;
+	/**
+	 * The first snapshot paints below the frame already on screen (the startup header) instead of clearing the
+	 * terminal history: set for the terminal's first attach, not for `/attach` switches.
+	 */
+	keepStartupFrame?: boolean;
 }
 
 /** A host id is 16 lowercase hex digits; it becomes part of a file name. */
@@ -150,6 +155,7 @@ export class HostedClientLink {
 	readonly #entry: SessionHostEntry;
 	readonly #replicaDir: string;
 	readonly #onClosed: HostedClientOptions["onClosed"];
+	readonly #keepStartupFrame: boolean;
 	readonly #client: RpcClient;
 	/** Distinguishes this client's replica files from every other client of the same host. */
 	readonly #instanceId = crypto.randomBytes(8).toString("hex");
@@ -197,6 +203,9 @@ export class HostedClientLink {
 	 * later view granted.
 	 */
 	#uiGeneration = 0;
+	/** Extension status and widget keys the host set on this view: cleared when the view is replaced or left. */
+	readonly #hostStatusKeys = new Set<string>();
+	readonly #hostWidgetKeys = new Set<string>();
 
 	private constructor(options: HostedClientOptions) {
 		this.hostId = options.entry.hostId;
@@ -204,6 +213,7 @@ export class HostedClientLink {
 		this.#entry = options.entry;
 		this.#replicaDir = options.replicaDir;
 		this.#onClosed = options.onClosed;
+		this.#keepStartupFrame = options.keepStartupFrame === true;
 		this.#client = new RpcClient({
 			spawn: () => connectSessionHost({ entry: options.entry, client: { kind: "tui" }, ui: true }),
 		});
@@ -574,7 +584,10 @@ export class HostedClientLink {
 		if (state.isStreaming) await ctx.eventController.handleEvent({ type: "agent_start" });
 		else ctx.statusLine.markActivityEnd();
 		try {
-			await ctx.renderInitialMessages({ clearTerminalHistory: true });
+			// The terminal's first attach keeps the startup frame (as an in-process launch does); a switch replaces it.
+			await ctx.renderInitialMessages(
+				this.#keepStartupFrame && !this.#attached ? { preserveExistingChat: true } : { clearTerminalHistory: true },
+			);
 		} catch (error) {
 			for (const handle of orphanedLiveBlocks) handle.seal();
 			throw error;
@@ -591,6 +604,9 @@ export class HostedClientLink {
 		this.#epoch = epoch;
 		ctx.updatePendingMessagesDisplay();
 		this.#refreshChrome();
+		// Statuses and widgets the host's extensions show now, most set before this client attached.
+		this.#clearHostUi();
+		for (const request of snapshot.uiState ?? []) this.#applyUiRequest(request, uiGeneration);
 		// Only the dialogs still wanted: one the host withdrew while this snapshot was applying is no longer awaited.
 		for (const request of snapshot.pendingUi) this.#applyUiRequest(request, uiGeneration);
 	}
@@ -617,9 +633,18 @@ export class HostedClientLink {
 	 */
 	async #discardLocalState(): Promise<void> {
 		this.#retireOrigin();
+		this.#clearHostUi();
 		for (const file of this.#replicas) {
 			if (await this.#deleteReplica(file)) this.#replicas.delete(file);
 		}
+	}
+
+	/** Remove every status and widget the host set on this view. */
+	#clearHostUi(): void {
+		for (const key of this.#hostStatusKeys) this.#ctx.setHookStatus(key, undefined);
+		for (const key of this.#hostWidgetKeys) this.#ctx.setHookWidget(key, undefined);
+		this.#hostStatusKeys.clear();
+		this.#hostWidgetKeys.clear();
 	}
 
 	/**
@@ -768,12 +793,16 @@ export class HostedClientLink {
 				ctx.showHookNotify(sanitizeDisplayText(request.message), request.notifyType);
 				return;
 			case "setStatus":
+				if (request.statusText === undefined) this.#hostStatusKeys.delete(request.statusKey);
+				else this.#hostStatusKeys.add(request.statusKey);
 				ctx.setHookStatus(
 					request.statusKey,
 					request.statusText === undefined ? undefined : sanitizeDisplayLine(request.statusText),
 				);
 				return;
 			case "setWidget":
+				if (request.widgetLines === undefined) this.#hostWidgetKeys.delete(request.widgetKey);
+				else this.#hostWidgetKeys.add(request.widgetKey);
 				ctx.setHookWidget(request.widgetKey, request.widgetLines, { placement: request.widgetPlacement });
 				return;
 			case "setTitle":
