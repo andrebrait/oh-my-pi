@@ -272,7 +272,18 @@ export type ThinkingConfigAdaptive = {
 	block_binding?: ThinkingBlockBinding;
 };
 
-export type ThinkingConfigParam = ThinkingConfigEnabled | ThinkingConfigDisabled | ThinkingConfigAdaptive;
+/**
+ * Sonnet 5.5's replacement for `disabled`: no up-front thinking, progress
+ * updates between tool calls only. Takes no other field, and effort above
+ * `high` is rejected alongside it.
+ */
+export type ThinkingConfigBetweenTools = { type: "between_tools" };
+
+export type ThinkingConfigParam =
+	| ThinkingConfigEnabled
+	| ThinkingConfigDisabled
+	| ThinkingConfigAdaptive
+	| ThinkingConfigBetweenTools;
 
 export type OutputConfig = {
 	/** Adaptive-thinking effort level (effort beta). */
@@ -342,6 +353,8 @@ export type MessageCreateParams = {
 	 * header: `server-side-fallback-2026-06-01`.
 	 */
 	fallbacks?: FallbackParam[];
+	/** Fallback credit token redeemed from a prior refusal (`fallback-credit-2026-06-01` / `fallback-credit-2026-07-01`). */
+	fallback_credit_token?: string;
 };
 
 export type MessageCreateParamsStreaming = MessageCreateParams & { stream: true };
@@ -452,6 +465,8 @@ export type StopDetails = {
 	type: string;
 	category?: string | null;
 	explanation?: string | null;
+	fallback_credit_token?: string | null;
+	fallback_has_prefill_claim?: boolean | null;
 };
 
 export type MessageDelta = {

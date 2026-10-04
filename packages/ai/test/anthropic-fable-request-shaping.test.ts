@@ -140,8 +140,8 @@ function answered(text: string, turn: CapturedTurn): AssistantMessage {
 const READ_TOOL = { name: "read", description: "Read a file.", parameters: { type: "object", properties: {} } };
 
 describe("Anthropic preserved-thinking request shaping", () => {
-	it("opts Fable 5.1 into dropping prefix-mismatched thinking", async () => {
-		const payload = await capturePayload(makeAnthropicModel("claude-fable-5-1"), {
+	it.each(["claude-fable-5-1", "claude-opus-5-5"])("opts %s into dropping prefix-mismatched thinking", async id => {
+		const payload = await capturePayload(makeAnthropicModel(id), {
 			thinkingEnabled: true,
 			reasoning: Effort.High,
 		});
@@ -166,7 +166,7 @@ describe("Anthropic preserved-thinking request shaping", () => {
 			cacheRetention: "long",
 		});
 
-		expect(payload.system?.[1]?.cache_control?.ttl).toBe("1h");
+		expect(payload.system?.at(-1)?.cache_control?.ttl).toBe("1h");
 		const messageContent = payload.messages?.[0]?.content;
 		if (!Array.isArray(messageContent)) throw new Error("expected block message content");
 		expect(messageContent.at(-1)?.cache_control?.ttl).toBe("1h");
@@ -281,7 +281,7 @@ describe("Anthropic preserved-thinking request shaping", () => {
 	});
 });
 
-describe("Anthropic Fable/Mythos forced tool_choice", () => {
+describe("Anthropic forced tool_choice", () => {
 	it("downgrades a forced tool to auto for Fable (which rejects forced tool use)", async () => {
 		const payload = await capturePayload(adaptiveModel("claude-fable-5"), {
 			toolChoice: { type: "tool", name: "get_weather" },
@@ -296,11 +296,20 @@ describe("Anthropic Fable/Mythos forced tool_choice", () => {
 		expect(payload.tool_choice?.type).toBe("auto");
 	});
 
-	it("preserves a forced tool_choice for non-Fable models (Opus 4.8 supports it)", async () => {
-		const payload = await capturePayload(adaptiveModel("claude-opus-4-8"), {
+	it("downgrades a forced tool to auto for Opus 5.5 (rejects forced tool use)", async () => {
+		const payload = await capturePayload(adaptiveModel("claude-opus-5-5"), {
 			toolChoice: { type: "tool", name: "get_weather" },
 		});
-		expect(payload.tool_choice?.type).toBe("tool");
+		expect(payload.tool_choice?.type).toBe("auto");
+	});
+
+	it("preserves a forced tool_choice below the Opus 5.5 floor (Opus 5, Opus 4.8)", async () => {
+		for (const id of ["claude-opus-5", "claude-opus-4-8"]) {
+			const payload = await capturePayload(adaptiveModel(id), {
+				toolChoice: { type: "tool", name: "get_weather" },
+			});
+			expect(payload.tool_choice?.type).toBe("tool");
+		}
 	});
 });
 
@@ -311,6 +320,40 @@ describe("Anthropic adaptive-only thinking disable", () => {
 		});
 		expect(payload.thinking).toBeUndefined();
 		expect(payload.output_config?.effort).toBe("low");
+	});
+
+	it("turns thinking off with between_tools on Sonnet 5.5, without an effort pin or block_binding", async () => {
+		const payload = await capturePayload(makeAnthropicModel("claude-sonnet-5-5"), {
+			thinkingEnabled: false,
+		});
+		expect(payload.thinking).toEqual({ type: "between_tools" });
+		expect(payload.output_config?.effort).toBeUndefined();
+	});
+
+	it("keeps Sonnet 5 on adaptive-only omission, never sending between_tools", async () => {
+		const payload = await capturePayload(makeAnthropicModel("claude-sonnet-5"), {
+			thinkingEnabled: false,
+		});
+		expect(payload.thinking?.type).not.toBe("between_tools");
+	});
+
+	it("falls back to default adaptive when Sonnet 5.5 has xhigh effort in force (between_tools 400s above high)", async () => {
+		const model = makeAnthropicModel("claude-sonnet-5-5");
+		const first = await captureTurn(model, { thinkingEnabled: true, reasoning: Effort.XHigh });
+		const payload = await capturePayload(
+			model,
+			{ thinkingEnabled: false },
+			{
+				...CONTEXT,
+				messages: [
+					...CONTEXT.messages,
+					answered("sunny", first),
+					{ role: "user", content: "continue", timestamp: Date.now() },
+				],
+			},
+		);
+		expect(first.payload.output_config?.effort).toBe("xhigh");
+		expect(payload.thinking).toBeUndefined();
 	});
 
 	it("still sends thinking.type:'disabled' for budget-based (non-adaptive) models", async () => {

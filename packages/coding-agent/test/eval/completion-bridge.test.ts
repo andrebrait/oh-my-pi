@@ -24,6 +24,8 @@ import { disposeAllKernelSessions, type PythonResult } from "../../src/eval/py/e
 import type { ToolSession } from "../../src/tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
+import { cfgRetryFallbackChains, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
+
 async function runEvalCompletionAndWait(
 	args: unknown,
 	options: EvalCompletionBridgeOptions,
@@ -135,7 +137,8 @@ async function runPythonCompletionsInSubprocess(tempDir: TempDir): Promise<Pytho
 	const code = [
 		"import json",
 		'plain = completion("hi", model="smol").wait()',
-		'structured = completion("hi", schema={"type": "object"}).wait()',
+		// `await` resolves on a worker thread; it must keep the cell's run context.
+		'structured = await completion("hi", schema={"type": "object"})',
 		'print(json.dumps({"plain": plain, "structured": structured}))',
 	].join("\n");
 	await Bun.write(
@@ -241,7 +244,7 @@ describe("runEvalCompletion", () => {
 	it("uses the tier fallback chain after the primary model fails", async () => {
 		const fallback = makeModel("p", "fallback");
 		const session = makeSession({ available: [SMOL, fallback] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/fallback"] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/fallback"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
@@ -258,7 +261,7 @@ describe("runEvalCompletion", () => {
 
 	it("retries the same model at a lower effort when the fallback chain suffixes it", async () => {
 		const session = makeSession({ available: [SMOL, DEFAULT, REASONING_SLOW], roles: { slow: "p/slow" } });
-		session.settings.set("retry.fallbackChains", { slow: ["p/slow:low"] });
+		cfgRetryFallbackChains.set(session.settings, { slow: ["p/slow:low"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
@@ -276,7 +279,7 @@ describe("runEvalCompletion", () => {
 	it("applies the tier chain when the role assignment is too unqualified to parse", async () => {
 		const fallback = makeModel("p", "fallback");
 		const session = makeSession({ available: [SMOL, fallback], roles: { smol: "smol" } });
-		session.settings.set("retry.fallbackChains", { smol: ["p/fallback"] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/fallback"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
@@ -292,7 +295,7 @@ describe("runEvalCompletion", () => {
 		const b = makeModel("p", "b");
 		const c = makeModel("p", "c");
 		const session = makeSession({ available: [SMOL, b, c] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/b"], "p/b": ["p/c"] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/b"], "p/b": ["p/c"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "smol down" }))
@@ -308,7 +311,7 @@ describe("runEvalCompletion", () => {
 	it("terminates on cyclic fallback chains instead of looping", async () => {
 		const b = makeModel("p", "b");
 		const session = makeSession({ available: [SMOL, b] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/b"], "p/b": ["p/smol"] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/b"], "p/b": ["p/smol"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "always down" }));
@@ -323,7 +326,7 @@ describe("runEvalCompletion", () => {
 		const [b, c, d, e] = ["b", "c", "d", "e"].map(id => makeModel("p", id));
 		const session = makeSession({ available: [SMOL, b, c, d, e] });
 		session.settings.setModelRole("vision", "p/b");
-		session.settings.set("retry.fallbackChains", { smol: ["p/b", "p/c"], vision: ["p/d", "p/e"] });
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/b", "p/c"], vision: ["p/d", "p/e"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "smol down" }))
@@ -346,7 +349,7 @@ describe("runEvalCompletion", () => {
 		const b = makeModel("p", "b", { ...thinking });
 		const c = makeModel("p", "c", { ...thinking });
 		const session = makeSession({ available: [REASONING_SLOW, b, c], roles: { slow: "p/slow" } });
-		session.settings.set("retry.fallbackChains", { slow: ["p/b:low"], "p/b": ["p/c"] });
+		cfgRetryFallbackChains.set(session.settings, { slow: ["p/b:low"], "p/b": ["p/c"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "slow down" }))
@@ -368,7 +371,7 @@ describe("runEvalCompletion", () => {
 		const b = makeModel("p", "b", { ...thinking });
 		const c = makeModel("p", "c", { ...thinking });
 		const session = makeSession({ available: [REASONING_SLOW, b, c], roles: { slow: "p/slow" } });
-		session.settings.set("retry.fallbackChains", { slow: ["p/b:off"], "p/b": ["p/c"] });
+		cfgRetryFallbackChains.set(session.settings, { slow: ["p/b:off"], "p/b": ["p/c"] });
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "slow down" }))
@@ -386,8 +389,8 @@ describe("runEvalCompletion", () => {
 		const b = makeModel("p", "b");
 		const c = makeModel("p", "c");
 		const session = makeSession({ available: [SMOL, b, c] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/b", "p/c"] });
-		session.settings.set("retry.maxRetries", 1);
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/b", "p/c"] });
+		cfgRetryMaxRetries.set(session.settings, 1);
 		const registry = session.modelRegistry;
 		if (!registry) throw new Error("test requires a model registry");
 		registry.getApiKey = async model => (model.id === "b" ? undefined : "test-key");
@@ -414,7 +417,7 @@ describe("runEvalCompletion", () => {
 			available: [REASONING_SLOW, models.b, models.d, models.c, models.e],
 			roles: { slow: "p/slow" },
 		});
-		session.settings.set("retry.fallbackChains", {
+		cfgRetryFallbackChains.set(session.settings, {
 			slow: ["p/b:low", "p/d:high"],
 			"p/b": ["p/c"],
 			"p/d": ["p/c"],
@@ -438,8 +441,8 @@ describe("runEvalCompletion", () => {
 	it("stops the candidate walk once retry.maxRetries is spent", async () => {
 		const models = ["b1", "b2", "b3"].map(id => makeModel("p", id));
 		const session = makeSession({ available: [SMOL, ...models] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/b1", "p/b2", "p/b3"] });
-		session.settings.set("retry.maxRetries", 1);
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/b1", "p/b2", "p/b3"] });
+		cfgRetryMaxRetries.set(session.settings, 1);
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "quota exhausted" }));
@@ -453,8 +456,8 @@ describe("runEvalCompletion", () => {
 	it("attempts only the primary when retry.maxRetries is zero", async () => {
 		const fallback = makeModel("p", "fallback");
 		const session = makeSession({ available: [SMOL, fallback] });
-		session.settings.set("retry.fallbackChains", { smol: ["p/fallback"] });
-		session.settings.set("retry.maxRetries", 0);
+		cfgRetryFallbackChains.set(session.settings, { smol: ["p/fallback"] });
+		cfgRetryMaxRetries.set(session.settings, 0);
 		const spy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "quota exhausted" }));

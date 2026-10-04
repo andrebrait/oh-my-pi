@@ -7,6 +7,17 @@ var ws = null;
 var reconnectDelay = RECONNECT_MIN_MS;
 var pingTimer = null;
 var relayInitiatedDetachTabs = new Set;
+var instanceId = null;
+async function ensureInstanceId() {
+  if (instanceId)
+    return instanceId;
+  const key = "relayInstanceId";
+  const stored = await chrome.storage.local.get({ [key]: "" });
+  const existing = stored[key];
+  instanceId = typeof existing === "string" && existing.length > 0 ? existing : crypto.randomUUID();
+  await chrome.storage.local.set({ [key]: instanceId });
+  return instanceId;
+}
 async function loadSettings() {
   const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: "" });
   const port = Number(stored.port);
@@ -23,6 +34,7 @@ function snapshot(tab) {
     url: tab.url ?? tab.pendingUrl ?? "",
     title: tab.title ?? "",
     active: tab.active,
+    discarded: tab.discarded === true,
     windowId: tab.windowId,
     pinned: tab.pinned,
     groupId: tab.groupId
@@ -112,8 +124,10 @@ async function buildHello() {
   const versionMatch = /Chrome\/[\d.]+/.exec(navigator.userAgent);
   return {
     t: "hello",
+    instanceId: await ensureInstanceId(),
     userAgent: navigator.userAgent,
     browserVersion: versionMatch?.[0] ?? "Chrome/unknown",
+    discardedTabsProtocol: 1,
     tabs: snapshots,
     attachedTabIds
   };
@@ -229,6 +243,13 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
   const snap = snapshot(tab);
   if (snap)
     post({ t: "tabUpdated", tab: snap });
+});
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId).then((tab) => {
+    const snap = snapshot(tab);
+    if (snap)
+      post({ t: "tabUpdated", tab: snap });
+  }).catch(() => {});
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   post({ t: "tabRemoved", tabId });

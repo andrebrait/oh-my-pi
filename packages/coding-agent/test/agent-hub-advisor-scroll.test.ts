@@ -28,6 +28,8 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
+import { cfgTerminalShowImages } from "@oh-my-pi/pi-coding-agent/modes/settings";
+
 const TS = new Date().toISOString();
 
 function buildJsonl(): string {
@@ -182,6 +184,47 @@ function withViewer(fn: (viewer: AgentTranscriptViewer) => void): void {
 		removeSyncWithRetries(dir);
 	}
 }
+
+function renderSyntheticAssistant(usage?: { input: number; output: number }): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-usage-"));
+	const file = path.join(dir, "__advisor.jsonl");
+	fs.writeFileSync(
+		file,
+		[
+			JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: dir }),
+			JSON.stringify({
+				type: "message",
+				id: "a0",
+				parentId: null,
+				timestamp: TS,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "SYNTHETICREPLY" }],
+					model: "qq",
+					provider: "qq",
+					usage,
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			}),
+		].join("\n") + "\n",
+	);
+	try {
+		const viewer = makeViewer(file);
+		try {
+			viewer.render(80);
+			viewer.handleInput("g");
+			return viewer
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+		} finally {
+			viewer.dispose();
+		}
+	} finally {
+		removeSyncWithRetries(dir);
+	}
+}
 async function settleRemoteRefresh(): Promise<void> {
 	await Promise.resolve();
 	await Promise.resolve();
@@ -227,6 +270,14 @@ describe("AgentTranscriptViewer", () => {
 			// The body must not sit one column right of the title.
 			expect(gutter(bodyLine!)).toBe(gutter(titleLine!));
 		});
+	});
+
+	it("shows a synthetic assistant reply without usage", () => {
+		expect(renderSyntheticAssistant()).toContain("SYNTHETICREPLY");
+	});
+
+	it("shows a synthetic assistant reply with tokens but no cost", () => {
+		expect(renderSyntheticAssistant({ input: 1, output: 2 })).toContain("SYNTHETICREPLY");
 	});
 
 	it("collapses synthetic advisor inputs on cold open and expands their body on ctrl+o", () => {
@@ -315,7 +366,7 @@ describe("AgentTranscriptViewer", () => {
 	});
 
 	it("renders tool-result images through the shared Kitty placeholder budget", () => {
-		Settings.instance.override("terminal.showImages", true);
+		cfgTerminalShowImages.override(Settings.instance, true);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-image-"));
 		const file = path.join(dir, "__advisor.jsonl");
 		fs.writeFileSync(file, buildImageJsonl());
@@ -339,7 +390,7 @@ describe("AgentTranscriptViewer", () => {
 			expect(imageBudget.takeTransmits().join("")).toContain("a=t");
 		} finally {
 			viewer.dispose();
-			Settings.instance.clearOverride("terminal.showImages");
+			cfgTerminalShowImages.clearOverride(Settings.instance);
 			setKittyGraphics(previousGraphics);
 			setTerminalImageProtocol(previousProtocol);
 			removeSyncWithRetries(dir);

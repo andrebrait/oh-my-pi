@@ -11,10 +11,17 @@ import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { MCPManager } from "../mcp/manager";
 import { resolveMCPTimeoutMs } from "../mcp/timeout";
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
+import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
-import { formatPersistenceDurabilityFailure, formatPersistenceFailure } from "./persistence-failure";
+import {
+	formatPersistenceDurabilityFailure,
+	formatPersistenceFailure,
+	formatPersistenceNotice,
+} from "./persistence-failure";
 import { initializeExtensions } from "./runtime-init";
+
+import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 
 /**
  * Options for print mode.
@@ -172,8 +179,8 @@ async function runPrintModeCore(
 	// supported headless plan flow is `--plan-yolo` (auto-approve → implement),
 	// which is wired independently through the prewalk coordinator.
 	const planStartupIgnored =
-		session.settings.get("plan.defaultOnStartup") &&
-		session.settings.get("plan.enabled") &&
+		cfgPlanDefaultOnStartup.get(session.settings) &&
+		cfgPlanEnabled.get(session.settings) &&
 		session.sessionManager.buildSessionContext().messages.length === 0 &&
 		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
 		!planYolo;
@@ -182,14 +189,6 @@ async function runPrintModeCore(
 			"Note: plan.defaultOnStartup is ignored in print mode (no interactive surface to review the plan). Use --plan-yolo for a headless plan flow.\n",
 		);
 	}
-
-	// Always subscribe to enable session persistence via _handleAgentEvent
-	session.subscribe(event => {
-		// In JSON mode, output all events
-		if (mode === "json") {
-			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
-		}
-	});
 
 	// process.stderr.write is fire-and-forget as well: a diagnostic buffered
 	// behind a backpressured pipe would still be undelivered when runPrintMode
@@ -224,6 +223,21 @@ async function runPrintModeCore(
 	session.sessionManager.onPersistenceError(error => {
 		persistenceFailure = error;
 		writeStderrLine(formatPersistenceFailure(error.message));
+	});
+	session.sessionManager.onPersistenceNotice(notice => {
+		writeStderrLine(`Warning: ${formatPersistenceNotice(notice)}`);
+	});
+
+	// Always subscribe to enable session persistence via _handleAgentEvent
+	session.subscribe(event => {
+		// In JSON mode, output all events
+		if (mode === "json") {
+			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
+		} else if (event.type === "notice" && event.source === CREDENTIAL_DISABLED_NOTICE_SOURCE) {
+			// Text mode renders no session notices, but an automatic sign-out must not stay
+			// hidden behind a sibling account that quietly answers the prompt.
+			writeStderrLine(`Warning: ${event.message}`);
+		}
 	});
 
 	const timeoutMs = resolveMCPTimeoutMs();
@@ -325,8 +339,12 @@ async function runPrintModeCore(
 
 	// A turn-fatal exit cannot hold automation for the full normal drain budget.
 	if (!strictMCPFailure) {
+		// Print mode's drain budget covers a fallback-chain switch; the reviewer's
+		// verdict is the point of a headless advisor run, so wait through recovery,
+		// and wait on `strict` reviewers past the budget like every primary boundary.
 		await session.waitForAdvisorCatchup(
 			terminalFailure ? PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS : PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS,
+			{ waitThroughRecovery: true, strictWithoutDeadline: true },
 		);
 	}
 	// Error spans must reach the exporter; the postmortem `exit` handler can't await.

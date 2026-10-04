@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [18.5.1] - 2026-10-03
+
+### Fixed
+
+- Fixed tab adoption stalling when Chrome discards background tabs.
+
+## [18.3.1] - 2026-09-25
+
+### Fixed
+
+- Fixed browser relay support when multiple browser instances, such as Chrome and Edge, are connected simultaneously, ensuring tabs and relay requests remain associated with the correct browser while preserving single-browser compatibility for extensions without an instance identifier.
+
 ## [18.0.7] - 2026-08-26
 
 ### Changed

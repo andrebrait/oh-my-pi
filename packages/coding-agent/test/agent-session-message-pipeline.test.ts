@@ -745,6 +745,36 @@ describe("AgentSession message pipeline", () => {
 		expect(attachments).toEqual([{ label: "Image #1", uri: "attachment://1", image: userImage, sourcePath }]);
 	});
 
+	it("resolves attachment://N to images pasted into a newer ask answer", () => {
+		const userImage: ImageContent = { type: "image", data: "user-image", mimeType: "image/png" };
+		const answerImage: ImageContent = { type: "image", data: "answer-image", mimeType: "image/png" };
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		session.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "inspect this" }, userImage],
+			timestamp: Date.now(),
+		});
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "ask-1",
+			toolName: "ask",
+			content: [{ type: "text", text: "User selected: A\nUser added note: see [Image #1]" }, answerImage],
+			timestamp: Date.now(),
+			isError: false,
+		});
+
+		expect(session.getImageAttachments().map(entry => [entry.uri, entry.image])).toEqual([
+			["attachment://1", answerImage],
+		]);
+	});
+
 	it("normalizes historical WebP on the main provider request path", async () => {
 		using tempDir = TempDir.createSync("@pi-stb-main-path-");
 		const api = "test-stb-main-path";
@@ -1037,9 +1067,8 @@ describe("AgentSession message pipeline", () => {
 				},
 			}),
 			sessionManager,
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({ "compaction.enabled": false, "providers.openaiWebsockets": "on" }),
 			modelRegistry,
-			preferWebsockets: true,
 		});
 		sessions.push(session);
 		const cacheSessionId = session.sessionId;
@@ -2039,6 +2068,156 @@ describe("AgentSession message pipeline", () => {
 			authStorage.close();
 		}
 	});
+	it("rewrites finalized assistant text before it reaches history and session persistence", async () => {
+		using tempDir = TempDir.createSync("@pi-assistant-message-rewrite-");
+		const api = "test-assistant-message-rewrite";
+		registerCustomApi(api, () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() =>
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("original") }),
+			);
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-assistant-message-rewrite-model",
+			name: "Local Assistant Message Rewrite Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const rewrite: ExtensionFactory = pi => {
+			pi.on("assistant_message", event => ({
+				content: event.message.content.map(block =>
+					block.type === "text" ? { ...block, text: `${block.text} rewritten` } : block,
+				),
+			}));
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager,
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [rewrite],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+		});
+		try {
+			await session.sendUserMessage("rewrite this");
+			const assistant = session.agent.state.messages.findLast(message => message.role === "assistant");
+			expect(assistant?.role).toBe("assistant");
+			if (assistant?.role !== "assistant") throw new Error("Expected assistant history message");
+			expect(assistant.content).toEqual([{ type: "text", text: "original rewritten" }]);
+			const persisted = sessionManager.getEntries().findLast(entry => entry.type === "message");
+			if (persisted?.type !== "message" || persisted.message.role !== "assistant") {
+				throw new Error("Expected persisted assistant message");
+			}
+			expect(persisted.message.content).toEqual([{ type: "text", text: "original rewritten" }]);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+	it("retains completed assistant text in history when aborted during a pending rewrite", async () => {
+		using tempDir = TempDir.createSync("@pi-assistant-message-abort-");
+		const api = "test-assistant-message-abort";
+		registerCustomApi(api, () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() =>
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("original") }),
+			);
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-assistant-message-abort-model",
+			name: "Local Assistant Message Abort Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let skipped = false;
+		const rewrite: ExtensionFactory = pi => {
+			pi.on("assistant_message", event => ({
+				content: event.message.content.map(block =>
+					block.type === "text" ? { ...block, text: "accepted" } : block,
+				),
+			}));
+			pi.on("assistant_message", async () => {
+				entered.resolve();
+				await release.promise;
+				return { content: [{ type: "text", text: "late" }] };
+			});
+			pi.on("assistant_message", () => {
+				skipped = true;
+			});
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager,
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [rewrite],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+		});
+		try {
+			const turn = session.sendUserMessage("rewrite this");
+			await entered.promise;
+			await session.abort();
+			await turn;
+			const assistant = session.agent.state.messages.findLast(message => message.role === "assistant");
+			expect(assistant?.role).toBe("assistant");
+			if (assistant?.role !== "assistant") throw new Error("Expected assistant history message");
+			expect(assistant.content).toEqual([{ type: "text", text: "accepted" }]);
+			const persisted = sessionManager.getEntries().findLast(entry => entry.type === "message");
+			if (persisted?.type !== "message" || persisted.message.role !== "assistant") {
+				throw new Error("Expected persisted assistant message");
+			}
+			expect(persisted.message.content).toEqual([{ type: "text", text: "accepted" }]);
+			expect(skipped).toBe(false);
+		} finally {
+			release.resolve();
+			await session.dispose();
+			authStorage.close();
+		}
+	});
 	it("applies a tool_call input revision at arg-prep time across events, execution, and history", async () => {
 		// End-to-end wiring for the loop-level tool_call emission (session
 		// #beforeToolCall): the handler fires once per dispatch (the wrapper's
@@ -2144,17 +2323,115 @@ describe("AgentSession message pipeline", () => {
 			authStorage.close();
 		}
 	});
-	it("exposes ctx.invokeTool to a re-registered built-in so it can delegate to the native tool", async () => {
-		// End-to-end for the extension path: a tool that re-registers `bash` receives ctx.invokeTool
-		// (bound to its own name), delegates to the native bash, and the native output flows back.
-		using tempDir = TempDir.createSync("@pi-invoke-tool-");
-		const api = "test-invoke-tool";
-		let requests = 0;
-		registerCustomApi(api, () => {
-			requests++;
+	it("delivers tool_call and tool_result additionalContext on the next provider request", async () => {
+		using tempDir = TempDir.createSync("@pi-tool-call-context-");
+		const api = "test-tool-call-context";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
 			const stream = new AssistantMessageEventStream();
 			queueMicrotask(() => {
-				if (requests === 1) {
+				if (contexts.length === 1) {
+					const message = createAssistantMessage("");
+					const toolCall = {
+						type: "toolCall",
+						id: "call-context-1",
+						name: "bash",
+						arguments: { command: "echo output" },
+					} as const;
+					message.content = [toolCall];
+					message.stopReason = "toolUse";
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCall as never, partial: message });
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage("done");
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-tool-context-model",
+			name: "Local Tool Context Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const addToolContext: ExtensionFactory = pi => {
+			pi.on("tool_call", async event => {
+				if (event.toolName !== "bash") return undefined;
+				return { additionalContext: "Use the indexed result instead of searching again." };
+			});
+			pi.on("tool_result", async event => {
+				if (event.toolName !== "bash") return undefined;
+				return { additionalContext: "The command result is authoritative for this turn." };
+			});
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+				"tools.xdev": false,
+			}),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [addToolContext],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: ["bash"],
+		});
+		try {
+			await session.sendUserMessage("run it");
+
+			expect(contexts).toHaveLength(2);
+			const expected = [
+				{
+					type: "text" as const,
+					text:
+						"The command result is authoritative for this turn.\n\n" +
+						"Use the indexed result instead of searching again.",
+				},
+			];
+			const developer = contexts[1]?.messages.find(message => message.role === "developer");
+			expect(developer?.content).toEqual(expected);
+			const persisted = session.agent.state.messages.find(message => message.role === "developer");
+			expect(persisted?.content).toEqual(expected);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+
+	it("exposes tool-scoped context and invokeTool to a re-registered built-in", async () => {
+		// End-to-end for the registered-tool path: the execute context forwards passive context to
+		// the agent loop and binds invokeTool to the native built-in of the same name.
+		using tempDir = TempDir.createSync("@pi-invoke-tool-");
+		const api = "test-invoke-tool";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (contexts.length === 1) {
 					const message = createAssistantMessage("");
 					const toolCall = {
 						type: "toolCall",
@@ -2187,9 +2464,10 @@ describe("AgentSession message pipeline", () => {
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
 		let invokeToolPresent = false;
+		let addAdditionalContextPresent = false;
 		let delegatedText = "";
-		// Re-register `bash`: the wrapper ignores the model's args, delegates to the native bash with
-		// its own command via ctx.invokeTool, and returns the native result.
+		// Re-register `bash`: the wrapper records passive context, ignores the model's args, and
+		// delegates to the native bash with its own command via ctx.invokeTool.
 		const wrapBash: ExtensionFactory = pi => {
 			pi.registerTool({
 				name: "bash",
@@ -2204,6 +2482,8 @@ describe("AgentSession message pipeline", () => {
 					ctx: ExtensionContext,
 				) {
 					invokeToolPresent = typeof ctx.invokeTool === "function";
+					addAdditionalContextPresent = typeof ctx.addAdditionalContext === "function";
+					ctx.addAdditionalContext?.("Use the delegated tool output before running another command.");
 					const native = await ctx.invokeTool?.({ command: "echo from-wrapper" });
 					const textBlock = native?.content.find(b => b.type === "text");
 					delegatedText = textBlock?.type === "text" ? textBlock.text : "";
@@ -2241,6 +2521,12 @@ describe("AgentSession message pipeline", () => {
 			await session.sendUserMessage("run it");
 
 			expect(invokeToolPresent).toBe(true);
+			expect(addAdditionalContextPresent).toBe(true);
+			expect(contexts).toHaveLength(2);
+			const developer = contexts[1]?.messages.find(message => message.role === "developer");
+			expect(developer?.content).toEqual([
+				{ type: "text", text: "Use the delegated tool output before running another command." },
+			]);
 			// The native bash actually ran the wrapper's command, not the model's.
 			expect(delegatedText).toContain("from-wrapper");
 			expect(delegatedText).not.toContain("from-model");
