@@ -10,7 +10,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionFactory, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
 import { MAX_RPC_FRAME_BYTES, RpcFrameDecoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
@@ -67,23 +67,25 @@ async function startHost(options: Partial<SessionHostOptions> = {}): Promise<Tes
 }
 
 /** A session whose extension vetoes every switch to another session (`session_before_switch`), calling `duringVeto` first. */
-async function createVetoingSession(sessionDir: string, duringVeto: () => void): Promise<AgentSession> {
+function createVetoingSession(sessionDir: string, duringVeto: () => void): Promise<AgentSession> {
+	return createExtensionSession(sessionDir, "veto-switch", pi => {
+		pi.on("session_before_switch", () => {
+			duringVeto();
+			return { cancel: true };
+		});
+	});
+}
+
+async function createExtensionSession(
+	sessionDir: string,
+	name: string,
+	factory: ExtensionFactory,
+): Promise<AgentSession> {
 	const authStorage = await AuthStorage.create(path.join(sessionDir, "auth.db"));
 	const modelRegistry = new ModelRegistry(authStorage, path.join(sessionDir, "models.yml"));
 	const sessionManager = SessionManager.create(sessionDir, path.join(sessionDir, "sessions"));
 	const runtime = new ExtensionRuntime();
-	const extension = await loadExtensionFromFactory(
-		pi => {
-			pi.on("session_before_switch", () => {
-				duringVeto();
-				return { cancel: true };
-			});
-		},
-		sessionDir,
-		new EventBus(),
-		runtime,
-		"veto-switch",
-	);
+	const extension = await loadExtensionFromFactory(factory, sessionDir, new EventBus(), runtime, name);
 	return new AgentSession({
 		agent: new Agent({
 			initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
@@ -236,6 +238,56 @@ describe("session host", () => {
 		const reply = JSON.parse((await once(sock, "data"))[0].toString().split("\n")[0]);
 		expect(reply).toMatchObject({ success: false, code: "unauthorized" });
 		await host.stop();
+	});
+
+	it("publishes before extension startup, so an attached client can answer a dialog session_start awaits", async () => {
+		const sessionDir = path.join(dir, "startup-dialog");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const session = await createExtensionSession(sessionDir, "startup-dialog", pi => {
+			pi.on("session_start", async (_event, ctx) => {
+				ctx.ui.notify(`answered ${await ctx.ui.confirm("Trust?", "startup")}`);
+			});
+		});
+		// Resolves only once the entry is published: before the fix, never, as startup waited on the dialog.
+		const host = await serveSession(session);
+		const a = await rawClient({ capabilities: { ui: true } });
+		const { snapshot } = await a.next(isHandshake);
+		// In the snapshot, or live if this client attached before session_start reached the dialog.
+		const request =
+			(isRecord(snapshot) && Array.isArray(snapshot.pendingUi) ? snapshot.pendingUi[0] : undefined) ??
+			(await a.next(frame => frame.method === "confirm"));
+		expect(request).toMatchObject({ method: "confirm", title: "Trust?" });
+		// Held until startup finishes. `set_ask_dialog` is served during startup, through the same command queue: had
+		// get_state not been held, its response would come first.
+		a.write({ id: "state", type: "get_state" });
+		a.write({ id: "ask", type: "set_ask_dialog", enabled: true });
+		await a.next(frame => frame.id === "ask");
+		expect(a.frames.some(frame => frame.id === "state")).toBe(false);
+		a.write({ type: "extension_ui_response", id: request.id, confirmed: true });
+		const state = await a.next(frame => frame.id === "state");
+		expect(state).toMatchObject({ type: "response", success: true });
+		const notice = a.frames.findIndex(frame => frame.method === "notify");
+		expect(a.frames[notice]).toMatchObject({ message: "answered true" });
+		expect(notice).toBeLessThan(a.frames.indexOf(state));
+		await stopWith(host, [a]);
+	});
+
+	it("withdraws its registry entry and endpoint when extension startup fails after publishing", async () => {
+		const sessionDir = path.join(dir, "startup-failure");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const session = await createTestSession(sessionDir, { handler: { content: ["ok"] } });
+		await expect(
+			runSessionHost(session, {
+				hostId: newHostId(),
+				registryDir,
+				setToolUIContext: () => {
+					throw new Error("startup failed");
+				},
+				onExit: () => Promise.withResolvers<never>().promise,
+			}),
+		).rejects.toThrow("startup failed");
+		expect(await fs.readdir(registryDir)).toEqual([]);
+		await session.dispose();
 	});
 
 	it("rejects a valid hello whose line overruns the hello size limit", async () => {
