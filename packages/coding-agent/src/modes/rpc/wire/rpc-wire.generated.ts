@@ -545,6 +545,22 @@ export interface PromoteQueuedMessageResult {
 	promoted: boolean;
 }
 
+/** Queued user content withdrawn from the queue, as the editor would restore it. */
+export interface RestoredQueuedMessage {
+	text: string;
+	images?: ImageContent[];
+}
+
+/** User-authored queued input withdrawn before the abort, oldest first. */
+export interface AbortAndRestoreQueueResult {
+	steering: RestoredQueuedMessage[];
+	followUp: RestoredQueuedMessage[];
+	/** Only ever `true`: the full result exceeded the transport limit and every `images` was omitted. */
+	imagesDropped?: boolean;
+	/** Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed. */
+	truncated?: boolean;
+}
+
 export interface BranchMessage {
 	entryId: string;
 	text: string;
@@ -1638,6 +1654,7 @@ export interface RpcWireCommands {
 	promote_queued_message: { params: PromoteQueuedMessageParams; result: PromoteQueuedMessageResult };
 	abort: { params: undefined; result: undefined };
 	abort_and_prompt: { params: AbortAndPromptParams; result: undefined };
+	abort_and_restore_queue: { params: undefined; result: AbortAndRestoreQueueResult };
 	new_session: { params: NewSessionParams; result: CancellationResult };
 	open_session: { params: OpenSessionParams; result: OpenSessionResult };
 	get_state: { params: undefined; result: SessionState };

@@ -98,6 +98,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "abort_and_restore_queue",
+				"doc": "Withdraw queued user input, then abort the current run; returns the withdrawn input.",
+				"params": null,
+				"result": "AbortAndRestoreQueueResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "new_session",
 				"doc": "Start a new session.",
 				"params": "NewSessionParams",
@@ -2699,6 +2710,54 @@
 			"required": [
 				"promoted"
 			]
+		},
+		"RestoredQueuedMessage": {
+			"type": "object",
+			"properties": {
+				"text": {
+					"type": "string"
+				},
+				"images": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
+				}
+			},
+			"required": [
+				"text"
+			],
+			"description": "Queued user content withdrawn from the queue, as the editor would restore it."
+		},
+		"AbortAndRestoreQueueResult": {
+			"type": "object",
+			"properties": {
+				"steering": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RestoredQueuedMessage"
+					}
+				},
+				"followUp": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RestoredQueuedMessage"
+					}
+				},
+				"imagesDropped": {
+					"type": "boolean",
+					"description": "Only ever `true`: the full result exceeded the transport limit and every `images` was omitted."
+				},
+				"truncated": {
+					"type": "boolean",
+					"description": "Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed."
+				}
+			},
+			"required": [
+				"steering",
+				"followUp"
+			],
+			"description": "User-authored queued input withdrawn before the abort, oldest first."
 		},
 		"BranchMessage": {
 			"type": "object",

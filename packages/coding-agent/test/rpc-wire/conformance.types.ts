@@ -19,6 +19,7 @@ import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import type { RpcGoalResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
 import type { RpcMessagesPage } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-messages";
 import type {
+	RpcAbortAndRestoreQueueResult,
 	RpcAgentSessionEventFrame,
 	RpcAskDialogQuestion,
 	RpcAvailableCommandsUpdateFrame,
@@ -53,6 +54,7 @@ import type {
 	RpcSubagentSnapshot,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type * as Wire from "@oh-my-pi/pi-coding-agent/modes/rpc/wire/rpc-wire.generated";
+import type { RestoredQueuedMessage } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionStats } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
@@ -253,6 +255,8 @@ export type State = Assert<
 		sessionCredits: Outbound<NonNullable<SessionStats["credits"]>, Wire.SessionCredits>;
 		messagesPage: Outbound<RpcMessagesPage, Wire.MessagesPage>;
 		openSession: Outbound<RpcOpenSessionResult, Wire.OpenSessionResult>;
+		abortAndRestoreQueue: Outbound<RpcAbortAndRestoreQueueResult, Wire.AbortAndRestoreQueueResult>;
+		restoredQueuedMessage: Outbound<RestoredQueuedMessage, Wire.RestoredQueuedMessage>;
 		slashCommand: Outbound<RpcAvailableSlashCommand, Wire.AvailableSlashCommand>;
 		slashSubcommand: Outbound<NonNullable<RpcAvailableSlashCommand["subcommands"]>[number], Wire.SlashSubcommand>;
 		subagentSnapshot: Outbound<RpcSubagentSnapshot, Wire.SubagentSnapshot>;

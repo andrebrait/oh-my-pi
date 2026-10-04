@@ -704,6 +704,24 @@ class PromoteQueuedMessageResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class RestoredQueuedMessage:
+    """Queued user content withdrawn from the queue, as the editor would restore it."""
+    text: str
+    images: tuple[ImageContent, ...] | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class AbortAndRestoreQueueResult:
+    """User-authored queued input withdrawn before the abort, oldest first."""
+    steering: tuple[RestoredQueuedMessage, ...]
+    follow_up: tuple[RestoredQueuedMessage, ...]
+    images_dropped: bool | None = None
+    """Only ever `true`: the full result exceeded the transport limit and every `images` was omitted."""
+    truncated: bool | None = None
+    """Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class BranchMessage:
     entry_id: str
     text: str
@@ -1886,6 +1904,24 @@ def parse_promote_queued_message_result(value: object, path: str = "PromoteQueue
     )
 
 
+def parse_restored_queued_message(value: object, path: str = "RestoredQueuedMessage") -> RestoredQueuedMessage:
+    payload = expect_object(value, path)
+    return RestoredQueuedMessage(
+        text=required(payload, "text", decode_str, path),
+        images=optional(payload, "images", array(parse_image_content), path),
+    )
+
+
+def parse_abort_and_restore_queue_result(value: object, path: str = "AbortAndRestoreQueueResult") -> AbortAndRestoreQueueResult:
+    payload = expect_object(value, path)
+    return AbortAndRestoreQueueResult(
+        steering=required(payload, "steering", array(parse_restored_queued_message), path),
+        follow_up=required(payload, "followUp", array(parse_restored_queued_message), path),
+        images_dropped=optional(payload, "imagesDropped", decode_bool, path),
+        truncated=optional(payload, "truncated", decode_bool, path),
+    )
+
+
 def parse_branch_message(value: object, path: str = "BranchMessage") -> BranchMessage:
     payload = expect_object(value, path)
     return BranchMessage(
@@ -2906,6 +2942,11 @@ class WireClient:
         params: dict[str, object] = {}
         self._command("abort", params)
 
+    def abort_and_restore_queue(self) -> AbortAndRestoreQueueResult:
+        """Withdraw queued user input, then abort the current run; returns the withdrawn input."""
+        params: dict[str, object] = {}
+        return parse_abort_and_restore_queue_result(self._command("abort_and_restore_queue", params), "abort_and_restore_queue")
+
     def new_session(self, parent_session: str | None = None) -> CancellationResult:
         """Start a new session."""
         params: dict[str, object] = {}
@@ -3404,6 +3445,7 @@ class WireClient:
 
 
 __all__ = [
+    "AbortAndRestoreQueueResult",
     "AdvisorCostChangedEvent",
     "AdvisorYieldedEvent",
     "AgentEndEvent",
@@ -3521,6 +3563,7 @@ __all__ = [
     "ReadyEvent",
     "RedactedThinkingContent",
     "RemoveQueuedMessageResult",
+    "RestoredQueuedMessage",
     "RetryFallbackAppliedEvent",
     "RetryFallbackSucceededEvent",
     "RpcAgentEvent",
@@ -3583,6 +3626,7 @@ __all__ = [
     "UserContent",
     "UserMessage",
     "WidgetPlacement",
+    "parse_abort_and_restore_queue_result",
     "parse_advisor_cost_changed_event",
     "parse_advisor_yielded_event",
     "parse_agent_end_event",
@@ -3680,6 +3724,7 @@ __all__ = [
     "parse_ready_event",
     "parse_redacted_thinking_content",
     "parse_remove_queued_message_result",
+    "parse_restored_queued_message",
     "parse_retry_fallback_applied_event",
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",

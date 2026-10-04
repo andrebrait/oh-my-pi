@@ -2659,6 +2659,56 @@ func (v *PromoteQueuedMessageResult) decodeFrom(raw map[string]json.RawMessage) 
 	return nil
 }
 
+// Queued user content withdrawn from the queue, as the editor would restore it.
+type RestoredQueuedMessage struct {
+	Text   string         `json:"text"`
+	Images []ImageContent `json:"images,omitempty"`
+}
+
+func (v *RestoredQueuedMessage) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RestoredQueuedMessage", v.decodeFrom)
+}
+
+func (v *RestoredQueuedMessage) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RestoredQueuedMessage
+	d := fieldDecoder{raw: raw, owner: "RestoredQueuedMessage"}
+	d.required("text", &out.Text)
+	d.optional("images", &out.Images)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+// User-authored queued input withdrawn before the abort, oldest first.
+type AbortAndRestoreQueueResult struct {
+	Steering []RestoredQueuedMessage `json:"steering"`
+	FollowUp []RestoredQueuedMessage `json:"followUp"`
+	// Only ever `true`: the full result exceeded the transport limit and every `images` was omitted.
+	ImagesDropped *bool `json:"imagesDropped,omitempty"`
+	// Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed.
+	Truncated *bool `json:"truncated,omitempty"`
+}
+
+func (v *AbortAndRestoreQueueResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AbortAndRestoreQueueResult", v.decodeFrom)
+}
+
+func (v *AbortAndRestoreQueueResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AbortAndRestoreQueueResult
+	d := fieldDecoder{raw: raw, owner: "AbortAndRestoreQueueResult"}
+	d.required("steering", &out.Steering)
+	d.required("followUp", &out.FollowUp)
+	d.optional("imagesDropped", &out.ImagesDropped)
+	d.optional("truncated", &out.Truncated)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type BranchMessage struct {
 	EntryID string `json:"entryId"`
 	Text    string `json:"text"`
@@ -6912,6 +6962,13 @@ type AbortAndPromptCommand struct {
 // Its work completes later with a prompt_result frame carrying the request id (see WithRequestID).
 func (c Commands) AbortAndPrompt(ctx context.Context, p AbortAndPromptCommand) error {
 	return c.call(ctx, "abort_and_prompt", p, 0, nil)
+}
+
+// AbortAndRestoreQueue sends "abort_and_restore_queue": Withdraw queued user input, then abort the current run; returns the withdrawn input.
+func (c Commands) AbortAndRestoreQueue(ctx context.Context) (AbortAndRestoreQueueResult, error) {
+	var out AbortAndRestoreQueueResult
+	err := c.call(ctx, "abort_and_restore_queue", nil, 0, &out)
+	return out, err
 }
 
 // NewSessionCommand holds the parameters of "new_session".

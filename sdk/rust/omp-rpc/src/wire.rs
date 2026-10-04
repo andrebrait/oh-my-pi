@@ -3101,6 +3101,28 @@ pub struct PromoteQueuedMessageResult {
 	pub promoted: bool,
 }
 
+/// Queued user content withdrawn from the queue, as the editor would restore it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoredQueuedMessage {
+	pub text: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub images: Option<Vec<ImageContent>>,
+}
+
+/// User-authored queued input withdrawn before the abort, oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbortAndRestoreQueueResult {
+	pub steering: Vec<RestoredQueuedMessage>,
+	#[serde(rename = "followUp")]
+	pub follow_up: Vec<RestoredQueuedMessage>,
+	/// Only ever `true`: the full result exceeded the transport limit and every `images` was omitted.
+	#[serde(rename = "imagesDropped", default, skip_serializing_if = "Option::is_none")]
+	pub images_dropped: Option<bool>,
+	/// Only ever `true`: even the text-only result exceeded the limit, so only an oldest-first prefix is listed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub truncated: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchMessage {
 	#[serde(rename = "entryId")]
@@ -5689,6 +5711,20 @@ impl Command for AbortAndPromptCommand {
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		let _ = data;
 		Ok(())
+	}
+}
+
+/// Withdraw queued user input, then abort the current run; returns the withdrawn input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AbortAndRestoreQueueCommand {}
+
+impl Command for AbortAndRestoreQueueCommand {
+	const NAME: &'static str = "abort_and_restore_queue";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = AbortAndRestoreQueueResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<AbortAndRestoreQueueResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

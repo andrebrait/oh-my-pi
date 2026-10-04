@@ -67,6 +67,11 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		completion: "prompt_result",
 	},
 	{
+		name: "abort_and_restore_queue",
+		doc: "Withdraw queued user input, then abort the current run; returns the withdrawn input.",
+		result: "AbortAndRestoreQueueResult",
+	},
+	{
 		name: "new_session",
 		doc: "Start a new session.",
 		params: { "parentSession?": "string" },
