@@ -787,7 +787,7 @@ async function runInteractiveMode(
 			if (!link) break; // closed while connecting or sending: a shutdown is under way
 			try {
 				using _keepalive = new EventLoopKeepalive();
-				await link.prompt(text, images, "steer");
+				await link.promptToCompletion(text, images);
 			} catch (error: unknown) {
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}

@@ -543,6 +543,8 @@ export class RpcServer {
 	readonly #goalTurnScheduled: RpcScheduledTurnProbe;
 	/** One acceptance order for every connection's user input, aborts and session changes. */
 	readonly #inputGate = new RpcUserInputGate();
+	/** Frames held back until {@link init} finishes, in arrival order; `undefined` once it has (see {@link #serve}). */
+	#deferred: Array<() => void> | undefined = [];
 	/** Host-wide message ids: every connection sees the same id for a message. */
 	readonly #messageIds = new RpcMessageIdStamper();
 	readonly #pendingExtensionRequests = new RpcPendingExtensionRequests();
@@ -611,7 +613,7 @@ export class RpcServer {
 	 */
 	onLeave?: (conn: RpcConnection, command: "detach" | "exit") => void;
 
-	/** Use {@link RpcServer.start}. */
+	/** Use {@link RpcServer.start}, or call {@link init} once a host has wired its hooks and is reachable. */
 	constructor(session: AgentSession, options: RpcServerOptions) {
 		this.session = session;
 		this.#options = options;
@@ -677,17 +679,32 @@ export class RpcServer {
 	 * Initialize extensions and start serving. `first` is registered before
 	 * extension startup, so it receives the startup frames (extension UI,
 	 * `available_commands_update`) right after its `ready`, as stdio always has;
-	 * its input is read only once startup finishes.
+	 * it can answer a startup dialog, and its commands run once startup finishes.
 	 */
 	static async start(session: AgentSession, options: RpcServerOptions, first?: RpcConnection): Promise<RpcServer> {
 		const server = new RpcServer(session, options);
 		if (first) {
 			first.scheduledTurn = server.#goalTurnScheduled;
 			server.#connections.add(first);
+			server.#serve(first);
+			// Read from now on: a transport error during startup must not be an unhandled rejection. The caller
+			// still observes it through its own `inputClosed`.
+			void first.inputClosed.catch(() => {});
 		}
-		await server.#init();
-		if (first) server.#serve(first);
+		await server.init();
 		return server;
+	}
+
+	/**
+	 * Initialize extensions and the session feed. Connections made before it finishes are read at once, but only
+	 * dialog answers and `set_ask_dialog` are handled: an extension's `session_start` may be waiting on a dialog.
+	 * Every other frame waits for startup. Rejects, leaving those frames unhandled, if startup fails.
+	 */
+	async init(): Promise<void> {
+		await this.#init();
+		const deferred = this.#deferred;
+		this.#deferred = undefined;
+		for (const run of deferred ?? []) run();
 	}
 
 	get connections(): ReadonlySet<RpcConnection> {
@@ -1000,18 +1017,25 @@ export class RpcServer {
 			acceptInput: command => this.#inputGate.accept(command),
 		});
 		this.#dispatchers.set(conn, dispatcher);
+		const receive = (parsed: unknown): void => {
+			// A dropped connection's later input is ignored.
+			if (this.#dispatchers.get(conn) !== dispatcher) return;
+			dispatcher.dispatch(parsed);
+			// First answer wins: withdraw the dialog from every other UI client. A late answer finds nothing pending.
+			if (!isRpcExtensionUIResponse(parsed) || !this.#uiPending.delete(parsed.id)) return;
+			this.#broadcast(
+				{ type: "extension_ui_request", id: Snowflake.next() as string, method: "cancel", targetId: parsed.id },
+				toUi,
+				conn,
+			);
+		};
 		conn.listen(
 			parsed => {
-				// A dropped connection's later input is ignored.
-				if (this.#dispatchers.get(conn) !== dispatcher) return;
-				dispatcher.dispatch(parsed);
-				// First answer wins: withdraw the dialog from every other UI client. A late answer finds nothing pending.
-				if (!isRpcExtensionUIResponse(parsed) || !this.#uiPending.delete(parsed.id)) return;
-				this.#broadcast(
-					{ type: "extension_ui_request", id: Snowflake.next() as string, method: "cancel", targetId: parsed.id },
-					toUi,
-					conn,
-				);
+				// While startup runs, a connection may answer a dialog `session_start` awaits and set its own dialog
+				// preference (a hosted client sends it while attaching); everything else waits.
+				const now = isRpcExtensionUIResponse(parsed) || (isRecord(parsed) && parsed.type === "set_ask_dialog");
+				if (this.#deferred && !now) this.#deferred.push(() => receive(parsed));
+				else receive(parsed);
 			},
 			message => conn.send(rpcError(undefined, "parse", message)),
 		);

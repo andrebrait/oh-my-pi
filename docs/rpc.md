@@ -33,6 +33,7 @@ Behavior notes:
 - RPC/ACP pin neutral defaults for settings declaring the corresponding `protocolDefault`, including task isolation/execution, memory, advisor, and advisor tier settings. RPC additionally pins async-job and bash/eval auto-background defaults. Explicit project/global config, `--config`, and isolated settings remain authoritative; on-disk config changes are watched in long-lived CLI RPC processes. Todo settings are not host-defaulted.
 - The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
 - At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
+- Extension startup (`session_start`) runs after `ready`. While it runs, only `extension_ui_response` (an extension may be waiting on a dialog) and `set_ask_dialog` are handled; every other frame is read and waits, in order, until startup finishes.
 - When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, pending stdout is delivered, and normal shutdown exits with code `0`. A session-persistence failure still latched at disposal exits with code `1` after delivering its `notice` frame.
 - Responses/events are written as one JSON object per line.
 
@@ -1433,7 +1434,7 @@ omp --mode host --host-id <16 lowercase hex digits> [regular CLI options]
 
 ### Registry
 
-Each live host publishes `<config root>/run/session-hosts/<hostId>.json`, where the config root is `~/.omp` by default (profile-independent). The directory is mode `0700` and entries are written atomically with mode `0600`. The entry is written after the host owns its session file and is listening, and is rewritten when its fields change, including `cwd` and `sessionFile` as soon as `/move` or `/wt` relocates the session. A host that cannot bind its endpoint, because a live host already uses that id, fails without removing that host's socket or entry. Fields:
+Each live host publishes `<config root>/run/session-hosts/<hostId>.json`, where the config root is `~/.omp` by default (profile-independent). The directory is mode `0700` and entries are written atomically with mode `0600`. The entry is written after the host owns its session file and is listening, before extension startup, so a client can attach and answer a dialog `session_start` awaits (other commands wait for startup, as on stdio). It is rewritten when its fields change, including `cwd` and `sessionFile` as soon as `/move` or `/wt` relocates the session. A host that cannot bind its endpoint, because a live host already uses that id, fails without removing that host's socket or entry; a host whose extension startup fails withdraws its entry. Fields:
 
 | Field | Meaning |
 |---|---|
@@ -1689,7 +1690,7 @@ Current helper characteristics:
 - Exposes `onPromptResult()`, `onSessionSettled()`, command-availability and subagent listeners, plus extension UI requests
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Drives live voice sessions with `liveStart()`, `liveStop()`, `liveMute()`, and delivers live frames through `onLive()`
-- `promptAndWait()` waits for that prompt's result (or synchronous local completion); `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
+- `promptAndWait()` waits for that prompt's result (or synchronous local completion); `promptToCompletion(message, { images, streamingBehavior, preconditions, timeoutMs })` does the same without collecting events or a default timeout, and rejects when the result reports an error. `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
 - `detach()` and `exit()` send the session-host commands of those names, then stop the client. `RpcCommandError` carries `code`, plus `epoch` and `leafId` (`stale`) and `hostId` (`session_hosted`) when the host returns them. A host connection comes from `connectSessionHost` (`src/session-host/client.ts`), which fits the custom `spawn` transport; see [Session hosts](#session-hosts).
 - `onHostFrame()` delivers the session-host frames (`attached`, `resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`, `config_update`, `session_info_update`) as the `RpcHostFrame` union, in arrival order, with any `seq` and an `entry` frame's `leafId` kept. They reach no other listener, so register before `start()` to see `attached`. A frame that lacks a field the client reads is not delivered.

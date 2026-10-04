@@ -1502,29 +1502,55 @@ export class RpcClient {
 	 * the events seen so far.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const id = `req_${++this.#requestId}`;
 		const events: AgentEvent[] = [];
-		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const unsubscribe = this.onEvent(event => events.push(event));
+		try {
+			await this.promptToCompletion(message, { images, timeoutMs: timeout });
+			return events;
+		} finally {
+			unsubscribe();
+		}
+	}
+
+	/**
+	 * {@link prompt}, resolving at its own `prompt_result`: once all work it caused has settled. A prompt the host
+	 * answered locally (`agentInvoked: false`: a slash command, a handled input hook) has no result and resolves at
+	 * its acknowledgement. Rejects when the result reports an error, or after `timeoutMs` (default: no limit).
+	 */
+	async promptToCompletion(
+		message: string,
+		options: {
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			preconditions?: RpcPreconditions;
+			timeoutMs?: number;
+		} = {},
+	): Promise<void> {
+		const { images, streamingBehavior, preconditions, timeoutMs } = options;
+		// Registered under the id before sending: the result can never arrive unclaimed.
+		const id = `req_${++this.#requestId}`;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#promptResultWaiters.set(id, result => {
-			if (result.status === "error") {
-				reject(new Error(result.error?.message ?? "Prompt failed"));
-				return;
-			}
-			resolve(events);
+			if (result.status === "error") reject(new Error(result.error?.message ?? "Prompt failed"));
+			else resolve();
 		});
 		this.#promptErrorWaiters.set(id, reject);
 		let timeoutId: NodeJS.Timeout | undefined;
 		try {
-			const response = await this.#send({ type: "prompt", message, images }, 30_000, id);
+			const response = await this.#send(
+				{ type: "prompt", message, images, streamingBehavior, ...writeGuard(preconditions) },
+				30_000,
+				id,
+			);
 			const data = this.#getData<{ agentInvoked?: boolean } | undefined>(response);
-			if (data?.agentInvoked === false) return events;
-			timeoutId = this.#startTimeout(timeout, () => {
-				reject(new Error(`Timeout waiting for prompt_result. Stderr: ${this.#process?.peekStderr() ?? ""}`));
-			});
-			return await promise;
+			if (data?.agentInvoked === false) return;
+			if (timeoutMs !== undefined) {
+				timeoutId = this.#startTimeout(timeoutMs, () => {
+					reject(new Error(`Timeout waiting for prompt_result. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+				});
+			}
+			await promise;
 		} finally {
-			unsubscribe();
 			clearTimeout(timeoutId);
 			this.#promptResultWaiters.delete(id);
 			this.#promptErrorWaiters.delete(id);

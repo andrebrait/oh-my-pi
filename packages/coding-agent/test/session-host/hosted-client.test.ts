@@ -590,6 +590,28 @@ describe("HostedClientLink", () => {
 		expect(a.local.isStreaming).toBe(false);
 	});
 
+	it("resolves a startup prompt only once its turn has ended, so the next one is not steered into it", async () => {
+		const release = Promise.withResolvers<void>();
+		const host = await fixture.startHost({}, release.promise);
+		try {
+			const a = await attach(host);
+			// A command the host answers itself starts no turn and gets no prompt_result: it must not hang.
+			await a.hostLink.promptToCompletion("/session");
+			let settled = false;
+			const first = a.hostLink.promptToCompletion("A").then(() => {
+				settled = true;
+			});
+			await waitFor(() => a.hostLink.isStreaming);
+			// Admitted after A on the same connection: A's own admission response has been read by now.
+			await a.hostLink.prompt("B", undefined, "followUp");
+			expect(settled).toBe(false);
+			release.resolve();
+			await first;
+		} finally {
+			release.resolve();
+		}
+	});
+
 	it("renders a partial message once for a client that attaches mid-turn", async () => {
 		const release = Promise.withResolvers<void>();
 		const host = await fixture.startHost({}, release.promise);
