@@ -630,3 +630,97 @@ describe("RpcServer sequencing", () => {
 		});
 	});
 });
+
+describe("RpcServer idle activity reports", () => {
+	const report = (client: TestClient, isComposing: unknown, extra: Record<string, unknown> = {}) =>
+		client.command({ type: "set_idle_activity", isComposing, ...extra });
+
+	it("answers a report with the validated state and neither prompts the model nor touches the transcript", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		const entries = session.sessionManager.getEntries().length;
+		const messages = session.agent.state.messages.length;
+
+		expect(await report(a, true)).toMatchObject({
+			success: true,
+			command: "set_idle_activity",
+			data: { isComposing: true },
+		});
+		expect(server.isIdleActivityBlocked).toBe(true);
+		expect(await report(a, false, { ifEpoch: server.epoch })).toMatchObject({
+			success: true,
+			data: { isComposing: false },
+		});
+		expect(server.isIdleActivityBlocked).toBe(false);
+		expect(session.sessionManager.getEntries().length).toBe(entries);
+		expect(session.agent.state.messages.length).toBe(messages);
+		expect(session.isStreaming).toBe(false);
+	});
+
+	it("rejects a non-boolean isComposing before changing the report or notifying", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		let changes = 0;
+		server.onIdleActivityChanged = () => void changes++;
+		const a = new TestClient(server);
+		const afterConnect = changes;
+		// A truthy string, a falsy number, and an absent value (JSON drops `undefined`).
+		const bad = ["false", 0, undefined];
+
+		for (const composing of [false, true]) {
+			expect((await report(a, composing)).success).toBe(true);
+			const settled = changes;
+			for (const value of bad) {
+				expect(await report(a, value)).toMatchObject({ success: false, command: "set_idle_activity" });
+			}
+			expect(server.isIdleActivityBlocked).toBe(composing);
+			expect(changes).toBe(settled);
+		}
+		expect(changes).toBeGreaterThan(afterConnect);
+	});
+
+	it("answers a stale-epoch report with the existing stale response and cannot clear the current blocker", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		const stale = server.epoch;
+		expect((await report(a, false)).success).toBe(true);
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		await a.command({ type: "new_session" });
+		expect(server.epoch).toBe(stale + 1);
+		// The earlier clear belongs to the old session: the new one is unknown until reported.
+		expect(server.isIdleActivityBlocked).toBe(true);
+
+		const refused = await report(a, false, { ifEpoch: stale });
+		expect(refused).toMatchObject({
+			success: false,
+			command: "set_idle_activity",
+			code: "stale",
+			epoch: server.epoch,
+		});
+		expect(server.isIdleActivityBlocked).toBe(true);
+
+		expect((await report(a, false, { ifEpoch: server.epoch })).success).toBe(true);
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		// A late composing report from the old epoch cannot block the new session either.
+		expect((await report(a, true, { ifEpoch: stale })).code).toBe("stale");
+		expect(server.isIdleActivityBlocked).toBe(false);
+	});
+
+	it("rejects a report from stdio, which never blocks and cannot clear a socket client's blocker", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const stdio = new TestClient(server, { sequenced: false });
+		await stdio.command({ type: "get_state" });
+		expect(server.isIdleActivityBlocked).toBe(false);
+		expect(await report(stdio, true)).toMatchObject({ success: false, command: "set_idle_activity" });
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		const a = new TestClient(server);
+		await report(a, true);
+		expect(await report(stdio, false, { ifEpoch: server.epoch })).toMatchObject({ success: false });
+		expect(server.isIdleActivityBlocked).toBe(true);
+		await report(a, false);
+		expect(await report(stdio, true)).toMatchObject({ success: false });
+		expect(server.isIdleActivityBlocked).toBe(false);
+	});
+});

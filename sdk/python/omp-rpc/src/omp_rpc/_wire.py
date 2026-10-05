@@ -1111,6 +1111,13 @@ class QueueUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class IdleRecapEvent:
+    """The host produced a recap while the session sat idle: the full reply (de-duplicated and capped like any side-channel reply), journaled in the session history database. It never enters the transcript or the model context."""
+    type: Literal["idle_recap"] = "idle_recap"
+    recap: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class ReadyEvent:
     """First frame after startup; transport fields are absent on servers without protocol v2."""
     type: Literal["ready"] = "ready"
@@ -1577,6 +1584,11 @@ class NegotiateProtocolResult:
     protocol_version: int
 
 
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SetIdleActivityResult:
+    is_composing: bool
+
+
 UserContent: TypeAlias = TextContent | ImageContent
 
 
@@ -1591,7 +1603,7 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
-RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
+RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent | IdleRecapEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
@@ -2471,6 +2483,14 @@ def parse_queue_update_event(value: object, path: str = "QueueUpdateEvent") -> Q
     )
 
 
+def parse_idle_recap_event(value: object, path: str = "IdleRecapEvent") -> IdleRecapEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["idle_recap"]]', literal(frozenset({"idle_recap"}))), path)
+    return IdleRecapEvent(
+        recap=required(payload, "recap", decode_str, path),
+    )
+
+
 def parse_ready_event(value: object, path: str = "ReadyEvent") -> ReadyEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["ready"]]', literal(frozenset({"ready"}))), path)
@@ -2989,6 +3009,13 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_set_idle_activity_result(value: object, path: str = "SetIdleActivityResult") -> SetIdleActivityResult:
+    payload = expect_object(value, path)
+    return SetIdleActivityResult(
+        is_composing=required(payload, "isComposing", decode_bool, path),
+    )
+
+
 def parse_rpc_agent_event(value: object, path: str = "RpcAgentEvent") -> RpcAgentEvent:
     return dispatch("type", _RPC_AGENT_EVENT_CASES)(value, path)
 
@@ -3034,6 +3061,7 @@ _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
         "thinking_level_changed": parse_thinking_level_changed_event,
         "goal_updated": parse_goal_updated_event,
         "queue_update": parse_queue_update_event,
+        "idle_recap": parse_idle_recap_event,
 }
 
 
@@ -3091,6 +3119,7 @@ _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "thinking_level_changed": parse_rpc_agent_event,
         "goal_updated": parse_rpc_agent_event,
         "queue_update": parse_rpc_agent_event,
+        "idle_recap": parse_rpc_agent_event,
 }
 
 
@@ -3192,6 +3221,12 @@ class WireClient:
         params: dict[str, object] = {}
         params["enabled"] = enabled
         return required(expect_object(self._command("set_ask_dialog", params), "set_ask_dialog"), "enabled", decode_bool, "set_ask_dialog")
+
+    def set_idle_activity(self, is_composing: bool) -> SetIdleActivityResult:
+        """Socket clients only: report whether this client has an unsent draft, so host-owned idle maintenance (recap and idle compaction) stays out of its way. Answered at once, even while another command runs. Like any write it honors the common `ifEpoch` precondition; generated SDK methods send none and bind to the current epoch."""
+        params: dict[str, object] = {}
+        params["isComposing"] = is_composing
+        return parse_set_idle_activity_result(self._command("set_idle_activity", params), "set_idle_activity")
 
     def get_available_commands(self) -> tuple[AvailableSlashCommand, ...]:
         """List the slash-command catalog."""
@@ -3669,6 +3704,10 @@ class WireClient:
         """Subscribe to `queue_update`: Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes."""
         return self._listen("queue_update", listener)
 
+    def on_idle_recap(self, listener: Callable[[IdleRecapEvent], None]) -> Callable[[], None]:
+        """Subscribe to `idle_recap`: The host produced a recap while the session sat idle: the full reply (de-duplicated and capped like any side-channel reply), journaled in the session history database. It never enters the transcript or the model context."""
+        return self._listen("idle_recap", listener)
+
 
 __all__ = [
     "AdvisorCostChangedEvent",
@@ -3752,6 +3791,7 @@ __all__ = [
     "HookMessage",
     "HostToolDefinition",
     "HostUriSchemeDefinition",
+    "IdleRecapEvent",
     "ImageContent",
     "InputUiRequest",
     "InterruptMode",
@@ -3813,6 +3853,7 @@ __all__ = [
     "SessionStats",
     "SessionTree",
     "SetEditorTextUiRequest",
+    "SetIdleActivityResult",
     "SetStatusUiRequest",
     "SetTitleUiRequest",
     "SetWidgetUiRequest",
@@ -3930,6 +3971,7 @@ __all__ = [
     "parse_hook_message",
     "parse_host_tool_definition",
     "parse_host_uri_scheme_definition",
+    "parse_idle_recap_event",
     "parse_image_content",
     "parse_input_ui_request",
     "parse_irc_message_event",
@@ -3981,6 +4023,7 @@ __all__ = [
     "parse_session_stats",
     "parse_session_tree",
     "parse_set_editor_text_ui_request",
+    "parse_set_idle_activity_result",
     "parse_set_status_ui_request",
     "parse_set_title_ui_request",
     "parse_set_widget_ui_request",

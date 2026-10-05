@@ -4109,6 +4109,32 @@ func (v QueueUpdateEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"queue_update"`, nil)
 }
 
+// The host produced a recap while the session sat idle: the full reply (de-duplicated and capped like any side-channel reply), journaled in the session history database. It never enters the transcript or the model context.
+type IdleRecapEvent struct {
+	Recap string `json:"recap"`
+}
+
+func (v *IdleRecapEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "IdleRecapEvent", v.decodeFrom)
+}
+
+func (v *IdleRecapEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out IdleRecapEvent
+	d := fieldDecoder{raw: raw, owner: "IdleRecapEvent"}
+	d.constant("type", "idle_recap")
+	d.required("recap", &out.Recap)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v IdleRecapEvent) MarshalJSON() ([]byte, error) {
+	type plain IdleRecapEvent
+	return encodeObject(plain(v), `"type":"idle_recap"`, nil)
+}
+
 // A session event, discriminated by `type`; `set_event_filter` selects which are sent.
 type RpcAgentEvent struct {
 	// Value holds one variant, chosen by "type" on decode.
@@ -4152,6 +4178,7 @@ func (NoticeEvent) isRpcAgentEvent()                 {}
 func (ThinkingLevelChangedEvent) isRpcAgentEvent()   {}
 func (GoalUpdatedEvent) isRpcAgentEvent()            {}
 func (QueueUpdateEvent) isRpcAgentEvent()            {}
+func (IdleRecapEvent) isRpcAgentEvent()              {}
 func (UnknownNotification) isRpcAgentEvent()         {}
 
 func (v RpcAgentEvent) MarshalJSON() ([]byte, error) {
@@ -4235,6 +4262,8 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "idle_recap":
+		value, err = decodeVariant[IdleRecapEvent](raw)
 	default:
 		return unknownValue("RpcAgentEvent.type", tag)
 	}
@@ -6482,6 +6511,7 @@ func (NoticeEvent) isRpcNotification()                  {}
 func (ThinkingLevelChangedEvent) isRpcNotification()    {}
 func (GoalUpdatedEvent) isRpcNotification()             {}
 func (QueueUpdateEvent) isRpcNotification()             {}
+func (IdleRecapEvent) isRpcNotification()               {}
 func (UnknownNotification) isRpcNotification()          {}
 
 func (v RpcNotification) MarshalJSON() ([]byte, error) {
@@ -6602,6 +6632,8 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "idle_recap":
+		value, err = decodeVariant[IdleRecapEvent](raw)
 	default:
 		value = newUnknownNotification(tag, data)
 	}
@@ -6681,6 +6713,7 @@ func (NoticeEvent) isRpcServerFrame()                  {}
 func (ThinkingLevelChangedEvent) isRpcServerFrame()    {}
 func (GoalUpdatedEvent) isRpcServerFrame()             {}
 func (QueueUpdateEvent) isRpcServerFrame()             {}
+func (IdleRecapEvent) isRpcServerFrame()               {}
 func (UnknownNotification) isRpcServerFrame()          {}
 
 func (v RpcServerFrame) MarshalJSON() ([]byte, error) {
@@ -6811,6 +6844,8 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "idle_recap":
+		value, err = decodeVariant[IdleRecapEvent](raw)
 	default:
 		value = newUnknownNotification(tag, data)
 	}
@@ -6852,6 +6887,25 @@ func (v *SetAskDialogResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SetAskDialogResult
 	d := fieldDecoder{raw: raw, owner: "SetAskDialogResult"}
 	d.required("enabled", &out.Enabled)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type SetIdleActivityResult struct {
+	IsComposing bool `json:"isComposing"`
+}
+
+func (v *SetIdleActivityResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SetIdleActivityResult", v.decodeFrom)
+}
+
+func (v *SetIdleActivityResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SetIdleActivityResult
+	d := fieldDecoder{raw: raw, owner: "SetIdleActivityResult"}
+	d.required("isComposing", &out.IsComposing)
 	if d.err != nil {
 		return d.err
 	}
@@ -7437,6 +7491,18 @@ func (c Commands) SetAskDialog(ctx context.Context, p SetAskDialogCommand) (bool
 	var out SetAskDialogResult
 	err := c.call(ctx, "set_ask_dialog", p, 0, &out)
 	return out.Enabled, err
+}
+
+// SetIdleActivityCommand holds the parameters of "set_idle_activity".
+type SetIdleActivityCommand struct {
+	IsComposing bool `json:"isComposing"`
+}
+
+// SetIdleActivity sends "set_idle_activity": Socket clients only: report whether this client has an unsent draft, so host-owned idle maintenance (recap and idle compaction) stays out of its way. Answered at once, even while another command runs. Like any write it honors the common `ifEpoch` precondition; generated SDK methods send none and bind to the current epoch.
+func (c Commands) SetIdleActivity(ctx context.Context, p SetIdleActivityCommand) (SetIdleActivityResult, error) {
+	var out SetIdleActivityResult
+	err := c.call(ctx, "set_idle_activity", p, 0, &out)
+	return out, err
 }
 
 // GetAvailableCommands sends "get_available_commands": List the slash-command catalog.

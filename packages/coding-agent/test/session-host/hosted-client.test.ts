@@ -802,6 +802,26 @@ describe("HostedClientLink", () => {
 		expect(a.dialogs).toHaveLength(1);
 	});
 
+	it("stays attached when the host replaces the session again before the view has reported its draft state for the first replacement", async () => {
+		const host = await fixture.startHost();
+		const a = await attach(host);
+		const oldEpoch = a.hostLink.epoch;
+
+		// A is still repainting the first replacement when the host moves on to a second one.
+		a.renderGate = Promise.withResolvers<void>();
+		const repaints = a.renderCount;
+		await host.session.newSession();
+		await waitFor(() => a.renderCount > repaints);
+		await host.session.newSession();
+		a.renderGate.resolve();
+
+		await waitFor(() => a.hostLink.epoch > oldEpoch + 1 || a.closed.length > 0);
+		// The first replacement is already out of date by the time its view settles; the second one is what A follows.
+		expect(a.closed).toEqual([]);
+		expect(a.showError).not.toHaveBeenCalled();
+		expect(a.hostLink.epoch).toBeGreaterThan(oldEpoch + 1);
+	});
+
 	it("presents a dialog that was already open at attach time, and answers it", async () => {
 		let ui: ExtensionUIContext | undefined;
 		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });

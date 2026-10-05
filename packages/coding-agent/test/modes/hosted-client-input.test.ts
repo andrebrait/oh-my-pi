@@ -5,10 +5,12 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -18,12 +20,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
+import { privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { cfgLoopMode, cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgCompletionNotify, cfgLoopMode, cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import type { InteractiveModeContext, SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -31,16 +33,19 @@ import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { listSessionRecaps, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { HostedClientLink } from "@oh-my-pi/pi-coding-agent/session-host/hosted-client";
+import { newHostId, type SessionHostEntry } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { cfgTasksTodoClearDelay } from "@oh-my-pi/pi-coding-agent/tools/settings";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { getEditorTheme } from "@oh-my-pi/pi-tui/theme/tui-adapters";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import { drive, driveTurn, elapse, flush, nextIdleRecap, until, wait } from "../helpers/fake-clock";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 import { createTestSession } from "../helpers/rpc-server-harness";
 import { listTree, SessionHostFixture, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
@@ -55,6 +60,8 @@ const PIXEL: ImageContent = {
 let fixture: SessionHostFixture;
 const gates: PromiseWithResolvers<void>[] = [];
 const inputs: HostedInput[] = [];
+/** Stops for the hosts a test started itself; they run once every client of the host has left. */
+const hostStops: (() => Promise<void>)[] = [];
 
 beforeAll(async () => {
 	await initTheme();
@@ -71,6 +78,7 @@ afterEach(async () => {
 	// A held host reply must finish before its host can be stopped.
 	for (const gate of gates.splice(0)) gate.resolve();
 	for (const input of inputs.splice(0)) await input.close();
+	for (const stop of hostStops.splice(0)) await stop();
 	await fixture.dispose();
 	resetSettingsForTest();
 });
@@ -246,11 +254,12 @@ class HostedInput {
 		return input;
 	}
 
-	async connect(host: TestSessionHost): Promise<void> {
+	/** Join `host`; `entry` redirects the connection (through a tap, say) instead of the host's published endpoint. */
+	async connect(host: TestSessionHost, entry?: SessionHostEntry): Promise<void> {
 		this.#host = host;
 		this.link = await HostedClientLink.connect({
 			ctx: this.ctx,
-			entry: await fixture.entry(host),
+			entry: entry ?? (await fixture.entry(host)),
 			replicaDir: this.replicaDir,
 			onClosed: reason => this.closed.push(reason),
 		});
@@ -821,75 +830,178 @@ describe("a hosted client's controls", () => {
 	});
 });
 
-function assistantMessage(): AssistantMessage {
+async function flushMicrotasks(): Promise<void> {
+	for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+// ── idle maintenance under frozen time ─────────────────────────────────────
+//
+// A real `AgentSession` runs real turns against scripted providers, so the observable results are provider requests,
+// journaled recaps and the transcript. Fake timers freeze the clock; real async work (promises, sockets, files,
+// `setImmediate`) keeps running under them, so the shared `helpers/fake-clock` waits yield the event loop instead of guessing durations.
+
+const RECAP = "Reworked the login flow; next: wire the focused token-refresh test.";
+const WORKER_RECAP = "The worker is mid-way through the migration; next: run the backfill.";
+/** `recap.idleSeconds` is set explicitly, to the smallest delay the scheduler allows, never inherited from a default. */
+const RECAP_DELAY_MS = 1_000;
+const RECAP_SETTINGS = { "compaction.enabled": false, "todo.reminders": false, "recap.idleSeconds": 1 };
+
+/** The providers of one session: `main` answers its turns, `side` its idle recaps. Both record every request. */
+interface Models {
+	main: MockModel;
+	side: MockModel;
+}
+
+/** An `InteractiveMode` over a real session, with the means to tear it down and to put a second agent beside it. */
+interface OpenedMode {
+	mode: InteractiveMode;
+	session: AgentSession;
+	dispose: () => Promise<void>;
+	/** Another real session over the same registry and directory. */
+	spawn: (models: Models) => Promise<AgentSession>;
+}
+
+/** An {@link OpenedMode} that finished starting up, over the scripted providers of its session. */
+interface RecapMode extends OpenedMode {
+	models: Models;
+}
+
+function scriptedModels(recap: string): Models {
 	return {
-		role: "assistant",
-		content: [{ type: "text", text: "done" }],
-		api: "anthropic-messages",
-		provider: "anthropic",
-		model: "claude-sonnet-4-5",
-		usage: {
-			input: 200,
-			output: 10,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 210,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-		timestamp: Date.now(),
+		main: createMockModel({ handler: { content: ["Work finished."] } }),
+		side: createMockModel({ handler: { content: [recap] } }),
 	};
 }
 
-async function flushMicrotasks(): Promise<void> {
-	for (let i = 0; i < 10; i++) await Promise.resolve();
+/** Park the next request `model` gets until `release`; `started` settles once the provider has been asked. */
+function holdNext(model: MockModel): { started: Promise<void>; release(response: MockResponse): void } {
+	const started = Promise.withResolvers<void>();
+	const reply = Promise.withResolvers<MockResponse>();
+	model.push(() => {
+		started.resolve();
+		return reply.promise;
+	});
+	return { started: started.promise, release: response => reply.resolve(response) };
+}
+
+/** One real turn of `session`. The clock stands still once the terminal `agent_end` is out, so the idle stretch starts there. */
+async function runTurn(session: AgentSession, text = "please work"): Promise<void> {
+	await driveTurn(session, session.prompt(text));
+	await wait(session.waitForIdle());
+	await flush();
+}
+
+/**
+ * A host whose session answers its turns and its idle recaps from scripted providers, with recaps due after one
+ * second. The fixture's side-channel seam keeps the recaps off the network.
+ */
+async function startRecapHost(): Promise<{ host: TestSessionHost; side: MockModel }> {
+	const models = scriptedModels(RECAP);
+	const host = await fixture.startHost({}, undefined, {
+		mock: models.main,
+		settings: RECAP_SETTINGS,
+		sideStreamFn: models.side.stream,
+	});
+	return { host, side: models.side };
+}
+
+interface Tap {
+	/** The host's entry with its endpoint redirected through the tap. */
+	entry: SessionHostEntry;
+	/** Everything the client has written so far. */
+	sent(): string;
+	/**
+	 * How many idle-activity reports the host has accepted, counted from its answers as they leave the host: a held
+	 * answer counts, since the host has accepted the report whether or not the client has been told.
+	 */
+	acceptedReports(): number;
+	/** Keep what the host writes to the client from reaching it, until {@link Tap.releaseReplies}. */
+	holdReplies(): void;
+	releaseReplies(): void;
+	close(): void;
+}
+
+/** The complete JSON lines in a socket stream, kept across chunks; anything that is not JSON is not a frame. */
+class FrameLines {
+	#pending = "";
+
+	take(chunk: Buffer): Record<string, unknown>[] {
+		this.#pending += chunk.toString("utf8");
+		const lines = this.#pending.split("\n");
+		this.#pending = lines.pop() ?? "";
+		return lines.flatMap(line => {
+			try {
+				const frame: unknown = JSON.parse(line);
+				return isRecord(frame) ? [frame] : [];
+			} catch {
+				return [];
+			}
+		});
+	}
+}
+
+/**
+ * A unix socket in front of a host's endpoint that records what the client writes, counts the idle-activity reports the
+ * host accepts, and can delay what the host answers.
+ */
+async function tapHost(entry: SessionHostEntry): Promise<Tap> {
+	const endpoint = await privateEndpoint(fixture.dir, `tap-${newHostId()}`, { prefix: "tap", label: "test" });
+	const sent: Buffer[] = [];
+	const held: (() => void)[] = [];
+	const sockets = new Set<net.Socket>();
+	let holding = false;
+	let accepted = 0;
+	const server = net.createServer(client => {
+		const upstream = net.connect(entry.endpoint);
+		const answers = new FrameLines();
+		client.on("data", (chunk: Buffer | string) => {
+			const bytes = Buffer.from(chunk);
+			sent.push(bytes);
+			upstream.write(bytes);
+		});
+		upstream.on("data", (chunk: Buffer | string) => {
+			const bytes = Buffer.from(chunk);
+			for (const frame of answers.take(bytes)) {
+				if (frame.type === "response" && frame.command === "set_idle_activity" && frame.success === true)
+					accepted++;
+			}
+			if (holding) held.push(() => client.write(bytes));
+			else client.write(bytes);
+		});
+		for (const socket of [client, upstream]) {
+			sockets.add(socket);
+			socket.on("error", () => {});
+			socket.on("close", () => {
+				sockets.delete(socket);
+				client.destroy();
+				upstream.destroy();
+			});
+		}
+	});
+	const listening = Promise.withResolvers<void>();
+	server.listen(endpoint, listening.resolve);
+	await listening.promise;
+	return {
+		entry: { ...entry, endpoint },
+		sent: () => Buffer.concat(sent).toString("utf8"),
+		acceptedReports: () => accepted,
+		holdReplies: () => {
+			holding = true;
+		},
+		releaseReplies: () => {
+			holding = false;
+			for (const write of held.splice(0)) write();
+		},
+		close: () => {
+			server.close();
+			for (const socket of sockets) socket.destroy();
+		},
+	};
 }
 
 describe("a hosted client's automation", () => {
 	afterEach(() => {
 		vi.useRealTimers();
-	});
-
-	/** One turn ends and the screen idles past both the idle-compaction (60 s) and recap (4 min) delays. */
-	async function idleAfterTurn(hostedClientMode: boolean): Promise<{ compactions: number; recaps: number }> {
-		resetSettingsForTest();
-		await Settings.init({
-			inMemory: true,
-			overrides: {
-				"compaction.idleEnabled": true,
-				"compaction.idleThresholdTokens": 100,
-				"compaction.idleTimeoutSeconds": 60,
-				"completion.notify": "off",
-			},
-		});
-		vi.useFakeTimers();
-		const runIdleCompaction = vi.fn(async () => {});
-		const runEphemeralTurn = vi.fn(async () => ({ replyText: "Recap body.", assistantMessage: assistantMessage() }));
-		const context = createInteractiveModeContext({
-			hostedClientMode,
-			sessionManager: { getSessionName: () => undefined },
-			session: {
-				isCompacting: false,
-				isStreaming: false,
-				runIdleCompaction,
-				runEphemeralTurn,
-				model: { provider: "anthropic", id: "claude-sonnet-4-5" },
-				messages: [assistantMessage()],
-				getContextUsage: () => ({ tokens: 210, contextWindow: 1_000, percent: 21 }),
-			},
-		});
-		const controller = new EventController(context);
-		await controller.handleEvent({ type: "agent_end", messages: [assistantMessage()] });
-		vi.advanceTimersByTime(300_000);
-		await flushMicrotasks();
-		controller.dispose();
-		return { compactions: runIdleCompaction.mock.calls.length, recaps: runEphemeralTurn.mock.calls.length };
-	}
-
-	it("compacts and recaps an idle replica locally only when it is not a hosted client", async () => {
-		expect(await idleAfterTurn(false)).toEqual({ compactions: 1, recaps: 1 });
-		vi.useRealTimers();
-		expect(await idleAfterTurn(true)).toEqual({ compactions: 0, recaps: 0 });
 	});
 
 	describe("InteractiveMode", () => {
@@ -909,8 +1021,10 @@ describe("a hosted client's automation", () => {
 				withTools?: boolean;
 				passiveReplica?: boolean;
 				extension?: ExtensionFactory;
+				/** Scripted providers for the session's turns and idle recaps; without them neither can be asked. */
+				models?: Models;
 			} = {},
-		): Promise<{ mode: InteractiveMode; session: AgentSession; dispose: () => Promise<void> }> {
+		): Promise<OpenedMode> {
 			const dir = TempDir.createSync("@pi-hosted-mode-");
 			const authStorage = await AuthStorage.create(path.join(dir.path(), "testauth.db"));
 			authStorage.keys.setRuntime("anthropic", "test-key");
@@ -948,12 +1062,14 @@ describe("a hosted client's automation", () => {
 						tools: options.withTools ? [readTool] : [],
 						messages: [],
 					},
+					...(options.models ? { getApiKey: () => "test-key", streamFn: options.models.main.stream } : {}),
 				}),
 				sessionManager,
 				settings: options.settings ?? Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: registry,
 				extensionRunner,
 				passiveReplica: options.passiveReplica,
+				sideStreamFn: options.models?.side.stream,
 				...(options.withTools
 					? { toolRegistry: new Map([[readTool.name, readTool]]), builtInToolNames: ["read"] }
 					: {}),
@@ -970,7 +1086,22 @@ describe("a hosted client's automation", () => {
 				dir.removeSync();
 			};
 			cleanups.push(dispose);
-			return { mode, session, dispose };
+			const spawn = async (models: Models): Promise<AgentSession> => {
+				const worker = new AgentSession({
+					agent: new Agent({
+						getApiKey: () => "test-key",
+						initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+						streamFn: models.main.stream,
+					}),
+					sessionManager: SessionManager.create(dir.path(), dir.path()),
+					settings: Settings.isolated(RECAP_SETTINGS),
+					modelRegistry: registry,
+					sideStreamFn: models.side.stream,
+				});
+				cleanups.push(() => worker.dispose());
+				return worker;
+			};
+			return { mode, session, dispose, spawn };
 		}
 
 		/** The HUD's dismissal entries a session journaled and whether its todo panel still shows them. */
@@ -1257,5 +1388,307 @@ describe("a hosted client's automation", () => {
 			// A hosted client never saves a draft, so one it finds is not its to restore or delete.
 			expect(await draftAfterInit(true)).toEqual({ composer: "", sidecar: "unsent draft" });
 		});
+
+		/**
+		 * Idle recap in a real `InteractiveMode`: a real session runs real turns against scripted providers, and the
+		 * recap is judged by the provider requests it made, the journal it wrote and the transcript the user reads.
+		 */
+		describe("idle recap", () => {
+			beforeEach(() => {
+				resetSessionIndexForTests();
+			});
+			afterEach(() => {
+				resetSessionIndexForTests();
+			});
+
+			/** An initialized TUI (its startup is done) over a session whose turns and recaps come from scripted providers. */
+			async function openRecapMode(hostedClientMode: boolean): Promise<RecapMode> {
+				cfgStartupQuiet.set(Settings.instance, true);
+				cfgCompletionNotify.set(Settings.instance, "off");
+				const models = scriptedModels(RECAP);
+				const opened = await openMode(hostedClientMode, { settings: Settings.isolated(RECAP_SETTINGS), models });
+				await opened.mode.init({ suppressWelcomeIntro: true });
+				return { ...opened, models };
+			}
+
+			/** A second real agent, registered like a task subagent and with a recap text of its own. */
+			async function spawnAgent(opened: RecapMode, id: string) {
+				const models = scriptedModels(WORKER_RECAP);
+				const session = await opened.spawn(models);
+				const registry = AgentRegistry.global();
+				const ref = registry.register({
+					id,
+					displayName: id,
+					kind: "sub",
+					parentId: MAIN_AGENT_ID,
+					session,
+					status: "running",
+				});
+				cleanups.push(async () => {
+					if (opened.mode.focusedAgentId) await opened.mode.unfocusSession();
+					registry.unregister(id, ref);
+				});
+				return { id, session, models };
+			}
+
+			const screen = (mode: InteractiveMode): string => Bun.stripANSI(mode.chatContainer.render(120).join("\n"));
+			const shown = (mode: InteractiveMode, text: string): number => screen(mode).split(text).length - 1;
+			const journal = (session: AgentSession): string[] =>
+				listSessionRecaps({ sessionIds: [session.sessionManager.getSessionId()] }).map(row => row.recap);
+
+			/** One turn ends and the screen idles past the recap delay: what the provider, the journal and the transcript show. */
+			async function recapAfterTurn(hostedClientMode: boolean) {
+				const { mode, session, models, dispose } = await openRecapMode(hostedClientMode);
+				vi.useFakeTimers();
+				await runTurn(session);
+				await elapse(RECAP_DELAY_MS);
+				// An ordinary session is given until its recap shows; a hosted one as long as the event loop will run it.
+				if (hostedClientMode) await flush();
+				else await until(() => shown(mode, RECAP) > 0, "the recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				const result = {
+					providerRequests: models.side.calls.length,
+					journaled: journal(session),
+					shown: shown(mode, RECAP),
+				};
+				vi.useRealTimers();
+				// One initialized mode at a time: init claims process-wide handlers.
+				await dispose();
+				return result;
+			}
+
+			it("recaps an idle session once, on screen and in the journal, only when it is not a hosted client", async () => {
+				expect(await recapAfterTurn(false)).toEqual({ providerRequests: 1, journaled: [RECAP], shown: 1 });
+				expect(await recapAfterTurn(true)).toEqual({ providerRequests: 0, journaled: [], shown: 0 });
+			}, 30_000);
+
+			it("holds the recap back while a draft is being composed and delivers it once the draft is gone", async () => {
+				const { mode, session, models } = await openRecapMode(false);
+				vi.useFakeTimers();
+				await runTurn(session);
+
+				// The recap is due in a second; the draft arrives before that.
+				mode.editor.setText("half-written draft");
+				await flush();
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(models.side.calls).toHaveLength(0);
+				expect(journal(session)).toEqual([]);
+
+				// Whitespace is not a draft.
+				mode.editor.setText("  ");
+				await flush();
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, RECAP) > 0, "the recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+
+				expect(models.side.calls).toHaveLength(1);
+				expect(journal(session)).toEqual([RECAP]);
+				expect(shown(mode, RECAP)).toBe(1);
+			}, 30_000);
+
+			it("does idle work only for the agent on screen: a viewed subagent recaps, the root waits until it is back", async () => {
+				const opened = await openRecapMode(false);
+				const { mode, session: root, models: rootModels } = opened;
+				const worker = await spawnAgent(opened, "RecapWorker");
+				vi.useFakeTimers();
+
+				// Nobody has opened the worker: its turn ends unattended and nothing is started on its behalf.
+				await runTurn(worker.session);
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(worker.models.side.calls).toHaveLength(0);
+
+				// The root owes a recap, but the view moves to the worker before it is due.
+				await runTurn(root);
+				await wait(mode.focusAgentSession(worker.id));
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(rootModels.side.calls).toHaveLength(0);
+				expect(worker.models.side.calls).toHaveLength(0);
+
+				// Viewed now, the worker's own turn is the one that gets recapped.
+				await runTurn(worker.session);
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, WORKER_RECAP) > 0, "the worker's recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(worker.models.side.calls).toHaveLength(1);
+				expect(journal(worker.session)).toEqual([WORKER_RECAP]);
+				expect(shown(mode, WORKER_RECAP)).toBe(1);
+				expect(rootModels.side.calls).toHaveLength(0);
+				expect(journal(root)).toEqual([]);
+
+				// Back on main, the recap it still owes arrives, once.
+				await wait(mode.unfocusSession());
+				await flush();
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, RECAP) > 0, "the root's recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(rootModels.side.calls).toHaveLength(1);
+				expect(journal(root)).toEqual([RECAP]);
+				expect(shown(mode, RECAP)).toBe(1);
+				expect(worker.models.side.calls).toHaveLength(1);
+			}, 30_000);
+
+			it("abandons a recap being written when the view leaves its agent, and recaps the stretch that ended while away once it is viewed again", async () => {
+				const opened = await openRecapMode(false);
+				const { mode } = opened;
+				const worker = await spawnAgent(opened, "LeavingWorker");
+				const announced: string[] = [];
+				worker.session.subscribe(event => {
+					if (event.type === "idle_recap") announced.push(event.recap);
+				});
+				vi.useFakeTimers();
+				await wait(mode.focusAgentSession(worker.id));
+				await runTurn(worker.session);
+				const held = holdNext(worker.models.side);
+				await elapse(RECAP_DELAY_MS);
+				await wait(held.started);
+				const signal = worker.models.side.calls[0]?.options?.signal;
+				expect(signal?.aborted).toBe(false);
+
+				await wait(mode.unfocusSession());
+				expect(signal?.aborted).toBe(true);
+				held.release({ content: ["Late reply from a view that is gone."] });
+				await flush();
+				expect(announced).toEqual([]);
+				expect(journal(worker.session)).toEqual([]);
+
+				// The worker works on while nobody looks: that stretch is owed, not started.
+				await runTurn(worker.session);
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(worker.models.side.calls).toHaveLength(1);
+
+				await wait(mode.focusAgentSession(worker.id));
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, WORKER_RECAP) > 0, "the owed recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(worker.models.side.calls).toHaveLength(2);
+				expect(announced).toEqual([WORKER_RECAP]);
+				expect(journal(worker.session)).toEqual([WORKER_RECAP]);
+				expect(shown(mode, WORKER_RECAP)).toBe(1);
+			}, 30_000);
+
+			it("recaps the stretch once a goal continuation is cancelled before it starts, with no other turn to restart the clock", async () => {
+				const { mode, session, models } = await openRecapMode(false);
+				await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
+				vi.useFakeTimers();
+				// The main loop waits for input, so the end of the turn schedules the goal's next continuation.
+				const input = mode.getUserInput();
+				await runTurn(session);
+				expect(models.main.calls).toHaveLength(1);
+
+				// The continuation is submitted 800 ms after the turn ended; until its turn starts it holds the recap back.
+				await elapse(800);
+				expect((await wait(input)).customType).toBe("goal-continuation");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(models.side.calls).toHaveLength(0);
+
+				// Esc before the turn begins: no `agent_end` will ever follow to end this stretch.
+				expect(mode.cancelPendingSubmission()).toBe(true);
+				await flush();
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, RECAP) > 0, "the recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(models.main.calls).toHaveLength(1);
+				expect(models.side.calls).toHaveLength(1);
+				expect(journal(session)).toEqual([RECAP]);
+				expect(shown(mode, RECAP)).toBe(1);
+			}, 30_000);
+		});
 	});
+});
+
+/**
+ * What the editor of a hosted client tells the session host about its draft, judged by the host's own idle work: a
+ * real host, link, editor and input controller over real sockets, and a host session that recaps from a scripted
+ * provider. The TUI itself never schedules anything here; whether the host may recap is the only thing that varies.
+ */
+describe("a hosted client's idle activity", () => {
+	beforeEach(() => {
+		resetSessionIndexForTests();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		resetSessionIndexForTests();
+	});
+
+	const hostJournal = (): string[] => listSessionRecaps().map(row => row.recap);
+
+	it("keeps the host from recapping while the editor holds a draft, and lets it recap in each session once the draft is gone", async () => {
+		const { host, side } = await startRecapHost();
+		const tap = await tapHost(await fixture.entry(host));
+		// After the input has left through it, and before the fixture ends.
+		hostStops.push(async () => tap.close());
+		const input = await HostedInput.open();
+		// Typed before the connection exists: the first snapshot is what tells the host.
+		input.editor.setText("half-written draft");
+		await input.connect(host, tap.entry);
+		vi.useFakeTimers();
+
+		await runTurn(host.session);
+		await elapse(3 * RECAP_DELAY_MS);
+		expect(side.calls).toHaveLength(0);
+		expect(hostJournal()).toEqual([]);
+
+		// The clearing report crosses a real socket, which fake time cannot hurry or wait for: idle time may only
+		// pass once the host has accepted it. The recap is awaited as a consumer sees it, as the `idle_recap` of the
+		// host's session, with the clock nudged until it arrives however late the host arms its timer.
+		const firstRecap = nextIdleRecap(host.session);
+		const reported = tap.acceptedReports();
+		input.editor.setText("");
+		await until(() => tap.acceptedReports() > reported, "the host to accept the cleared draft");
+		expect(await drive(firstRecap)).toBe(RECAP);
+		expect(side.calls).toHaveLength(1);
+		expect(hostJournal()).toEqual([RECAP]);
+
+		// The host moves to a new session. Nothing is being composed, and the view says so again for that session.
+		const epoch = input.hostLink.epoch;
+		const reportedBefore = tap.acceptedReports();
+		await wait(host.session.newSession());
+		await until(() => input.hostLink.epoch > epoch, "the view of the new session");
+		await until(() => tap.acceptedReports() > reportedBefore, "the host to accept the new view's report");
+		const secondRecap = nextIdleRecap(host.session);
+		await runTurn(host.session);
+		expect(await drive(secondRecap)).toBe(RECAP);
+		expect(side.calls).toHaveLength(2);
+		expect(hostJournal()).toEqual([RECAP, RECAP]);
+		expect(input.errors).toEqual([]);
+		expect(input.closed).toEqual([]);
+	}, 30_000);
+
+	it("tells the host the newest state of the draft without waiting for older reports to be answered, and never sends the draft", async () => {
+		const { host, side } = await startRecapHost();
+		const tap = await tapHost(await fixture.entry(host));
+		// After the input has left through it, and before the fixture ends.
+		hostStops.push(async () => tap.close());
+		try {
+			const input = await HostedInput.open();
+			await input.connect(host, tap.entry);
+			const reported = tap.acceptedReports();
+			tap.holdReplies();
+
+			// Three edits in one tick: the host is told where the draft ended up, whatever it was a moment ago. The
+			// client is told nothing back; what the host has accepted is read from its answers as they leave the host.
+			input.editor.setText("first-draft-text");
+			input.editor.setText("");
+			input.editor.setText("second-draft-text");
+			await until(() => tap.acceptedReports() > reported, "the host to accept the draft report");
+			vi.useFakeTimers();
+
+			await runTurn(host.session);
+			await elapse(3 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(0);
+
+			// The editor still holds that report's answer back. Clearing the draft must not wait for it.
+			const recapped = nextIdleRecap(host.session);
+			const accepted = tap.acceptedReports();
+			input.editor.setText("");
+			await until(() => tap.acceptedReports() > accepted, "the host to accept the cleared draft");
+			expect(await drive(recapped)).toBe(RECAP);
+			expect(side.calls).toHaveLength(1);
+			expect(tap.sent()).not.toContain("draft-text");
+		} finally {
+			vi.useRealTimers();
+			// The input detaches in teardown, and that needs the answers it is owed.
+			tap.releaseReplies();
+		}
+	}, 30_000);
 });

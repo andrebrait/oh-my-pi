@@ -186,6 +186,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "set_idle_activity",
+				"doc": "Socket clients only: report whether this client has an unsent draft, so host-owned idle maintenance (recap and idle compaction) stays out of its way. Answered at once, even while another command runs. Like any write it honors the common `ifEpoch` precondition; generated SDK methods send none and bind to the current epoch.",
+				"params": "SetIdleActivityParams",
+				"result": "SetIdleActivityResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "get_available_commands",
 				"doc": "List the slash-command catalog.",
 				"params": null,
@@ -3873,6 +3884,22 @@
 			],
 			"description": "Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes."
 		},
+		"IdleRecapEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "idle_recap"
+				},
+				"recap": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"recap"
+			],
+			"description": "The host produced a recap while the session sat idle: the full reply (de-duplicated and capped like any side-channel reply), journaled in the session history database. It never enters the transcript or the model context."
+		},
 		"RpcAgentEvent": {
 			"anyOf": [
 				{
@@ -3967,6 +3994,9 @@
 				},
 				{
 					"$ref": "#/$defs/QueueUpdateEvent"
+				},
+				{
+					"$ref": "#/$defs/IdleRecapEvent"
 				}
 			],
 			"description": "A session event, discriminated by `type`; `set_event_filter` selects which are sent."
@@ -6109,6 +6139,28 @@
 			},
 			"required": [
 				"enabled"
+			]
+		},
+		"SetIdleActivityParams": {
+			"type": "object",
+			"properties": {
+				"isComposing": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"isComposing"
+			]
+		},
+		"SetIdleActivityResult": {
+			"type": "object",
+			"properties": {
+				"isComposing": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"isComposing"
 			]
 		},
 		"GetAvailableCommandsResult": {

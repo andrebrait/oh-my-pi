@@ -119,6 +119,12 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		unwrap: "enabled",
 	},
 	{
+		name: "set_idle_activity",
+		doc: "Socket clients only: report whether this client has an unsent draft, so host-owned idle maintenance (recap and idle compaction) stays out of its way. Answered at once, even while another command runs. Like any write it honors the common `ifEpoch` precondition; generated SDK methods send none and bind to the current epoch.",
+		params: { isComposing: "boolean" },
+		result: { isComposing: "boolean" },
+	},
+	{
 		name: "get_available_commands",
 		doc: "List the slash-command catalog.",
 		result: { commands: "AvailableSlashCommand[]" },

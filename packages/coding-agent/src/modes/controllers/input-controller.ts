@@ -742,7 +742,17 @@ export class InputController {
 		this.#setupEnhancedPaste();
 
 		this.ctx.editor.onChange = (text: string) => {
+			const wasComposing = (this.#draftText ?? "").trim() !== "";
 			this.#draftText = text;
+			const isComposing = text.trim() !== "";
+			if (wasComposing !== isComposing) {
+				if (this.ctx.hostedClientMode) {
+					const host = this.ctx.hostedClient;
+					if (host) void this.#hostWrite(host.setIdleActivity(isComposing));
+				} else {
+					this.ctx.syncIdleMaintenanceView();
+				}
+			}
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();

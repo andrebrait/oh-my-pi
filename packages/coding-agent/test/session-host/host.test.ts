@@ -1,21 +1,30 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { once } from "node:events";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionFactory, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { cfgGoalContinuationModes } from "@oh-my-pi/pi-coding-agent/goals/settings";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
 import { MAX_RPC_FRAME_BYTES, RpcFrameDecoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import {
+	cfgCompactionAutoContinue,
+	cfgCompactionKeepRecentTokens,
+} from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { listSessionRecaps, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tryAcquireSessionLease } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
@@ -28,7 +37,10 @@ import {
 	type SessionHostEntry,
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { isRecord, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
+import { drive, driveTurn, elapse, flush, nextIdleRecap, until, wait } from "../helpers/fake-clock";
 import { createTestSession, isolateAgentDir } from "../helpers/rpc-server-harness";
 import {
 	holdLeaseInAnotherProcess,
@@ -82,6 +94,7 @@ async function createExtensionSession(
 	factory: ExtensionFactory,
 ): Promise<AgentSession> {
 	const authStorage = await AuthStorage.create(path.join(sessionDir, "auth.db"));
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, path.join(sessionDir, "models.yml"));
 	const sessionManager = SessionManager.create(sessionDir, path.join(sessionDir, "sessions"));
 	const runtime = new ExtensionRuntime();
@@ -141,9 +154,11 @@ async function serveSession(session: AgentSession, options: Partial<SessionHostO
 	return host;
 }
 
-async function attachClient(host: TestHost): Promise<RpcClient> {
+async function attachClient(host: TestHost, options: { ui?: boolean } = {}): Promise<RpcClient> {
 	const entry = (await listSessionHosts(registryDir)).find(e => e.hostId === host.hostId)!;
-	const client = new RpcClient({ spawn: () => connectSessionHost({ entry, client: { kind: "test" }, ui: false }) });
+	const client = new RpcClient({
+		spawn: () => connectSessionHost({ entry, client: { kind: "test" }, ui: options.ui ?? false }),
+	});
 	await client.start();
 	return client;
 }
@@ -288,6 +303,102 @@ describe("session host", () => {
 		).rejects.toThrow("startup failed");
 		expect(await fs.readdir(registryDir)).toEqual([]);
 		await session.dispose();
+	});
+
+	it("admits socket text and images after idle compaction and completes the matching prompt", async () => {
+		const sessionDir = path.join(dir, "idle-admission");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const session = await createExtensionSession(sessionDir, "idle-admission", pi => {
+			pi.on("session_before_compact", async event => {
+				entered.resolve();
+				await release.promise;
+				return {
+					compaction: {
+						summary: "retained conversation",
+						firstKeptEntryId: event.preparation.firstKeptEntryId,
+						tokensBefore: event.preparation.tokensBefore,
+					},
+				};
+			});
+		});
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		cfgCompactionAutoContinue.set(session.settings, false);
+		session.sessionManager.appendMessage({ role: "user", content: "earlier question", timestamp: Date.now() });
+		session.sessionManager.appendMessage(createAssistantMessage("earlier answer"));
+		session.sessionManager.appendMessage({ role: "user", content: "latest question", timestamp: Date.now() });
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const mock = createMockModel({ responses: [{ content: ["completed after compaction"] }] });
+		const requests: Array<{ text: string; images: number }> = [];
+		session.agent.streamFn = (model, context, options) => {
+			const content = context.messages.findLast(message => message.role === "user")?.content;
+			requests.push({
+				text:
+					typeof content === "string"
+						? content
+						: (content?.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n") ?? ""),
+				images: typeof content === "string" ? 0 : (content?.filter(part => part.type === "image").length ?? 0),
+			});
+			return mock.stream(model, context, options);
+		};
+		// Normalize at once, so native image I/O cannot be what delays a wrongly admitted prompt.
+		const normalize = vi
+			.spyOn(imageLoading, "normalizeModelContextImages")
+			.mockImplementation(async images => images);
+		const host = await serveSession(session);
+		const client = await rawClient({});
+		await client.next(isHandshake);
+		const compacted = session.runIdleCompaction();
+		let admission: { mockRestore(): void } | undefined;
+		try {
+			await entered.promise;
+			// The prompt's own entry into admission is the signal, not a guess about socket or decode timing.
+			const admissionEntered = Promise.withResolvers<void>();
+			const waitForCleanup = SessionMaintenance.prototype.waitForMaintenanceCleanup;
+			admission = vi
+				.spyOn(SessionMaintenance.prototype, "waitForMaintenanceCleanup")
+				.mockImplementation(function (this: SessionMaintenance) {
+					admissionEntered.resolve();
+					return waitForCleanup.call(this);
+				});
+			client.write({
+				id: "after-idle",
+				type: "prompt",
+				message: "kept after idle",
+				images: [
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					},
+				],
+			});
+			await admissionEntered.promise;
+			await scheduler.yield();
+			client.write({ id: "barrier", type: "get_state" });
+			const barrier = await client.next(frame => frame.id === "barrier");
+			expect(isRecord(barrier.data) && barrier.data.isCompacting).toBe(true);
+			// Held in admission: no answer to the prompt, and nothing reached the model.
+			expect(client.frames.some(frame => frame.type === "response" && frame.id === "after-idle")).toBe(false);
+			expect(requests).toEqual([]);
+			release.resolve();
+			await compacted;
+			const reply = await client.next(frame => frame.type === "response" && frame.id === "after-idle");
+			expect(reply.success).toBe(true);
+			const result = await client.next(frame => frame.type === "prompt_result" && frame.id === "after-idle");
+			expect(result).toMatchObject({ status: "completed", agentInvoked: true });
+			expect(requests).toEqual([{ text: "kept after idle", images: 1 }]);
+			expect(client.frames.findIndex(frame => frame.type === "auto_compaction_end")).toBeLessThan(
+				client.frames.indexOf(reply),
+			);
+		} finally {
+			release.resolve();
+			await compacted;
+			admission?.mockRestore();
+			normalize.mockRestore();
+			await stopWith(host, [client]);
+		}
 	});
 
 	it("rejects a valid hello whose line overruns the hello size limit", async () => {
@@ -713,4 +824,309 @@ describe("session host", () => {
 		await a.detach();
 		await host.stop();
 	});
+});
+
+/**
+ * The host owns idle maintenance: a real `runSessionHost` (its socket, `RpcServer`, goal controller and settle
+ * watcher) around a real `AgentSession`, driven by real `RpcClient`s. Only the model is scripted: a main model for the
+ * turns and a side model for the recap request.
+ *
+ * Time is frozen with fake timers (see `helpers/fake-clock`), installed after every client is attached and before the
+ * first prompt so any timer the host arms is a fake one. Sockets and promise chains keep running on real event-loop
+ * turns, so waits yield those turns instead of guessing a duration. The clock stands still once a turn's terminal
+ * `agent_end` is out and moves only through `elapse`; shutting the host down needs the real clock again, so it
+ * happens after `vi.useRealTimers()`.
+ */
+describe("session host idle recap", () => {
+	/** `recap.idleSeconds` at its floor: the fake clock only ever moves a second at a time. */
+	const RECAP_SECONDS = 1;
+	const RECAP_DELAY_MS = RECAP_SECONDS * 1000;
+	/** Multi-line and far longer than any one-line preview (yet under the 4 KiB side-reply cap): the whole text must arrive. */
+	const RECAP_REPLY = [
+		"Reworking the login flow; the auth suite passes.",
+		"",
+		...Array.from(
+			{ length: 24 },
+			(_, index) => `- Verified refresh path ${index + 1} of 24 against the token fixture.`,
+		),
+		"",
+		"Next: wire the focused token-refresh test.",
+	].join("\n");
+
+	beforeEach(() => {
+		// Recaps are journaled in history.db under the agent dir the file-level hook just isolated.
+		resetSessionIndexForTests();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		resetSessionIndexForTests();
+	});
+
+	interface RecapHost {
+		host: TestHost;
+		/** Serves the turns. */
+		main: MockModel;
+		/** Serves the recap requests: one call per recap generated. */
+		side: MockModel;
+	}
+
+	/** A served session whose recap is on at the shortest delay and whose other idle work is off, settings its own. */
+	async function startRecapHost(name: string, extensionFactory?: ExtensionFactory): Promise<RecapHost> {
+		const sessionDir = path.join(dir, name);
+		await fs.mkdir(sessionDir, { recursive: true });
+		const main = createMockModel({ handler: { content: ["Work finished."] } });
+		const side = createMockModel({ handler: { content: [RECAP_REPLY] } });
+		const session = await createTestSession(sessionDir, main, undefined, {
+			extensionFactory,
+			settings: { "compaction.idleEnabled": false, "recap.enabled": true, "recap.idleSeconds": RECAP_SECONDS },
+			sideStreamFn: side.stream,
+		});
+		return { host: await serveSession(session), main, side };
+	}
+
+	/** What a client has been told, through the session-event listener a UI uses. */
+	function listen(client: RpcClient): { recaps: string[]; types: Set<string> } {
+		const told = { recaps: [] as string[], types: new Set<string>() };
+		client.onSessionEvent(event => {
+			told.types.add(event.type);
+			if (event.type === "idle_recap") told.recaps.push(event.recap);
+		});
+		return told;
+	}
+
+	/** The session's journaled recaps (history.db), which never enter the transcript. */
+	const journaled = ({ host }: RecapHost): string[] =>
+		listSessionRecaps({ sessionIds: [host.session.sessionManager.getSessionId()] }).map(row => row.recap);
+
+	/** Clients the host last published, read from its registry entry. */
+	async function attachedClients(host: TestHost): Promise<number> {
+		const text = await fs.readFile(path.join(registryDir, `${host.hostId}.json`), "utf8");
+		const entry = JSON.parse(text) as SessionHostEntry;
+		return entry.clients;
+	}
+
+	async function finish(host: TestHost, clients: RpcClient[]): Promise<void> {
+		// Shutdown flushes sockets against real timers.
+		vi.useRealTimers();
+		for (const client of clients) await client.stop();
+		await waitFor(async () => (await attachedClients(host)) === 0);
+		await host.stop();
+	}
+
+	it("holds the recap while any UI client may be mid-draft, then gives one full reply to every client still subscribed", async () => {
+		const recapHost = await startRecapHost("recap-draft");
+		const { host, side } = recapHost;
+		// Joined first and silent: until it reports, the host cannot know this client has no draft.
+		const composer = await attachClient(host, { ui: true });
+		const viewer = await attachClient(host, { ui: true });
+		const filtered = await attachClient(host, { ui: true });
+		const headless = await attachClient(host);
+		const told = { viewer: listen(viewer), filtered: listen(filtered), headless: listen(headless) };
+		try {
+			await viewer.setIdleActivity(false);
+			await filtered.setIdleActivity(false);
+			// No UI means no draft: even this report of composing must hold nothing back.
+			await headless.setIdleActivity(true);
+			await filtered.setEventFilter(["agent_end"]);
+
+			vi.useFakeTimers();
+			await driveTurn(host.session, viewer.promptToCompletion("keep working on the login flow"));
+			await flush();
+			// Two UI clients are clear, yet the one that has not reported blocks the host.
+			await elapse(2 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(0);
+
+			await wait(composer.setIdleActivity(true));
+			await flush();
+			// Composing blocks just as much while every other UI client reports clear.
+			await elapse(2 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(0);
+
+			const left = Promise.withResolvers<void>();
+			viewer.onHostFrame(frame => {
+				if (frame.type === "clients_changed" && frame.clients.length === 3) left.resolve();
+			});
+			// Subscribed before the composer leaves: the recap is awaited as a consumer sees it, with the clock nudged
+			// until it arrives, however late the host arms its timer.
+			const recapped = nextIdleRecap(host.session);
+			await wait(composer.detach());
+			await wait(left.promise);
+			await drive(recapped);
+			await until(
+				() => told.viewer.recaps.length > 0 && told.headless.recaps.length > 0,
+				"the recap to reach the clients still attached",
+			);
+
+			// A round trip after the recap: every frame owed to the filtered client has arrived by now.
+			await wait(filtered.getState());
+			expect(told.viewer.recaps).toEqual([RECAP_REPLY]);
+			expect(told.headless.recaps).toEqual([RECAP_REPLY]);
+			expect(told.filtered.recaps).toEqual([]);
+			expect(told.filtered.types.has("agent_end")).toBe(true);
+			expect(side.calls).toHaveLength(1);
+			expect(journaled(recapHost)).toEqual([RECAP_REPLY]);
+
+			// That stretch has had its recap: more idle time asks for nothing further.
+			await elapse(3 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(1);
+			expect(told.viewer.recaps).toHaveLength(1);
+			expect(journaled(recapHost)).toHaveLength(1);
+		} finally {
+			await finish(host, [composer, viewer, filtered, headless]);
+		}
+	}, 60_000);
+
+	it("produces and journals the recap with no client attached: the host, not a connection, owns the schedule", async () => {
+		const recapHost = await startRecapHost("recap-unattended");
+		const { host, side } = recapHost;
+		const announced: string[] = [];
+		host.session.subscribe(event => {
+			if (event.type === "idle_recap") announced.push(event.recap);
+		});
+		const solo = await attachClient(host, { ui: true });
+		try {
+			await solo.setIdleActivity(true);
+
+			vi.useFakeTimers();
+			await driveTurn(host.session, solo.promptToCompletion("work while I type"));
+			await flush();
+			await elapse(2 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(0);
+
+			// The only client leaves: nobody is left to hold the recap back, and nobody to receive it.
+			const recapped = nextIdleRecap(host.session);
+			await wait(solo.detach());
+			await until(async () => (await attachedClients(host)) === 0, "the last client to leave");
+			await drive(recapped);
+
+			expect(journaled(recapHost)).toEqual([RECAP_REPLY]);
+			expect(announced).toEqual([RECAP_REPLY]);
+			expect(side.calls).toHaveLength(1);
+			expect(await attachedClients(host)).toBe(0);
+		} finally {
+			await finish(host, [solo]);
+		}
+	}, 60_000);
+
+	it("recaps once a goal continuation the host scheduled is abandoned, with no further activity to restart the idle clock", async () => {
+		const recapHost = await startRecapHost("recap-abandoned-goal");
+		const { host, main, side } = recapHost;
+		const client = await attachClient(host);
+		const told = listen(client);
+		const settled = Promise.withResolvers<void>();
+		client.onSessionSettled(() => settled.resolve());
+		try {
+			// Goal mode is on, but the host does not yet continue goals: creating one runs no turn.
+			await client.goal("create", { objective: "Ship the login flow" });
+			cfgGoalContinuationModes.set(host.session.settings, ["rpc"]);
+			// The host's prompt re-arms the goal, so the end of its turn schedules a continuation turn. The gate that
+			// continuation re-reads when it is due closes while it waits, so it never runs and only the host's
+			// "settled" report is left to say the stretch is over.
+			host.session.subscribe(event => {
+				if (event.type === "agent_end" && event.isTerminal !== false) {
+					cfgGoalContinuationModes.set(host.session.settings, ["interactive"]);
+				}
+			});
+
+			const recapped = nextIdleRecap(host.session);
+			vi.useFakeTimers();
+			await driveTurn(host.session, client.promptToCompletion("Wire the token refresh test"));
+			await wait(settled.promise);
+			await drive(recapped);
+			await until(() => told.recaps.length > 0, "the recap to reach the client after the abandoned continuation");
+
+			expect(told.recaps).toEqual([RECAP_REPLY]);
+			// Only the host's prompt reached the model: the continuation was abandoned, not run.
+			expect(main.calls).toHaveLength(1);
+			expect(side.calls).toHaveLength(1);
+			expect(journaled(recapHost)).toEqual([RECAP_REPLY]);
+		} finally {
+			await finish(host, [client]);
+		}
+	}, 60_000);
+
+	it("holds the recap through extension startup, then gives the stretch that ended meanwhile its one recap", async () => {
+		const recapHost = await startRecapHost("recap-startup", pi => {
+			pi.on("session_start", async (_event, ctx) => {
+				await ctx.ui.confirm("Trust?", "startup");
+			});
+		});
+		const { host, main, side } = recapHost;
+		// Startup waits on the dialog, and RpcClient negotiates before it can attach: this client is raw.
+		const ui = await rawClient({ capabilities: { ui: true } });
+		/** The dialog this test owns while startup waits on it; unset once answered. */
+		let dialogId: unknown;
+		try {
+			const { snapshot } = await ui.next(isHandshake);
+			const request =
+				(isRecord(snapshot) && Array.isArray(snapshot.pendingUi) ? snapshot.pendingUi[0] : undefined) ??
+				(await ui.next(frame => frame.method === "confirm"));
+			dialogId = request.id;
+			// The only UI client has no draft, so nothing but the host's own startup stands in the recap's way.
+			ui.write({ id: "clear", type: "set_idle_activity", isComposing: false });
+			expect(await ui.next(frame => frame.id === "clear")).toMatchObject({ success: true });
+
+			const recapped = nextIdleRecap(host.session);
+			vi.useFakeTimers();
+			await driveTurn(host.session, host.session.prompt("work while startup waits"));
+			await flush();
+			await elapse(3 * RECAP_DELAY_MS);
+			expect(main.calls).toHaveLength(1);
+			expect(side.calls).toHaveLength(0);
+			expect(journaled(recapHost)).toEqual([]);
+			// Startup is still open: a command that is not a dialog answer waits for it.
+			ui.write({ id: "state", type: "get_state" });
+			await flush();
+			expect(ui.frames.some(frame => frame.id === "state")).toBe(false);
+
+			ui.write({ type: "extension_ui_response", id: dialogId, confirmed: true });
+			dialogId = undefined;
+			await wait(ui.next(frame => frame.id === "state"));
+			await drive(recapped);
+			expect(journaled(recapHost)).toEqual([RECAP_REPLY]);
+			expect(side.calls).toHaveLength(1);
+			await elapse(3 * RECAP_DELAY_MS);
+			expect(side.calls).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+			// Stopping the host sends `exit`, which waits behind startup. A failing assertion must not leave the
+			// dialog open, so it is answered here, and startup is seen to finish, before anything is closed.
+			if (dialogId !== undefined) {
+				ui.write({ type: "extension_ui_response", id: dialogId, confirmed: true });
+				ui.write({ id: "startup-done", type: "get_state" });
+				await ui.next(frame => frame.id === "startup-done");
+			}
+			ui.close();
+			await finish(host, []);
+		}
+	}, 60_000);
+
+	it("keeps the original deadline when a client repeats a report that changes nothing", async () => {
+		const recapHost = await startRecapHost("recap-repeated-report");
+		const { host, side } = recapHost;
+		const viewer = await attachClient(host, { ui: true });
+		try {
+			await viewer.setIdleActivity(false);
+
+			vi.useFakeTimers();
+			await driveTurn(host.session, viewer.promptToCompletion("finish the refactor"));
+			// The host's own quiet check starts at this barrier, and it has armed the recap well within the flush.
+			await wait(host.session.waitForIdle());
+			await flush(200);
+			await elapse(RECAP_DELAY_MS - 250);
+			expect(side.calls).toHaveLength(0);
+
+			// The recap is due in 250 ms and the client says again that it has no draft: nothing changed for the host.
+			await wait(viewer.setIdleActivity(false));
+			await flush();
+			await elapse(250);
+			// Clock-free from here: only the original deadline can have started the request. A deadline pushed back by
+			// the repeated report would never arrive.
+			await until(() => side.calls.length === 1, "the recap at its original deadline");
+			await until(() => journaled(recapHost).length === 1, "the recap in the journal");
+			expect(journaled(recapHost)).toEqual([RECAP_REPLY]);
+		} finally {
+			await finish(host, [viewer]);
+		}
+	}, 60_000);
 });

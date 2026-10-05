@@ -293,10 +293,11 @@ The terminal does not reconnect automatically. When the connection ends unexpect
 - Extension dialogs (`select`, `confirm`, `input`, `editor`) and the `ask` dialog with its notes, images, and "discuss instead" choice. The first terminal to answer wins, and the others' dialogs close.
 - Slash commands that have a headless handler run on the host, and their output appears as a status line. Extension commands, skill commands, and prompt templates are sent to the host as the text you typed. `/hotkeys`, `/copy`, `/open`, `/detach`, `/attach`, `/exit`, and `/quit` run in the terminal.
 - Images pasted from the clipboard travel to the host as image data. A large text paste offers only the wrapped-block and inline choices, because a local file would sit on the terminal's side.
+- Idle recap and idle compaction run once in the host, including while no terminal is attached. A nonempty editor draft in any attached terminal suppresses them; only its composing boolean travels to the host. All terminals receive the same recap.
 
 #### Unavailable when attached
 
-Commands and shortcuts below report that they are unavailable when attached, and typed input stays in the editor. Nothing runs locally or is silently forwarded in its place. Automation and automatic titles are simply off.
+Commands and shortcuts below report that they are unavailable when attached, and typed input stays in the editor. Nothing runs locally or is silently forwarded in its place. The remaining terminal-owned automation and automatic titles are off.
 
 | Area | Unavailable | Notes |
 | --- | --- | --- |
@@ -311,7 +312,7 @@ Commands and shortcuts below report that they are unavailable when attached, and
 | Panels | `/extensions`, `/agents`, `/hub`, `/git`, `/debug`, `/skills`, focusing a subagent, and the `/btw` side question | `/btw` waits for host ownership of its lifecycle. |
 | Collaboration and capture | `/collab`, `/join`, `/leave`, `/live`, `/record`, `/pause`, `/tan`, `/omfg`, `/cleanse`, and collab auto-hosting | |
 | Extension UI | Custom components (`custom()`), `setFooter`, `setHeader`, `setEditorComponent`, raw terminal input, component-factory widgets, and extension keyboard shortcuts | Extensions run in the host with the same UI limits as [RPC](./rpc.md#extension-ui-sub-protocol). Status, notifications, string-array widgets, titles, and editor text from the host are shown. A terminal that attaches later still gets the statuses and widgets showing at that moment; earlier notifications, titles, and editor text are not replayed. |
-| Automation | Idle compaction, idle recap, goal continuation, loop auto-submit, plan-mode model reconciliation, and automatic todo clearing | Terminal-owned automation is off so that several terminals never run it more than once; it has not moved to the host yet. |
+| Automation | Goal continuation, loop auto-submit, plan-mode model reconciliation, and automatic todo clearing | These terminal-owned paths have not moved to the host yet. Idle compaction and idle recap are host-owned. |
 
 ## Subcommands
 
