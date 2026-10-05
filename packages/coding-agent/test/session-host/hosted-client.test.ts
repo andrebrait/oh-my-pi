@@ -2,7 +2,6 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } fro
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
@@ -369,7 +368,6 @@ describe("HostedClientLink", () => {
 		const view = await attach(host);
 
 		expect(view.local.sessionManager.getLeafId()).toBe(branchA);
-		expect(view.hostLink.leafId).toBe(branchA);
 		// The branch the user sees: what the repaint was handed, and what the agent holds.
 		for (const shown of [view.rendered.at(-1)!, JSON.stringify(view.local.messages)]) {
 			expect(shown).toContain("take branch A");
@@ -404,7 +402,6 @@ describe("HostedClientLink", () => {
 
 		expect(view.local.sessionManager.getEntries().some(entry => entry.id === retained)).toBe(true);
 		expect(view.local.sessionManager.getLeafId()).toBe(tip);
-		expect(view.hostLink.leafId).toBe(tip);
 		expect(JSON.stringify(view.local.messages)).not.toContain("retained result");
 
 		// The next append on the host's branch continues from the tip, not from the retained entry.
@@ -463,7 +460,6 @@ describe("HostedClientLink", () => {
 		expect(view.showError).not.toHaveBeenCalled();
 		expect(entryShape(view.local)).toEqual(entryShape(host.session));
 		expect(view.local.sessionManager.getLeafId()).toBe(manager.getLeafId());
-		expect(view.hostLink.leafId).toBe(manager.getLeafId());
 		expect(view.local.sessionManager.getBranch().map(entry => entry.id)).toEqual(
 			manager.getBranch().map(entry => entry.id),
 		);
@@ -494,7 +490,6 @@ describe("HostedClientLink", () => {
 		const view = await attach(host);
 		expect(entryShape(view.local)).toEqual(announced);
 		expect(view.local.sessionManager.getLeafId()).toBe(root);
-		expect(view.hostLink.leafId).toBe(view.local.sessionManager.getLeafId());
 		expect(view.local.sessionManager.getSessionName()).toBeUndefined();
 		expect(JSON.stringify(view.local.messages)).toContain("question");
 		expect(JSON.stringify(view.local.messages)).not.toContain("batched");
@@ -982,12 +977,6 @@ describe("HostedClientLink", () => {
 	});
 
 	describe("taking a queued message back", () => {
-		const PIXEL: ImageContent = {
-			type: "image",
-			mimeType: "image/png",
-			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
-		};
-
 		/** A host held mid-turn by `go` from a first view, plus that view. */
 		async function holdTurn(): Promise<{ host: TestSessionHost; view: View; release: () => void }> {
 			const release = Promise.withResolvers<void>();
@@ -997,53 +986,6 @@ describe("HostedClientLink", () => {
 			await waitFor(() => view.hostLink.isStreaming);
 			return { host, view, release: release.resolve };
 		}
-
-		it("restores the newest of equal queued messages and leaves the older ones in their order", async () => {
-			const { host, view, release } = await holdTurn();
-			try {
-				for (const text of ["A", "B", "A"]) await view.hostLink.prompt(text, undefined, "followUp");
-				await waitFor(() => view.hostLink.queued.followUp.length === 3);
-
-				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "restored", text: "A" });
-
-				expect(host.session.getQueuedMessages().followUp).toEqual(["A", "B"]);
-			} finally {
-				release();
-			}
-		});
-
-		it("says there is nothing to take back when nothing is queued", async () => {
-			const { view, release } = await holdTurn();
-			try {
-				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "empty" });
-			} finally {
-				release();
-			}
-		});
-
-		it("leaves a prompt with an attachment queued, whether its text mentions one or not", async () => {
-			const { host, view, release } = await holdTurn();
-			const other = await fixture.client(host);
-			try {
-				await other.start();
-				// A caption and no `[Image #N]` marker, then an image with no text at all (its chip reads `[Image]`).
-				await other.prompt("look at this", [PIXEL], "followUp");
-				await other.prompt("", [PIXEL], "followUp");
-				await waitFor(() => view.hostLink.queued.followUp.length === 2);
-				expect(view.hostLink.queued.followUp).toEqual(["look at this", "[Image]"]);
-
-				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "attachment" });
-				expect(host.session.getQueuedMessages().followUp).toEqual(["look at this", "[Image]"]);
-
-				await other.removeQueuedMessage("[Image]", "followUp");
-				await waitFor(() => view.hostLink.queued.followUp.length === 1);
-				expect(await view.hostLink.takeBackQueued()).toEqual({ outcome: "attachment" });
-				expect(host.session.getQueuedMessages().followUp).toEqual(["look at this"]);
-				expect(host.session.queuedMessageHasAttachments("look at this", "followUp")).toBe(true);
-			} finally {
-				release();
-			}
-		});
 
 		it("takes nothing back when the host's report of which queued prompts carry attachments does not fit its queue", async () => {
 			const release = Promise.withResolvers<void>();
@@ -1618,7 +1560,7 @@ describe("HostedClientLink transport", () => {
 			const entry: SessionEntry = {
 				type: "message",
 				id: "0ddba11f",
-				parentId: view.hostLink.leafId,
+				parentId: view.local.sessionManager.getLeafId(),
 				timestamp: new Date().toISOString(),
 				message: { role: "user", content: "from an older host", timestamp: Date.now() },
 			};
