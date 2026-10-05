@@ -32,7 +32,7 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { sanitizeDisplayLine, sanitizeDisplayText } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import { clearAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, toError } from "@oh-my-pi/pi-utils";
 import type { ExtensionUISelectItem } from "../extensibility/extensions/types";
 import { ensurePrivateDir, pidAlive } from "../ipc/private-endpoint";
 import { RpcClient } from "../modes/rpc/rpc-client";
@@ -134,10 +134,6 @@ function readQueueAttachments(
 	const { steering, followUp } = value;
 	if (!isFlagList(steering, queued.steering.length) || !isFlagList(followUp, queued.followUp.length)) return undefined;
 	return { steering: [...steering], followUp: [...followUp] };
-}
-
-function toError(error: unknown): Error {
-	return error instanceof Error ? error : new Error(String(error));
 }
 
 /** Whether `pid` is still a running process, giving a just-killed process time to be reaped. */
@@ -272,11 +268,6 @@ export class HostedClientLink {
 	/** Host session epoch of the view on screen: the `ifEpoch` of every write. */
 	get epoch(): number {
 		return this.#epoch;
-	}
-
-	/** Leaf entry id of the replica, for `ifLeaf` on tree mutations. */
-	get leafId(): string | null {
-		return this.#ctx.session.sessionManager.getLeafId();
 	}
 
 	/**

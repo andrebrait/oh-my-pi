@@ -670,32 +670,39 @@ export class SelectorController {
 		};
 		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const current = this.ctx.session.model;
+		this.#showModelPickerOverlay(
+			done =>
+				new ModelPickerComponent(
+					this.ctx.ui,
+					createModelBrowserSource(this.ctx.settings),
+					registry,
+					[],
+					{
+						onPick: async model => {
+							try {
+								await host.setModel(model.provider, model.id);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+							done();
+						},
+						onCancel: done,
+					},
+					{ currentSelector: current ? `${current.provider}/${current.id}` : undefined },
+				),
+		);
+	}
+
+	#showModelPickerOverlay(createPicker: (done: () => void) => Component): void {
 		let closed = false;
 		const done = () => {
 			if (closed) return;
 			closed = true;
-			overlayHandle?.hide();
+			overlayHandle.hide();
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
-		const picker = new ModelPickerComponent(
-			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings),
-			registry,
-			[],
-			{
-				onPick: async model => {
-					try {
-						await host.setModel(model.provider, model.id);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-					done();
-				},
-				onCancel: done,
-			},
-			{ currentSelector: current ? `${current.provider}/${current.id}` : undefined },
-		);
+		const picker = createPicker(done);
 		const overlayHandle = this.ctx.ui.showOverlay(picker, {
 			anchor: "bottom-center",
 			width: "100%",
@@ -776,75 +783,62 @@ export class SelectorController {
 		// else the session model (the bundled task agent inherits it by default).
 		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
-		let closed = false;
-		const done = () => {
-			if (closed) return;
-			closed = true;
-			overlayHandle?.hide();
-			this.focusActiveEditorArea();
-			this.ctx.ui.requestRender();
-		};
-		const picker = new ModelPickerComponent(
-			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings),
-			this.ctx.session.modelRegistry,
-			this.ctx.session.scopedModels,
-			{
-				onPick: async (model, selector, { overContext }) => {
-					try {
-						// Over-context pick: close the picker first so the compaction
-						// loader is visible.
-						if (overContext) done();
-						await this.#applySessionModel(model, selector, undefined, overContext);
-						if (!overContext) done();
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
-				onPickRole: async entry => {
-					try {
-						await this.ctx.session.applyRoleModel(entry);
-						this.ctx.statusLine.invalidate();
-						this.ctx.updateEditorBorderColor();
-						this.ctx.showModelCycleTrack(
-							quickRoleOrder.map(role => ({ label: role })),
-							quickRoleOrder.indexOf(entry.role),
-						);
-						done();
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
-				onPickTask: (_model, selector) => {
-					// Session-only: layer the Task override onto the runtime settings
-					// layer so it is never persisted, mirroring the session-model pick.
-					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
-						...cfgTaskAgentModelOverrides.get(this.ctx.settings),
-						task: selector,
-					});
-					this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
-					done();
-				},
-				onCancel: done,
-			},
-			{
-				currentContextTokens,
-				currentSelector,
-				taskModeKeys: this.ctx.keybindings.getKeys("app.model.selectTemporary"),
-				taskSelector,
-				quickRoles: quickRoleCycle?.models,
-				quickRoleOrder,
-				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
-			},
+		this.#showModelPickerOverlay(
+			done =>
+				new ModelPickerComponent(
+					this.ctx.ui,
+					createModelBrowserSource(this.ctx.settings),
+					this.ctx.session.modelRegistry,
+					this.ctx.session.scopedModels,
+					{
+						onPick: async (model, selector, { overContext }) => {
+							try {
+								// Over-context pick: close the picker first so the compaction
+								// loader is visible.
+								if (overContext) done();
+								await this.#applySessionModel(model, selector, undefined, overContext);
+								if (!overContext) done();
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
+						onPickRole: async entry => {
+							try {
+								await this.ctx.session.applyRoleModel(entry);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								this.ctx.showModelCycleTrack(
+									quickRoleOrder.map(role => ({ label: role })),
+									quickRoleOrder.indexOf(entry.role),
+								);
+								done();
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+						},
+						onPickTask: (_model, selector) => {
+							// Session-only: layer the Task override onto the runtime settings
+							// layer so it is never persisted, mirroring the session-model pick.
+							cfgTaskAgentModelOverrides.override(this.ctx.settings, {
+								...cfgTaskAgentModelOverrides.get(this.ctx.settings),
+								task: selector,
+							});
+							this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
+							done();
+						},
+						onCancel: done,
+					},
+					{
+						currentContextTokens,
+						currentSelector,
+						taskModeKeys: this.ctx.keybindings.getKeys("app.model.selectTemporary"),
+						taskSelector,
+						quickRoles: quickRoleCycle?.models,
+						quickRoleOrder,
+						currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
+					},
+				),
 		);
-		const overlayHandle = this.ctx.ui.showOverlay(picker, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-		});
-		this.ctx.ui.setFocus(picker);
-		this.ctx.ui.requestRender();
 	}
 
 	/**
