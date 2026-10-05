@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Writable } from "node:stream";
 import { registerOAuthProvider, unregisterOAuthProvider } from "@oh-my-pi/pi-ai/oauth";
 import type { MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionFactory, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -279,5 +279,158 @@ describe("RpcServer with two connections", () => {
 		expect(sink.destroyed).toBe(true);
 		expect((await healthy.next(f => f.method === "notify")).message).toBe("x".repeat(2048));
 		expect((await healthy.command({ type: "get_state" })).success).toBe(true);
+	});
+});
+
+/** What a scheduler reads each time the host reports that its blocker may have changed. */
+function trackIdleActivity(): boolean[] {
+	const observed: boolean[] = [];
+	server.onIdleActivityChanged = () => observed.push(server.isIdleActivityBlocked);
+	return observed;
+}
+
+const reportActivity = (client: TestClient, isComposing: boolean, extra: Record<string, unknown> = {}) =>
+	client.command({ type: "set_idle_activity", isComposing, ...extra });
+
+/** A session whose `session_start` / `session_before_switch` hooks come from `extensionFactory`. */
+const createExtensionSession = (extensionFactory: ExtensionFactory): Promise<AgentSession> =>
+	createTestSession(dir, { handler: { content: ["ok"] } }, undefined, { extensionFactory });
+
+describe("RpcServer idle activity aggregation", () => {
+	it("blocks only for a sequenced UI client without a current report, never for none, non-UI or stdio", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const observed = trackIdleActivity();
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		const headless = new TestClient(server, { ui: false });
+		const stdio = new TestClient(server, { sequenced: false });
+		await reportActivity(headless, true);
+		await stdio.command({ type: "get_state" });
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		// A UI client that has not said anything yet might be mid-draft.
+		const a = new TestClient(server);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		expect(observed.at(-1)).toBe(true);
+		await reportActivity(a, false);
+		expect(server.isIdleActivityBlocked).toBe(false);
+		expect(observed.at(-1)).toBe(false);
+	});
+
+	it("keeps blocking for a composing client while another is empty, and releases it when that client disconnects", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const observed = trackIdleActivity();
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		await reportActivity(b, false);
+		await reportActivity(a, true);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		await reportActivity(b, false);
+		expect(server.isIdleActivityBlocked).toBe(true);
+
+		await server.disconnect(a.conn, "test");
+		expect(server.isIdleActivityBlocked).toBe(false);
+		expect(observed.at(-1)).toBe(false);
+
+		// A client that joins later is unknown until it reports.
+		const late = new TestClient(server);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		expect(observed.at(-1)).toBe(true);
+		await server.disconnect(late.conn, "test");
+		expect(server.isIdleActivityBlocked).toBe(false);
+		await server.disconnect(b.conn, "test");
+		expect(server.isIdleActivityBlocked).toBe(false);
+	});
+
+	it("keeps the latest of rapid composing, clear, composing reports, and of the reverse", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		const burst = (...states: boolean[]) => Promise.all(states.map(state => reportActivity(a, state)));
+
+		const first = await burst(true, false, true);
+		expect(first.map(r => (isRecord(r.data) ? r.data.isComposing : undefined))).toEqual([true, false, true]);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		await burst(false, true, false);
+		expect(server.isIdleActivityBlocked).toBe(false);
+	});
+
+	it("drops every client's report when the session is replaced, so each must report again", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const observed = trackIdleActivity();
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		await reportActivity(a, false);
+		await reportActivity(b, false);
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		const epoch = server.epoch;
+		expect((await a.command({ type: "new_session" })).success).toBe(true);
+		expect(server.epoch).toBe(epoch + 1);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		expect(observed.at(-1)).toBe(true);
+
+		await reportActivity(a, false);
+		expect(server.isIdleActivityBlocked).toBe(true);
+		await reportActivity(b, false);
+		expect(server.isIdleActivityBlocked).toBe(false);
+		expect(observed.at(-1)).toBe(false);
+	});
+
+	it("accepts an activity report while extension startup waits on a dialog, and runs other commands only afterwards", async () => {
+		// Extension startup stays open until a client answers the dialog `session_start` waits on.
+		session = await createExtensionSession(pi => {
+			pi.on("session_start", async (_event, ctx) => {
+				await ctx.ui.confirm("Trust?", "startup");
+			});
+		});
+		server = new RpcServer(session, {});
+		const a = new TestClient(server);
+		const started = server.init();
+		const request = await a.next(f => f.type === "extension_ui_request" && f.method === "confirm");
+
+		// Held until startup finishes; the activity report is a connection preference, served right away.
+		a.write({ id: "state", type: "get_state" });
+		a.write({ id: "activity", type: "set_idle_activity", isComposing: false });
+		expect(await a.next(f => f.id === "activity")).toMatchObject({ success: true, data: { isComposing: false } });
+		expect(a.frames.some(f => f.id === "state")).toBe(false);
+		expect(server.isIdleActivityBlocked).toBe(false);
+
+		a.write({ type: "extension_ui_response", id: request.id, confirmed: true });
+		await started;
+		expect(await a.next(f => f.id === "state")).toMatchObject({ type: "response", success: true });
+		// Startup did not change the epoch, so the early report still counts.
+		expect(server.isIdleActivityBlocked).toBe(false);
+	});
+
+	it("answers a report while an earlier serial command is held, and applies it before that command finishes", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		// `new_session` holds the shared command queue for as long as its `session_before_switch` hook waits.
+		session = await createExtensionSession(pi => {
+			pi.on("session_before_switch", async () => {
+				entered.resolve();
+				await release.promise;
+				return { cancel: true };
+			});
+		});
+		server = await RpcServer.start(session, {});
+		const a = new TestClient(server);
+		expect((await reportActivity(a, false)).success).toBe(true);
+
+		a.write({ id: "switch", type: "new_session" });
+		await entered.promise;
+		try {
+			// Answered while the switch is still held, and the last report sent is the one that counts.
+			expect(await reportActivity(a, true)).toMatchObject({ success: true, data: { isComposing: true } });
+			expect(server.isIdleActivityBlocked).toBe(true);
+			expect(await reportActivity(a, false)).toMatchObject({ success: true, data: { isComposing: false } });
+			expect(server.isIdleActivityBlocked).toBe(false);
+			expect(a.frames.some(f => f.id === "switch")).toBe(false);
+		} finally {
+			release.resolve();
+		}
+		expect(await a.next(f => f.id === "switch")).toMatchObject({ success: true, data: { cancelled: true } });
+		// The veto left the epoch alone, so the reports made while it was held still count.
+		expect(server.isIdleActivityBlocked).toBe(false);
 	});
 });

@@ -13,7 +13,8 @@ import { RpcWordPredictor } from "./rpc-mode";
 import { RpcOutputWriter } from "./rpc-output";
 import { RpcPromptResults } from "./rpc-prompt-results";
 import { RpcSessionEventForwarder } from "./rpc-session-events";
-import type { RpcScheduledTurnProbe, RpcSettleSession } from "./rpc-session-settle";
+import type { SessionSettleState } from "../../session/session-settle";
+import type { RpcScheduledTurnProbe } from "./rpc-session-settle";
 import type { RpcSubagentSubscriptionLevel } from "./rpc-types";
 
 export interface RpcConnectionTransport {
@@ -42,6 +43,11 @@ export class RpcConnection {
 	readonly hostUris: RpcHostUriBridge;
 	/** Set by `set_ask_dialog`; hosts that never opt in keep the select/editor ask fallback. */
 	askDialogEnabled = false;
+	/**
+	 * Set by `set_idle_activity`: whether this client has an unsent draft, as of session epoch `epoch`. One coherent
+	 * report; a report from an earlier epoch no longer counts. Absent until the client reports.
+	 */
+	idleActivity: { epoch: number; isComposing: boolean } | undefined;
 	/** Set by `set_subagent_subscription`; gates which subagent frames this client receives. */
 	subagentLevel: RpcSubagentSubscriptionLevel = "off";
 	/**
@@ -59,7 +65,7 @@ export class RpcConnection {
 
 	/** Writes the `ready` frame. `onOutputFailure` runs once the sink can no longer take frames. */
 	constructor(
-		session: RpcSettleSession,
+		session: SessionSettleState,
 		transport: RpcConnectionTransport,
 		readonly options: RpcConnectionOptions,
 		onOutputFailure: (error: Error) => void,

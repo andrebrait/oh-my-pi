@@ -174,6 +174,8 @@ export interface InteractiveModeContext {
 	readonly sessionName: string | undefined;
 	/** Session the transcript/editor/status are attached to: the focused agent's, else `session`. */
 	readonly viewSession: AgentSession;
+	/** Bind idle maintenance to the local view, or release UI activity bindings on null; hosted replicas never activate. */
+	syncIdleMaintenanceView(target?: AgentSession | null): void;
 	/** Id of the focused agent, undefined when the main session is attached. */
 	readonly focusedAgentId: string | undefined;
 	/** Set while a tool-approval dialog owns the composer: its drafts steer the main session awaiting that approval, even from a focused agent's view. */
