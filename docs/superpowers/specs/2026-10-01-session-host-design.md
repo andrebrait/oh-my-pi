@@ -99,7 +99,7 @@ flowchart LR
 | `detach` | The host closes this connection. The session continues. |
 | `exit` | `detach` if other connections remain; from the last connection, dispose and exit 0 (exit 1 on a latched persistence failure, as in RPC mode today). |
 | `slash_command{text}` | Runs a built-in slash command's headless `handle` (`SlashCommandSpec`) on the host. **Not implemented in P2:** until P3, a client sends `/name args` to the host as the text of an ordinary `prompt`, whose handler already runs a built-in that has a headless `handle`. Clients built against this spec, such as ompweb, must do the same until the command exists. |
-| Read commands | Queued message text, plan and goal state, cwd, jobs and MCP status: the reads RPC currently lacks. The P2 plan fixes the exact list. |
+| Read commands | Existing RPC reads expose session state (including queued text and goal state), models, entries, tree, and subagents; socket snapshots expose cwd through `origin`. Reads for plan state, job listings, and MCP status belong to their P3 follow-ups. |
 
 `new_session`, `switch_session`, and `branch` act on the host. Switching to a file another host owns returns `error{code:"session_hosted", hostId}`.
 
@@ -222,7 +222,7 @@ Behavioral tests against a real host process over a real socket or pipe, each wi
 4. Resume: reconnect with an in-ring `lastSeq` → replay with no gaps or duplicates; an expired `lastSeq` → snapshot.
 5. Lifetime: `/detach` from the last client leaves the host running. `/exit` with two clients leaves it running. `/exit` from the last client stops it and removes the registry entry. SIGKILL of a client counts as detach.
 6. Switching: `new_session` from A → B receives `session_replaced` with a new epoch. Switching to a file another host owns → `session_hosted`.
-7. Windows: the same suite over named pipes on the win32 CI runner (the P1 plan verifies the runner exists).
+7. Windows: the same suite over named pipes on the win32 CI runner.
 8. Smoke: `omp --smoke-test` adds a spawn → attach → ping → exit host probe, so binary, tarball, and source installs exercise the detached spawn path.
 9. Preconditions: B switches session, then A prompts with the old `ifEpoch` → `stale`, and nothing is appended to either session. B branches, then A forks with the old `ifLeaf` → `stale`. `abort` with an old epoch still aborts.
 
