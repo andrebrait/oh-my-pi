@@ -767,32 +767,39 @@ export class SelectorController {
 		};
 		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const current = this.ctx.session.model;
+		this.#showModelPickerOverlay(
+			done =>
+				new ModelPickerComponent(
+					this.ctx.ui,
+					createModelBrowserSource(this.ctx.settings),
+					registry,
+					[],
+					{
+						onPick: async model => {
+							try {
+								await host.setModel(model.provider, model.id);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+							done();
+						},
+						onCancel: done,
+					},
+					{ currentSelector: current ? `${current.provider}/${current.id}` : undefined },
+				),
+		);
+	}
+
+	#showModelPickerOverlay(createPicker: (done: () => void) => Component): void {
 		let closed = false;
 		const done = () => {
 			if (closed) return;
 			closed = true;
-			overlayHandle?.hide();
+			overlayHandle.hide();
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
-		const picker = new ModelPickerComponent(
-			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings),
-			registry,
-			[],
-			{
-				onPick: async model => {
-					try {
-						await host.setModel(model.provider, model.id);
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					}
-					done();
-				},
-				onCancel: done,
-			},
-			{ currentSelector: current ? `${current.provider}/${current.id}` : undefined },
-		);
+		const picker = createPicker(done);
 		const overlayHandle = this.ctx.ui.showOverlay(picker, {
 			anchor: "bottom-center",
 			width: "100%",
