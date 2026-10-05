@@ -25,6 +25,7 @@ import * as taskSettings from "../task/settings";
 import * as planModeSettings from "../plan-mode/settings";
 import * as goalsSettings from "../goals/settings";
 import * as extensibilitySettings from "../extensibility/settings";
+import * as resourceSettings from "../extensibility/resource-settings";
 import * as webSettings from "../web/settings";
 import * as toolsBrowserSettings from "../tools/browser/settings";
 import * as idaSettings from "../ida/settings";
@@ -64,6 +65,7 @@ const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	planModeSettings,
 	goalsSettings,
 	extensibilitySettings,
+	resourceSettings,
 	webSettings,
 	toolsBrowserSettings,
 	idaSettings,
