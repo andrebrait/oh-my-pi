@@ -187,6 +187,7 @@ const sessionEventTypes = new Set<AgentSessionEvent["type"]>([
 	"model_changed",
 	"goal_updated",
 	"queue_update",
+	"idle_recap",
 ]);
 
 function isRpcResponse(value: unknown): value is RpcResponse {
@@ -835,6 +836,16 @@ export class RpcClient {
 	 */
 	async setAskDialog(enabled: boolean): Promise<void> {
 		this.#getData(await this.#send({ type: "set_ask_dialog", enabled }));
+	}
+
+	/**
+	 * Tell a session host whether this client has an unsent draft, so its idle maintenance (recap and idle
+	 * compaction) stays out of the way. Session-host sockets only; stdio hosts reject it. `preconditions` as for the
+	 * other mutating controls: a report from an earlier session epoch rejects with `code: "stale"` instead of
+	 * clearing the current blocker.
+	 */
+	async setIdleActivity(isComposing: boolean, preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "set_idle_activity", isComposing, ...writeGuard(preconditions) }));
 	}
 
 	/**
