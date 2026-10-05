@@ -101,7 +101,7 @@
 - Fixed a supervised PTY service on Windows hanging when it asks the terminal for the cursor position; the launch broker now answers the query as it does on Linux and macOS
 ### Added
 
-- Added consent-gated AI relationship analysis to `/skills diagnostics` and `omp plugin doctor --analyze`, with cited evidence, recommendations, and separately confirmed content-bound choices that affect OMP only.
+- Added consent-gated AI relationship analysis to `/skills diagnostics` and `omp plugin doctor --analyze`, with cited evidence, recommendations, and separately confirmed content-bound choices that affect OMP only ([#14458](https://github.com/can1357/oh-my-pi/pull/14458) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.6.2] - 2026-10-04
 ### Added
