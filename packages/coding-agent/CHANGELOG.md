@@ -4,17 +4,17 @@
 
 ### Added
 
-- Hosted sessions now generate idle recaps and run idle compaction once, even with no terminals attached; composing a draft in any attached terminal suppresses both ([andrebrait/oh-my-pi#41](https://github.com/andrebrait/oh-my-pi/pull/41) by [@andrebrait](https://github.com/andrebrait)).
-- RPC: added the socket-only `set_idle_activity` command, with which a UI client reports whether it holds an unsent draft (a boolean, never the text). It is answered at once, even while another command runs. Hosted sessions emit the new `idle_recap` event (the full recap reply, journaled in the history database and never added to the transcript) to subscribed clients; `RpcClient.setIdleActivity()` accepts `ifEpoch`/`ifLeaf` preconditions, and the Python, Go and Rust SDKs gain the matching command and event ([andrebrait/oh-my-pi#41](https://github.com/andrebrait/oh-my-pi/pull/41) by [@andrebrait](https://github.com/andrebrait)).
-- SDK: `AgentSession.enableIdleMaintenance()` and `refreshIdleMaintenance()` let an owner opt a session in to the idle recap and idle compaction; `AgentSessionEvent` gains `idle_recap` ([andrebrait/oh-my-pi#41](https://github.com/andrebrait/oh-my-pi/pull/41) by [@andrebrait](https://github.com/andrebrait)).
+- Hosted sessions now generate idle recaps and run idle compaction once, even with no terminals attached; composing a draft in any attached terminal suppresses both ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
+- RPC: added the socket-only `set_idle_activity` command, with which a UI client reports whether it holds an unsent draft (a boolean, never the text). It is answered at once, even while another command runs. Hosted sessions emit the new `idle_recap` event (the full recap reply, journaled in the history database and never added to the transcript) to subscribed clients; `RpcClient.setIdleActivity()` accepts `ifEpoch`/`ifLeaf` preconditions, and the Python, Go and Rust SDKs gain the matching command and event ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
+- SDK: `AgentSession.enableIdleMaintenance()` and `refreshIdleMaintenance()` let an owner opt a session in to the idle recap and idle compaction; `AgentSessionEvent` gains `idle_recap` ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 
-- Idle recap and idle compaction now run from one session-owned scheduler. Clearing a draft re-arms the recap and compaction that the stretch still owes, and a view that is returned to receives the recap it still owed; the former per-terminal timers dropped both ([andrebrait/oh-my-pi#41](https://github.com/andrebrait/oh-my-pi/pull/41) by [@andrebrait](https://github.com/andrebrait)).
+- Idle recap and idle compaction now run from one session-owned scheduler. Clearing a draft re-arms the recap and compaction that the stretch still owes, and a view that is returned to receives the recap it still owed; the former per-terminal timers dropped both ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
-- Prompts submitted during idle compaction now wait for it to finish before starting a turn ([andrebrait/oh-my-pi#41](https://github.com/andrebrait/oh-my-pi/pull/41) by [@andrebrait](https://github.com/andrebrait)).
+- Prompts submitted during idle compaction now wait for it to finish before starting a turn ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.6.2] - 2026-10-04
 ### Breaking Changes
