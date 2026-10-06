@@ -500,6 +500,7 @@ export class RpcClient {
 
 			this.#process = null;
 			this.#abortController.abort(error);
+			this.#rejectPromptWaiters(error);
 			const pendingRequests = Array.from(this.#pendingRequests.values());
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
@@ -647,6 +648,7 @@ export class RpcClient {
 		}
 		this.#abortController.abort(error);
 		this.#process = null;
+		this.#rejectPromptWaiters(error);
 		for (const request of this.#pendingRequests.values()) request.reject(error);
 		this.#pendingRequests.clear();
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
@@ -654,6 +656,16 @@ export class RpcClient {
 		}
 		this.#pendingHostToolCalls.clear();
 		return this.#waitForExit(child);
+	}
+
+	/** Fail prompts that were acknowledged but whose `prompt_result` can no longer arrive. */
+	#rejectPromptWaiters(error: Error): void {
+		for (const [id, reject] of this.#promptErrorWaiters) {
+			// Still-unacknowledged prompts fail through their pending request instead.
+			if (!this.#pendingRequests.has(id)) reject(error);
+		}
+		this.#promptErrorWaiters.clear();
+		this.#promptResultWaiters.clear();
 	}
 
 	/**
