@@ -64,18 +64,31 @@ function passiveContextLine(context: string): string | undefined {
 	return oneLine ? `↳ Context: ${oneLine}` : undefined;
 }
 
-/** Render passive tool context as one sanitized, dim transcript line. */
-export function renderToolAdditionalContext(context: string, width: number): string {
+/**
+ * Render passive tool context as sanitized, dim transcript text: one truncated
+ * line while collapsed, the full text wrapped once tools are expanded (`Ctrl+O`).
+ */
+export function renderToolAdditionalContext(context: string, width: number, expanded: boolean): string {
 	const line = passiveContextLine(context);
-	return line ? truncateToWidth(theme.fg("dim", line), width) : "";
+	if (!line) return "";
+	const dim = theme.fg("dim", line);
+	return expanded ? dim : truncateToWidth(dim, width);
 }
 
-/** The native counterpart of {@link renderToolAdditionalContext}: a one-line body child, or nothing. */
-export function describeToolAdditionalContext(context: string | undefined): NativeChild[] {
+/**
+ * The native counterpart of {@link renderToolAdditionalContext}: one line with
+ * the full text as its tooltip while collapsed, wrapped when expanded; or nothing.
+ */
+export function describeToolAdditionalContext(context: string | undefined, expanded: boolean): NativeChild[] {
 	const line = context === undefined ? undefined : passiveContextLine(context);
-	return line
-		? [text([span(line, "dim")], { lines: 1, truncate: "end", key: "context", role: "omp.tool.context" })]
-		: [];
+	if (!line) return [];
+	const props = { key: "context", role: "omp.tool.context" };
+	return [
+		text(
+			[span(line, "dim")],
+			expanded ? { ...props, wrap: "word" } : { ...props, lines: 1, truncate: "end", title: line },
+		),
+	];
 }
 
 type DisplaceableToolName = "wait" | "todo";
@@ -545,7 +558,7 @@ export class ToolExecutionComponent extends Container {
 			contentWidth =>
 				this.#additionalContext === undefined
 					? ""
-					: renderToolAdditionalContext(this.#additionalContext, contentWidth),
+					: renderToolAdditionalContext(this.#additionalContext, contentWidth, this.#expanded),
 			1,
 			0,
 		);
@@ -996,7 +1009,10 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	setExpanded(expanded: boolean): void {
-		if (this.#expanded !== expanded) this.#blockVersion++;
+		if (this.#expanded !== expanded) {
+			this.#blockVersion++;
+			this.#additionalContextText.invalidate();
+		}
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
@@ -1078,7 +1094,7 @@ export class ToolExecutionComponent extends Container {
 		];
 		return this.#native.get(key, () => {
 			const described = dataFirst ? this.#describeTool(media) : this.#describeCard(media);
-			const context = describeToolAdditionalContext(this.#additionalContext);
+			const context = describeToolAdditionalContext(this.#additionalContext, this.#expanded);
 			return withHidden(context.length > 0 ? col([described, ...context]) : described, !this.#toolActivityVisible);
 		});
 	}
