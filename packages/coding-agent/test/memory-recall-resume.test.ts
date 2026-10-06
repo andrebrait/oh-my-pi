@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { hindsightBackend } from "@oh-my-pi/pi-coding-agent/hindsight/backend";
 import type { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
@@ -231,6 +232,28 @@ describe("Mnemopi recall across a resume", () => {
 
 		expect(await firstTurnRecall(await resume(dir, sessionFile, dir))).toBeUndefined();
 	});
+
+	it("does not restore another scope's recall after a memory_edit", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir));
+		live.rememberScoped("The deploy host is alpha-7.");
+		await firstTurnRecall(live);
+		let sessionFile = await writeTranscript(live.session.sessionManager);
+
+		// Resumed against another store, the transcript gains a second scope's recall, then an edit there.
+		const otherStore = tempDir();
+		const elsewhere = await resume(otherStore, sessionFile, dir);
+		const id = elsewhere.rememberScoped("The deploy host is gamma-3.");
+		await firstTurnRecall(elsewhere);
+		expect(elsewhere.editScopedMemory("forget", id).status).toBe("deleted");
+		sessionFile = await writeTranscript(elsewhere.session.sessionManager);
+
+		// Back on the first store, its old recall must not be restored: the turn recalls afresh and records it.
+		const back = await resume(dir, sessionFile, dir);
+		const recorded = recallEntryCount(back.session.sessionManager);
+		await firstTurnRecall(back);
+		expect(recallEntryCount(back.session.sessionManager)).toBe(recorded + 1);
+	});
 });
 
 describe("Hindsight recall across a resume", () => {
@@ -295,5 +318,26 @@ describe("Hindsight recall across a resume", () => {
 
 		const otherBank = startHindsight(await SessionManager.open(sessionFile, sessions), "other", "gamma-3");
 		expect(await hindsightFirstTurn(otherBank)).toContain("gamma-3");
+	});
+
+	it("recalls afresh after /memory clear", async () => {
+		const dir = tempDir();
+		const live = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.");
+		await hindsightFirstTurn(live);
+		let current: HindsightSessionState | undefined = live;
+		const session = {
+			sessionManager: live.session.sessionManager,
+			getHindsightSessionState: () => current,
+			setHindsightSessionState: (next: HindsightSessionState | undefined) => {
+				const previous = current;
+				current = next;
+				return previous;
+			},
+		};
+		await hindsightBackend.clear("/tmp", "/tmp", session as never);
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		const resumed = startHindsight(await SessionManager.open(sessionFile, dir.join("sessions")), "project", "beta-9");
+		expect(await hindsightFirstTurn(resumed)).toContain("beta-9");
 	});
 });

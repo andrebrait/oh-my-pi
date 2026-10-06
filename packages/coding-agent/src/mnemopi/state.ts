@@ -14,7 +14,7 @@ import {
 	truncateRecallQuery,
 } from "../hindsight/content";
 import { countUserTurns, extractMessages } from "../hindsight/transcript";
-import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
+import { discardPersistedRecalls, findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -344,8 +344,7 @@ export class MnemopiSessionState {
 		const result = this.#applyScopedMemoryEdit(op, id, options);
 		if (result.status === "updated" || result.status === "deleted" || result.status === "invalidated") {
 			// A recall recorded in the transcript must not bring the edited memory back on resume.
-			const primary = this.aliasOf ?? this;
-			persistRecall(primary.session.sessionManager, getMnemopiRecallScope(primary.config), null);
+			discardPersistedRecalls((this.aliasOf ?? this).session.sessionManager);
 		}
 		return result;
 	}

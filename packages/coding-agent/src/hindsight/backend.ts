@@ -10,6 +10,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { discardPersistedRecalls } from "../memory-backend/recall-entry";
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
@@ -119,6 +120,8 @@ export const hindsightBackend: MemoryBackend = {
 		if (state) await state.flushRetainQueue();
 		const previous = session?.setHindsightSessionState(undefined);
 		previous?.dispose();
+		// The cleared recall cache includes the recall recorded in this transcript.
+		if (session) discardPersistedRecalls(session.sessionManager);
 		logger.warn(
 			"Hindsight memory is server-side; only the local recall cache was cleared. " +
 				"Delete the Hindsight bank from the UI to wipe upstream state.",
