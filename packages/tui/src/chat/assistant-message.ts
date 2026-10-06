@@ -49,19 +49,6 @@ function thoughtLabel(clock: { start: number; end?: number } | undefined): strin
 	return `Thought for ${ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))}s` : formatDuration(ms)}`;
 }
 
-/** Session GitHub repo (`owner/repo`) that bare `#N` refs in assistant prose link to. */
-let proseGithubRepo: string | undefined;
-
-/**
- * Install the session's GitHub repo for bare `#N` prose refs. Returns whether
- * it changed; callers then invalidate the UI so cached prose themes rebuild.
- */
-export function setProseGithubRepo(repo: string | undefined): boolean {
-	if (repo === proseGithubRepo) return false;
-	proseGithubRepo = repo;
-	return true;
-}
-
 type ThinkingContentBlock = Extract<AssistantMessage["content"][number], { type: "thinking" }>;
 /** Renders one text or thinking block: Markdown, or {@link FigureMarkdown} for text holding a ```svg fence. */
 type ProseBlock = Markdown | FigureMarkdown;
@@ -379,6 +366,8 @@ export class AssistantMessageComponent extends Container {
 	#markdownTheme: MarkdownTheme | undefined;
 	/** Text-block sources with {@link #linkTargets} applied, for the native `md` nodes; reset with the targets. */
 	#nativeLinkSources = new Map<string, string>();
+	/** GitHub repo (`owner/repo`) of the session that produced this reply; bare `#N` refs link to it. */
+	readonly #githubRepo: () => string | undefined;
 	/** Block this reply reacts to; undefined when the preceding block takes no reactions. */
 	#reactionTarget: ReactionTarget | undefined;
 	/** Reaction lifted from the reply's opening emoji, once resolved. */
@@ -407,7 +396,7 @@ export class AssistantMessageComponent extends Container {
 		if (this.#markdownTheme) return this.#markdownTheme;
 		const base = getMarkdownTheme();
 		const snapshot = this.#linkTargets;
-		const githubRepo = proseGithubRepo;
+		const githubRepo = this.#githubRepo();
 		const markdownTheme =
 			snapshot.size > 0 || githubRepo ? getMarkdownThemeWithLinkTargets(snapshot, githubRepo) : base;
 		this.#markdownTheme = markdownTheme;
@@ -514,6 +503,7 @@ export class AssistantMessageComponent extends Container {
 		proseOnlyThinking = true,
 		linkTargets?: ReadonlyMap<string, string>,
 		expandThinkingBlocks = false,
+		githubRepo: () => string | undefined = () => undefined,
 	) {
 		super();
 		this.#hideThinkingBlock = hideThinkingBlock;
@@ -526,6 +516,7 @@ export class AssistantMessageComponent extends Container {
 		ensureThemeSync();
 		this.#transcriptBlockFinalized = message !== undefined;
 		if (linkTargets?.size) this.#linkTargets = linkTargets;
+		this.#githubRepo = githubRepo;
 
 		// Container for text/thinking content.
 		this.#contentContainer = new Container();
