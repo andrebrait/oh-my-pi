@@ -7,6 +7,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
+import { replaceFileAtomically } from "../utils/atomic-file";
 
 export function tokenMatches(expected: string, presented: unknown): boolean {
 	if (typeof presented !== "string") return false;
@@ -105,19 +107,26 @@ export async function privateEndpoint(
  * removes the temp file again.
  */
 export async function writePrivateJson(target: string, value: unknown): Promise<void> {
-	const tmpPath = `${target}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-	const handle = await fs.promises.open(tmpPath, "wx", 0o600);
-	try {
+	const write = async (): Promise<void> => {
+		const tmpPath = `${target}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+		const handle = await fs.promises.open(tmpPath, "wx", 0o600);
 		try {
-			await handle.writeFile(JSON.stringify(value), "utf8");
-		} finally {
-			await handle.close();
+			try {
+				await handle.writeFile(JSON.stringify(value), "utf8");
+			} finally {
+				await handle.close();
+			}
+			await replaceFileAtomically(tmpPath, target);
+		} catch (err) {
+			fs.rmSync(tmpPath, { force: true });
+			throw err;
 		}
-		await fs.promises.rename(tmpPath, target);
-	} catch (err) {
-		fs.rmSync(tmpPath, { force: true });
-		throw err;
+	};
+	if (process.platform === "win32") {
+		await withFileLock(target, write);
+		return;
 	}
+	await write();
 }
 
 /**
