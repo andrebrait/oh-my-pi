@@ -7,8 +7,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
+import { hasFsCode } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
-import { replaceFileAtomically } from "../utils/atomic-file";
 
 export function tokenMatches(expected: string, presented: unknown): boolean {
 	if (typeof presented !== "string") return false;
@@ -105,6 +105,12 @@ export async function privateEndpoint(
  * outside a `*.json` listing filter; the random part keeps concurrent
  * rewrites of one entry from colliding. Any failure after the exclusive create
  * removes the temp file again.
+ *
+ * Windows refuses a rename over a target that another writer is replacing or a
+ * reader holds open (EPERM). Writers of one target are serialized there, and
+ * the rename is retried with backoff while a reader holds the file. The rename
+ * stays direct: moving the old file aside first would let a concurrent list
+ * see the entry missing and treat a live host as gone.
  */
 export async function writePrivateJson(target: string, value: unknown): Promise<void> {
 	const write = async (): Promise<void> => {
@@ -116,7 +122,7 @@ export async function writePrivateJson(target: string, value: unknown): Promise<
 			} finally {
 				await handle.close();
 			}
-			await replaceFileAtomically(tmpPath, target);
+			await renameOverReaders(tmpPath, target);
 		} catch (err) {
 			fs.rmSync(tmpPath, { force: true });
 			throw err;
@@ -127,6 +133,24 @@ export async function writePrivateJson(target: string, value: unknown): Promise<
 		return;
 	}
 	await write();
+}
+
+// ponytail: 20 attempts with 2..50 ms backoff, about 0.8 s in all. A Windows
+// probe with a reader re-reading the file in a tight loop needed at most 8
+// attempts (171 ms); raise the cap if a slower reader exhausts it.
+const RENAME_ATTEMPTS = 20;
+
+async function renameOverReaders(source: string, target: string): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await fs.promises.rename(source, target);
+			return;
+		} catch (err) {
+			const transient = hasFsCode(err, "EPERM") || hasFsCode(err, "EACCES") || hasFsCode(err, "EBUSY");
+			if (process.platform !== "win32" || !transient || attempt >= RENAME_ATTEMPTS) throw err;
+			await Bun.sleep(Math.min(2 ** attempt, 50));
+		}
+	}
 }
 
 /**
