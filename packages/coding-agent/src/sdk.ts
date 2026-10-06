@@ -169,7 +169,13 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
-import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
+import {
+	AgentSession,
+	type InitialRetryFallbackState,
+	MCP_DISCOVERY_TURN_WAIT_MS,
+	type PlanYolo,
+	type Prewalk,
+} from "./session/agent-session";
 import {
 	createAuthStorageSettingsSync,
 	discoverAuthStorage as discoverAuthStorageFromConfig,
@@ -2493,6 +2499,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 									enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
 								}),
 							);
+							// Discovery returns after the startup window while slower servers keep
+							// connecting. Give them the first turn's wait budget so that turn's
+							// prompt already carries their routes and instructions.
+							if (!liveSession.isDisposed) await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
 							// The session can be torn down while servers are still connecting.
 							// Don't resurrect tools on a disposed session, and don't leak the
 							// transports/subprocesses the connect just spawned.
@@ -2502,8 +2512,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							}
 							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
-							// Connected MCP tools are enabled and mounted under xd:// devices.
-							await liveSession.refreshMCPTools(mcpResult.tools);
+							// Connected MCP tools are enabled and mounted under xd:// devices. The
+							// final snapshot includes servers that connected during the barrier.
+							await liveSession.refreshMCPTools(deferredMCPManager.getTools());
 						} catch (error) {
 							logger.error("MCP tool load failed", {
 								path: ".mcp.json",

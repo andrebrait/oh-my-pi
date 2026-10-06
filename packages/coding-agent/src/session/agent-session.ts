@@ -519,10 +519,11 @@ const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 /**
- * How long a turn waits for deferred UI/RPC MCP discovery: the default 250ms
- * startup window plus config load, while a hung server costs at most 1.5s.
+ * How long the first turn waits for deferred UI/RPC MCP startup (the sdk's startup barrier
+ * uses it too): covers the 250ms startup window, config load, and servers that connect soon
+ * after, while a hung server costs at most 1.5s.
  */
-const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
+export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
 
@@ -7628,14 +7629,17 @@ export class AgentSession implements SettingsScope {
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
 		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
-		if (this.#pendingMCPDiscovery) {
+		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
+		if (pendingMCPDiscovery) {
+			const timedOut = new Error("MCP discovery still pending");
 			// Abort ends the wait at once.
-			await withTimeout(
-				this.#pendingMCPDiscovery,
-				MCP_DISCOVERY_TURN_WAIT_MS,
-				"MCP discovery still pending",
-				signal,
-			).catch(error => logger.debug("Turn started before MCP discovery finished", { error: String(error) }));
+			await withTimeout(pendingMCPDiscovery, MCP_DISCOVERY_TURN_WAIT_MS, timedOut, signal).catch(error => {
+				// Only the first turn pays the wait; later turns take whatever discovery has applied.
+				if (error === timedOut && this.#pendingMCPDiscovery === pendingMCPDiscovery) {
+					this.#pendingMCPDiscovery = undefined;
+				}
+				logger.debug("Turn started before MCP discovery finished", { error: String(error) });
+			});
 		}
 		for (let attempt = 0; attempt < AGENT_START_POLICY_MAX_ATTEMPTS; attempt++) {
 			await this.#memory.transition;

@@ -38,7 +38,7 @@
 
 ### Fixed
 
-- Fixed the first prompt of a UI or RPC session (including `--resume`) missing the provider prompt cache when sent while MCP servers were still connecting; the turn now waits up to 1.5s for MCP discovery so its system prompt matches later turns
+- Fixed the first prompt of a UI or RPC session (including `--resume`) missing the provider prompt cache when MCP servers were still connecting: it now waits up to 1.5 s for MCP startup, so servers that connect within that time are already in its system prompt
 
 ## [18.7.0] - 2026-10-06
 
