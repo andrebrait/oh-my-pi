@@ -287,13 +287,18 @@ describe("Hindsight recall across a resume", () => {
 		mentalModelMaxRenderChars: 16_000,
 	};
 
-	function startHindsight(sessionManager: SessionManager, bankId: string, memory: string): HindsightSessionState {
+	function startHindsight(
+		sessionManager: SessionManager,
+		bankId: string,
+		memory: string,
+		hindsightApiToken: string | null = null,
+	): HindsightSessionState {
 		const client = { recall: async () => ({ results: [{ id: "m", text: memory }] }) } as unknown as HindsightApi;
 		return new HindsightSessionState({
 			sessionId: sessionManager.getSessionId(),
 			client,
 			bankId,
-			config,
+			config: { ...config, hindsightApiToken },
 			session: { sessionManager, subscribe: () => () => {} } as never,
 			banksSet: new Set(),
 		});
@@ -305,7 +310,7 @@ describe("Hindsight recall across a resume", () => {
 		return preparation?.context;
 	}
 
-	it("reuses the transcript's recall for the same bank only", async () => {
+	it("reuses the transcript's recall for the same bank and account only", async () => {
 		const dir = tempDir();
 		const live = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.");
 		const sent = await hindsightFirstTurn(live);
@@ -318,6 +323,14 @@ describe("Hindsight recall across a resume", () => {
 
 		const otherBank = startHindsight(await SessionManager.open(sessionFile, sessions), "other", "gamma-3");
 		expect(await hindsightFirstTurn(otherBank)).toContain("gamma-3");
+
+		const otherAccount = startHindsight(
+			await SessionManager.open(sessionFile, sessions),
+			"project",
+			"delta-4",
+			"token",
+		);
+		expect(await hindsightFirstTurn(otherAccount)).toContain("delta-4");
 	});
 
 	it("recalls afresh after /memory clear", async () => {

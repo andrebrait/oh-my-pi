@@ -343,8 +343,10 @@ export class MnemopiSessionState {
 	): MnemopiMemoryEditResult {
 		const result = this.#applyScopedMemoryEdit(op, id, options);
 		if (result.status === "updated" || result.status === "deleted" || result.status === "invalidated") {
-			// A recall recorded in the transcript must not bring the edited memory back on resume.
-			discardPersistedRecalls((this.aliasOf ?? this).session.sessionManager);
+			// A recall recorded in the transcript, or one still pending, must not bring the edited memory back.
+			const primary = this.aliasOf ?? this;
+			primary.#recallGeneration++;
+			discardPersistedRecalls(primary.session.sessionManager);
 		}
 		return result;
 	}
@@ -901,10 +903,10 @@ export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly st
 	return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);
 }
 
-/** Identifies the databases a first-turn recall reads, so a persisted recall is only reused for the same ones. */
+/** Identifies the banks and databases a first-turn recall reads, so a persisted recall is only reused for the same ones. */
 export function getMnemopiRecallScope(config: MnemopiBackendConfig): string {
 	const { recallBanks } = resolveScopedBanks(config);
-	return JSON.stringify(["mnemopi", recallBanks.map(bank => resolveBankDbPath(config, bank))]);
+	return JSON.stringify(["mnemopi", recallBanks.map(bank => [bank, resolveBankDbPath(config, bank)])]);
 }
 
 function dedupeScopedTargets(targets: readonly MnemopiScopedMemory[]): readonly MnemopiScopedMemory[] {
