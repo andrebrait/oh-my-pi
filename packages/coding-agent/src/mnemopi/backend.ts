@@ -19,6 +19,7 @@ import type {
 	MemoryBackendStatus,
 	MemoryPromptPreparation,
 } from "../memory-backend/types";
+import { persistRecall } from "../memory-backend/recall-entry";
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
@@ -33,6 +34,7 @@ import {
 	truncateApproxTokens,
 } from "./config";
 import {
+	getMnemopiRecallScope,
 	getMnemopiScopedBanks,
 	getMnemopiScopedDbPaths,
 	getMnemopiSessionState,
@@ -183,6 +185,8 @@ export const mnemopiBackend: MemoryBackend = {
 		requireMnemopiCore().resetMemoryForTests();
 		await Bun.sleep(0);
 		await removeDbFiles(getMnemopiScopedDbPaths(config));
+		// A recall recorded in this transcript must not bring the wiped memories back.
+		if (session) persistRecall(session.sessionManager, getMnemopiRecallScope(config), null);
 		if (!session?.sessionId || previous?.aliasOf || cfgMemoryBackend.get(session.settings) !== "mnemopi") return;
 		try {
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);

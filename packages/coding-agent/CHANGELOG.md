@@ -35,6 +35,9 @@
 - Fixed slowdowns when processing long evaluation output, large Python kernel results, compiler/linter output, and ephemeral side-channel replies.
 - Fixed documents served as `application/octet-stream` being downloaded twice.
 - Fixed collaboration guests rebuilding the transcript excessively during streaming.
+### Fixed
+
+- Fixed resumed sessions recalling a different set of Mnemopi or Hindsight memories on their first turn, which changed the system prompt and missed the provider prompt cache; a resumed, switched-to, or forked session now reuses the memories it recalled originally.
 
 ## [18.7.0] - 2026-10-06
 

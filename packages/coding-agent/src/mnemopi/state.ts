@@ -14,6 +14,7 @@ import {
 	truncateRecallQuery,
 } from "../hindsight/content";
 import { countUserTurns, extractMessages } from "../hindsight/transcript";
+import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -340,6 +341,20 @@ export class MnemopiSessionState {
 		id: string,
 		options: MnemopiMemoryEditOptions = {},
 	): MnemopiMemoryEditResult {
+		const result = this.#applyScopedMemoryEdit(op, id, options);
+		if (result.status === "updated" || result.status === "deleted" || result.status === "invalidated") {
+			// A recall recorded in the transcript must not bring the edited memory back on resume.
+			const primary = this.aliasOf ?? this;
+			persistRecall(primary.session.sessionManager, getMnemopiRecallScope(primary.config), null);
+		}
+		return result;
+	}
+
+	#applyScopedMemoryEdit(
+		op: MnemopiMemoryEditOperation,
+		id: string,
+		options: MnemopiMemoryEditOptions,
+	): MnemopiMemoryEditResult {
 		const targets = dedupeScopedTargets([
 			this.scoped.retain,
 			...this.scoped.recall,
@@ -505,6 +520,14 @@ export class MnemopiSessionState {
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
 		const generation = ++this.#recallGeneration;
+		// Reuse this transcript's recall so a resumed session sends the same prompt.
+		const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+		if (persisted !== undefined) {
+			return {
+				context: persisted || undefined,
+				commit: () => this.#commitRecall(generation, persisted, false),
+			};
+		}
 		const history = extractMessages(this.session.sessionManager);
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
@@ -512,13 +535,17 @@ export class MnemopiSessionState {
 		const context = await this.recallForContext(truncated, signal);
 		return {
 			context,
-			commit: () => {
-				if (this.#recallGeneration !== generation) return false;
-				this.hasRecalledForFirstTurn = true;
-				if (context) this.lastRecallSnippet = context;
-				return true;
-			},
+			commit: () => this.#commitRecall(generation, context ?? "", true),
 		};
+	}
+
+	/** Adopts a first-turn recall unless a newer turn or reset superseded it; `""` means it found nothing. */
+	#commitRecall(generation: number, context: string, persist: boolean): boolean {
+		if (this.#recallGeneration !== generation) return false;
+		this.hasRecalledForFirstTurn = true;
+		if (context) this.lastRecallSnippet = context;
+		if (persist) persistRecall(this.session.sessionManager, getMnemopiRecallScope(this.config), context);
+		return true;
 	}
 
 	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
@@ -637,27 +664,28 @@ export class MnemopiSessionState {
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
 		const generation = this.#recallGeneration;
-		const messages = extractMessages(this.session.sessionManager);
-		const lastUser = messages.findLast(message => message.role === "user");
-		if (!lastUser) return;
-		const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
-		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
-		let context: string | undefined;
-		try {
-			context = await this.recallForContext(truncated);
-		} catch (error) {
-			logger.warn("Mnemopi: auto-recall failed", {
-				bank: this.config.bank,
-				error: toError(error).message,
-			});
-			return;
+		const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+		let context: string | undefined = persisted;
+		if (persisted === undefined) {
+			const messages = extractMessages(this.session.sessionManager);
+			const lastUser = messages.findLast(message => message.role === "user");
+			if (!lastUser) return;
+			const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
+			const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			try {
+				context = await this.recallForContext(truncated);
+			} catch (error) {
+				logger.warn("Mnemopi: auto-recall failed", {
+					bank: this.config.bank,
+					error: toError(error).message,
+				});
+				return;
+			}
 		}
 		// A claimed user turn or a transcript reset supersedes this background
 		// lookup. Do not consume its first recall or overwrite its prompt context.
-		if (this.#recallGeneration !== generation) return;
-		this.hasRecalledForFirstTurn = true;
+		if (!this.#commitRecall(generation, context ?? "", persisted === undefined)) return;
 		if (!context) return;
-		this.lastRecallSnippet = context;
 		try {
 			await this.session.refreshBaseSystemPrompt();
 		} catch (error) {
@@ -872,6 +900,12 @@ export function getMnemopiScopedDbPaths(config: MnemopiBackendConfig): readonly 
 export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly string[] {
 	const banks = resolveScopedBanks(config);
 	return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);
+}
+
+/** Identifies the databases a first-turn recall reads, so a persisted recall is only reused for the same ones. */
+export function getMnemopiRecallScope(config: MnemopiBackendConfig): string {
+	const { recallBanks } = resolveScopedBanks(config);
+	return JSON.stringify(["mnemopi", recallBanks.map(bank => resolveBankDbPath(config, bank))]);
 }
 
 function dedupeScopedTargets(targets: readonly MnemopiScopedMemory[]): readonly MnemopiScopedMemory[] {
