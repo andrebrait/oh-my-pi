@@ -654,7 +654,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 				if (usage) body.push(this.#nativeUsage(usage, `u${entry.toolCallId}`));
 			}
 		}
-		body.push(...describeToolAdditionalContext(this.#additionalContext));
+		body.push(...describeToolAdditionalContext(this.#additionalContext, this.#expanded));
 		return node(
 			"tool",
 			{
@@ -818,7 +818,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			const usage = this.#usageRows.get(entry.toolCallId);
 			if (usage) children.push(this.#nativeUsage(usage, `u${entry.toolCallId}`));
 		}
-		children.push(...describeToolAdditionalContext(this.#additionalContext));
+		children.push(...describeToolAdditionalContext(this.#additionalContext, this.#expanded));
 		return card(
 			{
 				role: "omp.tool.read",
@@ -926,7 +926,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#appendAdditionalContext(): void {
 		if (this.#additionalContext === undefined) return;
 		this.addChild(
-			new WidthAwareText(width => renderToolAdditionalContext(this.#additionalContext ?? "", width), 1, 0),
+			new WidthAwareText(
+				width => renderToolAdditionalContext(this.#additionalContext ?? "", width, this.#expanded),
+				1,
+				0,
+			),
 		);
 	}
 	#displayTargetsForEntries(entries: ReadEntry[]): ReadDisplayTarget[] {
