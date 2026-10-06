@@ -25,6 +25,8 @@ export interface AssistantMessageHost {
 	readonly ui: { requestRender(): void; readonly imageBudget: ImageBudget };
 	/** Resolve already-extracted Markdown link destinations to local targets. */
 	resolveAssistantMessageLinkHrefs(hrefs: readonly string[]): Promise<ReadonlyMap<string, string>>;
+	/** Reads the view session's GitHub repo (`owner/repo`) for bare `#N` prose refs; undefined until resolved. */
+	proseGithubRepo(): () => string | undefined;
 }
 
 const kMarkdownLinkTargets = Symbol("markdownLinkTargets");
@@ -125,6 +127,7 @@ export function createAssistantMessageComponent(
 		ctx.proseOnlyThinking,
 		linkTargets,
 		ctx.expandThinkingBlocks,
+		ctx.proseGithubRepo(),
 	);
 	component.setImagesVisible(ctx.assistantImagesVisible);
 	component.setTableChartsVisible(ctx.tableChartsVisible);
