@@ -8,6 +8,7 @@
 
 ### Added
 
+- Added a navigable `/skills diagnostics` panel and shared RPC workflow for consent-gated AI relationship analysis, with retained per-skill results, cancellation, cited evidence, and separately confirmed content-bound choices that affect OMP only. `omp plugin doctor --analyze` offers the same analyzer for plugins and extensions ([#14458](https://github.com/can1357/oh-my-pi/pull/14458) by [@andrebrait](https://github.com/andrebrait)).
 - Added an agents HUD pill counting running subagents, opening the agent hub on click
 - Added the `composer.thinkingInModel` setting (Thinking Level in Model Chip): in Tern the thinking level shows as the model chip's icon instead of a separate chip, still cycling on click
 - Added `computer.zoom()` and window-local `zoom()` in JavaScript and Python Eval, with native-detail region captures that preserve full-screenshot click coordinates.
@@ -99,9 +100,6 @@
 - Fixed `omp worktree add` and other git operations failing with `git open: … does not appear to be a git repository` when the checkout directory name ends in `.git` ([#14553](https://github.com/can1357/oh-my-pi/issues/14553))
 - Fixed Mnemopi embedding workers (and other local-model workers) staying alive and holding gigabytes of RAM after the omp process that started them exited mid-embedding ([#14340](https://github.com/can1357/oh-my-pi/issues/14340))
 - Fixed a supervised PTY service on Windows hanging when it asks the terminal for the cursor position; the launch broker now answers the query as it does on Linux and macOS
-### Added
-
-- Added consent-gated AI relationship analysis to `/skills diagnostics` and `omp plugin doctor --analyze`, with cited evidence, recommendations, and separately confirmed content-bound choices that affect OMP only ([#14458](https://github.com/can1357/oh-my-pi/pull/14458) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.6.2] - 2026-10-04
 ### Added
