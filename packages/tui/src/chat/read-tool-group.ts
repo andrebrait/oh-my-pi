@@ -18,7 +18,7 @@ import { PREVIEW_LIMITS, shortenPath } from "../render/render-utils";
 import { fileHyperlink, renderCodeCell } from "../render";
 import { canonicalizeMessage } from "./thinking-display";
 import { internalUrlSchemeSpec, splitUrlScheme } from "../tools/url-scheme-host";
-import { renderToolAdditionalContext, type ToolExecutionHandle } from "./tool-execution";
+import { describeToolAdditionalContext, renderToolAdditionalContext, type ToolExecutionHandle } from "./tool-execution";
 import { formatUsageRow } from "../overlays/usage-row";
 import { formatCount } from "@oh-my-pi/pi-utils";
 import type { TspCardStatus, TspSpan, TspText } from "@oh-my-pi/pi-wire";
@@ -654,6 +654,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 				if (usage) body.push(this.#nativeUsage(usage, `u${entry.toolCallId}`));
 			}
 		}
+		body.push(...describeToolAdditionalContext(this.#additionalContext));
 		return node(
 			"tool",
 			{
@@ -817,6 +818,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			const usage = this.#usageRows.get(entry.toolCallId);
 			if (usage) children.push(this.#nativeUsage(usage, `u${entry.toolCallId}`));
 		}
+		children.push(...describeToolAdditionalContext(this.#additionalContext));
 		return card(
 			{
 				role: "omp.tool.read",
