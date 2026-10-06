@@ -1053,7 +1053,8 @@ export class ToolExecutionComponent extends Container {
 	 * `elapsed` timer in the head and terminal-local collapse clamped to the
 	 * view's preview. Renderers without describe hooks (and extension tools
 	 * with only render hooks) get the generic card. Hidden tool activity stays
-	 * mounted so toggling it is one prop change.
+	 * mounted so toggling it is one prop change. Passive context sits below the
+	 * card, outside its collapse clamp, as in the terminal.
 	 */
 	override describe(cx?: DescribeContext): NativeNode {
 		if (this.#toolName === "wait" && this.#isBenignSkip()) return EMPTY_NODE;
@@ -1075,9 +1076,11 @@ export class ToolExecutionComponent extends Container {
 			this.#additionalContext,
 			getThemeEpoch(),
 		];
-		return this.#native.get(key, () =>
-			withHidden(dataFirst ? this.#describeTool(media) : this.#describeCard(media), !this.#toolActivityVisible),
-		);
+		return this.#native.get(key, () => {
+			const described = dataFirst ? this.#describeTool(media) : this.#describeCard(media);
+			const context = describeToolAdditionalContext(this.#additionalContext);
+			return withHidden(context.length > 0 ? col([described, ...context]) : described, !this.#toolActivityVisible);
+		});
 	}
 
 	/** Milliseconds since execution started (running) or its total (settled); undefined before it starts. */
@@ -1129,7 +1132,6 @@ export class ToolExecutionComponent extends Container {
 		const late = this.#lateDiagnosticsParts();
 		const body: NativeChild[] = [...(view.body ?? []), ...this.#nativeResultImages(view.body)];
 		if (late.section) body.push(late.section);
-		body.push(...describeToolAdditionalContext(this.#additionalContext));
 		const inline = view.inline === true;
 		const hasBody = body.length > 0;
 		const ms = this.#elapsedMs(status);
@@ -1218,7 +1220,6 @@ export class ToolExecutionComponent extends Container {
 			...(view.body ?? []),
 			...this.#nativeResultImages(view.body),
 			...(late.section ? [late.section] : []),
-			...describeToolAdditionalContext(this.#additionalContext),
 		];
 		const role = `omp.tool.${this.#toolName}`;
 		if (view.inline) return col(children, { role });
