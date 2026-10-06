@@ -37,7 +37,7 @@
 - Fixed collaboration guests rebuilding the transcript excessively during streaming.
 ### Fixed
 
-- Fixed resumed sessions recalling a different set of Mnemopi or Hindsight memories on their first turn, which changed the system prompt and missed the provider prompt cache; a resumed, switched-to, or forked session now reuses the memories it recalled originally.
+- Fixed resumed sessions recalling a different set of Mnemopi or Hindsight memories on their first turn, which changed the system prompt and missed the provider prompt cache; a resumed, switched-to, or forked session now reuses the memories it recalled originally ([#14656](https://github.com/can1357/oh-my-pi/pull/14656) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.7.0] - 2026-10-06
 
