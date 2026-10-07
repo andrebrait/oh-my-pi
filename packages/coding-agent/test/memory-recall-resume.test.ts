@@ -263,6 +263,25 @@ describe("Mnemopi recall across a resume", () => {
 		expect(await recallCutInRunbook(0)).not.toContain(runbook);
 	});
 
+	it("reports a recalled fact retired with its source memory", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir));
+		const source = live.rememberScoped("Ops notes for the week.");
+		live.memory.beam.db
+			.prepare(
+				"INSERT INTO facts (fact_id, session_id, subject, predicate, object, source_msg_id) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run("fact-deploy-host", live.memory.beam.sessionId, "deploy host", "is", "zeta-5", source);
+		const { block } = await firstTurn(live);
+		expect(block).toContain("zeta-5");
+		expect(live.editScopedMemory("invalidate", source).status).toBe("invalidated");
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		const turn = await firstTurn(await resume(dir, sessionFile, dir));
+		expect(turn.block).toBe(block);
+		expect(turn.notice?.content).toContain("zeta-5");
+	});
+
 	it("compares and quotes memories as the recall block shows them, clipped", async () => {
 		const original = `The deploy host is alpha-7. ${"Rollout detail. ".repeat(100)}`;
 		const { dir, live, id, block, sessionFile } = await recalledTranscript(original);

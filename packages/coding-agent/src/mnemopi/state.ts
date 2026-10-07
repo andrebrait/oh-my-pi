@@ -327,12 +327,15 @@ export class MnemopiSessionState {
 			if (!raw) continue;
 			const store: MnemopiMemoryStore =
 				raw.memory_store === "episodic" || raw.memory_store === "fact" ? raw.memory_store : "working";
+			// A fact is retired with its source memory: recall hides facts whose source is invalidated.
+			const source = store === "fact" ? factSourceRow(target.memory, raw) : raw;
 			return {
 				bank: target.bank,
 				store,
 				invalidated:
-					(typeof raw.superseded_by === "string" && raw.superseded_by.length > 0) ||
-					(typeof raw.valid_until === "string" && Date.parse(raw.valid_until) <= Date.now()),
+					source !== null &&
+					((typeof source.superseded_by === "string" && source.superseded_by.length > 0) ||
+						(typeof source.valid_until === "string" && Date.parse(source.valid_until) <= Date.now())),
 				row: {
 					id: typeof raw.id === "string" ? raw.id : id,
 					content: typeof raw.content === "string" ? raw.content : "",
@@ -514,12 +517,9 @@ export class MnemopiSessionState {
 		const results = await this.collectScopedRecallResults(query);
 		if (signal?.aborted) return undefined;
 		if (results.length === 0) return { text: "", memories: [] };
-		// Facts are derived rows: invalidating their source does not retire them, so a
-		// lookup cannot tell whether they still hold.
-		const memories = results.flatMap(result => {
-			const hit = result.id ? this.getScopedMemory(result.id) : null;
-			return hit && hit.store !== "fact" ? [{ id: result.id, text: recalledText(result.content) }] : [];
-		});
+		const memories = results.flatMap(result =>
+			result.id && this.getScopedMemory(result.id) ? [{ id: result.id, text: recalledText(result.content) }] : [],
+		);
 		return { text: formatRecallBlock(results), memories };
 	}
 
@@ -539,7 +539,8 @@ export class MnemopiSessionState {
 				removed.push(quoteMemoryText(memory.text));
 				continue;
 			}
-			const text = recalledText(clipRecallContent(hit.row.content).content);
+			// Facts are immutable rows that only disappear or retire with their source.
+			const text = hit.store === "fact" ? memory.text : recalledText(clipRecallContent(hit.row.content).content);
 			current.push({ id: memory.id, text });
 			if (text !== memory.text) updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
 		}
@@ -1110,6 +1111,24 @@ function recalledText(content: string): string {
 /** Neutralises markup in memory text quoted into a note, so it cannot close or forge the note's tags. */
 function quoteMemoryText(text: string): string {
 	return text.replaceAll("<", "&lt;");
+}
+
+/** The memory a fact was extracted from, or null when the fact has no source or it no longer exists. */
+function factSourceRow(memory: Mnemopi, fact: MnemopiStoredMemoryRow): MnemopiStoredMemoryRow | null {
+	let metadata: unknown = fact.metadata;
+	if (typeof metadata === "string") {
+		try {
+			metadata = JSON.parse(metadata);
+		} catch {
+			return null;
+		}
+	}
+	const sourceId =
+		typeof metadata === "object" && metadata !== null && "source_msg_id" in metadata
+			? metadata.source_msg_id
+			: undefined;
+	if (typeof sourceId !== "string" || sourceId.length === 0) return null;
+	return memory.get(sourceId) as MnemopiStoredMemoryRow | null;
 }
 
 function flattenAgentMessages(messages: AgentMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
