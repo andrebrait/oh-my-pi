@@ -140,10 +140,12 @@ export function resetReplicaEventState(ctx: InteractiveModeContext): void {
 }
 
 /**
- * Feed one host session event to the TUI through the controller's coalescing dispatch, the same
- * path a local session uses: `message_update` joins the coalesced streaming rebuild and every
- * other event runs serialized behind it, so a mirrored stream tail cannot reorder
- * (message_update → message_end → agent_end).
+ * Feed one host session event to the TUI.
+ *
+ * `dispatch` defaults to the controller's direct handler, which a hosted client awaits event by event.
+ * The collab guest passes the controller's coalescing `dispatchSessionEvent` instead, the path a local
+ * session uses (#14715): `message_update` joins the coalesced streaming rebuild and every other event
+ * runs serialized behind it, so a mirrored stream tail cannot reorder.
  *
  * Orphan-delta guard: when attaching mid-turn the `message_start` for the in-flight assistant
  * message predates the snapshot. `message_update` carries the full accumulating message, so the
@@ -151,7 +153,11 @@ export function resetReplicaEventState(ctx: InteractiveModeContext): void {
  * tolerant of unknown anchors (guarded by streamingComponent/pendingTools lookups). The state
  * resets when the assistant message ends or the agent run ends.
  */
-export async function applyReplicaEvent(ctx: InteractiveModeContext, event: AgentSessionEvent): Promise<void> {
+export async function applyReplicaEvent(
+	ctx: InteractiveModeContext,
+	event: AgentSessionEvent,
+	dispatch: (event: AgentSessionEvent) => Promise<void> = e => ctx.eventController.handleEvent(e),
+): Promise<void> {
 	// All state transitions happen synchronously on receipt, before any handler is awaited: a slow
 	// handler (e.g. one blocked on `ctx.init()`) must neither delay a later event's dispatch nor
 	// clobber the flag a newer stream already set.
@@ -164,12 +170,12 @@ export async function applyReplicaEvent(ctx: InteractiveModeContext, event: Agen
 		!assistantStreamSynced.get(ctx)
 	) {
 		assistantStreamSynced.set(ctx, true);
-		synthesizedStart = ctx.eventController.dispatchSessionEvent({ type: "message_start", message: event.message });
+		synthesizedStart = dispatch({ type: "message_start", message: event.message });
 	} else if ((event.type === "message_end" && event.message.role === "assistant") || event.type === "agent_end") {
 		assistantStreamSynced.delete(ctx);
 	}
 	// Start and event are dispatched back to back without awaiting between them.
-	await Promise.all([synthesizedStart, ctx.eventController.dispatchSessionEvent(event)]);
+	await Promise.all([synthesizedStart, dispatch(event)]);
 }
 
 /**

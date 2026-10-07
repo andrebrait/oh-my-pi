@@ -140,7 +140,7 @@ class Terminal {
 
 	/** What the real resolver, asked as the transcript renderer asks it, maps `hrefs` to. */
 	async resolve(hrefs: string[]): Promise<Record<string, string>> {
-		const targets = await this.mode.resolveAssistantMessageLinks(hrefs.map(href => `[x](${href})`));
+		const targets = await this.mode.resolveAssistantMessageLinkHrefs(hrefs);
 		return Object.fromEntries(targets);
 	}
 
