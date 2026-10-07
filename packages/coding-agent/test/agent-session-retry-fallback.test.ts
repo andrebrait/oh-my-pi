@@ -1158,7 +1158,7 @@ describe("AgentSession retry fallback", () => {
 		async (primaryProvider, preferSlowMode, slowMode, servedProvider, baseUrl) => {
 			const bundled =
 				primaryProvider === "openai-codex"
-					? getBundledModel("openai-codex", "gpt-5.5")
+					? getBundledModel("openai-codex", "gpt-5.6-sol")
 					: getBundledModel("anthropic", "claude-sonnet-4-5");
 			const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
 			if (!bundled || !fallbackModel) throw new Error("Expected bundled slow-mode preflight models");
