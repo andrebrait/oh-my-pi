@@ -4,7 +4,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type MCPLoadResult, MCPManager, type MCPStartupStatus } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { type CustomTool, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { MCP_DISCOVERY_TURN_WAIT_MS } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -69,7 +69,7 @@ function parkOnFirstTimer(started: () => boolean): Promise<void> {
 }
 
 function probeTools(): MCPTools {
-	const tool: CustomTool = {
+	const tool: MCPTools[number] = {
 		name: MCP_TOOL_NAME,
 		label: "probe/lookup",
 		description: "Look a value up.",
@@ -80,7 +80,7 @@ function probeTools(): MCPTools {
 			return { content: [{ type: "text", text: "found" }] };
 		},
 	};
-	return [tool as MCPTools[number]];
+	return [tool];
 }
 
 /**
