@@ -323,23 +323,32 @@ describe("Mnemopi recall across a resume", () => {
 		expect(await recallCutInRunbook(0)).not.toContain(runbook.slice(0, 10));
 	});
 
-	it("reports a recalled fact retired with its source memory", async () => {
-		const dir = tempDir();
-		const live = startProcess(dir, newSession(dir));
-		const source = live.rememberScoped("Ops notes for the week.");
-		live.memory.beam.db
-			.prepare(
-				"INSERT INTO facts (fact_id, session_id, subject, predicate, object, source_msg_id) VALUES (?, ?, ?, ?, ?, ?)",
-			)
-			.run("fact-deploy-host", live.memory.beam.sessionId, "deploy host", "is", "zeta-5", source);
-		const { block } = await firstTurn(live);
-		expect(block).toContain("zeta-5");
-		expect(live.editScopedMemory("invalidate", source).status).toBe("invalidated");
-		const sessionFile = await writeTranscript(live.session.sessionManager);
+	it("reports a recalled fact retired the way recall retires it", async () => {
+		/** Recalls a fact extracted from `source`, retires the source, and returns the resumed turn's note. */
+		const retireFactSource = async (source: (live: MnemopiSessionState) => string) => {
+			const dir = tempDir();
+			const live = startProcess(dir, newSession(dir));
+			const sourceId = source(live);
+			live.memory.beam.db
+				.prepare(
+					"INSERT INTO facts (fact_id, session_id, subject, predicate, object, source_msg_id) VALUES (?, ?, ?, ?, ?, ?)",
+				)
+				.run("fact-deploy-host", live.memory.beam.sessionId, "deploy host", "is", "zeta-5", sourceId);
+			const { block } = await firstTurn(live);
+			expect(block).toContain("zeta-5");
+			expect(live.editScopedMemory("invalidate", sourceId).status).toBe("invalidated");
+			const sessionFile = await writeTranscript(live.session.sessionManager);
+			const turn = await firstTurn(await resume(dir, sessionFile, dir));
+			expect(turn.block).toBe(block);
+			return turn.notice?.content;
+		};
 
-		const turn = await firstTurn(await resume(dir, sessionFile, dir));
-		expect(turn.block).toBe(block);
-		expect(turn.notice?.content).toContain("zeta-5");
+		// Recall hides a fact once its working-memory source is retired.
+		expect(await retireFactSource(live => live.rememberScoped("Ops notes for the week."))).toContain("zeta-5");
+		// Recall keeps showing a fact whose source is an episodic memory, so no change to report.
+		const episodic = (live: MnemopiSessionState) =>
+			live.memory.beam.consolidateToEpisodic("Ops summary for the week.", [live.rememberScoped("Ops notes.")]);
+		expect(await retireFactSource(episodic)).toBeUndefined();
 	});
 
 	it("compares and quotes memories as the recall block shows them, clipped", async () => {

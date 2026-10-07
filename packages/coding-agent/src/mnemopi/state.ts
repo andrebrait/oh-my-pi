@@ -336,8 +336,10 @@ export class MnemopiSessionState {
 			if (!raw) continue;
 			const store: MnemopiMemoryStore =
 				raw.memory_store === "episodic" || raw.memory_store === "fact" ? raw.memory_store : "working";
-			// A fact is retired with its source memory: recall hides facts whose source is invalidated.
-			const source = store === "fact" ? factSourceRow(target.memory, raw) : raw;
+			// A fact is retired with its source the way recall decides it: only a retired
+			// working-memory source hides the fact.
+			const factSource = store === "fact" ? factSourceRow(target.memory, raw) : null;
+			const source = store !== "fact" ? raw : factSource?.memory_store === "working" ? factSource : null;
 			return {
 				bank: target.bank,
 				store,
