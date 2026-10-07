@@ -97,9 +97,10 @@ export interface MemoryPromptPreparation {
 	context?: string;
 	/**
 	 * Model-facing note delivered with this turn's user message, e.g. what changed in the
-	 * memories a reused recall holds. Persisted in the transcript like any other message.
+	 * memories a reused recall holds. Persisted in the transcript as a hidden custom message
+	 * whose `details` carry the backend's bookkeeping, so both land only once delivered.
 	 */
-	notice?: string;
+	notice?: { content: string; details: unknown };
 	/** Commit synchronously after delivery validation; false rejects lost ownership without state writes. */
 	commit(): boolean;
 }

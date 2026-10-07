@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Exported `clipRecallContent`, which clips content the way recall previews are clipped
+
 ## [18.5.1] - 2026-10-03
 
 ### Changed

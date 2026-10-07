@@ -170,6 +170,7 @@ import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -7633,8 +7634,9 @@ export class AgentSession implements SettingsScope {
 			if (basePreparation.memoryNotice) {
 				messages.push({
 					role: "custom",
-					customType: "memory-recall-changes",
-					content: basePreparation.memoryNotice,
+					customType: MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+					content: basePreparation.memoryNotice.content,
+					details: basePreparation.memoryNotice.details,
 					display: false,
 					attribution: "agent",
 					timestamp: Date.now(),

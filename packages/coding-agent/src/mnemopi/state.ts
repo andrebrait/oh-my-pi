@@ -16,6 +16,7 @@ import {
 import { countUserTurns, extractMessages } from "../hindsight/transcript";
 import {
 	findPersistedRecall,
+	type MemoryRecallChangesDetails,
 	type PersistedRecall,
 	persistRecall,
 	type RecalledMemory,
@@ -513,39 +514,37 @@ export class MnemopiSessionState {
 		const results = await this.collectScopedRecallResults(query);
 		if (signal?.aborted) return undefined;
 		if (results.length === 0) return { text: "", memories: [] };
+		// Facts are derived rows: invalidating their source does not retire them, so a
+		// lookup cannot tell whether they still hold.
 		const memories = results.flatMap(result => {
 			const hit = result.id ? this.getScopedMemory(result.id) : null;
-			return hit ? [{ id: result.id, hash: hashMemory(hit.row.content), text: recalledText(result.content) }] : [];
+			return hit && hit.store !== "fact" ? [{ id: result.id, text: recalledText(result.content) }] : [];
 		});
 		return { text: formatRecallBlock(results), memories };
 	}
 
 	/**
-	 * Compares a reused recall's memories with the live store. Returns the model-facing
-	 * note about what changed since the model last heard, and the memories still current,
-	 * or undefined when nothing changed.
+	 * Compares a reused recall's memories with the live store as the recall block would
+	 * show them now. Returns the model-facing note about what changed since the model last
+	 * heard, and the memories still current, or undefined when nothing changed.
 	 */
-	#recallChanges(memories: readonly RecalledMemory[]): { notice: string; memories: RecalledMemory[] } | undefined {
+	#recallChanges(memories: readonly RecalledMemory[]): { content: string; memories: RecalledMemory[] } | undefined {
+		const { clipRecallContent } = requireMnemopi();
 		const removed: string[] = [];
 		const updated: Array<{ before: string; after: string }> = [];
 		const current: RecalledMemory[] = [];
 		for (const memory of memories) {
 			const hit = this.getScopedMemory(memory.id);
 			if (!hit || hit.invalidated) {
-				removed.push(memory.text);
+				removed.push(quoteMemoryText(memory.text));
 				continue;
 			}
-			const hash = hashMemory(hit.row.content);
-			if (hash === memory.hash) {
-				current.push(memory);
-				continue;
-			}
-			const after = recalledText(hit.row.content);
-			updated.push({ before: memory.text, after });
-			current.push({ id: memory.id, hash, text: after });
+			const text = recalledText(clipRecallContent(hit.row.content).content);
+			current.push({ id: memory.id, text });
+			if (text !== memory.text) updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
 		}
 		if (removed.length === 0 && updated.length === 0) return undefined;
-		return { notice: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
+		return { content: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
 	}
 
 	async beforeAgentStartPrompt(
@@ -558,18 +557,19 @@ export class MnemopiSessionState {
 		const generation = ++this.#recallGeneration;
 		// The transcript's recall is history: a resumed session sends it unchanged, so the
 		// prompt cache still matches, and reports what changed since as a new message.
-		const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+		const scope = getMnemopiRecallScope(this.config);
+		const persisted = findPersistedRecall(this.session.sessionManager, scope);
 		if (persisted !== undefined) {
+			// The note carries what it reports, so a turn that never delivers it leaves the
+			// change for the next resume to report.
 			const changes = this.#recallChanges(persisted.memories);
 			return {
 				context: persisted.text || undefined,
-				notice: changes?.notice,
-				commit: () =>
-					this.#commitRecall(
-						generation,
-						persisted.text,
-						changes && { text: persisted.text, memories: changes.memories },
-					),
+				notice: changes && {
+					content: changes.content,
+					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,
+				},
+				commit: () => this.#commitRecall(generation, persisted.text, undefined),
 			};
 		}
 		const history = extractMessages(this.session.sessionManager);
@@ -585,8 +585,7 @@ export class MnemopiSessionState {
 
 	/**
 	 * Adopts a first-turn recall block unless a newer turn or reset superseded it, and
-	 * writes `record` to the transcript: a fresh recall, or a reused one's memories after
-	 * a change note.
+	 * writes a fresh recall, `record`, to the transcript.
 	 */
 	#commitRecall(generation: number, text: string, record: PersistedRecall | undefined): boolean {
 		if (this.#recallGeneration !== generation) return false;
@@ -1094,8 +1093,9 @@ function recalledText(content: string): string {
 	return stripRetentionProtocolMarkers(content) || content;
 }
 
-function hashMemory(content: string): string {
-	return Bun.hash(content).toString(16);
+/** Neutralises markup in memory text quoted into a note, so it cannot close or forge the note's tags. */
+function quoteMemoryText(text: string): string {
+	return text.replaceAll("<", "&lt;");
 }
 
 function flattenAgentMessages(messages: AgentMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
