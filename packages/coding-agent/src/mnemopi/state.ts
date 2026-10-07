@@ -548,8 +548,8 @@ export class MnemopiSessionState {
 	}
 
 	/**
-	 * `budget` maps a recall block to the part the prompt actually carries (the injection
-	 * token limit); only memories that part shows are tracked for change reports.
+	 * `budget` cuts a recall block to the prefix the prompt actually carries (the injection
+	 * token limit); memories that prefix shows, even in part, are tracked for change reports.
 	 */
 	async beforeAgentStartPrompt(
 		promptText: string,
@@ -582,10 +582,14 @@ export class MnemopiSessionState {
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		const recall = await this.#recallBlock(truncated, signal);
-		const delivered = recall?.text ? budget(recall.text) : "";
+		// The budget keeps a prefix of the block, ending in "…" when it cut one.
+		const delivered = recall?.text ? budget(recall.text).replace(/…$/, "") : "";
 		const record = recall && {
 			text: recall.text,
-			memories: recall.memories.filter(memory => delivered.includes(memory.text)),
+			memories: recall.memories.filter(memory => {
+				const offset = recall.text.indexOf(memory.text);
+				return offset >= 0 && offset < delivered.length;
+			}),
 		};
 		return {
 			context: recall?.text || undefined,

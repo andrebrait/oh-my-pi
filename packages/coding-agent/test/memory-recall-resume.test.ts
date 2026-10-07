@@ -243,27 +243,24 @@ describe("Mnemopi recall across a resume", () => {
 		expect((await firstTurn(await resume(dir, sessionFile, dir))).notice?.content).toContain("No longer in memory");
 	});
 
-	it("tracks only memories the budgeted block delivered", async () => {
-		const dir = tempDir();
-		const live = startProcess(dir, newSession(dir));
-		const seen = live.rememberScoped("The deploy host is alpha-7.");
-		const unseen = live.rememberScoped("The deploy runbook lives on the deploy host wiki.");
-		// A budget that cuts the runbook line, as the injection token limit can.
-		const budget = (block: string) =>
-			block
-				.split("\n")
-				.filter(line => !line.includes("runbook"))
-				.join("\n");
-		const preparation = await live.beforeAgentStartPrompt(PROMPT, undefined, budget);
-		expect(preparation?.context).toContain("runbook");
-		expect(preparation?.commit()).toBe(true);
-		expect(live.editScopedMemory("forget", unseen).status).toBe("deleted");
-		expect(live.editScopedMemory("forget", seen).status).toBe("deleted");
-		const sessionFile = await writeTranscript(live.session.sessionManager);
+	it("tracks memories the budgeted block showed, even in part, and not ones it cut", async () => {
+		const runbook = "The deploy runbook lives on the deploy host wiki.";
+		/** Recalls with a budget that cuts the block `at` characters into the runbook bullet; forgets every memory. */
+		const recallCutInRunbook = async (at: number) => {
+			const dir = tempDir();
+			const live = startProcess(dir, newSession(dir));
+			const ids = [live.rememberScoped("The deploy host is alpha-7."), live.rememberScoped(runbook)];
+			// Cut like the injection token limit: a prefix of the block ending in "…".
+			const budget = (block: string) => `${block.slice(0, block.indexOf(runbook) + at)}…`;
+			const preparation = await live.beforeAgentStartPrompt(PROMPT, undefined, budget);
+			expect(preparation?.commit()).toBe(true);
+			for (const id of ids) expect(live.editScopedMemory("forget", id).status).toBe("deleted");
+			const sessionFile = await writeTranscript(live.session.sessionManager);
+			return (await firstTurn(await resume(dir, sessionFile, dir))).notice?.content ?? "";
+		};
 
-		const notice = (await firstTurn(await resume(dir, sessionFile, dir))).notice?.content ?? "";
-		expect(notice).toContain("alpha-7");
-		expect(notice).not.toContain("runbook");
+		expect(await recallCutInRunbook(10)).toContain(runbook);
+		expect(await recallCutInRunbook(0)).not.toContain(runbook);
 	});
 
 	it("compares and quotes memories as the recall block shows them, clipped", async () => {
