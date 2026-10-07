@@ -647,7 +647,8 @@ export class CollabGuestLink {
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
-		applyReplicaEvent(this.#ctx, event).catch(err => {
+		// Same pipeline as a local session: coalesced `message_update`s, everything else serialized behind them.
+		applyReplicaEvent(this.#ctx, event, e => this.#ctx.eventController.dispatchSessionEvent(e)).catch(err => {
 			logger.warn("collab guest event dispatch failed", { type: event.type, error: String(err) });
 		});
 		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
