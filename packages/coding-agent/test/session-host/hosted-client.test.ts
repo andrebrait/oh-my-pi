@@ -289,19 +289,30 @@ function visibleFiles(names: string[]): string[] {
  * staged by then, and none of its entries has been announced.
  */
 function holdNextPublish(file: string | undefined, failure?: Error): { held: Promise<void>; release: () => void } {
-	const publish = FileSessionStorage.prototype.writeTextAtomic;
+	const publishText = FileSessionStorage.prototype.writeTextAtomic;
+	const publishLines = FileSessionStorage.prototype.writeLinesAtomic;
 	const held = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	let armed = true;
+	// Holds the first publish of `file` on either atomic path: the manager streams through
+	// `writeLinesAtomic` when the storage has it and falls back to `writeTextAtomic` otherwise.
+	const gate = async (target: string): Promise<void> => {
+		if (!armed || target !== file) return;
+		armed = false;
+		held.resolve();
+		await release.promise;
+		if (failure) throw failure;
+	};
 	spyOn(FileSessionStorage.prototype, "writeTextAtomic").mockImplementation(
 		async function (this: FileSessionStorage, target, content, options) {
-			if (armed && target === file) {
-				armed = false;
-				held.resolve();
-				await release.promise;
-				if (failure) throw failure;
-			}
-			return publish.call(this, target, content, options);
+			await gate(target);
+			return publishText.call(this, target, content, options);
+		},
+	);
+	spyOn(FileSessionStorage.prototype, "writeLinesAtomic").mockImplementation(
+		async function (this: FileSessionStorage, target, lines, options) {
+			await gate(target);
+			return publishLines.call(this, target, lines, options);
 		},
 	);
 	return { held: held.promise, release: release.resolve };

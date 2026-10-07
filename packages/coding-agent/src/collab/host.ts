@@ -795,7 +795,7 @@ export class CollabHost {
 		// into it later, so the live entries are read without a defensive deep
 		// copy. Chunk frames are assembled from these strings only as the
 		// transport drains.
-		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
+		const snapshot = this.#ctx.sessionManager.snapshotForReplication(value => value);
 		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
 		const state = this.#buildState();
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
