@@ -47,13 +47,18 @@ function tempDir(): TempDir {
 }
 
 /** One omp process: a session over `sessionManager` with its own Mnemopi state on the store in `storeDir`. */
-function startProcess(storeDir: TempDir, sessionManager: SessionManager): MnemopiSessionState {
+function startProcess(
+	storeDir: TempDir,
+	sessionManager: SessionManager,
+	overrides: Record<string, unknown> = {},
+): MnemopiSessionState {
 	const settings = Settings.isolated({
 		"memory.backend": "mnemopi",
 		"mnemopi.scoping": "global",
 		"mnemopi.dbPath": storeDir.join("mnemopi.db"),
 		"mnemopi.noEmbeddings": true,
 		"mnemopi.llmMode": "none",
+		...overrides,
 	});
 	const session = {
 		sessionId: sessionManager.getSessionId(),
@@ -168,6 +173,38 @@ describe("Mnemopi recall across a resume", () => {
 		const resumed = await resume(dir, sessionFile, dir);
 		await resumed.maybeRecallOnAgentStart();
 		expect(resumed.lastRecallSnippet).toBe(block);
+	});
+
+	it("records the background agent_start recall within the injection budget", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir), { "mnemopi.injectionTokenLimit": 300 });
+		for (const host of ["alpha", "bravo", "charlie", "delta"]) {
+			live.rememberScoped(`The deploy host ${host} notes: ${"steady rollout guidance ".repeat(12)}`);
+		}
+		await writeTranscript(live.session.sessionManager);
+		await live.maybeRecallOnAgentStart();
+		const full = live.lastRecallSnippet ?? "";
+		const delivered = live.budgetRecallBlock(full);
+		expect(delivered.length).toBeLessThan(full.length);
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		expect((await firstTurn(await resume(dir, sessionFile, dir))).block).toBe(delivered);
+	});
+
+	it("tracks a memory by its own bullet, not an earlier match of its text", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir));
+		// The memory's text also occurs in the block's preamble.
+		const id = live.rememberScoped("background knowledge");
+		const budget = (block: string) => `${block.slice(0, block.lastIndexOf("- background knowledge"))}…`;
+		const preparation = await live.beforeAgentStartPrompt("What background knowledge do we have?", undefined, budget);
+		expect(preparation?.context).toContain("- background knowledge");
+		expect(preparation?.commit()).toBe(true);
+		expect(live.editScopedMemory("forget", id).status).toBe("deleted");
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		// The budget cut the memory's bullet, so the model never saw it recalled.
+		expect((await firstTurn(await resume(dir, sessionFile, dir))).notice).toBeUndefined();
 	});
 
 	it("keeps a first turn that recalled nothing memory-free after the store fills", async () => {
