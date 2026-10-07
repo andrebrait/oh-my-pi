@@ -3456,9 +3456,10 @@ export class SessionManager {
 
 	/**
 	 * Snapshot the session for replication: the header and entries, and the leaf and name that go
-	 * with them. Nothing is copied by default: the host mutates entries in place on rewrite paths,
-	 * so callers must not mutate what this returns and must serialize it synchronously, before any
-	 * such rewrite can run. Pass `copy` for a snapshot that outlives that window.
+	 * with them. Entries are deep-copied by default (`structuredClone`), because the host mutates
+	 * them in place on rewrite paths and a caller that keeps the snapshot must not share references.
+	 * Pass the identity for no copy: the caller must then not mutate what this returns and must
+	 * serialize it synchronously, before any such rewrite can run (the collab welcome does).
 	 *
 	 * `announcedOnly` limits the snapshot to what the {@link subscribeEntryAppended} taps have been told, for a client
 	 * that is then sent every later announcement: each entry reaches it exactly once, here or as its announcement.
@@ -3469,7 +3470,7 @@ export class SessionManager {
 	 * (an open batch, the durability hold, or the announcement queue). With nothing left out it is the live snapshot.
 	 */
 	snapshotForReplication(
-		copy: <T>(value: T) => T = value => value,
+		copy: <T>(value: T) => T = structuredClone,
 		options: { announcedOnly?: boolean } = {},
 	): ReplicationSnapshot {
 		if (!options.announcedOnly) {
