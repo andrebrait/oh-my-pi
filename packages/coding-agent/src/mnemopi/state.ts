@@ -588,8 +588,9 @@ export class MnemopiSessionState {
 				removed.push(quoteMemoryText(memory.text));
 				continue;
 			}
-			// Facts are immutable rows that only disappear or retire with their source.
-			const text = hit.store === "fact" ? memory.text : recalledText(clipRecallContent(hit.row.content).content);
+			// Compare what a fresh recall would show: a fact recalls as its object.
+			const content = hit.store === "fact" ? factRecallContent(hit.row.metadata) : hit.row.content;
+			const text = recalledText(clipRecallContent(content).content);
 			// A cut memory changed only if the part the model saw did.
 			if (memory.cut ? text.startsWith(memory.text) : text === memory.text) {
 				current.push(memory);
@@ -1169,20 +1170,29 @@ function quoteMemoryText(text: string): string {
 	return text.replaceAll("<", "&lt;");
 }
 
-/** The memory a fact was extracted from, or null when the fact has no source or it no longer exists. */
-function factSourceRow(memory: Mnemopi, fact: MnemopiStoredMemoryRow): MnemopiStoredMemoryRow | null {
-	let metadata: unknown = fact.metadata;
-	if (typeof metadata === "string") {
+/** A fact row's `{subject, predicate, object, source_msg_id}` metadata, or an empty record. */
+function factMetadata(metadata: unknown): Record<string, unknown> {
+	let parsed = metadata;
+	if (typeof parsed === "string") {
 		try {
-			metadata = JSON.parse(metadata);
+			parsed = JSON.parse(parsed);
 		} catch {
-			return null;
+			return {};
 		}
 	}
-	const sourceId =
-		typeof metadata === "object" && metadata !== null && "source_msg_id" in metadata
-			? metadata.source_msg_id
-			: undefined;
+	return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+}
+
+/** How recall shows a fact (`factRecall`): its object, or subject and predicate without one. */
+function factRecallContent(metadata: unknown): string {
+	const { subject, predicate, object } = factMetadata(metadata);
+	if (typeof object === "string" && object.length > 0) return object;
+	return `${typeof subject === "string" ? subject : ""} ${typeof predicate === "string" ? predicate : ""}`.trim();
+}
+
+/** The memory a fact was extracted from, or null when the fact has no source or it no longer exists. */
+function factSourceRow(memory: Mnemopi, fact: MnemopiStoredMemoryRow): MnemopiStoredMemoryRow | null {
+	const sourceId = factMetadata(fact.metadata).source_msg_id;
 	if (typeof sourceId !== "string" || sourceId.length === 0) return null;
 	return memory.get(sourceId) as MnemopiStoredMemoryRow | null;
 }

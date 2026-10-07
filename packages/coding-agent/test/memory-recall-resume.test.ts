@@ -351,6 +351,24 @@ describe("Mnemopi recall across a resume", () => {
 		expect(await retireFactSource(episodic)).toBeUndefined();
 	});
 
+	it("reports a recalled fact whose value changed in place", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir));
+		const insert = live.memory.beam.db.prepare(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object) VALUES (?, ?, ?, ?, ?)",
+		);
+		insert.run("fact-deploy-host", live.memory.beam.sessionId, "deploy host", "is", "zeta-5");
+		const { block } = await firstTurn(live);
+		expect(block).toContain("zeta-5");
+		// Belief revision rewrites a fact's object under the same id.
+		live.memory.beam.db.prepare("UPDATE facts SET object = ? WHERE fact_id = ?").run("omega-6", "fact-deploy-host");
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		const notice = (await firstTurn(await resume(dir, sessionFile, dir))).notice?.content;
+		expect(notice).toContain("Recalled as: zeta-5");
+		expect(notice).toContain("Now: omega-6");
+	});
+
 	it("compares and quotes memories as the recall block shows them, clipped", async () => {
 		const original = `The deploy host is alpha-7. ${"Rollout detail. ".repeat(100)}`;
 		const { dir, live, id, block, sessionFile } = await recalledTranscript(original);
