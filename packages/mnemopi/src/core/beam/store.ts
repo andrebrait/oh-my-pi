@@ -740,7 +740,7 @@ export function updateWorking(
 export function get(beam: BeamMemoryState, memoryId: string): Row | null {
 	using workingStatement = beam.db.prepare(`
 		SELECT id, content, source, timestamp, session_id,
-			   importance, metadata_json, veracity, created_at
+			   importance, metadata_json, veracity, created_at, valid_until, superseded_by
 		FROM working_memory
 		WHERE id = ?
 	`);
@@ -749,7 +749,7 @@ export function get(beam: BeamMemoryState, memoryId: string): Row | null {
 
 	using episodicStatement = beam.db.prepare(`
 		SELECT id, content, source, timestamp, session_id,
-			   importance, metadata_json, veracity, created_at
+			   importance, metadata_json, veracity, created_at, valid_until, superseded_by
 		FROM episodic_memory
 		WHERE id = ? AND (session_id = ? OR scope = 'global')
 	`);

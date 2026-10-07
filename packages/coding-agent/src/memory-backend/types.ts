@@ -95,6 +95,11 @@ export interface MemoryBackendStartOptions {
 /** A successful recall, including an empty result, staged until user-turn delivery. */
 export interface MemoryPromptPreparation {
 	context?: string;
+	/**
+	 * Model-facing note delivered with this turn's user message, e.g. what changed in the
+	 * memories a reused recall holds. Persisted in the transcript like any other message.
+	 */
+	notice?: string;
 	/** Commit synchronously after delivery validation; false rejects lost ownership without state writes. */
 	commit(): boolean;
 }

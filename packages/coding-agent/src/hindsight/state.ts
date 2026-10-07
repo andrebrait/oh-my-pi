@@ -445,12 +445,13 @@ export class HindsightSessionState {
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
 		const generation = ++this.#recallGeneration;
-		// Reuse this transcript's recall so a resumed session sends the same prompt.
+		// Reuse this transcript's recall so a resumed session sends the same prompt. Hindsight
+		// memories cannot be looked up by id, so changes since are not reported.
 		const persisted = findPersistedRecall(this.session.sessionManager, this.#recallScope());
 		if (persisted !== undefined) {
 			return {
-				context: persisted || undefined,
-				commit: () => this.#commitRecall(generation, persisted, false),
+				context: persisted.text || undefined,
+				commit: () => this.#commitRecall(generation, persisted.text, false),
 			};
 		}
 
@@ -472,7 +473,7 @@ export class HindsightSessionState {
 		if (this.#recallGeneration !== generation) return false;
 		this.hasRecalledForFirstTurn = true;
 		if (context) this.lastRecallSnippet = context;
-		if (persist) persistRecall(this.session.sessionManager, this.#recallScope(), context);
+		if (persist) persistRecall(this.session.sessionManager, this.#recallScope(), { text: context, memories: [] });
 		return true;
 	}
 
