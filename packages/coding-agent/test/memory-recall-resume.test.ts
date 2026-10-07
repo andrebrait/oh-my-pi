@@ -183,12 +183,23 @@ describe("Mnemopi recall across a resume", () => {
 		}
 		await writeTranscript(live.session.sessionManager);
 		await live.maybeRecallOnAgentStart();
-		const full = live.lastRecallSnippet ?? "";
-		const delivered = live.budgetRecallBlock(full);
-		expect(delivered.length).toBeLessThan(full.length);
+		const delivered = live.lastRecallSnippet ?? "";
+		// The budget cut the block, as the prompt carries it.
+		expect(delivered.endsWith("…")).toBe(true);
 		const sessionFile = await writeTranscript(live.session.sessionManager);
 
 		expect((await firstTurn(await resume(dir, sessionFile, dir))).block).toBe(delivered);
+	});
+
+	it("resends the delivered block unchanged after the injection budget shrinks", async () => {
+		const { dir, block, sessionFile } = await recalledTranscript(
+			`The deploy host is alpha-7. ${"Rollout detail. ".repeat(20)}`,
+		);
+
+		const sessionManager = await SessionManager.open(sessionFile, dir.join("sessions"));
+		const resumed = startProcess(dir, sessionManager, { "mnemopi.injectionTokenLimit": 150 });
+		expect(resumed.budgetRecallBlock(block ?? "")).not.toBe(block);
+		expect((await firstTurn(resumed)).block).toBe(block);
 	});
 
 	it("tracks a memory by its own bullet, not an earlier match of its text", async () => {
@@ -196,9 +207,14 @@ describe("Mnemopi recall across a resume", () => {
 		const live = startProcess(dir, newSession(dir));
 		// The memory's text also occurs in the block's preamble.
 		const id = live.rememberScoped("background knowledge");
-		const budget = (block: string) => `${block.slice(0, block.lastIndexOf("- background knowledge"))}…`;
+		let recalled = "";
+		const budget = (block: string) => {
+			recalled = block;
+			return `${block.slice(0, block.lastIndexOf("- background knowledge"))}…`;
+		};
 		const preparation = await live.beforeAgentStartPrompt("What background knowledge do we have?", undefined, budget);
-		expect(preparation?.context).toContain("- background knowledge");
+		expect(recalled).toContain("- background knowledge");
+		expect(preparation?.context).not.toContain("- background knowledge");
 		expect(preparation?.commit()).toBe(true);
 		expect(live.editScopedMemory("forget", id).status).toBe("deleted");
 		const sessionFile = await writeTranscript(live.session.sessionManager);
@@ -291,7 +307,7 @@ describe("Mnemopi recall across a resume", () => {
 			const budget = (block: string) => `${block.slice(0, block.indexOf(runbook) + at)}…`;
 			const preparation = await live.beforeAgentStartPrompt(PROMPT, undefined, budget);
 			expect(preparation?.commit()).toBe(true);
-			const delivered = budget(preparation?.context ?? "");
+			const delivered = preparation?.context;
 			for (const id of ids) expect(live.editScopedMemory("forget", id).status).toBe("deleted");
 			const sessionFile = await writeTranscript(live.session.sessionManager);
 			// Resumed without the budget (as after raising the token limit), the block stays as delivered.

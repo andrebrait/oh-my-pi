@@ -601,8 +601,9 @@ export class MnemopiSessionState {
 	}
 
 	/**
-	 * `budget` cuts a recall block to the prefix the prompt actually carries; memories that
-	 * prefix shows, even in part, are tracked for change reports.
+	 * A fresh recall is cut by `budget` to the prefix the prompt carries next to the memory
+	 * instructions; a reused one is resent exactly as delivered. Memories the delivered block
+	 * shows, even in part, are tracked for change reports.
 	 */
 	async beforeAgentStartPrompt(
 		promptText: string,
@@ -637,8 +638,8 @@ export class MnemopiSessionState {
 		const recall = await this.#recallBlock(truncated, signal);
 		const record = recall && this.#deliveredRecall(recall, budget);
 		return {
-			context: recall?.text || undefined,
-			commit: () => this.#commitRecall(generation, recall?.text ?? "", record),
+			context: record?.text || undefined,
+			commit: () => this.#commitRecall(generation, record?.text ?? "", record),
 		};
 	}
 
@@ -783,8 +784,8 @@ export class MnemopiSessionState {
 			const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 			try {
 				const recall = await this.#recallBlock(truncated);
-				context = recall?.text;
 				record = recall && this.#deliveredRecall(recall, block => this.budgetRecallBlock(block));
+				context = record?.text;
 			} catch (error) {
 				logger.warn("Mnemopi: auto-recall failed", {
 					bank: this.config.bank,

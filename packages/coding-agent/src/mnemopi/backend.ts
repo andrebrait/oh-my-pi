@@ -150,9 +150,6 @@ export const mnemopiBackend: MemoryBackend = {
 		const state = getMnemopiSessionState(session);
 		const preparation = await state?.beforeAgentStartPrompt(promptText, signal);
 		if (!state || !preparation) return undefined;
-		// Match the canonical memory block's budget while the recall is staged
-		// separately from its static instructions. Commit still caches the full snippet.
-		if (preparation.context) preparation.context = state.budgetRecallBlock(preparation.context) || undefined;
 		return {
 			context: preparation.context,
 			notice: preparation.notice,
