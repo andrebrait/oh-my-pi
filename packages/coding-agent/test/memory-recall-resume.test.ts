@@ -243,6 +243,29 @@ describe("Mnemopi recall across a resume", () => {
 		expect((await firstTurn(await resume(dir, sessionFile, dir))).notice?.content).toContain("No longer in memory");
 	});
 
+	it("tracks only memories the budgeted block delivered", async () => {
+		const dir = tempDir();
+		const live = startProcess(dir, newSession(dir));
+		const seen = live.rememberScoped("The deploy host is alpha-7.");
+		const unseen = live.rememberScoped("The deploy runbook lives on the deploy host wiki.");
+		// A budget that cuts the runbook line, as the injection token limit can.
+		const budget = (block: string) =>
+			block
+				.split("\n")
+				.filter(line => !line.includes("runbook"))
+				.join("\n");
+		const preparation = await live.beforeAgentStartPrompt(PROMPT, undefined, budget);
+		expect(preparation?.context).toContain("runbook");
+		expect(preparation?.commit()).toBe(true);
+		expect(live.editScopedMemory("forget", unseen).status).toBe("deleted");
+		expect(live.editScopedMemory("forget", seen).status).toBe("deleted");
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+
+		const notice = (await firstTurn(await resume(dir, sessionFile, dir))).notice?.content ?? "";
+		expect(notice).toContain("alpha-7");
+		expect(notice).not.toContain("runbook");
+	});
+
 	it("compares and quotes memories as the recall block shows them, clipped", async () => {
 		const original = `The deploy host is alpha-7. ${"Rollout detail. ".repeat(100)}`;
 		const { dir, live, id, block, sessionFile } = await recalledTranscript(original);

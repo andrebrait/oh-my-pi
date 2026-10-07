@@ -148,20 +148,21 @@ export const mnemopiBackend: MemoryBackend = {
 
 	async beforeAgentStartPrompt(session, promptText, signal): Promise<MemoryPromptPreparation | undefined> {
 		const state = getMnemopiSessionState(session);
-		const preparation = await state?.beforeAgentStartPrompt(promptText, signal);
+		// Match the canonical memory block's budget while the recall is staged
+		// separately from its static instructions. Commit still caches the full snippet.
+		const instructions = prompt.render(mnemopiInstructions, {
+			toolRefs: memoryToolRefs(session.getXdevToolEntries()),
+		});
+		const budget = (block: string): string =>
+			truncateApproxTokens(
+				[instructions, block].join("\n\n").trim(),
+				cfgMnemopiInjectionTokenLimit.get(session.settings),
+			)
+				.slice(instructions.length)
+				.trim();
+		const preparation = await state?.beforeAgentStartPrompt(promptText, signal, budget);
 		if (!preparation) return undefined;
-		if (preparation.context) {
-			// Match the canonical memory block's budget while the recall is staged
-			// separately from its static instructions. Commit still caches the full snippet.
-			const instructions = prompt.render(mnemopiInstructions, {
-				toolRefs: memoryToolRefs(session.getXdevToolEntries()),
-			});
-			const rendered = [instructions, preparation.context].join("\n\n").trim();
-			preparation.context =
-				truncateApproxTokens(rendered, cfgMnemopiInjectionTokenLimit.get(session.settings))
-					.slice(instructions.length)
-					.trim() || undefined;
-		}
+		if (preparation.context) preparation.context = budget(preparation.context) || undefined;
 		return {
 			context: preparation.context,
 			notice: preparation.notice,

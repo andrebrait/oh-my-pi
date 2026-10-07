@@ -547,9 +547,14 @@ export class MnemopiSessionState {
 		return { content: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
 	}
 
+	/**
+	 * `budget` maps a recall block to the part the prompt actually carries (the injection
+	 * token limit); only memories that part shows are tracked for change reports.
+	 */
 	async beforeAgentStartPrompt(
 		promptText: string,
 		signal?: AbortSignal,
+		budget: (block: string) => string = block => block,
 	): Promise<MemoryPromptPreparation | undefined> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
 		const latestPrompt = promptText.trim();
@@ -577,9 +582,14 @@ export class MnemopiSessionState {
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		const recall = await this.#recallBlock(truncated, signal);
+		const delivered = recall?.text ? budget(recall.text) : "";
+		const record = recall && {
+			text: recall.text,
+			memories: recall.memories.filter(memory => delivered.includes(memory.text)),
+		};
 		return {
 			context: recall?.text || undefined,
-			commit: () => this.#commitRecall(generation, recall?.text ?? "", recall),
+			commit: () => this.#commitRecall(generation, recall?.text ?? "", record),
 		};
 	}
 
