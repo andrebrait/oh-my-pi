@@ -254,9 +254,13 @@ describe("Mnemopi recall across a resume", () => {
 			const budget = (block: string) => `${block.slice(0, block.indexOf(runbook) + at)}…`;
 			const preparation = await live.beforeAgentStartPrompt(PROMPT, undefined, budget);
 			expect(preparation?.commit()).toBe(true);
+			const delivered = budget(preparation?.context ?? "");
 			for (const id of ids) expect(live.editScopedMemory("forget", id).status).toBe("deleted");
 			const sessionFile = await writeTranscript(live.session.sessionManager);
-			return (await firstTurn(await resume(dir, sessionFile, dir))).notice?.content ?? "";
+			// Resumed without the budget (as after raising the token limit), the block stays as delivered.
+			const turn = await firstTurn(await resume(dir, sessionFile, dir));
+			expect(turn.block).toBe(delivered);
+			return turn.notice?.content ?? "";
 		};
 
 		expect(await recallCutInRunbook(10)).toContain(runbook);

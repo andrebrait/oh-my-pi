@@ -583,13 +583,16 @@ export class MnemopiSessionState {
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		const recall = await this.#recallBlock(truncated, signal);
-		// The budget keeps a prefix of the block, ending in "…" when it cut one.
-		const delivered = recall?.text ? budget(recall.text).replace(/…$/, "") : "";
+		// The transcript records the block as delivered, so a later budget change cannot
+		// show a resumed turn memories the bookkeeping never saw. The budget keeps a prefix
+		// of the block, ending in "…" when it cut one.
+		const delivered = recall?.text ? budget(recall.text) : "";
+		const deliveredPrefix = delivered.replace(/…$/, "");
 		const record = recall && {
-			text: recall.text,
+			text: delivered,
 			memories: recall.memories.filter(memory => {
 				const offset = recall.text.indexOf(memory.text);
-				return offset >= 0 && offset < delivered.length;
+				return offset >= 0 && offset < deliveredPrefix.length;
 			}),
 		};
 		return {
