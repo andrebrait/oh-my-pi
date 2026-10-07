@@ -195,6 +195,22 @@ describe("createAgentSession deferred MCP discovery and the first turn", () => {
 		expect(systemPrompts[0]).toContain(MCP_ROUTE);
 	});
 
+	it("publishes the tools discovery returned before waiting on slower servers", async () => {
+		// A slower server never finishes connecting, so the startup barrier never releases.
+		const { promise: neverReady } = Promise.withResolvers<MCPStartupStatus>();
+		const barrierReached = Promise.withResolvers<void>();
+		vi.spyOn(MCPManager.prototype, "waitForStartup").mockImplementation(() => {
+			barrierReached.resolve();
+			return neverReady;
+		});
+		const { session, servers } = await createDeferredSession();
+		// Discovery's startup window closes with the probe's tools (e.g. its cached routes) available.
+		servers.closeStartupWindow(probeTools());
+		await barrierReached.promise;
+		// A turn that runs out its wait builds from this prompt, so the routes must already be in it.
+		expect(session.agent.state.systemPrompt.join("\n")).toContain(MCP_ROUTE);
+	});
+
 	it("starts the first turn at the deadline and does not hold later turns", async () => {
 		const { session, systemPrompts, turnsStarted } = await createDeferredSession();
 		const started = () => turnsStarted() > 0;

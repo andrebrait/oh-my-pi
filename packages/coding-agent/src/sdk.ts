@@ -2499,10 +2499,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 									enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
 								}),
 							);
-							// Discovery returns after the startup window while slower servers keep
-							// connecting. Give them the first turn's wait budget so that turn's
-							// prompt already carries their routes and instructions.
-							if (!liveSession.isDisposed) await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
 							// The session can be torn down while servers are still connecting.
 							// Don't resurrect tools on a disposed session, and don't leak the
 							// transports/subprocesses the connect just spawned.
@@ -2512,8 +2508,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							}
 							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
-							// Connected MCP tools are enabled and mounted under xd:// devices. The
-							// final snapshot includes servers that connected during the barrier.
+							// Connected MCP tools (and cached routes of servers still connecting) are
+							// enabled and mounted under xd:// devices right away, so a turn whose
+							// wait runs out still carries them.
+							await liveSession.refreshMCPTools(mcpResult.tools);
+							// Discovery returns after the startup window while slower servers keep
+							// connecting. Give them the first turn's wait budget, then publish the
+							// final snapshot so that turn's prompt carries their instructions too.
+							await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
+							if (liveSession.isDisposed) return;
 							await liveSession.refreshMCPTools(deferredMCPManager.getTools());
 						} catch (error) {
 							logger.error("MCP tool load failed", {
