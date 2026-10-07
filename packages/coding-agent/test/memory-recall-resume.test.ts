@@ -244,7 +244,7 @@ describe("Mnemopi recall across a resume", () => {
 	});
 
 	it("tracks memories the budgeted block showed, even in part, and not ones it cut", async () => {
-		const runbook = "The deploy runbook lives on the deploy host wiki.";
+		const runbook = "Runbook: the deploy steps live on the deploy host wiki.";
 		/** Recalls with a budget that cuts the block `at` characters into the runbook bullet; forgets every memory. */
 		const recallCutInRunbook = async (at: number) => {
 			const dir = tempDir();
@@ -263,8 +263,11 @@ describe("Mnemopi recall across a resume", () => {
 			return turn.notice?.content ?? "";
 		};
 
-		expect(await recallCutInRunbook(10)).toContain(runbook);
-		expect(await recallCutInRunbook(0)).not.toContain(runbook);
+		const partlyShown = await recallCutInRunbook(10);
+		expect(partlyShown).toContain(runbook.slice(0, 10));
+		// The note quotes only what the model saw, never the cut-off rest.
+		expect(partlyShown).not.toContain("wiki");
+		expect(await recallCutInRunbook(0)).not.toContain(runbook.slice(0, 10));
 	});
 
 	it("reports a recalled fact retired with its source memory", async () => {

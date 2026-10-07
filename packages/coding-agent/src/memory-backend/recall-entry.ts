@@ -26,6 +26,8 @@ export interface RecalledMemory {
 	id: string;
 	/** The memory's text as the model last saw it: the recall preview, clipped. */
 	text: string;
+	/** The block's token budget cut this memory: `text` is the visible prefix only. */
+	cut?: true;
 }
 
 export interface PersistedRecall {
@@ -62,7 +64,8 @@ function isRecalledMemories(value: unknown): value is RecalledMemory[] {
 				"id" in memory &&
 				typeof memory.id === "string" &&
 				"text" in memory &&
-				typeof memory.text === "string",
+				typeof memory.text === "string" &&
+				(!("cut" in memory) || memory.cut === true),
 		)
 	);
 }

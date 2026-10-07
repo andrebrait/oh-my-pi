@@ -541,8 +541,13 @@ export class MnemopiSessionState {
 			}
 			// Facts are immutable rows that only disappear or retire with their source.
 			const text = hit.store === "fact" ? memory.text : recalledText(clipRecallContent(hit.row.content).content);
+			// A cut memory changed only if the part the model saw did.
+			if (memory.cut ? text.startsWith(memory.text) : text === memory.text) {
+				current.push(memory);
+				continue;
+			}
 			current.push({ id: memory.id, text });
-			if (text !== memory.text) updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
+			updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
 		}
 		if (removed.length === 0 && updated.length === 0) return undefined;
 		return { content: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
@@ -590,9 +595,13 @@ export class MnemopiSessionState {
 		const deliveredPrefix = delivered.replace(/…$/, "");
 		const record = recall && {
 			text: delivered,
-			memories: recall.memories.filter(memory => {
+			memories: recall.memories.flatMap((memory): RecalledMemory[] => {
 				const offset = recall.text.indexOf(memory.text);
-				return offset >= 0 && offset < deliveredPrefix.length;
+				if (offset < 0 || offset >= deliveredPrefix.length) return [];
+				const visible = deliveredPrefix.length - offset;
+				return visible >= memory.text.length
+					? [memory]
+					: [{ ...memory, text: memory.text.slice(0, visible), cut: true }];
 			}),
 		};
 		return {
