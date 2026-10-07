@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed resumed, switched-to, or forked sessions missing the prompt cache on their first turn with Mnemopi or Hindsight auto-recall enabled ([#14656](https://github.com/can1357/oh-my-pi/pull/14656) by [@andrebrait](https://github.com/andrebrait))
+
 ## [18.8.0] - 2026-10-07
 
 ### Added
@@ -35,9 +39,6 @@
 - Fixed slowdowns when processing long evaluation output, large Python kernel results, compiler/linter output, and ephemeral side-channel replies.
 - Fixed documents served as `application/octet-stream` being downloaded twice.
 - Fixed collaboration guests rebuilding the transcript excessively during streaming.
-### Fixed
-
-- Fixed resumed, switched-to, or forked sessions missing the prompt cache on their first turn with Mnemopi or Hindsight auto-recall enabled ([#14656](https://github.com/can1357/oh-my-pi/pull/14656) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.7.0] - 2026-10-06
 
