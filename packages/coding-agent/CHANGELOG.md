@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the first prompt of a UI or RPC session (including `--resume`) missing the provider prompt cache when MCP servers were still connecting: it now waits up to 1.5 s for MCP startup, so servers that connect within that time are already in its system prompt
+
 ## [18.8.0] - 2026-10-07
 
 ### Added
@@ -35,10 +39,6 @@
 - Fixed slowdowns when processing long evaluation output, large Python kernel results, compiler/linter output, and ephemeral side-channel replies.
 - Fixed documents served as `application/octet-stream` being downloaded twice.
 - Fixed collaboration guests rebuilding the transcript excessively during streaming.
-
-### Fixed
-
-- Fixed the first prompt of a UI or RPC session (including `--resume`) missing the provider prompt cache when MCP servers were still connecting: it now waits up to 1.5 s for MCP startup, so servers that connect within that time are already in its system prompt
 
 ## [18.7.0] - 2026-10-06
 
