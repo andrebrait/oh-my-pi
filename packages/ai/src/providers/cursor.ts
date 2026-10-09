@@ -1556,6 +1556,7 @@ function streamCursorWithWireMode(
 			if (h2Unavailable) error = mapH2TransportError(error, model.baseUrl || CURSOR_API_URL);
 			const fallbackWireModelId =
 				wireMode === "normalized" &&
+				!options?.preserveModelSelection &&
 				!sawProgressOrSideEffect &&
 				!options?.signal?.aborted &&
 				isCursorModelNotFound(error)

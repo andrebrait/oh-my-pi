@@ -25,9 +25,22 @@ import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-cred
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
+import {
+	adoptRoleRouteCandidate,
+	assertRoleDispatch,
+	inspectRoleRouteCandidate,
+	roleRouteFallbackCandidates,
+	roleRouteFallbackSelectors,
+	roleRouteMetadata,
+	ROLE_ROUTE_BLOCKED_PREFIX,
+	ROLE_ROUTE_UNAVAILABLE_PREFIX,
+	RoleRouteUnavailableError,
+	type RoleRoutePermit,
+} from "../task/role-routing";
 
 import type { Settings } from "../config/settings";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
@@ -40,8 +53,11 @@ import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	clampThinkingLevelToCeiling,
+	concreteThinkingLevel,
 	modelSupportsEffortCeiling,
 	resolveThinkingLevelForModel,
+	resolveProvisionalAutoLevel,
+	toReasoningEffort,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import type { AgentSessionEvent } from "./agent-session-events";
@@ -208,6 +224,7 @@ export interface TurnRecoveryHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
+	readonly roleRoute?: RoleRoutePermit;
 	configWarnings: string[];
 	model(): Model | undefined;
 	/**
@@ -244,7 +261,10 @@ export interface TurnRecoveryHost {
 	appendSessionMessage(message: AssistantMessage): void;
 	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
-	setModelWithProviderSessionReset(model: Model): Promise<void>;
+	setModelWithProviderSessionReset(
+		model: Model,
+		options?: { thinkingLevel: ConfiguredThinkingLevel | undefined },
+	): Promise<void>;
 	/** Edit mode resolved for the active model and settings, captured before a fallback swap. */
 	resolveActiveEditMode(): EditMode;
 	/** Rebuilds the model-dependent base system prompt when a swap changed the edit mode or model policy. */
@@ -1317,6 +1337,16 @@ export class TurnRecovery {
 		return id;
 	}
 
+	#isTerminalAdmissionError(message: AssistantMessage): boolean {
+		const errorMessage = message.errorMessage;
+		return (
+			errorMessage !== undefined &&
+			(errorMessage.startsWith(ROLE_ROUTE_BLOCKED_PREFIX) ||
+				errorMessage.startsWith(ROLE_ROUTE_UNAVAILABLE_PREFIX) ||
+				errorMessage.startsWith("ConfigurationError:"))
+		);
+	}
+
 	#isUsagePreflightBlocked(message: AssistantMessage): boolean {
 		return message.errorMessage?.startsWith(USAGE_PREFLIGHT_BLOCKED_PREFIX) === true;
 	}
@@ -1404,6 +1434,7 @@ export class TurnRecovery {
 	 */
 	isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
+		if (this.#isTerminalAdmissionError(message)) return false;
 		if (this.#isUsagePreflightBlocked(message)) return false;
 		if (AIError.isResponsesRequestBodyReadTimeout(message)) return false;
 		const model = this.#host.model();
@@ -1654,6 +1685,10 @@ export class TurnRecovery {
 	validateRetryFallbackChains(): void {
 		if (this.#fallbackChainsValidated) return;
 		this.#fallbackChainsValidated = true;
+		if (this.#host.roleRoute) {
+			roleRouteFallbackSelectors(this.#host.roleRoute, this.#host.modelRegistry);
+			return;
+		}
 		let deferred = false;
 		validateRetryFallbackChains(
 			this.#host.settings,
@@ -1690,6 +1725,11 @@ export class TurnRecovery {
 	 * @returns true when `configWarnings` changed and the header must rebuild.
 	 */
 	revalidateRetryFallbackChainsAfterDiscovery(): boolean {
+		if (this.#host.roleRoute) {
+			roleRouteFallbackSelectors(this.#host.roleRoute, this.#host.modelRegistry);
+			this.#pendingDiscoveryDeferredValidation = false;
+			return false;
+		}
 		const definitive = new Set<string>();
 		validateRetryFallbackChains(this.#host.settings, this.#host.modelRegistry, message => definitive.add(message));
 		this.#pendingDiscoveryDeferredValidation = false;
@@ -1750,6 +1790,10 @@ export class TurnRecovery {
 		currentModel: Model | null | undefined = this.#host.model(),
 		roleHint?: string,
 	): string | undefined {
+		if (this.#host.roleRoute) {
+			roleRouteFallbackSelectors(this.#host.roleRoute, this.#host.modelRegistry);
+			return roleRouteMetadata(this.#host.roleRoute)?.role ?? "__host_role_route__";
+		}
 		return resolveRetryFallbackChainKey(
 			this.#getRetryFallbackResolutionContext(),
 			currentSelector,
@@ -1780,6 +1824,7 @@ export class TurnRecovery {
 		currentModel: Model | null | undefined = this.#host.model(),
 		options?: { pinnedRole?: string; roleHint?: string },
 	): string[] {
+		if (this.#host.roleRoute) return [this.resolveRetryFallbackRole(currentSelector, currentModel)!];
 		const pinned = options?.pinnedRole ?? this.#activeRetryFallback?.role;
 		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, options?.roleHint);
 		if (!pinned) return current ? [current] : [];
@@ -1803,12 +1848,38 @@ export class TurnRecovery {
 		currentModel: Model | null | undefined = this.#host.model(),
 		options?: { wrapAround?: boolean },
 	): RetryFallbackSelector[] {
+		if (this.#host.roleRoute) {
+			return roleRouteFallbackCandidates(this.#host.roleRoute, this.#host.modelRegistry).map(candidate => ({
+				raw: candidate.selector,
+				provider: candidate.model.provider,
+				id: candidate.model.id,
+				thinkingLevel: concreteThinkingLevel(candidate.thinkingLevel),
+				...(candidate.thinkingLevel !== undefined ? { configuredThinkingLevel: candidate.thinkingLevel } : {}),
+			}));
+		}
 		return findRetryFallbackCandidates(
 			this.#getRetryFallbackResolutionContext(),
 			role,
 			currentSelector,
 			currentModel,
 			options,
+		);
+	}
+
+	#resolveRetryFallbackModel(selector: RetryFallbackSelector): Model | undefined {
+		if (this.#host.roleRoute) {
+			const permitted = roleRouteFallbackCandidates(this.#host.roleRoute, this.#host.modelRegistry).find(
+				candidate =>
+					candidate.selector === selector.raw &&
+					candidate.model.provider === selector.provider &&
+					candidate.model.id === selector.id &&
+					candidate.thinkingLevel === (selector.configuredThinkingLevel ?? selector.thinkingLevel),
+			);
+			return permitted?.model;
+		}
+		return (
+			resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings).model ??
+			this.#host.modelRegistry.find(selector.provider, selector.id)
 		);
 	}
 
@@ -1877,10 +1948,10 @@ export class TurnRecovery {
 		for (const role of chainKeys) {
 			for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
-				const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
+				const candidateModel = this.#resolveRetryFallbackModel(candidate);
 				if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
+				if (!this.#host.roleRoute && ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling))
+					continue;
 				// A usage fallback must also fit: skip a candidate whose window cannot
 				// hold the live context so we never switch onto an oversized request
 				// (issue #8065).
@@ -1999,8 +2070,10 @@ export class TurnRecovery {
 		const active = this.#host.model();
 		if (!active || formatModelStringWithRouting(candidate) !== formatModelStringWithRouting(active)) return false;
 		const configured = this.#host.configuredThinkingLevel();
-		const requested = selector.thinkingLevel ?? configured;
+		const requested = selector.configuredThinkingLevel ?? selector.thinkingLevel ?? configured;
 		if (requested === AUTO_THINKING || configured === AUTO_THINKING) return requested === configured;
+		if (this.#host.roleRoute && (selector.configuredThinkingLevel ?? selector.thinkingLevel) !== undefined)
+			return requested === configured;
 		const effective = resolveThinkingLevelForModel(
 			candidate,
 			clampThinkingLevelToCeiling(candidate, requested, this.#host.thinkingLevelCeiling()),
@@ -2014,11 +2087,15 @@ export class TurnRecovery {
 		currentSelector: string,
 		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
 	): Promise<boolean> {
-		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+		const candidate = this.#resolveRetryFallbackModel(selector);
 		if (!candidate) {
+			if (this.#host.roleRoute)
+				throw new Error(`Host role retry model/effort is not a remaining approved occurrence: ${selector.raw}`);
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
+		const rolePreview = this.#host.roleRoute
+			? inspectRoleRouteCandidate(this.#host.roleRoute, selector.raw, candidate, this.#host.modelRegistry)
+			: undefined;
 		const apiKey =
 			options?.apiKey ??
 			(await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal: options?.signal }));
@@ -2030,14 +2107,29 @@ export class TurnRecovery {
 		// Capture the configured selector (auto-aware) so a fallback chain preserves
 		// `auto` instead of collapsing it to the level it resolved to this turn.
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
-		const requestedThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
-		// A fallback selector's explicit level (or the carried level after the
-		// replacement model's floor clamp) must never exceed the session's
-		// per-spawn effort ceiling.
-		const nextThinkingLevel =
-			requestedThinkingLevel === AUTO_THINKING
-				? requestedThinkingLevel
-				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
+		const requestedThinkingLevel = selector.configuredThinkingLevel ?? selector.thinkingLevel ?? currentThinkingLevel;
+		const nextThinkingLevel = rolePreview?.fixedEffort
+			? rolePreview.thinkingLevel
+			: (rolePreview?.thinkingLevel ??
+				(requestedThinkingLevel === AUTO_THINKING
+					? requestedThinkingLevel
+					: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling())));
+		const reasoning = toReasoningEffort(
+			nextThinkingLevel === AUTO_THINKING
+				? clampThinkingLevelToCeiling(
+						candidate,
+						resolveProvisionalAutoLevel(candidate),
+						this.#host.thinkingLevelCeiling(),
+					)
+				: concreteThinkingLevel(nextThinkingLevel),
+		);
+		if (rolePreview && reasoning !== undefined && !getSupportedEfforts(candidate).includes(reasoning)) {
+			throw new Error("Host role retry cannot apply an unsupported serving effort.");
+		}
+		const roleSelection = this.#host.roleRoute
+			? adoptRoleRouteCandidate(this.#host.roleRoute, selector.raw, candidate, this.#host.modelRegistry)
+			: undefined;
+		assertRoleDispatch(this.#host.roleRoute, candidate, reasoning, options?.signal, this.#host.modelRegistry);
 		const candidateSelector = formatModelStringWithRouting(candidate);
 		const previousModel = this.#host.model();
 		// Capture the edit mode under the outgoing model so the base system prompt
@@ -2054,8 +2146,11 @@ export class TurnRecovery {
 		const servedBeforeSwap = this.#activeRetryFallback?.served;
 		this.#markFallbackRouted();
 		if (this.#activeRetryFallback) this.#activeRetryFallback.served = false;
-		await this.#host.setModelWithProviderSessionReset(candidate);
-		if (options?.signal?.aborted) {
+		await this.#host.setModelWithProviderSessionReset(
+			candidate,
+			roleSelection ? { thinkingLevel: nextThinkingLevel } : undefined,
+		);
+		if (options?.signal?.aborted && !this.#host.roleRoute) {
 			this.#fallbackRoutedFor = routedBeforeSwap;
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			if (previousModel && this.#host.model() === candidate) {
@@ -2068,8 +2163,12 @@ export class TurnRecovery {
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			return false;
 		}
-		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
-		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
+		this.#host.sessionManager.appendModelChange(
+			roleSelection?.selector ?? candidateSelector,
+			EPHEMERAL_MODEL_CHANGE_ROLE,
+			true,
+		);
+		if (!this.#host.roleRoute) this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
 		if (!this.#activeRetryFallback) {
 			this.#activeRetryFallback = {
@@ -2077,11 +2176,12 @@ export class TurnRecovery {
 				originalSelector: currentSelector,
 				originalThinkingLevel: currentThinkingLevel,
 				lastAppliedFallbackThinkingLevel: nextThinkingLevel,
-				pinned: options?.pinFallback === true,
+				pinned: options?.pinFallback === true || this.#host.roleRoute !== undefined,
 			};
 		} else {
 			this.#activeRetryFallback.lastAppliedFallbackThinkingLevel = nextThinkingLevel;
-			this.#activeRetryFallback.pinned = this.#activeRetryFallback.pinned || options?.pinFallback === true;
+			this.#activeRetryFallback.pinned =
+				this.#activeRetryFallback.pinned || options?.pinFallback === true || this.#host.roleRoute !== undefined;
 		}
 		await this.#host.syncAfterModelChange(previousEditMode);
 		await this.#host.emitSessionEvent({
@@ -2118,8 +2218,7 @@ export class TurnRecovery {
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
-				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				const candidate = this.#resolveRetryFallbackModel(selector);
 				if (!candidate) continue;
 				// A candidate that would leave the request exactly as it is — same
 				// routed model, same effective thinking level — is not a switch, and
@@ -2160,7 +2259,8 @@ export class TurnRecovery {
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
 				// clamped UP past the cap by its model floor — skip it entirely.
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
+				if (!this.#host.roleRoute && ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling))
+					continue;
 				// Skip a candidate whose window cannot hold the retry context. The
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
@@ -2170,10 +2270,16 @@ export class TurnRecovery {
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 				if (!apiKey) continue;
 				const previousEditMode = this.#host.resolveActiveEditMode();
-				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
-					...options,
-					reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
-				});
+				let applied: boolean;
+				try {
+					applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+						...options,
+						reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+					});
+				} catch (error) {
+					if (this.#host.roleRoute && error instanceof RoleRouteUnavailableError) continue;
+					throw error;
+				}
 				const editModeChanged = this.#host.resolveActiveEditMode() !== previousEditMode;
 				if (applied && options?.pinFallback === true && canRedeemFallbackCredit && !editModeChanged) {
 					this.#activeFallbackCreditRedemption = {
@@ -2208,6 +2314,7 @@ export class TurnRecovery {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		if (message.stopReason !== "error") return false;
+		if (this.#isTerminalAdmissionError(message)) return false;
 		if (this.#isUsagePreflightBlocked(message)) return false;
 		if (this.#hasReplayUnsafeOutput(message)) return false;
 		// A content refusal/sensitivity stop is the model's decision, not a route
@@ -2237,6 +2344,7 @@ export class TurnRecovery {
 	 */
 	isHardErrorFallbackEligible(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
+		if (this.#isTerminalAdmissionError(message)) return false;
 		if (this.#isUsagePreflightBlocked(message)) return false;
 		const model = this.#host.model();
 		if (!model) return false;
@@ -2276,6 +2384,20 @@ export class TurnRecovery {
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
 		if (!baseModel) return false;
+		if (this.#host.roleRoute) {
+			const candidate = this.findRetryFallbackCandidates("fireworks-fast", currentSelector).find(selector => {
+				const resolved = this.#resolveRetryFallbackModel(selector);
+				return (
+					resolved !== undefined &&
+					formatModelStringWithRouting(resolved) === formatModelStringWithRouting(baseModel)
+				);
+			});
+			if (!candidate) return false;
+			return this.applyRetryFallbackCandidate("fireworks-fast", candidate, currentSelector, {
+				pinFallback: true,
+				reason: "Request rejected by the Fast tier. Retrying on the Standard tier.",
+			});
+		}
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
@@ -2298,6 +2420,7 @@ export class TurnRecovery {
 	}
 
 	async #maybeRestoreRetryFallbackPrimary(): Promise<boolean> {
+		if (this.#host.roleRoute) return false;
 		if (!this.#activeRetryFallback) return false;
 		if (this.#activeRetryFallback.pinned) return false;
 		if (this.#getRetryFallbackRevertPolicy() !== "cooldown-expiry") return false;
@@ -2385,6 +2508,7 @@ export class TurnRecovery {
 	): Promise<boolean> {
 		const retrySettings = cfgRetry.get(this.#host.settings);
 		if (this.#host.abortInProgress() || this.#host.isDisposed()) return false;
+		if (this.#isTerminalAdmissionError(message)) return false;
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
 		// not a retry loop, so it runs even when the user disabled retries: it switches
 		// the model once and lets the base turn proceed.

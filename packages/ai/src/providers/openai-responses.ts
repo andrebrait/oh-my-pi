@@ -763,6 +763,7 @@ const streamOpenAIResponsesOnce = (
 			let activeReasoningEffortFallbackKey: string | undefined;
 			let activeRequestParams: OpenAIResponsesSamplingParams | undefined;
 			const applyReasoningEffortFallbackForRequest = (requestParams: OpenAIResponsesSamplingParams): string => {
+				if (options?.preserveModelSelection) return "";
 				const fallbackKey = createOpenAIReasoningEffortFallbackKey(
 					"responses",
 					resolvedBaseUrl,
@@ -892,7 +893,10 @@ const streamOpenAIResponsesOnce = (
 					} catch (error) {
 						const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
 						const reasoningEffortFallback =
-							activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
+							activeReasoningEffortFallbackKey &&
+							activeRequestParams &&
+							!requestSignal.aborted &&
+							!options?.preserveModelSelection
 								? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
 										explicitDisable:
 											options?.forceReasoningOff === true || options?.disableReasoning === true,
@@ -1692,6 +1696,17 @@ export function buildParams(
 		filterReasoningHistory: options?.filterReasoningHistory,
 		omitReasoningEffort: options?.omitReasoningEffort,
 	});
+	if (
+		options?.preserveModelSelection &&
+		options.reasoning !== undefined &&
+		!options.disableReasoning &&
+		!options.forceReasoningOff &&
+		!reasoningPolicy.reasoning.enabled
+	) {
+		throw new AIError.ConfigurationError(
+			"The selected reasoning effort cannot be honored with this tool request; no effort suppression is permitted.",
+		);
+	}
 	applyResponsesCompatPolicy(params, reasoningPolicy, {
 		reasoningSummary: resolveReasoningSummaryOption(model, options),
 		forceReasoningOff: options?.forceReasoningOff,
@@ -1715,7 +1730,16 @@ export function buildParams(
 		applyOpenAIGatewayRouting(params, model.compat);
 	}
 
+	const governedSelection = options?.preserveModelSelection
+		? { model: params.model, reasoning: JSON.stringify(params.reasoning) }
+		: undefined;
 	applyOpenAIExtraBody(params, options?.extraBody);
+	if (
+		governedSelection &&
+		(params.model !== governedSelection.model || JSON.stringify(params.reasoning) !== governedSelection.reasoning)
+	) {
+		throw new AIError.ConfigurationError("Provider extraBody changed the governed model/effort selection.");
+	}
 	applyOpenAIResponsesPromptCachePolicy(params, model, options, statefulCacheBaseline);
 
 	let trailingScaffoldingItems = 0;
