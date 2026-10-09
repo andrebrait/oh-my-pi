@@ -256,7 +256,7 @@ export function resolveAgentAutoloadSkills(
 	if (!autoloadSkills?.length) return [];
 	return autoloadSkills
 		.map(name => sessionSkills.find(skill => skill.name === name))
-		.filter(skill => skill !== undefined && skill.modelInvocationDisabled !== true)
+		.filter((skill): skill is Skill => skill !== undefined && skill.modelInvocationDisabled !== true)
 		.map(skill => ({ ...skill }));
 }
 
