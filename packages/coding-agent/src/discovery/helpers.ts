@@ -194,18 +194,20 @@ export function parseCSV(value: string): string[] {
 
 /**
  * Parse a value that may be an array of strings or a comma-separated string.
- * Returns undefined if the result would be empty.
+ * Returns undefined if the result would be empty, unless `options.keepEmpty`
+ * preserves the explicit `[]` literal as `[]` (fields where "present but
+ * empty" is distinct from absent). Only `[]` counts as explicit: a blank or
+ * non-string CSV yields undefined, so a malformed value degrades to the
+ * field's "absent" behavior instead of silently becoming an empty list.
  */
-export function parseArrayOrCSV(value: unknown): string[] | undefined {
-	if (Array.isArray(value)) {
-		const filtered = value.filter((item): item is string => typeof item === "string");
-		return filtered.length > 0 ? filtered : undefined;
-	}
-	if (typeof value === "string") {
-		const parsed = parseCSV(value);
-		return parsed.length > 0 ? parsed : undefined;
-	}
-	return undefined;
+export function parseArrayOrCSV(value: unknown, options?: { keepEmpty?: boolean }): string[] | undefined {
+	const parsed = Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+		: typeof value === "string"
+			? parseCSV(value)
+			: undefined;
+	if (!parsed || parsed.length > 0) return parsed;
+	return options?.keepEmpty && Array.isArray(value) && value.length === 0 ? parsed : undefined;
 }
 
 interface RuleMarkdownOptions {
@@ -298,6 +300,12 @@ export interface ParsedAgentFields {
 	output?: unknown;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	autoloadSkills?: string[];
+	/** Skill-name globs listed in the child's `<skills>` block. Absent = unrestricted; `[]`/`"none"` = none listed. */
+	skills?: string[];
+	/** Skill-name globs excluded from the child's `<skills>` block. Takes precedence over `skills` and `unhideSkills`. */
+	hideSkills?: string[];
+	/** Skill-name globs whose source `hide: true` is overridden for the child's `<skills>` block. */
+	unhideSkills?: string[];
 	readSummarize?: boolean;
 	blocking?: boolean;
 	/** `true` = keep `yield` and the output schema when `task.structured` is off. */
@@ -390,6 +398,24 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
+	// `skills: "none"` (case-insensitive, surrounding whitespace ignored) is
+	// sugar for the explicitly empty allowlist (`[]`): zero skills listed. An
+	// absent field stays `undefined` (unrestricted), and so does a malformed
+	// one that resolves to no usable name (a blank CSV, an array of blanks) —
+	// silently listing nothing is the one reading nobody asks for.
+	const rawSkillsValue =
+		typeof frontmatter.skills === "string" && frontmatter.skills.trim().toLowerCase() === "none"
+			? []
+			: parseArrayOrCSV(frontmatter.skills, { keepEmpty: true });
+	const namedSkills = rawSkillsValue?.map(s => s.trim()).filter(Boolean) ?? [];
+	const skills =
+		rawSkillsValue !== undefined && (rawSkillsValue.length === 0 || namedSkills.length > 0) ? namedSkills : undefined;
+	const hideSkills = parseArrayOrCSV(frontmatter.hideSkills)
+		?.map(s => s.trim())
+		.filter(Boolean);
+	const unhideSkills = parseArrayOrCSV(frontmatter.unhideSkills)
+		?.map(s => s.trim())
+		.filter(Boolean);
 	return {
 		name,
 		description,
@@ -401,6 +427,9 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		blocking,
 		structured,
 		autoloadSkills,
+		skills,
+		hideSkills,
+		unhideSkills,
 		readSummarize,
 		prewalk,
 		advisor,
