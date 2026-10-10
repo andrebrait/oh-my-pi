@@ -283,6 +283,9 @@
 ### Changed
 
 - Passive context emitted after a tool batch now appears as one dim line on the batch's final tool card instead of remaining invisible or creating a separate transcript row; expanding tools (`Ctrl+O` by default) shows its full text ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+- Added startup notices for conflicting skill variants and redundant installations, with `/skills diagnostics` for resolution details and `skills.showStartupDiagnostics` to disable the notices ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
+- RPC hosts can inspect skill conflicts and redundant installations through typed diagnostics snapshots, receive startup and live updates, and persist the startup-notice preference ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
+- Added declared repository and version provenance to skill diagnostics, with opt-in `skills.dedupeSameOrigin` resolution for differing same-name plugin variants from the same source repository ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Fixed
 
