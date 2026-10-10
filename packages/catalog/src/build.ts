@@ -9,6 +9,7 @@
 
 import { resolveDiscoveryApi, resolveModelPolicy } from "./compat/resolve";
 import type { ModelIdentity } from "./compat/types";
+import { THINKING_EFFORTS } from "./effort";
 import { resolveModelTokenizer } from "./model-tokenizer";
 import { materializeTimeBasedCost } from "./pricing";
 import { type Api, MODEL_KINDS, type Model, type ModelSpec } from "./types";
@@ -70,8 +71,8 @@ function isInputModalities(value: unknown): value is ("text" | "image")[] {
  * `context-window-floor`) overwrite upstream values; selection metadata
  * (`priority`, `apply-patch-tool-type`, `service-tier-cost`,
  * `requires-cursor-tool-schema-projection`, `requires-tool-result-image-hoisting`,
- * `supports-assistant-prefill`) is rule-owned; `context-promotion-target` fills
- * only when the spec left it unset.
+ * `supports-assistant-prefill`) is rule-owned; `context-promotion-target` and
+ * `vendor-default-effort` fill only when the spec left them unset.
  */
 function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: Record<string, unknown>): void {
 	const kind = MODEL_KINDS.find(value => value === catalog.kind);
@@ -162,6 +163,13 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
 	if (typeof contextPromotionTarget === "string" && model.contextPromotionTarget === undefined) {
 		model.contextPromotionTarget = contextPromotionTarget;
 	}
+	// Only reasoning models have an effort to default. An effort-pinned id
+	// (`claude-opus-4-8-low`) already fixes its effort; the lineage's vendor
+	// default does not describe it.
+	if (model.reasoning && model.vendorDefaultEffort === undefined && model.identity.effort === undefined) {
+		const vendorDefaultEffort = THINKING_EFFORTS.find(effort => effort === catalog.vendorDefaultEffort);
+		if (vendorDefaultEffort !== undefined) model.vendorDefaultEffort = vendorDefaultEffort;
+	}
 }
 
 /**
@@ -176,40 +184,6 @@ export function applyCatalogCorrections(
 	model: Pick<ModelSpec<Api>, "cost" | "contextWindow" | "maxTokens" | "input">,
 	catalog: Record<string, unknown>,
 ): void {
-	const longContext = objectPayload(catalog.longContext);
-	if (longContext !== undefined) {
-		const inputThreshold = numberField(longContext, "inputThreshold");
-		const inclusive = Reflect.get(longContext, "inputThresholdInclusive") === true;
-		const multiplier = numberField(longContext, "multiplier");
-		const input = numberField(longContext, "input");
-		const output = numberField(longContext, "output");
-		const cacheRead = numberField(longContext, "cacheRead");
-		const cacheWrite = numberField(longContext, "cacheWrite");
-		const base = model.cost;
-		const hasTokenPrice = base.input !== 0 || base.output !== 0 || base.cacheRead !== 0 || base.cacheWrite !== 0;
-		if (inputThreshold !== undefined && multiplier !== undefined && hasTokenPrice) {
-			// Multiplier form: tier rates derive from the row's live list price.
-			model.cost = {
-				...base,
-				longContext: {
-					inputThreshold,
-					...(inclusive && { inputThresholdInclusive: true }),
-					input: base.input * multiplier,
-					output: base.output * multiplier,
-					cacheRead: base.cacheRead * multiplier,
-					cacheWrite: base.cacheWrite * multiplier,
-				},
-			};
-		} else if (
-			inputThreshold !== undefined &&
-			input !== undefined &&
-			output !== undefined &&
-			cacheRead !== undefined &&
-			cacheWrite !== undefined
-		) {
-			model.cost = { ...model.cost, longContext: { inputThreshold, input, output, cacheRead, cacheWrite } };
-		}
-	}
 	const patch = objectPayload(catalog.costPatch);
 	if (patch !== undefined) {
 		model.cost = { ...model.cost };
@@ -244,6 +218,41 @@ export function applyCatalogCorrections(
 			// them in `timeBased` with empty peak windows would report
 			// permanent off-peak and never wake at the dated boundary.
 			applyEffectiveFallbackRates(model.cost, Reflect.get(fallback, "effectiveRates"));
+		}
+	}
+	const longContext = objectPayload(catalog.longContext);
+	if (longContext !== undefined) {
+		const inputThreshold = numberField(longContext, "inputThreshold");
+		const inclusive = Reflect.get(longContext, "inputThresholdInclusive") === true;
+		const multiplier = numberField(longContext, "multiplier");
+		const input = numberField(longContext, "input");
+		const output = numberField(longContext, "output");
+		const cacheRead = numberField(longContext, "cacheRead");
+		const cacheWrite = numberField(longContext, "cacheWrite");
+		const base = model.cost;
+		const hasTokenPrice = base.input !== 0 || base.output !== 0 || base.cacheRead !== 0 || base.cacheWrite !== 0;
+		if (inputThreshold !== undefined && multiplier !== undefined && hasTokenPrice) {
+			// Multiplier form: tier rates derive from the row's final base card,
+			// after `cost-patch`/`cost-fallback` corrected the live list price.
+			model.cost = {
+				...base,
+				longContext: {
+					inputThreshold,
+					...(inclusive && { inputThresholdInclusive: true }),
+					input: base.input * multiplier,
+					output: base.output * multiplier,
+					cacheRead: base.cacheRead * multiplier,
+					cacheWrite: base.cacheWrite * multiplier,
+				},
+			};
+		} else if (
+			inputThreshold !== undefined &&
+			input !== undefined &&
+			output !== undefined &&
+			cacheRead !== undefined &&
+			cacheWrite !== undefined
+		) {
+			model.cost = { ...model.cost, longContext: { inputThreshold, input, output, cacheRead, cacheWrite } };
 		}
 	}
 	if (catalog.cacheReadAtInputRate === true) {
@@ -365,7 +374,8 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	};
 	applyCatalogAssignments(model, policy.catalog);
 	applyCatalogCorrections(model, policy.catalog);
-	// Configured lifetimes replace catalog lifetimes rather than merging with them.
+	// Configured kinds and lifetimes replace catalog values rather than merging with them.
+	if (spec.kindConfig !== undefined) model.kind = spec.kindConfig;
 	if (spec.promptCacheConfig !== undefined) model.promptCache = { ...spec.promptCacheConfig };
 	return model;
 }

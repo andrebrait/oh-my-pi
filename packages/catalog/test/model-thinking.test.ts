@@ -854,6 +854,45 @@ describe("model thinking derivation", () => {
 		expect(vertex.compat.supportsPerMessageEffort).toBe(false);
 	});
 
+	it("materializes a bare /v1/models Haiku 5.5 row as adaptive and priced, unlike Haiku 4.5", () => {
+		// Anthropic's /v1/models carries no capability metadata for a new id.
+		const discovered = (id: string) =>
+			buildModel({
+				id,
+				name: id,
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: null,
+				maxTokens: null,
+			});
+		const haiku55 = discovered("claude-haiku-5-5");
+
+		expect(haiku55.reasoning).toBe(true);
+		expect(haiku55.thinking?.mode).toBe("anthropic-adaptive");
+		expect(getSupportedEfforts(haiku55)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+		expect(haiku55.thinking?.prefixBinding).toBe(true);
+		expect(haiku55.compat.supportsSamplingParams).toBe(false);
+		expect(haiku55.compat.supportsForcedToolChoice).toBe(true);
+		expect(haiku55.compat.supportsBetweenToolsThinking).toBe(false);
+		expect(haiku55.input).toEqual(["text", "image"]);
+		expect(haiku55.contextWindow).toBe(1_000_000);
+		expect(haiku55.maxTokens).toBe(128_000);
+		expect(haiku55.cost).toMatchObject({
+			input: 0.1,
+			output: 0.5,
+			longContext: { inputThreshold: 100_000, input: 0.5, output: 2.5 },
+		});
+
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.compat.supportsSamplingParams).toBe(true);
+	});
+
 	it("keeps per-message effort off every Vertex Claude line that takes it on the Claude API", () => {
 		for (const id of ["claude-fable-5-1", "claude-opus-5"]) {
 			const direct = createModel({ id, api: "anthropic-messages", provider: "anthropic" });
@@ -1198,6 +1237,31 @@ describe("model thinking derivation", () => {
 		expect(model.thinking?.mode).toBe("anthropic-budget-effort");
 		expect(getSupportedEfforts(model)).toEqual([Effort.High, Effort.Max]);
 		expect(model.thinking?.effortMap).toBeUndefined();
+	});
+});
+
+describe("vendor default effort rules", () => {
+	const vendorDefault = (provider: Provider, id: string, api: Api = "anthropic-messages") =>
+		createModel({ id, api, provider }).vendorDefaultEffort;
+
+	it("pins documented per-revision defaults, including the Opus 5.5 step down", () => {
+		expect(vendorDefault("anthropic", "claude-opus-5")).toBe(Effort.High);
+		expect(vendorDefault("anthropic", "claude-opus-5-5")).toBe(Effort.Medium);
+		expect(vendorDefault("openrouter", "anthropic/claude-opus-5.5", "openai-completions")).toBe(Effort.Medium);
+		expect(vendorDefault("openai", "gpt-5.5", "openai-responses")).toBe(Effort.Medium);
+		expect(vendorDefault("openai", "gpt-5.5-pro", "openai-responses")).toBe(Effort.High);
+		// A route suffix must not drop the pro tier to the revision-wide default.
+		expect(vendorDefault("openrouter", "openai/gpt-5.5-pro:batch", "openai-completions")).toBe(Effort.High);
+		expect(vendorDefault("anthropic", "claude-sonnet-5-5")).toBe(Effort.High);
+		expect(vendorDefault("google", "gemini-3.5-flash-lite", "google-generative-ai")).toBe(Effort.Minimal);
+	});
+
+	it("leaves undocumented and none-default models unset", () => {
+		expect(vendorDefault("anthropic", "claude-haiku-4-5")).toBeUndefined();
+		expect(vendorDefault("openai", "gpt-5.4", "openai-responses")).toBeUndefined();
+		expect(vendorDefault("openai", "gpt-6-astra", "openai-responses")).toBeUndefined();
+		// The id pins its effort, so the lineage default does not apply.
+		expect(vendorDefault("cursor", "claude-opus-4-8-low", "cursor-agent")).toBeUndefined();
 	});
 });
 

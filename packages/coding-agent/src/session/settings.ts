@@ -1003,6 +1003,29 @@ export const cfgProvidersTinyModelDtype = register({
 	},
 });
 
+export const cfgProvidersAutoThinkingSource = register({
+	id: "providers.autoThinkingSource",
+	type: "enum",
+	values: ["classifier", "vendor"] as const,
+	default: "classifier",
+	ui: {
+		tab: "model",
+		group: "Thinking",
+		label: "Auto Thinking Source",
+		description:
+			"How `auto` picks each turn's effort: classify the prompt with the judge model, or prefer the publisher's concrete default with no classifier call. Vendor mode falls back to omp's per-model default, then normal Auto fallback. The Auto Thinking Ceiling applies to both defaults.",
+		condition: "autoThinkingActive",
+		options: [
+			{ value: "classifier", label: "Classifier", description: "Classify each prompt's difficulty (default)" },
+			{
+				value: "vendor",
+				label: "Vendor default",
+				description: "Use the effort the vendor applies when a request omits it; no classifier call",
+			},
+		],
+	},
+});
+
 export const cfgProvidersAutoThinkingMaxEffort = register({
 	id: "providers.autoThinkingMaxEffort",
 	type: "enum",
@@ -1013,11 +1036,11 @@ export const cfgProvidersAutoThinkingMaxEffort = register({
 		group: "Thinking",
 		label: "Auto Thinking Ceiling",
 		description:
-			"Highest effort the `auto` classifier may resolve. `xhigh` keeps the classifier one tier below the top, so only an explicit `ultrathink` reaches `max`; `max` lets a turn the classifier judges exceptional bill the top tier on models that expose it.",
+			"Highest effort `auto` may resolve, from the classifier, publisher default, or omp's per-model fallback. `xhigh` keeps `auto` below `max`; `max` allows that tier where supported. An explicit `ultrathink` bypasses this ceiling.",
 		condition: "autoThinkingActive",
 		options: [
-			{ value: "xhigh", label: "xhigh", description: "Classifier stops at xhigh (default)" },
-			{ value: "max", label: "max", description: "Classifier may resolve max where the model supports it" },
+			{ value: "xhigh", label: "xhigh", description: "Auto stops at xhigh (default)" },
+			{ value: "max", label: "max", description: "Auto may resolve max where the model supports it" },
 		],
 	},
 });
@@ -1326,7 +1349,7 @@ export const cfgCodexResetsSalvageHorizonHours = register({
 		group: "Services",
 		label: "Codex Reset Salvage Horizon",
 		description:
-			"Spend a saved Codex reset automatically when it would otherwise expire within this many hours and either chat window (5h or weekly) has meaningful usage to restore (0 disables expiry salvage).",
+			"With auto-redeem enabled, spend a saved Codex reset within this many hours of expiry when either chat window has meaningful usage. 0 disables early salvage; credits expiring within 5 minutes are still attempted regardless of usage.",
 	},
 });
 
@@ -1387,7 +1410,7 @@ export const cfgClaudeResetsKeepCredits = register({
 		group: "Services",
 		label: "Claude Auto-Redeem Reserve",
 		description:
-			"Keep at least this many Claude resets banked (0 allows the last eligible reset to be spent automatically). The reserve also applies to expiry salvage.",
+			"Keep at least this many Claude resets banked (0 allows the last eligible reset to be spent automatically). The reserve applies to early salvage, but not to eligible resets expiring within 5 minutes.",
 	},
 });
 
@@ -1400,7 +1423,7 @@ export const cfgClaudeResetsSalvageHorizonHours = register({
 		group: "Services",
 		label: "Claude Reset Salvage Horizon",
 		description:
-			"Use a server-selected Cedar reset within this many hours of expiry only when its covered windows have meaningful usage to restore and the grant permits early use or a covered window is exhausted (0 disables salvage).",
+			"With auto-redeem enabled, use a server-selected Cedar reset within this many hours of expiry when its covered windows have meaningful usage. 0 disables early salvage; eligible Cedar or Juniper resets expiring within 5 minutes are still attempted regardless of usage or reserve. Provider limit requirements still apply.",
 	},
 });
 

@@ -14,7 +14,7 @@ import { BracketedPasteHandler, decodeReencodedPasteControls } from "../brackete
 import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keybindings";
 import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
-import type { TspEditorDecoration, TspEditorProps, TspTone } from "@oh-my-pi/pi-wire";
+import type { TspEditorDecoration, TspEditorProps, TspText, TspTone } from "@oh-my-pi/pi-wire";
 import { col, node } from "../native/describe";
 import { sameItems, sameProps } from "../native/memo";
 import { plainText } from "../native/spans";
@@ -74,12 +74,16 @@ export interface NativeEditorLayout {
 	readonly caret: string;
 }
 
-/** Vim mode as the TSP `editor.mode` label. */
-const VIM_MODE_LABELS: Record<VimMode, string> = {
-	insert: "INSERT",
+/**
+ * Vim mode as the TSP `editor.mode` label. Insert carries none: Insert edits like a plain field,
+ * and a host such as Tern stops native editing (selection, ⌘A/⌘C/⌘X) for any labelled mode.
+ */
+const VIM_MODE_LABELS: Record<VimMode, string | undefined> = {
+	insert: undefined,
 	normal: "NORMAL",
 	visual: "VISUAL",
 	"visual-line": "VISUAL",
+	replace: "REPLACE",
 };
 
 const PASSTHROUGH_COLOR = (text: string): string => text;
@@ -625,8 +629,11 @@ export class Editor implements Component, Focusable {
 	 * dialog's text field; only the prompt composer claims `omp.editor`).
 	 */
 	describeLayout: ((input: NativeNode, cx: DescribeContext) => NativeEditorLayout) | undefined;
-	/** TSP placeholder for the empty buffer; natively it replaces the rotating ANSI {@link placeholder} hints. */
-	describePlaceholder: (() => string) | undefined;
+	/**
+	 * TSP placeholder for the empty buffer; natively it replaces the rotating ANSI {@link placeholder} hints.
+	 * Return a stable value (the same spans array) while it is unchanged: the editor node is reused by identity.
+	 */
+	describePlaceholder: (() => TspText) | undefined;
 	#promptGutter: string | undefined;
 	/** Bumped by {@link invalidate}: host-side decoration inputs (spelling results, settings) changed. */
 	#nativeGeneration = 0;
@@ -666,7 +673,9 @@ export class Editor implements Component, Focusable {
 	// Emacs-style kill ring
 	#killRing = new KillRing();
 	/** Previous edit, for kill/yank chaining, undo coalescing, and the provisional space after a Tab word accept. */
-	#lastAction: "kill" | "yank" | "type-word" | "accept-word" | null = null;
+	#lastAction: "kill" | "yank" | "type-word" | "accept-word" | "replace" | null = null;
+	/** Graphemes overwritten in the current `R` session, so Backspace can restore them. */
+	#replaceLog: { line: number; col: number; removed: string; text: string }[] = [];
 
 	// Character jump mode
 	#jumpMode: "forward" | "backward" | null = null;
@@ -713,6 +722,7 @@ export class Editor implements Component, Focusable {
 
 	// Host-registered atomic chip tokens: exact buffer label → expansion emitted on submit.
 	#atoms: Map<string, string> = new Map();
+	#atomsRevision = 0;
 
 	/** Optional pattern matching atomic placeholder tokens (e.g. `[Image #1, 800x600]` or
 	 *  `[Paste #2, +30 lines]`) that the editor treats as indivisible: a backspace or forward-delete
@@ -1025,6 +1035,7 @@ export class Editor implements Component, Focusable {
 		this.#pastes.clear();
 		this.#pasteCounter = 0;
 		this.#atoms.clear();
+		this.#atomsRevision++;
 		this.#historyDraftActive = false;
 	}
 
@@ -1064,6 +1075,7 @@ export class Editor implements Component, Focusable {
 		if (entry?.draft || this.#historyDraftActive) {
 			this.#pastes = new Map(entry?.draft?.pastes);
 			this.#atoms = new Map(entry?.draft?.atoms);
+			this.#atomsRevision++;
 			this.#pasteCounter = entry?.draft?.pasteCounter ?? 0;
 			this.restoreHistoryState(entry?.draft?.restore);
 			this.#historyDraftActive = entry?.draft !== undefined;
@@ -2243,18 +2255,43 @@ export class Editor implements Component, Focusable {
 			return this.isShowingAutocomplete() ? false : this.#runVimKey("escape", vim);
 		}
 		if (vim.mode === "insert") return false;
+		if (vim.mode === "replace") {
+			if (canonical === "backspace" || matchesKey(data, "backspace") || matchesKey(data, "shift+backspace")) {
+				this.#replaceBackspace();
+				return true;
+			}
+			const replacing = extractPrintableText(data);
+			if (replacing) {
+				for (const seg of segmenter.segment(replacing)) this.#overwriteReplaceGrapheme(seg.segment);
+				return true;
+			}
+		}
 
+		// `f`/`t`/`r` are waiting for a character. Space is that character; arrows and other named
+		// keys cancel, instead of being rewritten to `h`/`l` and inserted or searched for.
+		const awaitingTarget = /[fFtTr]$/.test(vim.pendingText);
+		if (awaitingTarget && (canonical === "space" || data === " ")) return this.#runVimKey(" ", vim);
 		const mapped = canonical === undefined ? undefined : VIM_NAV_KEYS[canonical];
+		if (awaitingTarget && mapped !== undefined) return this.#runVimKey("escape", vim);
 		if (mapped !== undefined) return this.#runVimKey(mapped, vim);
 
-		// Control chords carry no printable text and stay with the host.
+		// Control chords, Enter, and Tab carry no printable text and stay with the host. A half-typed
+		// command (`r`, `f`, `d`) is cancelled first, like character-jump mode, so it cannot outlive a
+		// submit and swallow the first key of the next prompt.
 		const printable = extractPrintableText(data);
-		if (!printable) return false;
+		if (!printable) {
+			if (vim.pending) this.#runVimKey("escape", vim);
+			return false;
+		}
 
 		// Batched stdin can deliver several keystrokes at once, so replay the run one grapheme at a
-		// time. A command that drops out of Normal mode part-way (`iabc`) turns the rest of the run
-		// back into literal text rather than swallowing it.
+		// time. A command that drops out of Normal mode part-way (`iabc`, `Rxx`) turns the rest of
+		// the run into literal text or replace-mode overwrites rather than more Normal commands.
 		for (const seg of segmenter.segment(printable)) {
+			if (vim.mode === "replace") {
+				this.#overwriteReplaceGrapheme(seg.segment);
+				continue;
+			}
 			if (this.#runVimKey(seg.segment, vim)) continue;
 			this.#insertCharacter(printable.slice(seg.index));
 			return true;
@@ -2275,11 +2312,22 @@ export class Editor implements Component, Focusable {
 		if (vim.mode !== before || vim.pendingText !== pendingBefore || this.vimSelectedLines !== selectedLinesBefore) {
 			this.onVimModeChange?.(vim.mode);
 		}
+		if (before === "replace" && vim.mode !== "replace") this.#replaceLog.length = 0;
+		if (vim.mode === "replace" && before !== "replace") this.#replaceLog.length = 0;
 		return true;
 	}
 
 	#applyVimCommands(commands: readonly VimCommand[]): void {
 		for (const command of commands) {
+			// A delete or other edit in replace mode invalidates Backspace restores. Motions do not.
+			if (
+				this.#vim?.mode === "replace" &&
+				command.kind !== "move" &&
+				command.kind !== "mode" &&
+				command.kind !== "yank"
+			) {
+				this.#replaceLog.length = 0;
+			}
 			switch (command.kind) {
 				case "move":
 					this.#moveVimCursor(command.to);
@@ -2311,10 +2359,131 @@ export class Editor implements Component, Focusable {
 				case "undo":
 					this.#applyUndo();
 					break;
+				case "replace":
+					this.#replaceVimSpan(command.from, command.to, command.text);
+					break;
+				case "join":
+					this.#joinVimLines(command.fromLine, command.lines);
+					break;
+				case "indent":
+					this.#indentVimLines(command.fromLine, command.toLine, command.out);
+					break;
 			}
 		}
 		this.#clampVimCursor();
 		this.invalidate();
+	}
+
+	#replaceVimSpan(from: VimPosition, to: VimPosition, text: string): void {
+		const line = this.#state.lines[from.line] ?? "";
+		if (this.#spanCutsAtomicToken(line, from.col, to.col)) return;
+		this.#recordUndoState();
+		this.#lastAction = null;
+		this.#state.lines[from.line] = line.slice(0, from.col) + text + line.slice(to.col);
+		this.#state.cursorLine = from.line;
+		let last = from.col;
+		for (const seg of segmenter.segment(text)) last = from.col + seg.index;
+		this.#setCursorCol(last);
+		this.#afterVimEdit();
+	}
+
+	#overwriteReplaceGrapheme(grapheme: string): void {
+		const lineIdx = this.#state.cursorLine;
+		const line = this.#state.lines[lineIdx] ?? "";
+		const col = this.#state.cursorCol;
+		if (this.#atomicTokenAt(line, col)) return;
+		// Any other edit since the last overwrite (setText, `x`, paste) resets `#lastAction`, which
+		// makes the logged columns meaningless; start a fresh undo step and a fresh log.
+		if (this.#lastAction !== "replace") {
+			this.#recordUndoState();
+			this.#replaceLog.length = 0;
+		}
+		this.#lastAction = "replace";
+		// Editing a recalled prompt makes it a draft, so Up/Down at an edge move the cursor again
+		// instead of navigating history over the overwritten text (same as `#afterVimEdit`).
+		this.#historyIndex = -1;
+		const end = col >= line.length ? col : nextGraphemeStart(line, col);
+		const removed = line.slice(col, end);
+		this.#state.lines[lineIdx] = line.slice(0, col) + grapheme + line.slice(end);
+		this.#replaceLog.push({ line: lineIdx, col, removed, text: grapheme });
+		this.#setCursorCol(col + grapheme.length);
+		this.#notifyChange();
+	}
+
+	#replaceBackspace(): void {
+		if (this.#lastAction !== "replace") {
+			this.#replaceLog.length = 0;
+			return;
+		}
+		const entry = this.#replaceLog.pop();
+		if (!entry) return;
+		const line = this.#state.lines[entry.line] ?? "";
+		const stillThere = line.slice(entry.col, entry.col + entry.text.length) === entry.text;
+		const atCursor = this.#state.cursorLine === entry.line && this.#state.cursorCol === entry.col + entry.text.length;
+		if (!stillThere) return;
+		if (!atCursor) {
+			this.#replaceLog.push(entry);
+			return;
+		}
+		this.#state.lines[entry.line] =
+			line.slice(0, entry.col) + entry.removed + line.slice(entry.col + entry.text.length);
+		this.#setCursorCol(entry.col);
+		this.#notifyChange();
+	}
+
+	#joinVimLines(fromLine: number, span: number): void {
+		const start = Math.max(0, Math.min(fromLine, this.#state.lines.length - 1));
+		const last = Math.min(start + Math.max(span, 2) - 1, this.#state.lines.length - 1);
+		if (last <= start) return;
+		this.#recordUndoState();
+		let text = this.#state.lines[start] ?? "";
+		let cursor = text.length;
+		for (let i = start + 1; i <= last; i++) {
+			const raw = this.#state.lines[i] ?? "";
+			let trim = /^[ \t]*/.exec(raw)?.[0].length ?? 0;
+			const token = this.#atomicTokenAt(raw, 0);
+			if (token && token.start < trim) trim = token.start;
+			const next = raw.slice(trim);
+			const at = text.length;
+			if (i === start + 1) cursor = at;
+			// Vim join: no extra space after whitespace, before `)`, or for an empty line; two spaces after `.!?`.
+			const gap =
+				text.length === 0 || next.length === 0 || /[ \t]$/.test(text) || next.startsWith(")")
+					? ""
+					: /[.!?]$/.test(text)
+						? "  "
+						: " ";
+			text += gap + next;
+		}
+		this.#state.lines.splice(start, last - start + 1, text);
+		this.#state.cursorLine = start;
+		this.#setCursorCol(cursor);
+		this.#lastAction = null;
+		this.#afterVimEdit();
+	}
+
+	#indentVimLines(fromLine: number, toLine: number, out: boolean): void {
+		const first = Math.max(0, Math.min(fromLine, this.#state.lines.length - 1));
+		const last = Math.max(first, Math.min(toLine, this.#state.lines.length - 1));
+		// Two spaces, not Vim's shiftwidth of 8: a prompt draft should not jump a tab stop. A leading tab shifts by one tab so the line keeps its own indent style.
+		// Empty lines stay empty, as in Vim, so shifting a paragraph never leaves trailing blanks.
+		const next = this.#state.lines.slice(first, last + 1).map(line => {
+			const text = line ?? "";
+			if (!out) return text.length === 0 ? text : (text.startsWith("\t") ? "\t" : "  ") + text;
+			if (text.startsWith("\t")) return text.slice(1);
+			const spaces = /^ */.exec(text)?.[0].length ?? 0;
+			return text.slice(Math.min(2, spaces));
+		});
+		if (next.every((line, i) => line === (this.#state.lines[first + i] ?? ""))) return;
+		this.#recordUndoState();
+		for (let i = first; i <= last; i++) this.#state.lines[i] = next[i - first] ?? "";
+		this.#state.cursorLine = first;
+		const landed = this.#state.lines[first] ?? "";
+		let col = 0;
+		while (col < landed.length && /\s/.test(landed.charAt(col))) col++;
+		this.#setCursorCol(col);
+		this.#lastAction = null;
+		this.#afterVimEdit();
 	}
 
 	#moveVimCursor(to: VimPosition): void {
@@ -2661,6 +2830,11 @@ export class Editor implements Component, Focusable {
 		return this.#textRevision;
 	}
 
+	/** Monotonic atom-table revision for render caches: advances whenever {@link atoms} is mutated or replaced. */
+	get atomsRevision(): number {
+		return this.#atomsRevision;
+	}
+
 	#notifyChange(text?: string): void {
 		this.#textRevision++;
 		this.onChange?.(text ?? this.getText());
@@ -2699,6 +2873,7 @@ export class Editor implements Component, Focusable {
 	 *  it — for hosts that re-collapse restored draft text via {@link setText}. */
 	registerAtom(label: string, expansion: string): void {
 		this.#atoms.set(label, expansion);
+		this.#atomsRevision++;
 	}
 
 	/** Insert `label` (plus a trailing space) at the cursor and register it as an atom expanding
@@ -2735,6 +2910,7 @@ export class Editor implements Component, Focusable {
 	/** Drop every registered atom expansion (draft cleared or replaced by the host). */
 	clearAtoms(): void {
 		this.#atoms.clear();
+		this.#atomsRevision++;
 	}
 
 	/**
@@ -3391,6 +3567,23 @@ export class Editor implements Component, Focusable {
 			if (col < end) return { start, end };
 		}
 		return undefined;
+	}
+
+	/** True when `[from, to)` overlaps a placeholder. Counted `r` must no-op rather than split it.
+	 *  One pass over the line's matches, so a long counted replace stays linear. */
+	#spanCutsAtomicToken(line: string, from: number, to: number): boolean {
+		const re = this.#getAtomicTokenRe();
+		if (re === undefined) return false;
+		re.lastIndex = 0;
+		for (;;) {
+			const match = re.exec(line);
+			if (match === null || match.index >= to) return false;
+			if (match[0].length === 0) {
+				re.lastIndex = match.index + 1;
+				continue;
+			}
+			if (match.index + match[0].length > from) return true;
+		}
 	}
 
 	/** Expand the half-open range [start, end) so it never cuts through an atomic
