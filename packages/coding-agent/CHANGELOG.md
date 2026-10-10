@@ -207,6 +207,9 @@
 - Corrected tool behavior and configuration documentation for `read`, background `bash`, Python evaluation, replace editing, goal removal, and `advisor.immuneTurns`.
 - Fixed custom glob backends from hanging indefinitely; scans now respect the tool deadline and report incomplete results when necessary.
 - Fixed `--resume <path>` from silently creating a new session for a missing path; it now reports the missing path, consistent with `--fork <path>` and `--resume <id>`.
+### Fixed
+
+- Fixed resumed, switched-to, or forked sessions missing the prompt cache on their first turn with Mnemopi or Hindsight auto-recall enabled ([#14656](https://github.com/can1357/oh-my-pi/pull/14656) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.8.0] - 2026-10-07
 ### Breaking Changes
