@@ -24,6 +24,7 @@ import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { AgentDefinition } from "../task/types";
+import type { SessionAccountPoolScope } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -232,6 +233,12 @@ export interface AgentSessionConfig {
 	skillsSettings?: SkillsSettings;
 	/** Whether this session may start memory backends. Defaults to true. */
 	memoryEnabled?: boolean;
+	/**
+	 * A passive local replica of a session another process runs (a hosted TUI client). It adopts that session's
+	 * id, so disposing it must not release resources the id scopes (browser tabs), and it never starts memory
+	 * backends (implies `memoryEnabled: false`). The owning process does all execution and its cleanup.
+	 */
+	passiveReplica?: boolean;
 	/** Agent directory used when changing memory backends in a live session. */
 	memoryAgentDir?: string;
 	/** Recursion depth used to suppress live backend replacement in subagents. */
@@ -325,6 +332,8 @@ export interface AgentSessionConfig {
 	agentKind?: "main" | "sub";
 	/** Provider-facing session ID override. */
 	providerSessionId?: string;
+	/** OAuth account pools enforced on the session's key lookups; the session lifts them on dispose. */
+	accountPoolScope?: SessionAccountPoolScope;
 	/** Whether the provider prompt-cache key was explicit or fork-inherited. */
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Full advisor toolset built against an advisor-scoped tool session. */
@@ -376,6 +385,12 @@ export interface AgentSessionConfig {
 	disconnectOwnedMcpManager?: () => Promise<void>;
 	/** System prompt used by automatic session-title generation. */
 	titleSystemPrompt?: string;
+	/**
+	 * Name the unnamed session from the operator's messages, once each reply
+	 * begins (see `title.generator`). Only the interactive TUI sets this; print,
+	 * RPC, ACP, SDK and subagent sessions stay unnamed. Default: false.
+	 */
+	autoTitle?: boolean;
 }
 
 /** Options for AgentSession.prompt(). */

@@ -2,7 +2,7 @@ import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, isRecord, logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
@@ -25,7 +25,6 @@ import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { getSymbolTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
 import {
 	isSilentAbort,
@@ -34,14 +33,15 @@ import {
 	readQueueChipText,
 	resolveAbortLabel,
 } from "../../session/messages";
-import { resolveApproval } from "../../tools/approval";
+import { formatApprovalPrompt, resolveApproval } from "../../tools/approval";
+import { recoverAskQuestions } from "../../tools/ask";
 import { previewLine, PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { writeDeviceDispatch } from "../../tools/resolve";
-import { nextActionableTask } from "../../tools/todo";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
+import { type RunStatus, setRunStatus } from "../../utils/run-status";
 import { setTerminalTitleState } from "../../utils/title-generator";
 import {
 	assistantMessageLinkTargets,
@@ -64,11 +64,9 @@ import {
 	cfgDisplayShowTurnTime,
 	cfgDisplaySmoothStreaming,
 	cfgErrorNotify,
-	cfgRecap,
 	cfgTerminalShowImages,
 	cfgTerminalShowProgress,
 } from "../settings";
-import { cfgCompaction } from "../../session/context-settings";
 import { cfgReadToolResultPreview, cfgToolsApproval, cfgToolsApprovalMode } from "../../tools/settings";
 import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
 
@@ -85,8 +83,6 @@ const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
  * oldest live-region card retires as soon as a new one would exceed the cap.
  */
 const MAX_LIVE_IRC_CARDS = 4;
-const IDLE_RECAP_MIN_SECONDS = 1;
-const IDLE_RECAP_MAX_SECONDS = 3600;
 
 const RAW_PARTIAL_JSON_RENDERERS: Record<string, true> = { bash: true, edit: true, apply_patch: true };
 
@@ -140,6 +136,21 @@ interface ApprovalPreviewGate {
 	started: boolean;
 }
 
+/**
+ * Working-line text for a streamed tool intent, or `undefined` when unusable.
+ * Streamed JSON can deliver non-string `i` (object, number, boolean) before
+ * schema validation, so the type is guarded too.
+ */
+function normalizeIntent(intent: unknown): string | undefined {
+	if (typeof intent !== "string") return undefined;
+	return (
+		intent
+			.trim()
+			.replace(/\s*\.+$/, "")
+			.trim() || undefined
+	);
+}
+
 export class EventController {
 	#lastReadGroup: ReadToolGroupComponent | undefined = undefined;
 	/** Timestamp of the current turn's user prompt; drives the usage row's prompt→yield delta. */
@@ -158,9 +169,10 @@ export class EventController {
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
 	#backgroundTaskCallIds = new Set<string>();
-	/** Tool calls whose approval prompt drove the title into `attention`; cleared
-	 *  at their tool_execution_end so the title returns to `working`. */
-	#approvalAttentionToolCallIds = new Set<string>();
+	/** Tool calls waiting on the user (an approval prompt or `ask`), with the
+	 *  `blocked` status each reports; cleared at their tool_execution_end so the
+	 *  run returns to `working` once none is left. */
+	#blockingPrompts = new Map<string, RunStatus>();
 	#approvalPreviewGates = new Map<string, ApprovalPreviewGate>();
 	#pendingStreamPreviews = new Map<string, unknown>();
 	#detachToolApprovalPreviewWaiter: (() => void) | undefined;
@@ -226,14 +238,6 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
-	#idleCompactionTimer?: NodeJS.Timeout;
-	#idleRecapTimer?: NodeJS.Timeout;
-	// True from `agent_end` until this idle window's recap timer fires, so a live
-	// `recap.*` change can rearm without re-delivering a recap already shown.
-	#idleRecapPending = false;
-	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
-	// activity (new turn, compaction, editor draft) supersedes the idle recap.
-	#idleRecapAbort?: AbortController;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
 	// Insertion-ordered IRC cards not yet retired; values are the transcript
 	// components each card contributed (see #retireIrcCard for the guard).
@@ -255,10 +259,17 @@ export class EventController {
 	#prevHideThinking = false;
 	#handlers: AgentSessionEventHandlers;
 	#terminalProgressActive = false;
-	/** Bumped at every `agent_start`; an async-wait watch stands down once a new run begins. */
+	/**
+	 * Whether the running auto-compaction turned terminal progress on itself.
+	 * Only then does its end turn progress off: a compaction inside a live turn
+	 * leaves the turn's progress for that turn's `agent_end`, so Tern (which
+	 * reads progress as busy state) never sees the agent stop mid-run.
+	 */
+	#compactionOwnsProgress = false;
+	/** Bumped at every `agent_start`; a settle watch stands down once a new run begins. */
 	#runEpoch = 0;
-	/** Epoch of the in-flight {@link #finishWhenAsyncWorkDrains} watch, if any. */
-	#asyncDrainWatchEpoch: number | undefined = undefined;
+	/** Epoch of the in-flight {@link #finishWhenRunSettles} watch, if any. */
+	#settleWatchEpoch: number | undefined = undefined;
 	// Coalescing window for `message_update` events at the subscription boundary.
 	// `message_update` carries the CUMULATIVE assistant message (every update
 	// re-lists all content blocks), so when a burst of deltas arrives faster than
@@ -341,6 +352,10 @@ export class EventController {
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
+			idle_recap: async event => {
+				const recap = previewLine(event.recap, TRUNCATE_LENGTHS.RECAP);
+				if (recap) this.ctx.present(new RecapNotice(recap));
+			},
 			model_changed: async () => {
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender();
@@ -392,21 +407,6 @@ export class EventController {
 		} satisfies AgentSessionEventHandlers;
 	}
 
-	/** Rearm idle compaction after a live idle setting changes. */
-	refreshIdleCompactionTimer(): void {
-		if (this.ctx.viewSession.isStreaming) {
-			this.#cancelIdleCompaction();
-			return;
-		}
-		this.#scheduleIdleCompaction();
-	}
-
-	/** Rearm (or cancel) the idle recap after a live `recap.*` setting change. */
-	refreshIdleRecapTimer(): void {
-		if (!this.#idleRecapPending || this.ctx.viewSession.isStreaming) return;
-		this.#scheduleIdleRecap();
-	}
-
 	dispose(): void {
 		this.#detachToolApprovalPreviewWaiter?.();
 		this.#detachToolApprovalPreviewWaiter = undefined;
@@ -418,8 +418,6 @@ export class EventController {
 		this.#pendingMessageUpdate = undefined;
 		this.#streamingReveal.stop();
 		this.#toolArgsReveal.stop();
-		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
 		this.#setTerminalProgress(false);
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
@@ -715,13 +713,7 @@ export class EventController {
 
 	#updateWorkingMessageFromIntent(intent: unknown): void {
 		if (this.ctx.session.isAborting) return;
-		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
-		// schema validation; `?.` only guards null/undefined, so guard the type too.
-		if (typeof intent !== "string") return;
-		const trimmed = intent
-			.trim()
-			.replace(/\s*\.+$/, "")
-			.trim();
+		const trimmed = normalizeIntent(intent);
 		if (!trimmed || trimmed === this.#lastIntent) return;
 		this.#lastIntent = trimmed;
 		this.ctx.setWorkingMessage(trimmed);
@@ -739,24 +731,31 @@ export class EventController {
 		// the listener's first await, preserving the timing the coalescing
 		// tests assert on. `message_update` enqueue is itself synchronous and
 		// needs no serialization.
-		this.ctx.unsubscribe = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
-			// Coalesce the cumulative `message_update` deltas of a streaming turn
-			// into at most one handler run per window. `#handleMessageUpdate` is
-			// synchronous, so without this every token re-runs the whole
-			// streaming rebuild (splitAssistantMessageToolTimeline, reveal
-			// setTarget, per-block tool-call reconciliation) even though the TUI
-			// paints at most ~30fps — at 40-100 tps the handler work then
-			// dominates the CPU profile of an idle-looking streaming session
-			// (issue #7443). Only the latest snapshot is meaningful; non-update
-			// events flush the pending snapshot first so ordering is preserved.
-			if (event.type === "message_update") {
-				this.#enqueueMessageUpdate(event);
-				return;
-			}
-			await this.#runSerialized(async () => {
-				await this.#flushPendingMessageUpdate();
-				await this.handleEvent(event);
-			});
+		this.ctx.unsubscribe = this.ctx.session.subscribe(event => this.dispatchSessionEvent(event));
+	}
+
+	/**
+	 * Route one session event through the same pipeline as the live
+	 * subscription: coalesce the cumulative `message_update` deltas of a
+	 * streaming turn into at most one handler run per window, and serialize
+	 * every other event behind any in-flight run.
+	 *
+	 * `#handleMessageUpdate` is synchronous, so without coalescing every token
+	 * re-runs the whole streaming rebuild (splitAssistantMessageToolTimeline,
+	 * reveal setTarget, per-block tool-call reconciliation) even though the TUI
+	 * paints at most ~30fps — at 40-100 tps the handler work then dominates the
+	 * CPU profile of an idle-looking streaming session (issue #7443). Only the
+	 * latest snapshot is meaningful; non-update events flush the pending
+	 * snapshot first so ordering is preserved.
+	 */
+	async dispatchSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "message_update") {
+			this.#enqueueMessageUpdate(event);
+			return;
+		}
+		await this.#runSerialized(async () => {
+			await this.#flushPendingMessageUpdate();
+			await this.handleEvent(event);
 		});
 	}
 
@@ -888,7 +887,7 @@ export class EventController {
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
 		this.#backgroundTaskCallIds.clear();
-		this.#approvalAttentionToolCallIds.clear();
+		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
@@ -899,8 +898,6 @@ export class EventController {
 		this.#pinnedErrorMessage = undefined;
 		this.#restorePinnedErrorInline = true;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
-		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
 		for (const timer of this.#ircExpiryTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -1055,12 +1052,12 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
 		this.ctx.statusLine.markActivityStart();
+		// The turn owns progress from here; a compaction that started it hands it over.
+		this.#compactionOwnsProgress = false;
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
-		setTerminalTitleState("working");
+		setRunStatus({ state: "working" });
 		this.ctx.ui.requestRender();
 	}
 
@@ -1570,25 +1567,31 @@ export class EventController {
 				if (closed) component?.markTranscriptBlockFinalized();
 			}
 
-			// Update working message with intent from streamed tool arguments
-			for (const content of this.ctx.streamingMessage.content) {
-				if (content.type !== "toolCall") continue;
-				const args = content.arguments;
+			// Update working message with the intent of the LAST intent-bearing
+			// streamed tool call. Scanning in reverse skips the redundant
+			// intermediate setWorkingMessage calls a forward pass would make
+			// (only the last one survives the flush anyway).
+			const blocks = this.ctx.streamingMessage.content;
+			for (let index = blocks.length - 1; index >= 0; index--) {
+				const block = blocks[index];
+				if (block?.type !== "toolCall") continue;
+				const args = block.arguments;
 				if (!args || typeof args !== "object") continue;
+				let intent: string | undefined;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
-					continue;
-				}
-				const tool = this.ctx.viewSession.getToolByName(content.name);
-				if (typeof tool?.intent !== "function") continue;
-				try {
-					const derived = tool.intent(args as never)?.trim();
-					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
+					intent = normalizeIntent(args[INTENT_FIELD]);
+				} else {
+					const tool = this.ctx.viewSession.getToolByName(block.name);
+					if (typeof tool?.intent !== "function") continue;
+					try {
+						intent = normalizeIntent(tool.intent(args as never));
+					} catch {
+						// intent function must never break the UI
 					}
-				} catch {
-					// intent function must never break the UI
 				}
+				if (!intent) continue;
+				this.#updateWorkingMessageFromIntent(intent);
+				break;
 			}
 
 			this.ctx.ui.requestRender();
@@ -1809,9 +1812,10 @@ export class EventController {
 		this.#updateWorkingMessageFromIntent(event.intent);
 		const tool = this.ctx.viewSession.getToolByName(event.toolName);
 		const renderToolName = toolRenderName(event.toolName, tool);
-		if (renderToolName === "ask" || this.#toolWillPromptForApproval(renderToolName, event.args)) {
-			this.#approvalAttentionToolCallIds.add(event.toolCallId);
-			setTerminalTitleState("attention");
+		const blocked = this.#blockingPrompt(renderToolName, event.args);
+		if (blocked) {
+			this.#blockingPrompts.set(event.toolCallId, blocked);
+			setRunStatus(blocked);
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
@@ -1893,20 +1897,27 @@ export class EventController {
 	}
 
 	/**
-	 * Whether this tool call will block on an approval prompt before executing.
-	 * The extension wrapper waits on `uiContext.select(...)` after emitting
-	 * `tool_execution_start`, so an approval-mode / per-tool `prompt` policy is
-	 * user-blocking — the title should read `attention`, not `working`. Mirrors
-	 * the wrapper's `resolveApproval` inputs (approvalMode + tools.approval); uses
+	 * The `blocked` status of a tool call that waits on the user before it
+	 * completes: an `ask` question, or an approval prompt. The extension wrapper
+	 * waits on `uiContext.select(...)` after emitting `tool_execution_start`, so
+	 * an approval-mode / per-tool `prompt` policy is user-blocking — the run
+	 * reads `blocked`, not `working`. Mirrors the wrapper's `resolveApproval`
+	 * inputs (approvalMode + tools.approval) and prompt text; uses
 	 * `resolveApproval` rather than `requiresApproval` so a `deny` policy does not
 	 * throw in the render path.
 	 */
-	#toolWillPromptForApproval(toolName: string, args: unknown): boolean {
+	#blockingPrompt(toolName: string, args: unknown): RunStatus | undefined {
+		if (toolName === "ask") {
+			const questions = recoverAskQuestions(args)?.map(question => question.question);
+			return { state: "blocked", kind: "question", msg: questions?.join(" ") };
+		}
 		const tool = this.ctx.viewSession.getToolByName(toolName);
-		if (!tool) return false;
+		if (!tool) return undefined;
 		const mode = cfgToolsApprovalMode.get(settings);
 		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(settings);
-		return resolveApproval(tool, args, mode, userPolicies).policy === "prompt";
+		const approval = resolveApproval(tool, args, mode, userPolicies);
+		if (approval.policy !== "prompt") return undefined;
+		return { state: "blocked", kind: "permission", msg: formatApprovalPrompt(tool, args, approval.reason) };
 	}
 
 	async #handleToolExecutionUpdate(
@@ -2026,14 +2037,12 @@ export class EventController {
 		this.#ensureWorkingLoaderWhileStreaming();
 		// Return to `working` only when the LAST outstanding user-blocking prompt
 		// resolves: with queued approval prompts (always-ask/write), the first tool
-		// to finish must not clear the attention signal while another prompt still
-		// waits. `ask` ids are in the set too (added at tool_execution_start), so
-		// the delete also covers them without leaking ids until turn end.
-		if (
-			this.#approvalAttentionToolCallIds.delete(event.toolCallId) &&
-			this.#approvalAttentionToolCallIds.size === 0
-		) {
-			setTerminalTitleState("working");
+		// to finish must not clear the blocked signal while another prompt still
+		// waits — the run reports that prompt instead. `ask` ids are in the map too
+		// (added at tool_execution_start), so the delete also covers them without
+		// leaking ids until turn end.
+		if (this.#blockingPrompts.delete(event.toolCallId)) {
+			setRunStatus(this.#blockingPrompts.values().next().value ?? { state: "working" });
 		}
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
@@ -2186,24 +2195,21 @@ export class EventController {
 		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
 		// end of the run: the agent's own continuation (reminder, retry, queued
 		// steer/follow-up, IRC wake) follows, or background work may re-wake it.
-		// Skip the idle title/loader teardown; the later terminal `agent_end`
-		// performs it. Still flush a deferred model switch — the plan-mode
-		// reconciler queues it to apply once the current stream ends, and
-		// `#finishAgentEnd` is otherwise its only flush site, so the automatic
-		// continuation would otherwise run on the old model/thinking level until
-		// the terminal settle.
+		// Skip the idle title/loader teardown; the continuation's terminal
+		// `agent_end` performs it, or the settle watch does when that continuation
+		// never starts (an abort cancels it, background work ends without a wake).
+		// Still flush a deferred model switch — the plan-mode reconciler queues it
+		// to apply once the current stream ends, and `#finishAgentEnd` is otherwise
+		// its only flush site, so the automatic continuation would otherwise run
+		// on the old model/thinking level until the terminal settle.
 		if (event.isTerminal === false) {
 			// `awaitingAsyncWork`: the model handed control back and only a
 			// background-job result can resume it. The title tracks the model, so it
 			// goes idle now — before any await, so a wake landing mid-flush keeps the
-			// `working` its `agent_start` sets. That wake is not guaranteed (a
-			// cancelled job enqueues no delivery; acknowledged/watched ones are
-			// suppressed), so the loader/progress teardown waits out the background
-			// work instead of a terminal `agent_end` that may never come.
-			if (event.awaitingAsyncWork === true) {
-				setTerminalTitleState("idle");
-				void this.#finishWhenAsyncWorkDrains(event);
-			}
+			// `working` its `agent_start` sets. The OSC 7501 record stays `working`:
+			// the run is not over, it resumes or settles without the user.
+			if (event.awaitingAsyncWork === true) setTerminalTitleState("idle");
+			void this.#finishWhenRunSettles(event);
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already
 			// false: a command issued from now on mounts immediately. Leaving earlier
@@ -2213,7 +2219,7 @@ export class EventController {
 			this.ctx.flushPendingCommandOutput();
 			return;
 		}
-		setTerminalTitleState("idle");
+		setRunStatus(this.#settledRunStatus(event));
 
 		await this.#finishAgentEnd(event);
 		// This settle may belong to an extension-started turn while the main
@@ -2222,36 +2228,64 @@ export class EventController {
 	}
 
 	/**
-	 * Terminal teardown for an async-wait settle whose wake never arrives. Mirrors
-	 * `RpcSessionSettleWatcher`: wait out owner-scoped background work, then — if
-	 * no new run started and the session is quiet — run the same teardown a
-	 * terminal `agent_end` would. A real wake starts a run (bumping the epoch)
-	 * whose own `agent_end` finalizes it instead.
+	 * Terminal teardown for a non-terminal settle whose continuation never
+	 * starts. Its terminal `agent_end` is not guaranteed: an abort cancels a
+	 * scheduled retry or compaction continuation before its `agent_start`, and a
+	 * cancelled background job enqueues no wake (acknowledged/watched ones are
+	 * suppressed). Mirrors `RpcSessionSettleWatcher`: wait out retries, scheduled
+	 * continuations, and owner-scoped background work, then — if no new run
+	 * started and the session is quiet — run the same teardown a terminal
+	 * `agent_end` would. A continuation that does start bumps the epoch and its
+	 * own `agent_end` finalizes the run instead.
 	 */
-	async #finishWhenAsyncWorkDrains(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+	async #finishWhenRunSettles(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		const epoch = this.#runEpoch;
-		if (this.#asyncDrainWatchEpoch === epoch) return;
-		this.#asyncDrainWatchEpoch = epoch;
+		if (this.#settleWatchEpoch === epoch) return;
+		this.#settleWatchEpoch = epoch;
 		const session = this.ctx.session;
 		// No `hasAdmittedSubmission` gate: this very settle is emitted while the
 		// prompt that produced it is still admitted, and a new submission starts a
 		// run whose `agent_start` bumps the epoch anyway.
 		const superseded = () => this.#runEpoch !== epoch || this.ctx.session !== session || session.isStreaming;
 		try {
-			while (!superseded() && session.hasPendingAsyncWork()) {
+			while (!superseded()) {
+				await session.waitForIdle();
+				if (superseded() || !session.hasPendingAsyncWork()) break;
 				await session.settleAsyncWork();
 			}
 			await this.#runSerialized(async () => {
-				if (superseded() || session.hasPendingAsyncWork()) return;
-				setTerminalTitleState("idle");
+				if (
+					superseded() ||
+					session.hasPendingAsyncWork() ||
+					session.hasPostPromptWork ||
+					session.queuedMessageCount > 0
+				) {
+					return;
+				}
+				setRunStatus(this.#settledRunStatus(event));
 				await this.#finishAgentEnd(event);
 				if (this.ctx.shutdownRequested) this.ctx.requestShutdown();
 			});
 		} catch (error) {
-			logger.warn("Async-wait settle teardown failed", { error: String(error) });
+			logger.warn("Non-terminal settle teardown failed", { error: String(error) });
 		} finally {
-			if (this.#asyncDrainWatchEpoch === epoch) this.#asyncDrainWatchEpoch = undefined;
+			if (this.#settleWatchEpoch === epoch) this.#settleWatchEpoch = undefined;
 		}
+	}
+
+	/**
+	 * The run status a settled turn leaves: `done` with a result to read,
+	 * `error` with the failure, or `idle` when there is nothing new — the user
+	 * interrupted, or a pending auto-retry will start the turn over (a cancelled
+	 * retry leaves the user at the prompt). Reads the turn's own `agent_end`
+	 * messages for the reason `sendErrorNotification` does.
+	 */
+	#settledRunStatus(event: Extract<AgentSessionEvent, { type: "agent_end" }>): RunStatus {
+		if (this.#retryPending) return { state: "idle" };
+		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+		if (last?.stopReason === "error") return { state: "error", msg: last.errorMessage };
+		if (!last || last.stopReason === "aborted") return { state: "idle" };
+		return { state: "done" };
 	}
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
@@ -2267,7 +2301,7 @@ export class EventController {
 		}
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
-		this.#approvalAttentionToolCallIds.clear();
+		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#priorTurnToolComponents = new Map(this.#toolTimelineComponents);
@@ -2290,9 +2324,6 @@ export class EventController {
 		// torn-down "Working…" row with the "F5 to Retry" affordance.
 		this.ctx.syncRetryHintRow();
 		this.ctx.ui.requestRender();
-		this.#scheduleIdleCompaction();
-		this.#idleRecapPending = true;
-		this.#scheduleIdleRecap();
 		this.sendErrorNotification(event);
 		this.sendCompletionNotification(event);
 	}
@@ -2338,9 +2369,10 @@ export class EventController {
 	async #handleAutoCompactionStart(
 		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" }>,
 	): Promise<void> {
-		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
-		this.#setTerminalProgress(true);
+		if (!this.#terminalProgressActive) {
+			this.#setTerminalProgress(true);
+			this.#compactionOwnsProgress = this.#terminalProgressActive;
+		}
 		this.#stopWorkingLoader();
 		this.ctx.statusContainer.disposeChildren();
 		const reasonText =
@@ -2383,9 +2415,10 @@ export class EventController {
 	}
 
 	async #handleAutoCompactionEnd(event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>): Promise<void> {
-		this.#cancelIdleCompaction();
-		this.#cancelIdleRecap();
-		this.#setTerminalProgress(false);
+		if (this.#compactionOwnsProgress) {
+			this.#compactionOwnsProgress = false;
+			this.#setTerminalProgress(false);
+		}
 		if (this.ctx.autoCompactionLoader) {
 			this.ctx.autoCompactionLoader.stop();
 			this.ctx.autoCompactionLoader = undefined;
@@ -2615,128 +2648,6 @@ export class EventController {
 	}
 	async #handleTodoAutoClear(_event: Extract<AgentSessionEvent, { type: "todo_auto_clear" }>): Promise<void> {
 		await this.ctx.reloadTodos();
-	}
-
-	#cancelIdleCompaction(): void {
-		if (this.#idleCompactionTimer) {
-			clearTimeout(this.#idleCompactionTimer);
-			this.#idleCompactionTimer = undefined;
-		}
-	}
-
-	#cancelIdleRecap(): void {
-		if (this.#idleRecapTimer) {
-			clearTimeout(this.#idleRecapTimer);
-			this.#idleRecapTimer = undefined;
-		}
-		if (this.#idleRecapAbort) {
-			this.#idleRecapAbort.abort();
-			this.#idleRecapAbort = undefined;
-		}
-	}
-
-	#scheduleIdleCompaction(): void {
-		this.#cancelIdleCompaction();
-		// Don't schedule idle work while context maintenance is already running; the
-		// maintenance flow may reset the session before this timer fires.
-		if (this.ctx.viewSession.isCompacting) return;
-
-		const idleSettings = cfgCompaction.get(this.ctx.settings);
-		if (!idleSettings.idleEnabled) return;
-
-		// Only if input is empty
-		if (this.ctx.editor.getText().trim()) return;
-
-		const threshold = idleSettings.idleThresholdTokens;
-		if (threshold <= 0) return;
-		if (this.#currentContextTokens() < threshold) return;
-
-		const timeoutMs = Math.max(60, Math.min(3600, idleSettings.idleTimeoutSeconds)) * 1000;
-		this.#idleCompactionTimer = setTimeout(() => {
-			this.#idleCompactionTimer = undefined;
-			// Re-check conditions before firing. Pruning may have run between arming
-			// the timer and now, dropping usage back below the idle threshold.
-			if (this.ctx.viewSession.isStreaming) return;
-			if (this.ctx.viewSession.isCompacting) return;
-			if (this.ctx.editor.getText().trim()) return;
-			if (this.#currentContextTokens() < threshold) return;
-			void this.ctx.viewSession.runIdleCompaction();
-		}, timeoutMs);
-		this.#idleCompactionTimer.unref?.();
-	}
-
-	#scheduleIdleRecap(): void {
-		this.#cancelIdleRecap();
-		if (this.ctx.viewSession.isCompacting) return;
-
-		const recapSettings = cfgRecap.get(this.ctx.settings);
-		if (!recapSettings.enabled) return;
-		if (this.ctx.editor.getText().trim()) return;
-
-		const timeoutMs =
-			Math.max(IDLE_RECAP_MIN_SECONDS, Math.min(IDLE_RECAP_MAX_SECONDS, recapSettings.idleSeconds)) * 1000;
-		this.#idleRecapTimer = setTimeout(() => {
-			this.#idleRecapTimer = undefined;
-			this.#idleRecapPending = false;
-			void this.#runIdleRecap();
-		}, timeoutMs);
-		this.#idleRecapTimer.unref?.();
-	}
-
-	/**
-	 * Generate the idle recap with an ephemeral side-channel turn over the
-	 * current conversation (same pipeline as `/btw`), surface it in the transcript
-	 * ({@link RecapNotice}), and journal it to history.db (`session_recaps`) for the session that
-	 * produced it. Live goal/title and the active todo task are passed as anchoring
-	 * hints because the snapshot only carries conversation history, not the
-	 * controller's todo/goal state. The request is abortable: any activity
-	 * cancels it via #cancelIdleRecap, and idle conditions are re-checked after
-	 * the reply lands so a stale recap never paints over fresh work.
-	 */
-	async #runIdleRecap(): Promise<void> {
-		if (!this.#idleConditionsHold()) return;
-		if (!this.ctx.viewSession.model) return;
-		if (this.ctx.viewSession.messages.length === 0) return;
-
-		const promptText = prompt.render(idleRecapPrompt, {
-			goal: this.#idleRecapGoalText() ?? "",
-			task: nextActionableTask(this.ctx.todoPhases)?.content ?? "",
-		});
-
-		const abort = new AbortController();
-		this.#idleRecapAbort = abort;
-		try {
-			const session = this.ctx.viewSession;
-			const { replyText } = await session.runEphemeralTurn({ promptText, signal: abort.signal });
-			if (this.#idleRecapAbort !== abort || abort.signal.aborted || !this.#idleConditionsHold()) return;
-			const recap = previewLine(replyText, TRUNCATE_LENGTHS.RECAP);
-			if (!recap) return;
-			session.sessionManager.recordRecap(replyText);
-			this.ctx.present(new RecapNotice(recap));
-		} catch (error) {
-			if (!abort.signal.aborted) logger.debug("Idle recap turn failed", { error: String(error) });
-		} finally {
-			if (this.#idleRecapAbort === abort) this.#idleRecapAbort = undefined;
-		}
-	}
-
-	/** Idle gate shared by the recap timer fire and its post-reply re-check. */
-	#idleConditionsHold(): boolean {
-		if (this.ctx.viewSession.isStreaming) return false;
-		if (this.ctx.viewSession.isCompacting) return false;
-		if (this.ctx.editor.getText().trim()) return false;
-		return true;
-	}
-
-	#idleRecapGoalText(): string | undefined {
-		const goal = this.ctx.viewSession.getGoalModeState?.()?.goal.objective.trim();
-		if (goal) return goal;
-		const title = this.ctx.sessionManager.getSessionName()?.trim();
-		return title || undefined;
-	}
-
-	#currentContextTokens(): number {
-		return this.ctx.viewSession.getContextUsage()?.tokens ?? 0;
 	}
 
 	sendErrorNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {

@@ -13,7 +13,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
+import { RpcSubagentRegistry, subagentFrameVisible } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -568,6 +568,29 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.agentName).toBe("scout");
 	});
 
+	it("restores the live account pool for the persisted agent name, so a revived agent stays restricted", async () => {
+		const cwd = makeTempDir("@pi-revive-account-pool-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: "scout" });
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+		const settings = Settings.isolated({
+			"task.agentAccountPools": {
+				scout: { anthropic: ["email:a@example.com|org:org-a"] },
+				other: { anthropic: [] },
+			},
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { settings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(capturedOptions?.oauthAccountPools).toEqual({ anthropic: ["email:a@example.com|org:org-a"] });
+	});
+
 	it("falls back to the ref display name reviving a legacy session file without a persisted agent name", async () => {
 		const cwd = makeTempDir("@pi-revive-agent-name-legacy-");
 		const sessionFile = await createPersistedSession(cwd);
@@ -653,6 +676,25 @@ describe("persisted subagent revival", () => {
 		expect(cfgAdvisorEnabled.get(roleAdvised)).toBe(true);
 		expect(roleAdvised.getModelRole("advisor")).toBeUndefined();
 		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
+	});
+
+	it("keeps a nested spawn's owner-resolved advisor when reviving under root settings with a different advisor", async () => {
+		const cwd = makeTempDir("@pi-nested-advisor-revive-");
+		// What spawn persists for `@advisor:high` under a parent subagent whose advisor role is Sonnet.
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, "anthropic/claude-sonnet-4-5:high");
+		const rootSettings = Settings.isolated({ modelRoles: { advisor: "anthropic/claude-haiku-4-5" } });
+		let captured: Settings | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			captured = options?.settings;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { settings: rootSettings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(captured?.getModelRole("advisor")).toBe("anthropic/claude-sonnet-4-5:high");
 	});
 
 	it("restores the persisted custom model role before reopening the session", async () => {
@@ -772,10 +814,11 @@ describe("persisted subagent revival", () => {
 		const frames: RpcSubagentFrame[] = [];
 		const terminal = Promise.withResolvers<void>();
 		const rpcRegistry = new RpcSubagentRegistry(eventBus, frame => {
+			// What a `progress` subscriber receives.
+			if (!subagentFrameVisible("progress", frame.type)) return;
 			frames.push(frame);
 			if (frame.type === "subagent_lifecycle" && frame.payload.status !== "started") terminal.resolve();
 		});
-		rpcRegistry.setSubscriptionLevel("progress");
 		const ref = createRef(sessionFile);
 		AgentRegistry.global().register({
 			id: ref.id,

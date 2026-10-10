@@ -84,7 +84,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				},
 				entries: [],
 			}),
-			onEntryAppended: undefined,
+			subscribeEntryAppended: () => () => {},
 		},
 		session: {
 			get isSessionTransitioning() {
@@ -371,7 +371,9 @@ describe("collab host registry lifecycle (#6099)", () => {
 		try {
 			const abort = new AbortController();
 			const answer = host.requestGuestUi({ kind: "select", title: "Pending", options: ["Yes"] }, abort.signal);
-			expect(send.mock.calls.filter(([frame]) => frame.t === "ui-request")).toHaveLength(1);
+			expect(
+				send.mock.calls.filter(([frame]) => typeof frame !== "string" && frame.t === "ui-request"),
+			).toHaveLength(1);
 			const original = state.sessionId;
 			state.sessionId = "provisional";
 			send.mockClear();

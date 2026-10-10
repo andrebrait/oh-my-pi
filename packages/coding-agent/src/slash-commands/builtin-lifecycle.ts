@@ -6,9 +6,9 @@ import { logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
-import type { AgentSession, FreshSessionResult, HandoffResult } from "../session/agent-session";
+import type { FreshSessionResult, HandoffResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
-import { buildReplanTitleContext, USER_INTERRUPT_LABEL } from "../session/messages";
+import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveResumableSession } from "../session/session-listing";
 import { toggleSessionPin } from "../session/session-pins";
 import {
@@ -20,7 +20,6 @@ import {
 } from "../session/session-worktree";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
-import { isLowSignalTitleInput } from "../tiny/text";
 import { resolveToCwd } from "../tools/path-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
@@ -37,28 +36,33 @@ function formatFreshSessionResult(result: FreshSessionResult): string {
 	return `Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`;
 }
 
-/** Null reports no usable title; undefined silently discards an invalidated request. */
-async function generateRenameTitle(session: AgentSession, signal?: AbortSignal): Promise<string | null | undefined> {
-	const { sessionManager } = session;
-	const context = buildReplanTitleContext(session.messages);
-	if (!context || isLowSignalTitleInput(context)) return null;
-	const revision = sessionManager.reserveTitleRevision();
-	const sessionId = sessionManager.getSessionId();
-	const titleSignal = session.titleGenerationSignal;
-	const title = await session.generateTitle(context, undefined, signal);
-	return !titleSignal.aborted &&
-		sessionManager.getSessionId() === sessionId &&
-		sessionManager.titleRevision === revision
-		? title
-		: undefined;
-}
-
-export const shutdownHandlerTui = (
+/**
+ * `/exit` and `/quit`. A hosted client first sends the host `exit`: it stops the host when this is its last client
+ * and otherwise only leaves, so the other terminals keep their session.
+ */
+export const shutdownHandlerTui = async (
 	_command: ParsedSlashCommand,
 	runtime: TuiSlashCommandRuntime,
-): SlashCommandResult => {
+): Promise<SlashCommandResult> => {
 	clearSubmittedText(runtime);
-	void runtime.ctx.shutdown();
+	const { ctx } = runtime;
+	const link = ctx.hostedClientMode ? ctx.hostedClient : undefined;
+	if (!link) {
+		void ctx.shutdown();
+		return commandConsumed();
+	}
+	// The link has left the host by then; the shutdown has nothing more to detach and names no host to come back to.
+	try {
+		await link.exit();
+		ctx.hostedClient = undefined;
+		void ctx.shutdown();
+	} catch (error) {
+		ctx.hostedClient = undefined;
+		void ctx.shutdown({
+			exitCode: 1,
+			farewell: `Could not stop session host ${link.hostId}: ${errorMessage(error)}`,
+		});
+	}
 	return commandConsumed();
 };
 
@@ -650,13 +654,14 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					runtime.session === session &&
 					runtime.sessionManager === sessionManager &&
 					!runtime.signal?.aborted &&
-					!titleSignal.aborted &&
+					// An interrupt cancels a generated title; a typed one applies regardless.
+					!(titleSignal.aborted && !command.args) &&
 					sessionManager.getSessionId() === sessionId &&
 					sessionManager.titleRevision === titleRevision;
 				try {
-					const generation = command.args || generateRenameTitle(session, runtime.signal);
+					const generation = session.renameTitle(command.args, runtime.signal);
 					titleRevision = sessionManager.titleRevision;
-					const title = typeof generation === "string" ? generation : await generation;
+					const title = await generation;
 					if (!isCurrent() || title === undefined) return;
 					if (!title) {
 						await runtime.output("Could not generate a session title. Use /rename <title> to set one.");
@@ -691,14 +696,13 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const session = runtime.ctx.session;
 			const sessionManager = runtime.ctx.sessionManager;
 			const sessionId = sessionManager.getSessionId();
-			const titleSignal = session.titleGenerationSignal;
-			const generation = command.args.trim() || generateRenameTitle(session);
+			// `renameTitle` resolves undefined for a generated title an interrupt cancelled.
+			const generation = session.renameTitle(command.args.trim());
 			const titleRevision = sessionManager.titleRevision;
-			const title = typeof generation === "string" ? generation : await generation;
+			const title = await generation;
 			if (
 				runtime.ctx.session !== session ||
 				runtime.ctx.sessionManager !== sessionManager ||
-				titleSignal.aborted ||
 				sessionManager.getSessionId() !== sessionId ||
 				sessionManager.titleRevision !== titleRevision ||
 				title === undefined
@@ -850,6 +854,38 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		name: "exit",
 		description: "Exit the application",
 		handleTui: shutdownHandlerTui,
+	},
+	{
+		name: "detach",
+		icon: "signOut",
+		description: "Leave the session host running and close this terminal",
+		handleTui: (_command, runtime) => {
+			clearSubmittedText(runtime);
+			const { ctx } = runtime;
+			if (!ctx.hostedClientMode) {
+				ctx.showStatus("Not attached to a session host");
+				return commandConsumed();
+			}
+			// The shutdown detaches the link, so the host keeps its session for the next terminal.
+			void ctx.shutdown();
+			return commandConsumed();
+		},
+	},
+	{
+		name: "attach",
+		icon: "signIn",
+		description: "Attach this terminal to another session host",
+		inlineHint: "[host|session]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			clearSubmittedText(runtime);
+			const { ctx } = runtime;
+			if (!ctx.hostedClientMode || !ctx.attachHostedSession) {
+				ctx.showStatus("/attach needs a hosted session: start with `omp attach` or enable tui.hosted");
+				return;
+			}
+			await ctx.attachHostedSession(command.args.trim() || undefined);
+		},
 	},
 	{
 		name: "restart",

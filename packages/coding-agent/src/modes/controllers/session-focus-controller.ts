@@ -4,7 +4,7 @@ import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef, type RegistryEvent } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
-import { setTerminalTitleState } from "../../utils/title-generator";
+import { setRunStatus } from "../../utils/run-status";
 import type { InteractiveModeContext } from "../types";
 
 /**
@@ -66,6 +66,8 @@ export class SessionFocusController {
 	/** Focus the main view on an agent's live session. Throws an Error with a user-displayable message. */
 	async focusAgent(id: string): Promise<void> {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
+		// Before `ensureLive`: focusing a hosted client's agent would revive a local agent and aim the composer at it.
+		if (this.ctx.hostedClientMode) throw new Error("Viewing agents is unavailable when attached.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
 		const request = ++this.#focusRequestSeq;
 		let session: AgentSession;
@@ -144,6 +146,7 @@ export class SessionFocusController {
 	}
 
 	dispose(): void {
+		this.ctx.syncIdleMaintenanceView(null);
 		// A pending revive — or a running attachment — must not land during
 		// teardown: invalidate both generations the way leave-main does.
 		this.#focusRequestSeq++;
@@ -173,6 +176,7 @@ export class SessionFocusController {
 	/** Retarget core, both directions: swap subscription, transcript, and status line onto `target`. */
 	async #attach(target: AgentSession): Promise<boolean> {
 		const generation = ++this.#attachGeneration;
+		this.ctx.syncIdleMaintenanceView(target);
 		try {
 			this.ctx.unsubscribe?.();
 			this.ctx.clearTransientSessionUi();
@@ -217,7 +221,7 @@ export class SessionFocusController {
 			this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 			// Reset run bookkeeping before replay populates pending tool handles.
 			if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
-			else setTerminalTitleState("idle");
+			else setRunStatus({ state: "idle" });
 			if (generation !== this.#attachGeneration) return false;
 			await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 			if (generation !== this.#attachGeneration) return false;

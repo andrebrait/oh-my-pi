@@ -242,7 +242,11 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 		},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			dispatchSessionEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			resetTranscriptAnchors: () => {},
+		},
 		syncRunningSubagentBadge: () => {},
 		showHookSelector: (
 			title: string,
@@ -458,7 +462,7 @@ function makeHostContext(): InteractiveModeContext {
 				header: { type: "session", id: "sess-proto", timestamp: new Date().toISOString(), cwd: "/tmp" },
 				entries: [],
 			}),
-			onEntryAppended: undefined,
+			subscribeEntryAppended: () => () => {},
 		},
 		session: {
 			isStreaming: false,

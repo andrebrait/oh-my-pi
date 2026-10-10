@@ -19,13 +19,19 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
+import type { HostedClientLink } from "../session-host/hosted-client";
+import type { RpcSessionOrigin } from "./rpc/rpc-types";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
@@ -91,7 +97,15 @@ export interface InteractiveModeInitOptions {
 	autoStartCollab?: boolean;
 }
 
-export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<HookSelectorOptions, "disabledIndices">;
+export interface ShutdownOptions {
+	/** Process exit status once the terminal is restored. Default 0. */
+	exitCode?: number;
+	/** Written to stderr after the terminal is restored, in place of the resume or detach hint. */
+	farewell?: string;
+}
+
+export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
+	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
 
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
@@ -146,6 +160,8 @@ export interface InteractiveModeContext {
 	readonly sessionName: string | undefined;
 	/** Session the transcript/editor/status are attached to: the focused agent's, else `session`. */
 	readonly viewSession: AgentSession;
+	/** Bind idle maintenance to the local view, or release UI activity bindings on null; hosted replicas never activate. */
+	syncIdleMaintenanceView(target?: AgentSession | null): void;
 	/** Id of the focused agent, undefined when the main session is attached. */
 	readonly focusedAgentId: string | undefined;
 	/** Focus the main view on an agent's live session (delegates to SessionFocusController.focusAgent). */
@@ -175,6 +191,29 @@ export interface InteractiveModeContext {
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	/**
+	 * True from before `init()` until this process leaves hosted mode: this UI is (or is about to become) a
+	 * client of a session host. TUI-owned automation (timers, local model calls, plan/goal/loop machinery) must
+	 * not run, and input (submit, slash commands, keys, selectors) goes to the host through {@link hostedClient}
+	 * or is refused: it never falls through to the local replica session, also while the link is still
+	 * connecting. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
+	 */
+	hostedClientMode: boolean;
+	/** The link to the session host once connected; routes input and answers dialogs. Set by the caller of `HostedClientLink.connect`. */
+	hostedClient?: HostedClientLink;
+	/**
+	 * Hosted client only: where the host session on screen keeps its files, as its snapshot (or a relocation notice)
+	 * reported it. Links in the host's transcript resolve here (relative paths against `cwd`, `local://` under the root the
+	 * host itself resolved for it) instead of the terminal's own directory, which keeps the footer, completion, and `@file` to itself.
+	 * Set by the link before each snapshot's transcript is painted (a snapshot without it is refused), so unlike
+	 * {@link hostedClient} it exists for the first repaint; unset when the link ends, and then links resolve locally.
+	 */
+	hostOrigin?: RpcSessionOrigin;
+	/**
+	 * Hosted client only, set by the hosted startup: replace the connected session host by `target` (a host id, a
+	 * session id, or a session path); with no target a selector over the live hosts opens. Reports its own failures.
+	 */
+	attachHostedSession?: (target?: string) => Promise<void>;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -215,7 +254,9 @@ export interface InteractiveModeContext {
 	 */
 	readonly effectiveHideThinkingBlock: boolean;
 	readonly assistantImagesVisible: boolean;
-	resolveAssistantMessageLinks(texts: readonly string[]): Promise<ReadonlyMap<string, string>>;
+	/** Whether the viewed session's tables get charts: the main session's do, a focused subagent's do not. */
+	readonly tableChartsVisible: boolean;
+	resolveAssistantMessageLinkHrefs(hrefs: readonly string[]): Promise<ReadonlyMap<string, string>>;
 	/** Whether this visible session has produced thinking content the user can reveal. */
 	readonly hasDisplayableThinkingContent: boolean;
 	/** Record a message whose thinking content makes Ctrl+T meaningful even at thinking level "off"; returns true on first observation. */
@@ -279,7 +320,7 @@ export interface InteractiveModeContext {
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
-	shutdown(): Promise<void>;
+	shutdown(options?: ShutdownOptions): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
@@ -410,6 +451,12 @@ export interface InteractiveModeContext {
 	): Promise<void>;
 	renderInitialMessages(options?: { preserveExistingChat?: boolean; clearTerminalHistory?: boolean }): Promise<void>;
 	/**
+	 * Re-resolve the links of the transcript on screen against where the view's links resolve now, and give the
+	 * assistant messages already painted their new destinations, without repainting the transcript. For a hosted
+	 * view whose session moved without being replaced; a reply still streaming gets its destinations when it closes.
+	 */
+	refreshTranscriptLinks(): Promise<void>;
+	/**
 	 * In-place transcript rewind: drop the rendered components at/after
 	 * `message` when none of their rows reached native scrollback. Returns
 	 * false when the caller must fall back to a destructive
@@ -441,6 +488,7 @@ export interface InteractiveModeContext {
 	handleContextCommand(): void;
 	handleDumpCommand(): Promise<void>;
 	handleDumpAllCommand(): Promise<void>;
+	handleDumpAnonCommand(): Promise<void>;
 	handleAdvisorDumpCommand(isRaw?: boolean): void;
 	handleDebugTranscriptCommand(): Promise<void>;
 	handleClearCommand(): Promise<void>;
@@ -460,8 +508,8 @@ export interface InteractiveModeContext {
 	handleHandoffCommand(customInstructions?: string): Promise<void>;
 	handleShakeCommand(mode: ShakeMode): Promise<void>;
 	handleMoveCommand(targetPath?: string): Promise<void>;
-	/** `/wt`: fork the checkout into a new worktree (keeping changes) and move there. */
-	handleWorktreeCommand(branch?: string): Promise<void>;
+	/** `/wt`: fork the checkout into a new worktree (keeping changes unless `keepChanges` is false) and move there. */
+	handleWorktreeCommand(branch?: string, options?: { keepChanges?: boolean }): Promise<void>;
 	withBtwSessionMove(operation: () => Promise<boolean>): Promise<boolean>;
 	handleRenameCommand(title: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
@@ -511,7 +559,7 @@ export interface InteractiveModeContext {
 	showSessionPinSelector(): Promise<void>;
 	showResetUsageSelector(): Promise<void>;
 	showProviderSetup(): Promise<void>;
-	showHookConfirm(title: string, message: string): Promise<boolean>;
+	showHookConfirm(title: string, message: string, dialogOptions?: InteractiveSelectorDialogOptions): Promise<boolean>;
 	showDebugSelector(): Promise<void>;
 	showAgentHub(options?: AgentHubOpenOptions): void;
 	resetObserverRegistry(): void;
@@ -622,7 +670,11 @@ export interface InteractiveModeContext {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined>;
 	hideHookInput(): void;
 	showHookEditor(
 		title: string,
@@ -632,6 +684,11 @@ export interface InteractiveModeContext {
 	): Promise<string | undefined>;
 	hideHookEditor(): void;
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void;
+	/** Present the rich multi-question ask dialog on the editor surface (queued behind any open dialog). */
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 	showHookCustom<T>(
 		factory: (
 			tui: TUI,
