@@ -210,6 +210,7 @@
 ### Fixed
 
 - Fixed resumed, switched-to, or forked sessions missing the prompt cache on their first turn with Mnemopi or Hindsight auto-recall enabled ([#14656](https://github.com/can1357/oh-my-pi/pull/14656) by [@andrebrait](https://github.com/andrebrait))
+- Fixed the first prompt of an interactive or `--mode rpc-ui` session (including `--resume`) missing the provider prompt cache when MCP servers were still connecting: it now waits up to 1.5 s for MCP startup, so servers that connect within that time are already in its system prompt ([#14780](https://github.com/can1357/oh-my-pi/pull/14780) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.8.0] - 2026-10-07
 ### Breaking Changes

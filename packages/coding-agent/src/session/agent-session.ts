@@ -549,6 +549,12 @@ const cfgWorkspacePromptInputs = combine({
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
+/**
+ * How long the first turn waits for deferred UI/RPC MCP startup (the sdk's startup barrier
+ * uses it too): covers the 250ms startup window, config load, and servers that connect soon
+ * after, while a hung server costs at most 1.5s.
+ */
+export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
 
@@ -1088,6 +1094,12 @@ export class AgentSession implements SettingsScope {
 	 * Esc would otherwise stall for the full recall timeout (issue #12668).
 	 */
 	#promptSetupAbortController: AbortController | undefined;
+	/**
+	 * Deferred UI/RPC MCP discovery still in flight (see `sdk.ts`). A turn waits on it,
+	 * bounded, so its system prompt already carries the MCP routes and instructions;
+	 * otherwise the prompt changes on the next turn and the provider prompt cache misses.
+	 */
+	#pendingMCPDiscovery: Promise<void> | undefined;
 	#activeAgentContinue: ActiveAgentContinue | undefined;
 	#agentContinueSchedulerToken = 0;
 
@@ -6576,6 +6588,15 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.refreshMCPTools(mcpTools);
 	}
 
+	/** Makes turns wait, bounded, for in-flight MCP discovery before building their system prompt. */
+	setPendingMCPDiscovery(discovery: Promise<void>): void {
+		const settled = () => {
+			if (this.#pendingMCPDiscovery === pending) this.#pendingMCPDiscovery = undefined;
+		};
+		const pending = discovery.then(settled, settled);
+		this.#pendingMCPDiscovery = pending;
+	}
+
 	/** Replaces host-owned RPC tools before the next model call. */
 	refreshRpcHostTools(rpcTools: AgentTool[]): Promise<void> {
 		return this.#tools.refreshRpcHostTools(rpcTools);
@@ -7810,6 +7831,18 @@ export class AgentSession implements SettingsScope {
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
 		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
+		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
+		if (pendingMCPDiscovery) {
+			const timedOut = new Error("MCP discovery still pending");
+			// Abort ends the wait at once.
+			await withTimeout(pendingMCPDiscovery, MCP_DISCOVERY_TURN_WAIT_MS, timedOut, signal).catch(error => {
+				// Only the first turn pays the wait; later turns take whatever discovery has applied.
+				if (error === timedOut && this.#pendingMCPDiscovery === pendingMCPDiscovery) {
+					this.#pendingMCPDiscovery = undefined;
+				}
+				logger.debug("Turn started before MCP discovery finished", { error: String(error) });
+			});
+		}
 		for (let attempt = 0; attempt < AGENT_START_POLICY_MAX_ATTEMPTS; attempt++) {
 			await this.#memory.transition;
 			if (!isCurrent()) return cancelled;
