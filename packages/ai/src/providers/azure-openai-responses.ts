@@ -180,9 +180,10 @@ const streamAzureOpenAIResponsesOnce = (
 					break;
 				} catch (error) {
 					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
-					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
-						: undefined;
+					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined =
+						!requestSignal.aborted && !options?.preserveModelSelection
+							? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
+							: undefined;
 					if (reasoningEffortFallback === undefined) throw error;
 					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;

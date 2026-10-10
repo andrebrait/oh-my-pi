@@ -19,6 +19,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { createTaskModelFixture } from "./helpers/model-fixtures";
 
 describe("handleRpcCancelSubagent", () => {
 	let registry: RpcSubagentRegistry;
@@ -263,10 +264,26 @@ describe("handleRpcCancelSubagent", () => {
 			eventBus: new EventBus(),
 		} as CreateAgentSessionResult);
 		registry.setSubscriptionLevel("progress");
-		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const modelFixture = createTaskModelFixture();
+		const agent: AgentDefinition = {
+			name: "task",
+			description: "test",
+			systemPrompt: "test",
+			source: "bundled",
+			model: [modelFixture.selectors.primary],
+		};
 
 		// Foreground: awaited directly, with no async job behind it.
-		const run = runSubprocess({ cwd: artifactsDir, agent, task: "work", index: 0, id, eventBus, artifactsDir });
+		const run = runSubprocess({
+			cwd: artifactsDir,
+			agent,
+			task: "work",
+			index: 0,
+			id,
+			eventBus,
+			artifactsDir,
+			modelRegistry: modelFixture.modelRegistry,
+		}).finally(() => modelFixture.close());
 		await promptEntered.promise;
 
 		await expect(handleRpcCancelSubagent(registry, id)).resolves.toBe(true);

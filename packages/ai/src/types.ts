@@ -477,6 +477,8 @@ export type OpenAIResponseInclude =
 	| "message.output_text.logprobs";
 
 export interface StreamOptions {
+	/** @internal A governed caller forbids provider-side model or effort substitution. */
+	preserveModelSelection?: boolean;
 	temperature?: number;
 	topP?: number;
 	topK?: number;

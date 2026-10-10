@@ -1773,6 +1773,11 @@ function normalizeMandatoryReasoningOptions<TApi extends Api>(
 	}
 	const floor = defaultSupportedEffort(model);
 	if (floor === undefined) return options;
+	if (options?.preserveModelSelection && (options.disableReasoning || options.forceReasoningOff)) {
+		throw new AIError.ConfigurationError(
+			"The selected model cannot honor the requested reasoning-off state without effort substitution.",
+		);
+	}
 	return { ...options, reasoning: floor, disableReasoning: undefined, forceReasoningOff: undefined };
 }
 
@@ -1857,6 +1862,8 @@ function mapOptionsForApi<TApi extends Api>(
 		anthropicSlowMode: options?.anthropicSlowMode,
 		userProfileId: options?.userProfileId,
 		...simpleProviderOptions,
+		preserveModelSelection: options?.preserveModelSelection,
+		...(options?.preserveModelSelection ? { onPayload: options.onPayload, fallbacks: [] } : {}),
 	};
 
 	switch (model.api) {

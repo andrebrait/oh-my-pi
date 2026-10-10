@@ -24,6 +24,7 @@ import { BatchArgsScanner, type TaskLaunchSession } from "@oh-my-pi/pi-coding-ag
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { createTaskModelFixture, type TaskModelFixture } from "../helpers/model-fixtures";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -39,11 +40,19 @@ const sink: SpeculativeOperationSink = {
 	close: () => {},
 };
 
+const modelFixtures: TaskModelFixture[] = [];
+
 function createSession(manager: AsyncJobManager): ToolSession {
+	const settings = Settings.isolated({ "async.enabled": true, "task.batch": true });
+	const fixture = createTaskModelFixture(settings);
+	modelFixtures.push(fixture);
 	return {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated({ "async.enabled": true, "task.batch": true }),
+		settings,
+		modelRegistry: fixture.modelRegistry,
+		getActiveModel: fixture.getActiveModel,
+		getActiveModelString: fixture.getActiveModelString,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getAgentId: () => null,
@@ -164,6 +173,7 @@ describe("task speculative launch", () => {
 		startedIds.clear();
 		vi.restoreAllMocks();
 		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 1000 });
+		for (const fixture of modelFixtures.splice(0)) fixture.close();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
 	});
