@@ -146,11 +146,12 @@ are warnings; successfully deduplicated copies are informational. Symlinks to th
 same real file do not count as redundant installations, and filtered-out variants
 do not produce conflict notices.
 
-Run `/skills diagnostics` to inspect the current resolution in a read-only report
-outside the transcript. It lists the bare default (when included), namespaced
-variants, redundant copies, their backing paths and sources, declared source
-repositories and versions when available, and the selection rule. A shared name
-or self-declared repository does not establish authenticity.
+Run `/skills diagnostics` to open the diagnostics panel, a navigable list of
+every loaded skill with its issues and analysis state. Selecting a skill shows
+the bare default (when included), namespaced variants, redundant copies, their
+backing paths and sources, declared source repositories and versions when
+available, and the selection rule. A shared name or self-declared repository
+does not establish authenticity. See [Assisted diagnostics](#assisted-diagnostics).
 
 RPC hosts can inspect the same resolution through `get_skill_diagnostics`,
 `get_state.skillDiagnostics`, and `skill_diagnostics_update` frames, including
@@ -182,6 +183,115 @@ same normalized source repository are resolved like redundant copies: existing
 provider precedence selects one active skill, while diagnostics retain the hidden
 variant and its version. Skills without repository metadata and skills declaring
 different repositories continue to receive namespaced aliases.
+
+### Assisted diagnostics
+
+`/skills diagnostics` opens a navigable list of loaded skills, their conflicts,
+redundant installations, and missing provenance. Use **Up/Down** to select a skill
+and inspect its variants and retained analysis. Press **Enter** to analyze the
+selected competing copies, **C** to cancel an active analysis, **A** to apply an
+eligible recommendation, or **Esc** to close. Single-copy skills explain why
+relationship analysis is unavailable.
+
+Before sending any resource content, OMP names the model, shows the selected
+resource paths, payload size, and incomplete coverage, then asks for consent.
+Analysis uses the configured `smol` model role and may incur provider charges.
+Opening the panel, navigating it, querying RPC diagnostics, and startup notices
+do not trigger analysis. Consented work can finish after the panel closes;
+reopening it shows the results. Changing sessions discards that session's plans
+and results.
+
+RPC hosts use the same session-owned plans and results: prepare a selected skill
+with `prepare_skill_diagnostic_analysis`, explicitly consent with
+`analyze_skill_diagnostics`, and separately confirm an application with
+`apply_skill_diagnostic_analysis`. `cancel_skill_diagnostic_analysis` cancels a
+prepared or running plan. Snapshots and `skill_diagnostics_update` events carry
+per-skill status and results, including bounded verbatim evidence excerpts from
+the analyzed skill files; clients never submit resource contents or paths.
+See [RPC documentation](rpc.md) for the wire contract.
+
+The advisory result separates an inferred relationship, cited file evidence,
+meaningful differences, and a recommendation. It can recommend keeping all
+copies or preferring one for OMP. Inferences do not establish authorship, origin,
+authenticity, or interchangeable runtime behavior. Supporting scripts and
+references are inspected as data, never executed; the main conversation and
+session system prompt are not sent. Reviewed contents are checked again before
+sending and immediately before a preference is saved. Changed contents invalidate
+the analysis record; any completed result stays visible but cannot be applied.
+
+Known credential files and secret patterns are filtered, but a resource may still
+contain private information that detection cannot identify. Review the selected
+files before agreeing to send them to a model provider.
+
+Applying a preference requires a **second confirmation**. A confirmed choice
+hides the other reviewed copies in OMP only; nothing is uninstalled and other
+harnesses' files are untouched. The decision records fingerprints for every
+reviewed copy, including the preferred one. Changes to any copy invalidate the
+decision and allow it to load again. Incomplete reviews cannot authorize hiding
+copies. Only user-owned global approval records are honored: repository, launch,
+and runtime configuration layers cannot create approvals. Invalid records are
+ignored with a warning. Preferences do not override independent enable/disable
+or skill inclusion rules.
+
+Restore all globally saved choices with:
+
+```bash
+omp config reset diagnostics.resourceExclusions
+```
+
+#### Extension and plugin analysis
+
+The existing plugin health command offers the same read-only analyzer:
+
+```bash
+omp plugin doctor --analyze plugin-a plugin-b
+omp plugin doctor --analyze ./generic-extension.ts ./omp-extension.ts --model provider/model-id
+```
+
+Selecting an entrypoint inside a known extension package is refused: select its
+owning package so a confirmed exclusion covers all of its hooks, tools, skills,
+and other capabilities. Standalone extension files remain selectable.
+
+
+Select exactly two installed names or paths to extension files/package
+directories. OMP asks before sending their contents. `--yes` supplies **analysis
+consent only**, enabling non-interactive reports:
+
+```bash
+omp plugin doctor --analyze plugin-a plugin-b --yes --json
+```
+
+`--apply` requests a separate interactive confirmation after the report; it is
+refused with `--json` or without a terminal. `--fix` cannot be combined with
+`--analyze`: existing deterministic repairs never authorize AI-driven choices.
+Confirmed extension exclusions take effect on discovery/loading, including
+explicit paths. Restart existing sessions to unload extensions, hooks, tools,
+or MCP servers they already loaded.
+
+Snapshots are bounded to 40 files, 40 KiB per file, and 80 KiB of file content
+per resource. The aggregate resource-data budget is 400 KiB for two to eight
+copies, checked before consent. Symlinks, credential files, dependencies, binary
+payloads, and uninspected code are reported as omissions. Known provider tokens,
+secret-named assignments, and URL passwords are redacted. Incomplete coverage
+forces a keep-all recommendation.
+
+Code checks are deliberately bounded:
+
+- Runtime JavaScript/TypeScript imports use the transpiler's scanner; type-only
+  imports are ignored. Absolute, `file:`, `#`, `~`, nonliteral, and uninspected
+  external-package imports make coverage incomplete.
+- Node/Bun builtins, the Pi/OMP host APIs, and the host's TypeBox schema API are
+  platform assumptions; their implementations are not inspected.
+- Python imports must be known standard-library modules or actual local module
+  paths. Shell external/dynamic sourcing and unsupported code languages are
+  reported as incomplete.
+- Checks do not execute code, resolve a full module graph, simulate search paths,
+  or inspect programs merely launched by scripts. Static checks can conservatively
+  reject valid code.
+
+These are source-content comparisons, not a sandbox, a provenance attestation,
+or proof of interchangeable runtime behavior or safety.
+
 
 ## Runtime usage behavior
 
