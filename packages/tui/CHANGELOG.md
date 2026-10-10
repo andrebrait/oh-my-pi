@@ -95,6 +95,10 @@
 - Native tool cards can open expanded regardless of the transcript’s expansion state; the todo checklist uses this behavior.
 - Tool cards can now show passive model context as one sanitized, dim line, in both the terminal and native transcripts, without exposing it as a separate transcript message ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
 - Tool cards can now show passive model context as one sanitized, dim line, in both the terminal and native transcripts, without exposing it as a separate transcript message; expanding tools shows the full text, and the native line shows it on hover ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+- `CollabStatus.role` accepts `"hosted"` for a terminal attached to a session host, with an optional `contextUsage` that replaces the footer's local context estimate; the status line's collab segment shows it as `⇄ hosted:N`
+- Added `clearAssistantMessageLinkTargets()` to invalidate cached assistant file-link targets after a host switch or relocation.
+- `CollabStatus.role` accepts `"hosted"` for a terminal attached to a session host, with an optional `contextUsage` that replaces the footer's local context estimate; the status line's collab segment shows it as `⇄ hosted:N` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait))
+- Added `clearAssistantMessageLinkTargets()` to invalidate cached assistant file-link targets after a host switch or relocation ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 

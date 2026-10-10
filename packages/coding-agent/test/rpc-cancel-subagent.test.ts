@@ -263,7 +263,6 @@ describe("handleRpcCancelSubagent", () => {
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),
 		} as CreateAgentSessionResult);
-		registry.setSubscriptionLevel("progress");
 		const modelFixture = createTaskModelFixture();
 		const agent: AgentDefinition = {
 			name: "task",
