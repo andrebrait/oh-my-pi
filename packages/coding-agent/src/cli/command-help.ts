@@ -6,6 +6,11 @@ export const acpHelp = {
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;
 
+export const anonymizeHelp = {
+	description:
+		"Write a shareable copy of a session and its subagents: turn contents redacted, metadata kept, paths and literals replaced by consistent mock tokens",
+} satisfies CommandMetadata;
+
 export const authBrokerHelp = {
 	description: "Manage the omp auth-broker (credential vault)",
 } satisfies CommandMetadata;
@@ -13,6 +18,11 @@ export const authBrokerHelp = {
 export const authGatewayHelp = {
 	description:
 		"Run an auth-gateway: an HTTP forward proxy backed by the configured broker, or JSON lines on stdio with your own credentials",
+} satisfies CommandMetadata;
+
+export const attachHelp = {
+	description:
+		"List running session hosts (omp --mode host), or attach to one by host id, session id, or session path",
 } satisfies CommandMetadata;
 
 export const benchHelp = {

@@ -28,7 +28,14 @@ import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
 import { node, span } from "../native/describe";
 import { thinkingLevelToken } from "../theme/theme-class";
 import type { StatusLineSession } from "./host";
-import type { RenderedSegment, SegmentContext, SegmentView, StatusLineSegment, StatusLineSegmentId } from "./types";
+import type {
+	CollabStatus,
+	RenderedSegment,
+	SegmentContext,
+	SegmentView,
+	StatusLineSegment,
+	StatusLineSegmentId,
+} from "./types";
 
 export type { SegmentContext } from "./types";
 
@@ -183,7 +190,9 @@ function getProjectDirDisplay(projectDir: string): ProjectDirDisplay {
 		}
 	}
 	if (!scratch) {
-		displayRoots ??= [path.join(homeDir, "Projects"), "/work"].map(normalizePathForComparison);
+		displayRoots ??= [path.join(homeDir, "Projects"), path.join(homeDir, "repos"), "/work"].map(
+			normalizePathForComparison,
+		);
 		for (const root of displayRoots) {
 			const relative = relativePathWithinNormalizedRoot(root, normalizedProjectDir);
 			if (relative) {
@@ -967,16 +976,19 @@ const sessionSegment: StatusLineSegment = {
 	},
 };
 
+/** Short (first-label) machine hostname; resolved once — `os.hostname()` is a syscall per call. */
+let shortHostname: string | undefined;
+
 const hostnameSegment: StatusLineSegment = {
 	id: "hostname",
 	render(ctx) {
-		const name = ctx.hostname ?? os.hostname().split(".")[0];
+		const name = ctx.hostname ?? (shortHostname ??= os.hostname().split(".")[0]);
 		const content = withIcon(theme.icon.host, name);
 		const ansi = sessionAccentAnsi(ctx);
 		return { content: ansi ? `${ansi}${content}\x1b[39m` : content, visible: true };
 	},
 	describe(ctx) {
-		const name = ctx.hostname ?? os.hostname().split(".")[0];
+		const name = ctx.hostname ?? (shortHostname ??= os.hostname().split(".")[0]);
 		return segView([span(name, sessionAccentAnsi(ctx) ? "accent" : undefined)], "host");
 	},
 };
@@ -1036,18 +1048,22 @@ const sessionNameSegment: StatusLineSegment = {
 	},
 };
 
+const COLLAB_ROLE_LABEL: Record<CollabStatus["role"], string> = {
+	host: "collab",
+	guest: "collab guest",
+	hosted: "hosted",
+};
+
 const collabSegment: StatusLineSegment = {
 	id: "collab",
 	render(ctx) {
 		if (!ctx.collab) return { content: "", visible: false };
-		const participants = `${ctx.collab.participantCount}`;
-		const label = ctx.collab.role === "host" ? `⇄ collab:${participants}` : `⇄ collab guest:${participants}`;
+		const label = `⇄ ${COLLAB_ROLE_LABEL[ctx.collab.role]}:${ctx.collab.participantCount}`;
 		return { content: accentFg(ctx, "accent", label), visible: true };
 	},
 	describe(ctx) {
 		if (!ctx.collab) return null;
-		const participants = `${ctx.collab.participantCount}`;
-		const label = ctx.collab.role === "host" ? `collab:${participants}` : `collab guest:${participants}`;
+		const label = `${COLLAB_ROLE_LABEL[ctx.collab.role]}:${ctx.collab.participantCount}`;
 		return segView([span(label, accentToken(ctx, "accent"))], "collab");
 	},
 };
@@ -1080,6 +1096,7 @@ const VIM_MODE_LABELS: Record<NonNullable<SegmentContext["vim"]>["mode"], string
 	normal: "NORMAL",
 	visual: "VISUAL",
 	"visual-line": "V-LINE",
+	replace: "REPLACE",
 };
 
 /**
@@ -1092,6 +1109,7 @@ const VIM_MODE_ICON_KEYS: Record<NonNullable<SegmentContext["vim"]>["mode"], Sym
 	normal: "icon.vimNormal",
 	visual: "icon.vimVisual",
 	"visual-line": "icon.vimVisualLine",
+	replace: "icon.vimReplace",
 };
 
 const VIM_MODE_COLORS: Record<NonNullable<SegmentContext["vim"]>["mode"], ThemeColor> = {
@@ -1099,6 +1117,7 @@ const VIM_MODE_COLORS: Record<NonNullable<SegmentContext["vim"]>["mode"], ThemeC
 	normal: "accent",
 	visual: "warning",
 	"visual-line": "warning",
+	replace: "accent",
 };
 
 const vimSegment: StatusLineSegment = {

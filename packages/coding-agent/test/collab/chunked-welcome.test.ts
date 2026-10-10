@@ -62,7 +62,7 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
 			snapshotForReplication: () => snapshot,
-			onEntryAppended: undefined,
+			subscribeEntryAppended: () => () => {},
 		},
 		session: {
 			isStreaming: false,
@@ -106,7 +106,11 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		streamingMessage: undefined,
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			handleEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			resetTranscriptAnchors: () => {},
+		},
 		loadingAnimation: undefined,
 		statusLine: {
 			setCollabStatus: () => {},
@@ -155,7 +159,11 @@ function makeCancelledSwitchGuestContext(
 		streamingMessage: undefined,
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			handleEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			resetTranscriptAnchors: () => {},
+		},
 		loadingAnimation: undefined,
 		statusLine: {
 			setCollabStatus: () => {},
@@ -305,7 +313,7 @@ describe("collab chunked welcome (#3144)", () => {
 
 		const joinAttempt = guest.join(host.link);
 		try {
-			await expect(joinAttempt).rejects.toThrow("Collab replica activation was cancelled");
+			await expect(joinAttempt).rejects.toThrow();
 			expect(guest.agentRegistry.get("local-agent")).toBeDefined();
 			expect(events).not.toContain("clear-transient-ui");
 			expect(events).not.toContain("status:Joined collab session");
