@@ -1242,6 +1242,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	#loopConditionAbort: AbortController | undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
+	#pendingLoopIterations = 0;
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
 	#todoAutoClearGeneration = 0;
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
@@ -1594,6 +1595,36 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #inputController: InputController;
 	readonly #selectorController: SelectorController;
 	readonly #focusController: SessionFocusController;
+	/** Sessions retain this small activity record, not the terminal and its transcript, after the view leaves. */
+	readonly #idleMaintenanceActivity: {
+		target: AgentSession | undefined;
+		ready: boolean;
+		isComposing: boolean;
+		scheduledTurn: ((target: AgentSession) => boolean) | undefined;
+	} = { target: undefined, ready: false, isComposing: false, scheduledTurn: undefined };
+
+	syncIdleMaintenanceView(target: AgentSession | null = this.viewSession): void {
+		if (this.hostedClientMode) return;
+		const activity = this.#idleMaintenanceActivity;
+		const previous = activity.target;
+		if (target === null) {
+			activity.target = undefined;
+			activity.ready = false;
+			activity.isComposing = false;
+			activity.scheduledTurn = undefined;
+			previous?.refreshIdleMaintenance();
+			return;
+		}
+		if (!activity.scheduledTurn) return;
+		activity.target = target;
+		activity.isComposing = this.editor.getText().trim() !== "";
+		target.enableIdleMaintenance({
+			isBlocked: () => !activity.ready || activity.target !== target || activity.isComposing,
+			scheduledTurn: () => activity.scheduledTurn?.(target) === true,
+		});
+		if (previous !== target) previous?.refreshIdleMaintenance();
+		target.refreshIdleMaintenance();
+	}
 	get viewSession(): AgentSession {
 		return this.#focusController.target ?? this.session;
 	}
@@ -2117,6 +2148,15 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
+		if (!this.hostedClientMode) {
+			this.#idleMaintenanceActivity.scheduledTurn = target =>
+				target === this.session &&
+				(this.#goalContinuationTimer !== undefined ||
+					this.#pendingGoalContinuationTurns > 0 ||
+					this.#loopAutoSubmitTimer !== undefined ||
+					this.#pendingLoopIterations > 0);
+			this.syncIdleMaintenanceView();
+		}
 
 		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
 		// Before first paint, so hints the user already learned never flash on.
@@ -2617,6 +2657,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// `streamingBehavior: "steer"`, so whichever lands second queues into the
 		// other's turn instead of dying.
 		this.editor.disableSubmit = false;
+		this.#idleMaintenanceActivity.ready = true;
+		this.syncIdleMaintenanceView();
 		// Publish native send readiness even when no user input triggers another frame.
 		this.ui.requestRender();
 	}
@@ -2914,8 +2956,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Brief delay so the user has a chance to press Esc between iterations.
 		this.#loopAutoSubmitTimer = setTimeout(() => {
 			this.#loopAutoSubmitTimer = undefined;
-			if (!this.loopModeEnabled || !this.onInputCallback) return;
-			callback();
+			try {
+				if (!this.loopModeEnabled || !this.onInputCallback) return;
+				callback();
+			} finally {
+				this.syncIdleMaintenanceView();
+			}
 		}, 800);
 	}
 
@@ -2923,6 +2969,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#loopAutoSubmitTimer) {
 			clearTimeout(this.#loopAutoSubmitTimer);
 			this.#loopAutoSubmitTimer = undefined;
+			this.syncIdleMaintenanceView();
 		}
 	}
 
@@ -2945,30 +2992,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!prompt) return;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
-			if (!this.onInputCallback) return;
-			if (!this.goalModeEnabled || this.goalModePaused) return;
-			// The 800ms timer can outlive the idle window that scheduled it: a
-			// `/goal set` taken via the streaming branch (or any extension/hook
-			// path that starts a turn while we wait) leaves the agent busy. Firing
-			// the continuation now would route through `submitInteractiveInput` →
-			// `promptCustomMessage` with no `streamingBehavior` and resurface
-			// `AgentBusyError`. Drop this tick; `#handleGoalSessionEvent` reschedules
-			// on the next `agent_end`.
-			if (this.#isAutoSubmitBlocked()) return;
-			if (this.#pendingSubmittedInput) return;
-			if (this.editor.getText().trim().length > 0) return;
-			if ((this.editor.pendingImages?.length ?? 0) > 0) return;
-			const latestState = this.session.getGoalModeState();
-			if (!latestState?.enabled || latestState.goal.status !== "active") return;
-			if (this.#goalOpenWorkAllBlocked()) return;
-			this.#pendingGoalContinuationTurns++;
-			this.onInputCallback(
-				this.startPendingSubmission({
-					text: prompt,
-					customType: "goal-continuation",
-					display: false,
-				}),
-			);
+			try {
+				if (!this.onInputCallback) return;
+				if (!this.goalModeEnabled || this.goalModePaused) return;
+				// The 800ms timer can outlive the idle window that scheduled it: a
+				// `/goal set` taken via the streaming branch (or any extension/hook
+				// path that starts a turn while we wait) leaves the agent busy. Firing
+				// the continuation now would route through `submitInteractiveInput` →
+				// `promptCustomMessage` with no `streamingBehavior` and resurface
+				// `AgentBusyError`. Drop this tick; `#handleGoalSessionEvent` reschedules
+				// on the next `agent_end`.
+				if (this.#isAutoSubmitBlocked()) return;
+				if (this.#pendingSubmittedInput) return;
+				if (this.editor.getText().trim().length > 0) return;
+				if ((this.editor.pendingImages?.length ?? 0) > 0) return;
+				const latestState = this.session.getGoalModeState();
+				if (!latestState?.enabled || latestState.goal.status !== "active") return;
+				if (this.#goalOpenWorkAllBlocked()) return;
+				this.#pendingGoalContinuationTurns++;
+				this.onInputCallback(
+					this.startPendingSubmission({
+						text: prompt,
+						customType: "goal-continuation",
+						display: false,
+					}),
+				);
+			} finally {
+				this.syncIdleMaintenanceView();
+			}
 		}, 800);
 	}
 
@@ -2988,6 +3039,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#goalContinuationTimer) {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
+			this.syncIdleMaintenanceView();
 		}
 	}
 
@@ -3022,63 +3074,69 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (this.#isAutoSubmitBlocked()) {
-			this.#deferLoopAutoSubmit(() => {
-				void this.#runLoopIteration(action, prompt);
-			});
-			return;
-		}
+		this.#pendingLoopIterations++;
+		try {
+			if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+			if (this.#isAutoSubmitBlocked()) {
+				this.#deferLoopAutoSubmit(() => {
+					void this.#runLoopIteration(action, prompt);
+				});
+				return;
+			}
 
-		if (action === "reset" && (this.vibeModeEnabled || this.#vibeModeEntry !== undefined)) {
-			this.disableLoopMode("Exit vibe mode before using reset loops. Loop mode disabled.");
-			return;
-		}
+			if (action === "reset" && (this.vibeModeEnabled || this.#vibeModeEntry !== undefined)) {
+				this.disableLoopMode("Exit vibe mode before using reset loops. Loop mode disabled.");
+				return;
+			}
 
-		// An exhausted budget ends the loop regardless of the condition, so check
-		// it first: the user's command must not run one last time for nothing.
-		if (isLoopLimitExhausted(this.loopLimit)) {
-			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
-			return;
-		}
+			// An exhausted budget ends the loop regardless of the condition, so check
+			// it first: the user's command must not run one last time for nothing.
+			if (isLoopLimitExhausted(this.loopLimit)) {
+				this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+				return;
+			}
 
-		// The gate sits before the budget consume so a halt never burns an
-		// iteration that did not run, and after the blocked-check/defer above so
-		// a streaming turn cannot re-run the command on every retry tick.
-		if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
+			// The gate sits before the budget consume so a halt never burns an
+			// iteration that did not run, and after the blocked-check/defer above so
+			// a streaming turn cannot re-run the command on every retry tick.
+			if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
 
-		// The gate awaited a child process: a turn may have started meanwhile
-		// (async job, idle flush), so re-check before spending budget or
-		// compacting/resetting into the now-busy session.
-		if (this.#isAutoSubmitBlocked()) {
-			this.#deferLoopAutoSubmit(() => {
-				void this.#runLoopIteration(action, prompt);
-			});
-			return;
-		}
+			// The gate awaited a child process: a turn may have started meanwhile
+			// (async job, idle flush), so re-check before spending budget or
+			// compacting/resetting into the now-busy session.
+			if (this.#isAutoSubmitBlocked()) {
+				this.#deferLoopAutoSubmit(() => {
+					void this.#runLoopIteration(action, prompt);
+				});
+				return;
+			}
 
-		// /vibe can be enabled while the gate was awaiting: the pre-gate guard
-		// above is stale, and handleClearCommand would only warn and then let
-		// the iteration submit without resetting. Check the entering transition
-		// too: vibeModeEnabled is still false while activateVibeTools is in
-		// flight, but the reset must not run concurrently with the toolset switch.
-		if (action === "reset" && (this.vibeModeEnabled || this.#vibeModeEntry !== undefined)) {
-			this.disableLoopMode("Exit vibe mode before using reset loops. Loop mode disabled.");
-			return;
-		}
+			// /vibe can be enabled while the gate was awaiting: the pre-gate guard
+			// above is stale, and handleClearCommand would only warn and then let
+			// the iteration submit without resetting. Check the entering transition
+			// too: vibeModeEnabled is still false while activateVibeTools is in
+			// flight, but the reset must not run concurrently with the toolset switch.
+			if (action === "reset" && (this.vibeModeEnabled || this.#vibeModeEntry !== undefined)) {
+				this.disableLoopMode("Exit vibe mode before using reset loops. Loop mode disabled.");
+				return;
+			}
 
-		if (!consumeLoopLimitIteration(this.loopLimit)) {
-			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
-			return;
-		}
-		this.#syncLoopModeStatus();
+			if (!consumeLoopLimitIteration(this.loopLimit)) {
+				this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+				return;
+			}
+			this.#syncLoopModeStatus();
 
-		if (action === "compact") {
-			await this.handleCompactCommand();
-		} else if (action === "reset") {
-			await this.handleClearCommand();
+			if (action === "compact") {
+				await this.handleCompactCommand();
+			} else if (action === "reset") {
+				await this.handleClearCommand();
+			}
+			this.#submitLoopPromptWhenReady(prompt);
+		} finally {
+			this.#pendingLoopIterations--;
+			this.syncIdleMaintenanceView();
 		}
-		this.#submitLoopPromptWhenReady(prompt);
 	}
 
 	/**
@@ -3361,6 +3419,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		if (submission.customType !== "goal-continuation") {
 			this.#pendingGoalContinuationTurns = 0;
+			this.syncIdleMaintenanceView();
 		}
 		this.#pendingSubmittedInput = submission;
 		this.#pendingSubmissionPreservesDraft = options?.preserveDraft === true;
@@ -3411,6 +3470,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingWorkingMessage = undefined;
 		if (submission.customType === "goal-continuation") {
 			this.#pendingGoalContinuationTurns = Math.max(0, this.#pendingGoalContinuationTurns - 1);
+			this.syncIdleMaintenanceView();
 		}
 		if (this.loadingAnimation) {
 			this.#stopLoadingAnimation(true);
@@ -3569,10 +3629,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#renderSubagentList();
 			this.ui.requestRender();
 		}
-		if (any("compaction.idleEnabled", "compaction.idleThresholdTokens", "compaction.idleTimeoutSeconds")) {
-			this.#eventController.refreshIdleCompactionTimer();
-		}
-		if (any("recap.enabled", "recap.idleSeconds")) this.#eventController.refreshIdleRecapTimer();
 		if (any("compaction.enabled", "compaction.methodOrder")) {
 			this.statusLine.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 			this.ui.requestRender();
@@ -4759,6 +4815,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#scheduleGoalContinuation();
+		this.syncIdleMaintenanceView();
 	}
 
 	async #applyPlanModeModel(): Promise<void> {
@@ -4902,6 +4959,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#previousGoalContinuationActivity = undefined;
 			this.#goalSuppressNextContinuation = false;
 			this.#cancelGoalContinuation();
+			this.syncIdleMaintenanceView();
 			this.#updateGoalModeStatus();
 		}
 
@@ -5318,6 +5376,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#previousGoalContinuationActivity = undefined;
 		this.#goalSuppressNextContinuation = false;
 		this.#cancelGoalContinuation();
+		this.syncIdleMaintenanceView();
 		this.#updateGoalModeStatus();
 		if (!options?.silent) {
 			if (options?.reason === "completed") {
@@ -6862,6 +6921,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		this.syncIdleMaintenanceView(null);
 		this.#appearanceRefreshRequest = undefined;
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;

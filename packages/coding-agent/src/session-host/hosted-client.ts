@@ -35,7 +35,7 @@ import { clearAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/intera
 import { logger, toError } from "@oh-my-pi/pi-utils";
 import type { ExtensionUISelectItem } from "../extensibility/extensions/types";
 import { ensurePrivateDir, pidAlive } from "../ipc/private-endpoint";
-import { RpcClient } from "../modes/rpc/rpc-client";
+import { RpcClient, RpcCommandError } from "../modes/rpc/rpc-client";
 import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -175,6 +175,7 @@ export class HostedClientLink {
 	#failure: Error | undefined;
 	/** Session epoch of the view the user sees; sent as `ifEpoch` on writes. */
 	#epoch = 0;
+	#idleActivity: { epoch: number; isComposing: boolean; pending: Promise<void> } | undefined;
 	#isStreaming = false;
 	#isCompacting = false;
 	#queued: { steering: readonly string[]; followUp: readonly string[] } = { steering: [], followUp: [] };
@@ -284,6 +285,28 @@ export class HostedClientLink {
 	 */
 	async promptToCompletion(text: string, images?: ImageContent[]): Promise<void> {
 		await this.#client.promptToCompletion(text, { images, streamingBehavior: "steer", preconditions: this.#guard() });
+	}
+
+	/** Coalesce same-tick preferences; RPC already serializes writes, so a new draft never waits for an older ack. */
+	setIdleActivity(isComposing: boolean): Promise<void> {
+		const epoch = this.#epoch;
+		if (this.#idleActivity?.epoch === epoch && this.#idleActivity.isComposing === isComposing) {
+			return this.#idleActivity.pending;
+		}
+		const pending = Promise.resolve()
+			.then(async () => {
+				if (!this.#open || this.#lost || this.#epoch !== epoch || this.#idleActivity !== report) return;
+				await this.#client.setIdleActivity(isComposing, { ifEpoch: epoch });
+			})
+			.catch(error => {
+				if (this.#idleActivity === report) this.#idleActivity = undefined;
+				// A queued replacement owns the next report; this obsolete preference must not close its view.
+				if (error instanceof RpcCommandError && error.code === "stale") return;
+				throw error;
+			});
+		const report = { epoch, isComposing, pending };
+		this.#idleActivity = report;
+		return pending;
 	}
 
 	/** Abort the host's current run. Never guarded: an abort must reach the session the host runs now. */
@@ -608,6 +631,7 @@ export class HostedClientLink {
 		for (const request of snapshot.uiState ?? []) this.#applyUiRequest(request, uiGeneration);
 		// Only the dialogs still wanted: one the host withdrew while this snapshot was applying is no longer awaited.
 		for (const request of snapshot.pendingUi) this.#applyUiRequest(request, uiGeneration);
+		await this.setIdleActivity(ctx.editor.getText().trim() !== "");
 	}
 
 	/**

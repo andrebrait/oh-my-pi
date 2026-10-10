@@ -64,12 +64,8 @@ import {
 } from "./rpc-mode";
 import { RpcExtensionUserMessageTracker, type RpcPromptTicket, watchAndReportPromptResult } from "./rpc-prompt-results";
 import { RpcMessageIdStamper } from "./rpc-session-events";
-import {
-	isRpcSessionSettled,
-	type RpcScheduledTurnProbe,
-	RpcSessionSettleWatcher,
-	watchedScheduledTurnProbe,
-} from "./rpc-session-settle";
+import { isSessionSettled } from "../../session/session-settle";
+import { type RpcScheduledTurnProbe, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, subagentFrameVisible } from "./rpc-subagents";
 import type {
 	RpcAttachedFrame,
@@ -110,6 +106,8 @@ interface RpcRingSlot {
 const toSequenced = (conn: RpcConnection, frame: object): void => {
 	if (conn.options.sequenced) conn.send(frame);
 };
+/** Clients whose unsent draft the host must not interrupt: sequenced (socket) clients that render UI. */
+const tracksIdleActivity = (conn: RpcConnection): boolean => conn.options.sequenced && conn.options.ui;
 /** Extension UI frames: only clients that render UI. */
 const toUi = (conn: RpcConnection, frame: object): void => {
 	if (conn.options.ui) conn.send(frame);
@@ -211,7 +209,7 @@ function buildRpcSessionState(session: AgentSession, scheduledTurn: RpcScheduled
 		autoCompactionEnabled: session.autoCompactionEnabled,
 		queuedMessageCount: session.queuedMessageCount,
 		hasPendingAsyncWork: session.hasPendingAsyncWork(),
-		isSettled: isRpcSessionSettled(session, scheduledTurn),
+		isSettled: isSessionSettled(session, scheduledTurn),
 		queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 		todoPhases: session.getTodoPhases(),
 		fastModeEnabled: session.isFastModeEnabled(),
@@ -644,6 +642,12 @@ export class RpcServer {
 	 */
 	onSwitchSettled?: () => void;
 	/**
+	 * Host hook: an input of {@link isIdleActivityBlocked} may have changed (a UI client connected or left, a client
+	 * reported its draft, the session was replaced), or the session settled after a scheduled turn went away. Runs
+	 * after the state it reports is in place; carries no data, so read the getters. Never throws into the server.
+	 */
+	onIdleActivityChanged?: () => void;
+	/**
 	 * Host hook: the session was relocated (`/move`, `/wt`): same id, new file and/or cwd, no epoch change. Runs after
 	 * sequenced clients were told. Not called for a refused move.
 	 */
@@ -679,7 +683,11 @@ export class RpcServer {
 		);
 		this.#settleWatcher = new RpcSessionSettleWatcher(
 			session,
-			frame => this.#broadcast(frame),
+			frame => {
+				this.#broadcast(frame);
+				// A scheduled goal turn that never started is closed by this frame: pending idle work may resume.
+				this.#notifyIdleActivityChanged();
+			},
 			this.#goalTurnScheduled,
 		);
 		this.#subagentRegistry = options.subagentEventBus
@@ -761,6 +769,33 @@ export class RpcServer {
 	/** Bumped on every session replacement; `ifEpoch` is checked against it. */
 	get epoch(): number {
 		return this.#epoch;
+	}
+
+	/**
+	 * True while a connected sequenced UI client may be mid-draft: it is composing, or has not reported for the
+	 * current session epoch (a report belongs to the epoch it was made in). Stdio and non-UI clients never block,
+	 * and no connection at all is not blocked.
+	 */
+	get isIdleActivityBlocked(): boolean {
+		for (const conn of this.#connections) {
+			if (!tracksIdleActivity(conn)) continue;
+			const report = conn.idleActivity;
+			if (!report || report.epoch !== this.#epoch || report.isComposing) return true;
+		}
+		return false;
+	}
+
+	/** A host-scheduled goal turn has been decided but not yet admitted: the session is about to run again. */
+	get hasScheduledTurn(): boolean {
+		return this.#goalTurnScheduled();
+	}
+
+	#notifyIdleActivityChanged(): void {
+		try {
+			this.onIdleActivityChanged?.();
+		} catch (error) {
+			logger.warn("RPC idle activity hook failed", { error: String(error) });
+		}
 	}
 
 	/** Monotonic; incremented for every broadcast frame. */
@@ -861,6 +896,7 @@ export class RpcServer {
 		// A UI client that has not opted into the ask dialog withdraws it from the shared context.
 		this.#uiContext.askDialogEnabled = this.#allUiConnectionsAskEnabled();
 		this.#serve(conn);
+		if (tracksIdleActivity(conn)) this.#notifyIdleActivityChanged();
 		return conn;
 	}
 
@@ -896,6 +932,7 @@ export class RpcServer {
 			this.#dispatchers.delete(conn);
 			this.#uiContext.askDialogEnabled = this.#allUiConnectionsAskEnabled();
 			this.#syncSubagentEventFeed();
+			if (tracksIdleActivity(conn)) this.#notifyIdleActivityChanged();
 			logger.debug("RPC client disconnected", { clientId: conn.options.clientId, reason });
 			// Before the drain: a dropped client's login prompt must not hold the shared command queue.
 			conn.drop();
@@ -1082,7 +1119,9 @@ export class RpcServer {
 			parsed => {
 				// While startup runs, a connection may answer a dialog `session_start` awaits and set its own dialog
 				// preference (a hosted client sends it while attaching); everything else waits.
-				const now = isRpcExtensionUIResponse(parsed) || (isRecord(parsed) && parsed.type === "set_ask_dialog");
+				const now =
+					isRpcExtensionUIResponse(parsed) ||
+					(isRecord(parsed) && (parsed.type === "set_ask_dialog" || parsed.type === "set_idle_activity"));
 				if (this.#deferred && !now) this.#deferred.push(() => receive(parsed));
 				else receive(parsed);
 			},
@@ -1128,6 +1167,7 @@ export class RpcServer {
 				toSequenced,
 			);
 			this.onEpochChanged?.(epoch, sessionFile);
+			this.#notifyIdleActivityChanged();
 		} catch (error) {
 			logger.warn("RPC session replacement broadcast failed", { reason, error: String(error) });
 		}
@@ -1773,6 +1813,24 @@ export class RpcServer {
 				conn.askDialogEnabled = command.enabled === true;
 				this.#uiContext.askDialogEnabled = this.#allUiConnectionsAskEnabled();
 				return rpcSuccess(id, "set_ask_dialog", { enabled: conn.askDialogEnabled });
+			}
+
+			case "set_idle_activity": {
+				// Socket clients only: stdio has no scheduler to report to and nothing to block.
+				if (!conn.options.sequenced) {
+					return rpcError(id, "set_idle_activity", "set_idle_activity needs a session-host connection");
+				}
+				if (typeof command.isComposing !== "boolean") {
+					return rpcError(id, "set_idle_activity", "isComposing must be a boolean");
+				}
+				// An unchanged report is only acknowledged: notifying would restart every idle deadline, so a client
+				// that repeats itself more often than the delay would postpone idle work forever.
+				const known = conn.idleActivity;
+				if (known?.epoch !== this.#epoch || known.isComposing !== command.isComposing) {
+					conn.idleActivity = { epoch: this.#epoch, isComposing: command.isComposing };
+					this.#notifyIdleActivityChanged();
+				}
+				return rpcSuccess(id, "set_idle_activity", { isComposing: command.isComposing });
 			}
 
 			case "get_available_commands": {

@@ -33,7 +33,7 @@ Behavior notes:
 - RPC/ACP pin neutral defaults for settings declaring the corresponding `protocolDefault`, including task isolation/execution, memory, advisor, and advisor tier settings. RPC additionally pins async-job and bash/eval auto-background defaults. Explicit project/global config, `--config`, and isolated settings remain authoritative; on-disk config changes are watched in long-lived CLI RPC processes. Todo settings are not host-defaulted.
 - The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
 - At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
-- Extension startup (`session_start`) runs after `ready`. While it runs, only `extension_ui_response` (an extension may be waiting on a dialog) and `set_ask_dialog` are handled; every other frame is read and waits, in order, until startup finishes.
+- Extension startup (`session_start`) runs after `ready`. While it runs, `extension_ui_response` (an extension may be waiting on a dialog), `set_ask_dialog`, and socket `set_idle_activity` reports are handled; other frames wait, in order, until startup finishes.
 - When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, pending stdout is delivered, and normal shutdown exits with code `0`. A session-persistence failure still latched at disposal exits with code `1` after delivering its `notice` frame.
 - Responses/events are written as one JSON object per line.
 
@@ -152,6 +152,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_slow_mode", enabled: boolean }`
 - `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
 - `{ id?, type: "set_ask_dialog", enabled: boolean }`
+- `{ id?, type: "set_idle_activity", isComposing: boolean, ifEpoch?: number }` (socket connections only; see [Idle maintenance](#idle-maintenance))
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_skill_diagnostics" }`
 - `{ id?, type: "set_skill_startup_diagnostics", enabled: boolean }`
@@ -324,6 +325,8 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 ### `prompt` payload
 
 `prompt` is acknowledged once the message is admitted — an idle turn has started for it, it has been pushed onto the steer/follow-up/aside queue while the agent is busy, or it has been routed to a registered extension command (before that command's handler runs) — not after a model turn finishes. Admission runs any image normalization first (and, for a text-only model with vision description enabled, the vision-description call), so those complete before the acknowledgement. The vision-description call is capped at 20 seconds, which keeps the acknowledgement inside the bundled clients' 30-second request timeout; past the cap the image is still saved and the model is told its description is unavailable. The same applies to a `/skill:` invocation sent through `prompt`. A prompt that settles without ever being admitted (dropped by an `abort`, or failing first) is acknowledged once it settles. Gating the acknowledgement does not change completion: the prompt still completes exactly once, through `data.agentInvoked: false` or its `prompt_result` (below).
+
+When idle compaction is rewriting the session history, prompt setup waits for that pass to finish before admission. Text and images remain with the pending request; later control and read commands can still be handled while it waits.
 
 `prompt` starts after previously received ordinary commands, such as `new_session` or `set_model`, have completed. Its admission then runs in the background: the RPC server keeps handling later commands — `abort`, `steer`, `follow_up`, `get_state`, and so on — without waiting for slow image normalization or vision description. An `abort` that lands while a prompt's images are still being prepared cancels the vision-description call and drops the prompt, whether it would have started an idle turn or been queued with `streamingBehavior`.
 
@@ -862,6 +865,7 @@ Common event types:
 - `todo_reminder`, `todo_auto_clear`
 - `irc_message`, `notice`, `goal_updated`
 - `queue_update`
+- `idle_recap` (the full reply of a recap generated while the session sat idle; see [Idle maintenance](#idle-maintenance))
 
 ### `queue_update` event
 
@@ -1804,6 +1808,24 @@ omp --mode host --host-id <16 lowercase hex digits> [regular CLI options]
 - Extension UI is routed over the protocol to clients that declare `capabilities.ui`, as in `rpc-ui`. PTY use is disabled as in `rpc-ui`; title generation is disabled as in all RPC modes.
 - `SIGHUP` is ignored, so closing the launching terminal does not end the host. `SIGTERM` and `SIGINT` dispose the session, remove the registry entry and socket, and exit.
 
+### Idle maintenance
+
+The host owns idle recap and idle compaction once per session, independently of attached terminals. After a turn fully settles, it uses the session's existing `recap.*` and `compaction.idle*` settings. It can work with zero clients; stdio RPC, ACP, print mode, passive replicas and unfocused subagents do not opt in automatically.
+
+UI clients report whether their editor contains non-whitespace text:
+
+```json
+{ "id": "activity-1", "type": "set_idle_activity", "isComposing": true, "ifEpoch": 1790000000000 }
+```
+
+Success returns `data: { "isComposing": true }`. Only a boolean is accepted; stdio rejects this command. No draft text is transmitted or stored. The command is answered at once, even while another command such as `compact` or a `new_session` held by a `session_before_switch` hook is running; reports from one connection still apply in the order they were sent, and repeating a report that changes nothing is only acknowledged (it does not restart idle deadlines). Use `ifEpoch` from the current view: the existing stale-epoch response rejects an obsolete report without changing activity. Attached TUIs discard that obsolete preference and report again for the superseding snapshot; genuine prompt rejections remain visible. Like every generated SDK command, the Python/Go/Rust `set_idle_activity` methods carry no preconditions, so they report for the epoch current when the host receives them.
+
+Any connected UI client that is composing, or has not reported for the current epoch, blocks both maintenance tasks. Report after attaching and after each epoch change, and whenever composing changes. A clear report from another client cannot clear its blocker. Disconnect removes that client's blocker; non-UI clients never block. Reports are accepted during extension startup, but maintenance waits for startup to finish.
+
+A successful nonblank recap is written once to the existing history database before the session emits `{ "type": "idle_recap", "recap": "<full reply>" }`. The reply is de-duplicated and capped like any side-channel reply. Every subscribed client receives the same result, subject to `set_event_filter`; the recap does not enter model context or the session transcript. Attached TUIs render a one-line preview. New activity, session replacement/reload, or disposal cancels stale work. Clearing a draft or returning to a view re-arms the recap and idle compaction that stretch still owes.
+
+The ordinary in-process TUI uses the same session-owned scheduler, with its focused view and editor draft as blockers. SDK owners can opt in with `session.enableIdleMaintenance({ isBlocked?, scheduledTurn? })` and call `refreshIdleMaintenance()` when their probes change. Repeated activation keeps the first owner's probes; session disposal owns cleanup.
+
 ### Registry
 
 Each live host publishes `<config root>/run/session-hosts/<hostId>.json`, where the config root is `~/.omp` by default (profile-independent). The directory is mode `0700` and entries are written atomically with mode `0600`. The entry is written after the host owns its session file and is listening, before extension startup, so a client can attach and answer a dialog `session_start` awaits (other commands wait for startup, as on stdio). It is rewritten when its fields change, including `cwd` and `sessionFile` as soon as `/move` or `/wt` relocates the session. A host that cannot bind its endpoint, because a live host already uses that id, fails without removing that host's socket or entry; a host whose extension startup fails withdraws its entry. Fields:
@@ -2068,7 +2090,7 @@ Current helper characteristics:
 - `detach()` and `exit()` send the session-host commands of those names, then stop the client. `RpcCommandError` carries `code`, plus `epoch` and `leafId` (`stale`) and `hostId` (`session_hosted`) when the host returns them. A host connection comes from `connectSessionHost` (`src/session-host/client.ts`), which fits the custom `spawn` transport; see [Session hosts](#session-hosts).
 - `onHostFrame()` delivers the session-host frames (`attached`, `resumed`, `entry`, `session_replaced`, `clients_changed`, `command_output`, `config_update`, `session_info_update`) as the `RpcHostFrame` union, in arrival order, with any `seq` and an `entry` frame's `leafId` kept. They reach no other listener, so register before `start()` to see `attached`. A frame that lacks a field the client reads is not delivered.
 - `onClose()` reports a transport that ended without `stop()`, `detach()`, or `exit()`: stdout EOF or a failed reader, such as a socket the host closed or that broke. It runs once per close, after the client has stopped and its pending requests have rejected with the same error. It runs only for a transport that finished `start()`. A `start()` that fails, including a transport lost during protocol negotiation or custom-tool registration, rejects `start()` and calls no `onClose` listener, so a caller tells a failed start from a later loss by which of the two reports it. Listeners stay registered across restarts. A closed socket says nothing about whether the host process is alive: check the registry entry's `pid` before telling the user the host is gone.
-- `prompt(message, images?, streamingBehavior?, preconditions?)`, `steer(message, images?, preconditions?)`, `followUp(message, images?, preconditions?)`, `removeQueuedMessage(message, queue, preconditions?, options?)`, `setModel(provider, modelId, preconditions?)`, `cycleModel(preconditions?)`, `setThinkingLevel(level, preconditions?)`, and `cycleThinkingLevel(preconditions?)` take an optional `{ ifEpoch, ifLeaf }`. Only those two fields reach the command, even when the object passed has more keys. A stale one rejects with `RpcCommandError` (`code: "stale"`); stdio hosts ignore them. `abort()` takes none and is never rejected.
+- `prompt(message, images?, streamingBehavior?, preconditions?)`, `steer(message, images?, preconditions?)`, `followUp(message, images?, preconditions?)`, `removeQueuedMessage(message, queue, preconditions?, options?)`, `setModel(provider, modelId, preconditions?)`, `cycleModel(preconditions?)`, `setThinkingLevel(level, preconditions?)`, `cycleThinkingLevel(preconditions?)`, and `setIdleActivity(isComposing, preconditions?)` take an optional `{ ifEpoch, ifLeaf }`. Only those two fields reach the command, even when the object passed has more keys. A stale one rejects with `RpcCommandError` (`code: "stale"`); stdio hosts ignore them. `abort()` takes none and is never rejected.
 - `getAvailableModels(): Promise<Model[]>` returns complete `Model` records, as `set_model` does. It replaces the reduced `ModelInfo` projection, which is no longer exported.
 - `onExtensionUiRequest(listener)` delivers each `extension_ui_request` frame the host sends. A host sends them only to a client whose hello declared `capabilities.ui`. Answer a dialog with `sendExtensionUiResponse(response)` (it throws when the client is not started); a `cancel` request withdraws a dialog and expects no reply. `setAskDialog(true)` opts in to the `ask` dialog, which every UI client of a host must do before the host sends one `ask` request instead of a `select` per question.
 

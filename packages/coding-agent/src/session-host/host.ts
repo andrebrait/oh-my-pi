@@ -215,6 +215,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	/** A no-op until the host is published and registers {@link withdraw}. */
 	let unregisterWithdraw = (): void => {};
 	let unregisterTeardown = (): void => {};
+	let initialized = false;
 
 	// Initialized only once the host is reachable (below): an extension's `session_start` may await a dialog that
 	// only an attached client can answer.
@@ -223,6 +224,11 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		hostId,
 		// `pi.shutdown()`: the server already disposed the session and wrote every owed response.
 		onShutdown: async () => lifetime.resolve(stop()),
+	});
+	server.onIdleActivityChanged = () => session.refreshIdleMaintenance();
+	session.enableIdleMaintenance({
+		isBlocked: () => !initialized || stopping !== undefined || server.isIdleActivityBlocked,
+		scheduledTurn: () => server.hasScheduledTurn,
 	});
 	server.onBeforeSwitch = async target => {
 		if (target === owned?.file) return undefined;
@@ -278,6 +284,8 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 
 	/** Last-client `exit` or `pi.shutdown()`: withdraw the host, then hand off to `onExit`. */
 	const stop = (): Promise<never> => {
+		initialized = false;
+		session.refreshIdleMaintenance();
 		stopping ??= (async () => {
 			unsubscribeEvents();
 			unsubscribeEntries();
@@ -424,6 +432,8 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		);
 		logger.debug("Session host listening", { hostId, endpoint, sessionFile: session.sessionFile });
 		await server.init();
+		initialized = true;
+		session.refreshIdleMaintenance();
 	} catch (error) {
 		published = false;
 		unregisterWithdraw();
