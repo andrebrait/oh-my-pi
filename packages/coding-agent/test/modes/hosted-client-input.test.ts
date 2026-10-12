@@ -11,6 +11,7 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -20,7 +21,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
@@ -945,7 +945,7 @@ class FrameLines {
  * host accepts, and can delay what the host answers.
  */
 async function tapHost(entry: SessionHostEntry): Promise<Tap> {
-	const endpoint = await privateEndpoint(fixture.dir, `tap-${newHostId()}`, { prefix: "tap", label: "test" });
+	const endpoint = ipcEndpoint(fixture.dir, `tap-${newHostId()}`);
 	const sent: Buffer[] = [];
 	const held: (() => void)[] = [];
 	const sockets = new Set<net.Socket>();
