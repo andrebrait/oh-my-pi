@@ -1616,7 +1616,7 @@ Each live host publishes `<config root>/run/session-hosts/<hostId>.json`, where 
 | `version` | Registry schema version (`1`) |
 | `hostId` | The 16-hex host id |
 | `pid` | Host process id |
-| `endpoint` | Unix socket path (`<hostId>.sock` next to the entry, or in a short owner-private directory when that path would be too long) or `\\.\pipe\omp-host-<hostId>` |
+| `endpoint` | Unix socket path (`<hostId>.sock` next to the entry, or `/tmp/omp-<euid>/<hash>.sock` when that path would overflow `sun_path`) or a `\\.\pipe\omp-<hostId>-<hash>` named pipe |
 | `token` | Random 256-bit hex bearer token, new on every start |
 | `cwd` | Session working directory |
 | `sessionFile` | Session file, absent for an in-memory session |

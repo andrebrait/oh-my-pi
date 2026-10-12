@@ -7,21 +7,19 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { getBaseConfigRoot, isEnoent, isRecord } from "@oh-my-pi/pi-utils";
 import {
 	assertPrivateDir,
-	DEFAULT_SOCKET_FALLBACK_BASE,
+	endpointFiles,
 	ensurePrivateDir,
 	pidAlive,
 	probeEndpoint,
-	socketFallbackDir,
 	writePrivateJson,
 } from "../ipc/private-endpoint";
 
 export const SESSION_HOST_REGISTRY_VERSION = 1;
 export const SESSION_HOST_REGISTRY_LABEL = "session host registry";
-/** `privateEndpoint` prefix: `omp-host-<id>` pipes, `omp-host-…` relocated socket dirs. */
-export const SESSION_HOST_ENDPOINT_PREFIX = "host";
 /** Per-entry liveness probe deadline during listing. */
 const PROBE_TIMEOUT_MS = 1_500;
 /** `<hostId>.json`. Nothing else in the directory is parsed or pruned: it may not be ours. */
@@ -79,19 +77,17 @@ function parseEntry(name: string, raw: Record<string, unknown>): SessionHostEntr
 
 /**
  * Remove a dead entry. `endpoint` is unlinked only when it is exactly the
- * socket a host with this entry's id binds here or in the relocated socket
- * directory: entries are untrusted input, and a crafted endpoint must not
+ * socket a host with this entry's id binds (here or in the natively relocated
+ * directory): entries are untrusted input, and a crafted endpoint must not
  * turn a listing into a deletion tool.
  */
 async function pruneEntry(dir: string, name: string, endpoint?: unknown): Promise<void> {
 	try {
 		await fs.promises.rm(path.join(dir, name), { force: true });
 		if (process.platform === "win32" || typeof endpoint !== "string") return;
-		const socketName = `${name.slice(0, -".json".length)}.sock`;
-		const fallbackDir = socketFallbackDir(dir, DEFAULT_SOCKET_FALLBACK_BASE, SESSION_HOST_ENDPOINT_PREFIX);
 		const target = path.resolve(endpoint);
-		if (target === path.resolve(dir, socketName) || target === path.resolve(fallbackDir, socketName))
-			await fs.promises.rm(target, { force: true });
+		if (target === path.resolve(ipcEndpoint(dir, name.slice(0, -".json".length))))
+			for (const file of endpointFiles(target)) await fs.promises.rm(file, { force: true });
 	} catch {
 		// Best-effort: a concurrent lister may have pruned it first.
 	}

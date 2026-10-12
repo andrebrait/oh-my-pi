@@ -1,12 +1,12 @@
 /**
- * Owner-private local IPC endpoint helpers shared by the Collab registry and
- * the session host registry: private directories, socket path resolution,
- * win32 pipe naming, atomic 0600 JSON writes, token comparison, liveness probes.
+ * Owner-private local IPC helpers shared by the Collab registry and the
+ * session host registry: private directories, endpoint files, atomic 0600 JSON
+ * writes, token comparison, liveness probes. Endpoint paths come from the
+ * native `ipcEndpoint`.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as net from "node:net";
-import * as path from "node:path";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { hasFsCode } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 
@@ -78,46 +78,6 @@ export function removeFilesSync(files: string[]): void {
 	}
 }
 
-/** `sun_path` capacity: 104 bytes on macOS, 108 elsewhere; the kernel rejects paths at or past it. */
-const SUN_PATH_LIMIT = process.platform === "darwin" ? 104 : 108;
-export const DEFAULT_SOCKET_FALLBACK_BASE = "/tmp";
-
-/**
- * Short owner-private socket directory for registries whose canonical path
- * would overflow `sun_path`: the relocation the SSH control sockets use
- * (#9070), keyed by uid and the canonical registry directory.
- */
-export function socketFallbackDir(dir: string, base: string, prefix: string): string {
-	const key = new Bun.CryptoHasher("sha256")
-		.update(String(process.getuid?.() ?? 0))
-		.update("\0")
-		.update(dir)
-		.digest("hex")
-		.slice(0, 20);
-	return path.join(base, `omp-${prefix}-${key}`);
-}
-
-/**
- * POSIX socket path for `entryId` under `dir`, or the win32 pipe name. The
- * canonical location is next to the metadata, but a deep config root (long
- * home directory, nested `PI_CONFIG_DIR`) can push that past `sun_path`, and a
- * host that cannot bind would silently stay absent from listings. The path is
- * then relocated to a short owner-private directory. Listers never guess the
- * relocated path; the metadata records the endpoint.
- */
-export async function privateEndpoint(
-	dir: string,
-	entryId: string,
-	options: { prefix: string; fallbackBase?: string; label: string },
-): Promise<string> {
-	if (process.platform === "win32") return `\\\\.\\pipe\\omp-${options.prefix}-${entryId}`;
-	const canonical = path.join(dir, `${entryId}.sock`);
-	if (Buffer.byteLength(canonical) < SUN_PATH_LIMIT) return canonical;
-	const shortDir = socketFallbackDir(dir, options.fallbackBase ?? DEFAULT_SOCKET_FALLBACK_BASE, options.prefix);
-	await ensurePrivateDir(shortDir, options.label);
-	return path.join(shortDir, `${entryId}.sock`);
-}
-
 /**
  * Exclusive-create `${target}.<rand>.tmp` with mode 0600, write, rename over
  * `target`, so a concurrent list never observes a partial file (it would
@@ -176,22 +136,14 @@ async function renameOverReaders(source: string, target: string): Promise<void> 
 /**
  * Connect and immediately close. Endpoints die with their host process: a
  * refused or missing socket means the host is gone ("dead"). Any other error
- * (EMFILE, EACCES, EAGAIN, …) or a timeout says nothing about liveness
- * ("unknown") and must not prune a live host.
+ * (EMFILE, EACCES, ETIMEDOUT, …) says nothing about liveness ("unknown") and
+ * must not prune a live host.
  */
-export function probeEndpoint(endpoint: string, timeoutMs: number): Promise<"alive" | "dead" | "unknown"> {
-	const { promise, resolve } = Promise.withResolvers<"alive" | "dead" | "unknown">();
-	const socket = net.connect(endpoint);
-	const timer = setTimeout(() => finish("unknown"), timeoutMs);
-	const finish = (result: "alive" | "dead" | "unknown"): void => {
-		clearTimeout(timer);
-		socket.destroy();
-		resolve(result);
-	};
-	socket.once("connect", () => finish("alive"));
-	socket.once("error", err => {
-		const code = (err as NodeJS.ErrnoException).code;
-		finish(code === "ENOENT" || code === "ECONNREFUSED" ? "dead" : "unknown");
-	});
-	return promise;
+export async function probeEndpoint(endpoint: string, timeoutMs: number): Promise<"alive" | "dead" | "unknown"> {
+	try {
+		(await IpcConnection.connect(endpoint, { framing: "raw", timeoutMs })).destroy();
+		return "alive";
+	} catch (err) {
+		return hasFsCode(err, "ENOENT") || hasFsCode(err, "ECONNREFUSED") ? "dead" : "unknown";
+	}
 }
