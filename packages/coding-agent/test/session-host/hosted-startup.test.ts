@@ -1,11 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { pidAlive, privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -23,6 +22,7 @@ import {
 	type SessionHostEntry,
 	writeHostEntry,
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
+import { IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 import { holdLeaseInAnotherProcess, killLeaseProcesses } from "../helpers/session-lease-process";
 import { type IsolatedConfigRoot, isolateConfigRoot } from "../helpers/session-host-harness";
@@ -41,7 +41,7 @@ const MODEL_ARGS = [
 let dir: string;
 let registryDir: string;
 let sessionsDir: string;
-const servers: net.Server[] = [];
+const servers: IpcServer[] = [];
 /** Every host a test started; a failed test must not leave a detached host running. */
 const hostPids: number[] = [];
 
@@ -56,7 +56,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	for (const server of servers.splice(0)) server.close();
+	await Promise.all(servers.splice(0).map(server => server.close()));
 	killLeaseProcesses();
 	for (const pid of hostPids.splice(0)) if (pidAlive(pid)) process.kill(pid, "SIGKILL");
 	await removeWithRetries(dir);
@@ -86,12 +86,8 @@ async function persistedSession(): Promise<{ file: string; id: string }> {
 /** A listening stand-in for a live host serving `sessionFile`; the registry probes it alive. */
 async function standInHost(hostId: string, sessionFile: string | undefined): Promise<SessionHostEntry> {
 	await fs.promises.mkdir(registryDir, { recursive: true, mode: 0o700 });
-	const endpoint = await privateEndpoint(registryDir, hostId, { prefix: "host", label: "test" });
-	const server = net.createServer(socket => socket.on("error", () => {}));
-	servers.push(server);
-	const listening = Promise.withResolvers<void>();
-	server.listen(endpoint, () => listening.resolve());
-	await listening.promise;
+	const endpoint = ipcEndpoint(registryDir, hostId);
+	servers.push(await IpcServer.listen(endpoint, { framing: "raw" }, () => {}));
 	const entry: SessionHostEntry = {
 		version: SESSION_HOST_REGISTRY_VERSION,
 		hostId,

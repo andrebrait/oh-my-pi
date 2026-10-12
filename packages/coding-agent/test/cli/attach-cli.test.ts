@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ensurePrivateDir, privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { ensurePrivateDir } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import {
 	SESSION_HOST_REGISTRY_VERSION,
 	type SessionHostEntry,
@@ -17,15 +17,11 @@ const LIVE_ID = "aaaaaaaaaaaaaaaa";
 const DEAD_ID = "bbbbbbbbbbbbbbbb";
 
 let home: string;
-let server: net.Server | undefined;
+let server: IpcServer | undefined;
 
 afterEach(async () => {
-	if (server) {
-		const closed = Promise.withResolvers<void>();
-		server.close(() => closed.resolve());
-		server = undefined;
-		await closed.promise;
-	}
+	await server?.close();
+	server = undefined;
 	if (home) await removeWithRetries(home);
 });
 
@@ -65,11 +61,8 @@ async function attach(...args: string[]): Promise<{ stdout: string; stderr: stri
 /** A listening in-process stand-in for a live host; closed in `afterEach`. */
 async function listen(dir: string, hostId: string): Promise<string> {
 	await ensurePrivateDir(dir, "test");
-	const endpoint = await privateEndpoint(dir, hostId, { prefix: "host", label: "test" });
-	server = net.createServer(socket => socket.on("error", () => {}));
-	const listening = Promise.withResolvers<void>();
-	server.listen(endpoint, () => listening.resolve());
-	await listening.promise;
+	const endpoint = ipcEndpoint(dir, hostId);
+	server = await IpcServer.listen(endpoint, { framing: "raw" }, () => {});
 	return endpoint;
 }
 

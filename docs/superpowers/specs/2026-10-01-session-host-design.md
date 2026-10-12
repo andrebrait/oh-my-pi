@@ -12,7 +12,7 @@ Run each live omp session in a long-lived **host process** that is independent o
 |---|---|
 | D1 | One protocol: the existing RPC command and event grammar, extended with attach, snapshot, `seq`, and `session_replaced`. The collab wire is not reused. |
 | D2 | Multiplexing lives in the host. The host serves N RPC connections directly. No external mux. |
-| D3 | Transport: `node:net` on every platform. Unix socket on POSIX, named pipe `\\.\pipe\omp-host-<key>` on Windows, following the existing `collab/registry.ts` and `launch/paths.ts` convention. A bearer token is mandatory on every platform. Local machine only; cross-machine sharing stays with collab. |
+| D3 | Transport: native local IPC (`IpcServer`, `IpcConnection` and `ipcEndpoint` from `@oh-my-pi/pi-natives`) on every platform. Unix socket on POSIX, named pipe on Windows, following the existing `collab/registry.ts` and `launch/paths.ts` convention. A bearer token is mandatory on every platform. Local machine only; cross-machine sharing stays with collab. |
 | D4 | One host process per session (no multi-session daemon). |
 | D5 | All attached clients are equal: any client may prompt, abort, steer, or change model and settings. A mid-turn prompt follows the existing steer and follow-up rules. |
 | D6 | The host switches sessions and every client follows (`/new`, `/resume`, `/fork`, `/tree`). Client-only moves use `/attach`, `/new --solo`, and `/fork --solo`. |
@@ -46,8 +46,8 @@ flowchart LR
 | `RpcDispatcher` | Executes an `RpcCommand` against one `AgentSession` on behalf of a given connection | The existing command switch in `rpc-mode.ts`, made connection-aware |
 | `SessionHost` | Owns the `AgentSession` and its connections. Assigns `seq`, keeps the replay ring, fans out frames, arbitrates first-answer-wins UI, enforces D7 | New |
 | Stdio transport | Exactly one connection. EOF keeps today's behavior: dispose and exit | Existing `rpc-input.ts` and `RpcOutputWriter` |
-| Socket/pipe listener | N connections, token-authenticated `hello` | New, using the `node:net` convention from D3 |
-| Host registry | Owner-only JSON per host `{hostId, pid, endpoint, token, cwd, sessionFile, title, startedAt}` in the per-user agent dir | `collab/registry.ts` pattern, including socket path-length fallback |
+| Socket/pipe listener | N connections, token-authenticated `hello` | New, on the native IPC transport from D3 |
+| Host registry | Owner-only JSON per host `{hostId, pid, endpoint, token, cwd, sessionFile, title, startedAt}` in the per-user agent dir | `collab/registry.ts` pattern, including the native `ipcEndpoint` path-length relocation |
 | `omp --mode host` | Headless detached host entry point | New mode in `main.ts` |
 | `HostedClientLink` | Client-side link that owns an `RpcClient` over `connectSessionHost`, applies the host's snapshot, `entry`, event, and dialog frames to the idle local replica session the TUI renders, and sends input to the host over RPC. Replaces the planned `RemoteSession` object: the TUI keeps a local passive `AgentSession` and reads host state through the link | `session-host/hosted-client.ts`, built on `RpcClient` with a socket transport |
 | Replica `SessionManager` | Client-local mirror of the session tree for transcript and tree views, seeded by the snapshot and fed by `entry` frames. It lives in an owner-private replica file (directory `0700`, file `0600`) with a unique name per client and snapshot, outside the sessions listing. On leaving, the client deletes its own files once in-flight frame application has settled. A client that dies without running that path (`SIGKILL`, an out-of-memory kill, power loss) leaves its files behind: nothing sweeps the directory, so they are removed by hand. A client pid in the file name, with dead ones dropped on the next connect, would automate it; P2 does not build that | Collab-guest replica mechanics, shared in `session/replica-view.ts` |

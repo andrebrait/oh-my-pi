@@ -1,10 +1,11 @@
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Readable } from "node:stream";
+import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
+import { ipcDuplex } from "../ipc/ipc-duplex";
 import { ensurePrivateDir, pidAlive } from "../ipc/private-endpoint";
 import { type RpcAgentProcess, RpcClient } from "../modes/rpc/rpc-client";
 import type { RpcHelloFrame } from "../modes/rpc/rpc-types";
@@ -31,12 +32,7 @@ export interface ConnectSessionHostOptions {
 
 /** Socket transport for RpcClient's `spawn` option, speaking protocol v2 from `attached` on. `kill()` closes the socket (a detach). */
 export async function connectSessionHost(options: ConnectSessionHostOptions): Promise<RpcAgentProcess> {
-	const socket = net.connect(options.entry.endpoint);
-	const connected = Promise.withResolvers<void>();
-	socket.once("connect", connected.resolve);
-	socket.once("error", connected.reject);
-	await connected.promise;
-	socket.off("error", connected.reject);
+	const socket = ipcDuplex(await IpcConnection.connect(options.entry.endpoint, { framing: "raw" }));
 	// A reset after connect surfaces as the stream's end; `close` always follows.
 	socket.on("error", () => {});
 	const exited = Promise.withResolvers<number>();

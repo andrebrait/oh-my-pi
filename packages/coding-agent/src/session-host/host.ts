@@ -5,11 +5,12 @@
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as path from "node:path";
-import { Readable } from "node:stream";
+import { type Duplex, Readable } from "node:stream";
+import { IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { isRecord, logger, postmortem, Snowflake } from "@oh-my-pi/pi-utils";
-import { ensurePrivateDir, privateEndpoint, tokenMatches } from "../ipc/private-endpoint";
+import { ipcDuplex } from "../ipc/ipc-duplex";
+import { endpointFiles, ensurePrivateDir, removeFilesSync, tokenMatches } from "../ipc/private-endpoint";
 import type { RpcConnection } from "../modes/rpc/rpc-connection";
 import { exitWithDisposeResult } from "../modes/rpc/rpc-mode";
 import { RpcServer, type RpcServerOptions } from "../modes/rpc/rpc-server";
@@ -20,7 +21,6 @@ import {
 	findHostForSession,
 	removeHostEntry,
 	removeHostEntrySync,
-	SESSION_HOST_ENDPOINT_PREFIX,
 	SESSION_HOST_REGISTRY_LABEL,
 	SESSION_HOST_REGISTRY_VERSION,
 	type SessionHostEntry,
@@ -146,7 +146,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	const startedAt = Date.now();
 	/** Authenticated connections still attached; `detach`/`exit`/close remove them. */
 	const clients = new Set<RpcConnection>();
-	const sockets = new Set<net.Socket>();
+	const sockets = new Set<Duplex>();
 	const lifetime = Promise.withResolvers<never>();
 	let busy = false;
 	/** Registry writes run only between the first publication and the start of teardown. */
@@ -155,6 +155,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	let writes: Promise<void> = Promise.resolve();
 	let stopping: Promise<never> | undefined;
 	let endpoint = "";
+	let listener: IpcServer | undefined;
 	/**
 	 * What this attempt created, so it removes only that. `bound`: `listen` succeeded, the endpoint is ours (set when
 	 * the bind lands, not when the path is chosen). `entryWritten`: the first registry write landed (the entry is
@@ -195,7 +196,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	const removeArtifactsSync = (): void => {
 		try {
 			if (entryWritten) removeHostEntrySync(hostId, registryDir);
-			if (bound && process.platform !== "win32") fs.rmSync(endpoint, { force: true });
+			if (bound) removeFilesSync(endpointFiles(endpoint));
 		} catch {
 			// Best-effort: the next registry listing prunes a survivor.
 		}
@@ -281,8 +282,9 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		stopping ??= (async () => {
 			unsubscribeEvents();
 			unsubscribeEntries();
-			// Closing unlinks the POSIX socket; the pipe vanishes with it on Windows.
-			listener.close();
+			// Unlinks the POSIX socket; the pipe vanishes with it on Windows. The bind lock is ours to remove.
+			await listener?.close();
+			removeFilesSync(endpointFiles(endpoint));
 			const conns = [...server.connections];
 			// drop() discards unflushed output, so every owed frame is flushed first.
 			await Promise.all(conns.map(flush));
@@ -325,7 +327,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	};
 	server.onLeave = leave;
 
-	const accept = async (socket: net.Socket): Promise<void> => {
+	const accept = async (socket: Duplex): Promise<void> => {
 		sockets.add(socket);
 		socket.once("close", () => sockets.delete(socket));
 		socket.on("error", error => logger.debug("Session host socket error", { hostId, error: String(error) }));
@@ -380,13 +382,6 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		publish();
 	};
 
-	const listener = net.createServer(socket => {
-		// A throw after auth (e.g. snapshot() while the session is disposing) must not become a fatal unhandled rejection.
-		void accept(socket).catch(error => {
-			logger.warn("Session host accept failed", { hostId, error: String(error) });
-			socket.destroy();
-		});
-	});
 	const unsubscribeEvents = session.subscribe(event => {
 		if (event.type !== "agent_start" && event.type !== "agent_end") return;
 		busy = event.type === "agent_start";
@@ -397,18 +392,16 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 
 	try {
 		await ensurePrivateDir(registryDir, SESSION_HOST_REGISTRY_LABEL);
-		endpoint = await privateEndpoint(registryDir, hostId, {
-			prefix: SESSION_HOST_ENDPOINT_PREFIX,
-			label: SESSION_HOST_REGISTRY_LABEL,
+		endpoint = ipcEndpoint(registryDir, hostId);
+		listener = await IpcServer.listen(endpoint, { framing: "raw" }, connection => {
+			const socket = ipcDuplex(connection);
+			// A throw after auth (e.g. snapshot() while the session is disposing) must not become a fatal unhandled rejection.
+			void accept(socket).catch(error => {
+				logger.warn("Session host accept failed", { hostId, error: String(error) });
+				socket.destroy();
+			});
 		});
-		const listening = Promise.withResolvers<void>();
-		listener.once("error", listening.reject);
-		listener.listen(endpoint, listening.resolve);
-		await listening.promise;
 		bound = true;
-		listener.off("error", listening.reject);
-		listener.on("error", error => logger.warn("Session host listener error", { hostId, error: String(error) }));
-		if (process.platform !== "win32") await fs.promises.chmod(endpoint, 0o600);
 		const first = entry();
 		await writeHostEntry(first, registryDir);
 		entryWritten = true;
@@ -430,7 +423,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		unregisterTeardown();
 		unsubscribeEvents();
 		unsubscribeEntries();
-		listener.close();
+		await listener?.close();
 		for (const socket of sockets) socket.destroy();
 		await writes;
 		removeArtifactsSync();

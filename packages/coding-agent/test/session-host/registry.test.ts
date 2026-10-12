@@ -1,26 +1,22 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import {
 	listSessionHosts,
 	SESSION_HOST_REGISTRY_VERSION,
 	type SessionHostEntry,
 	writeHostEntry,
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
+import { IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 let dir: string;
 afterEach(async () => dir && (await removeWithRetries(dir)));
 
-async function listenOn(registryDir: string, hostId: string): Promise<{ endpoint: string; close(): void }> {
-	const endpoint = await privateEndpoint(registryDir, hostId, { prefix: "host", label: "test" });
-	const server = net.createServer(socket => socket.on("error", () => {}));
-	const listening = Promise.withResolvers<void>();
-	server.listen(endpoint, () => listening.resolve());
-	await listening.promise;
+async function listenOn(registryDir: string, hostId: string): Promise<{ endpoint: string; close(): Promise<void> }> {
+	const endpoint = ipcEndpoint(registryDir, hostId);
+	const server = await IpcServer.listen(endpoint, { framing: "raw" }, () => {});
 	return { endpoint, close: () => server.close() };
 }
 
@@ -48,7 +44,7 @@ describe("session host registry", () => {
 		await writeHostEntry(entry("bbbbbbbbbbbbbbbb", path.join(dir, "gone.sock")), dir);
 		expect((await listSessionHosts(dir)).map(e => e.hostId)).toEqual(["aaaaaaaaaaaaaaaa"]);
 		expect(await Bun.file(path.join(dir, "bbbbbbbbbbbbbbbb.json")).exists()).toBe(false);
-		live.close();
+		await live.close();
 	});
 
 	it("unlinks a dead host's own socket but never a crafted endpoint outside the registry", async () => {

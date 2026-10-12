@@ -6,10 +6,9 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as net from "node:net";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ensurePrivateDir, privateEndpoint } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { ensurePrivateDir } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import type { InteractiveModeContext, ShutdownOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as prediction from "@oh-my-pi/pi-coding-agent/predict/client";
@@ -24,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { attachCommand, resumeCommand } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
+import { type IpcConnection, IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { postmortem } from "@oh-my-pi/pi-utils";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
@@ -48,7 +48,7 @@ let config: IsolatedConfigRoot;
 const terminals: Terminal[] = [];
 const hostedModes: HostedMode[] = [];
 const proxies: HostProxy[] = [];
-const servers: net.Server[] = [];
+const servers: IpcServer[] = [];
 
 beforeAll(async () => {
 	await initTheme();
@@ -66,7 +66,7 @@ afterEach(async () => {
 	for (const terminal of terminals.splice(0)) await terminal.close();
 	for (const hosted of hostedModes.splice(0)) await hosted.close();
 	for (const proxy of proxies.splice(0)) proxy.close();
-	for (const server of servers.splice(0)) server.close();
+	await Promise.all(servers.splice(0).map(server => server.close()));
 	setWordPredictionHost(undefined);
 	vi.restoreAllMocks();
 	await config.restore();
@@ -184,22 +184,25 @@ interface StandIn {
 async function standInHost(hold: boolean): Promise<StandIn> {
 	await ensurePrivateDir(fixture.registryDir, "test");
 	const hostId = newHostId();
-	const endpoint = await privateEndpoint(fixture.registryDir, hostId, { prefix: "host", label: "test" });
-	const held: net.Socket[] = [];
+	const endpoint = ipcEndpoint(fixture.registryDir, hostId);
+	const held: IpcConnection[] = [];
 	let hellos = 0;
-	const server = net.createServer(socket => {
-		socket.on("error", () => {});
-		// The registry's liveness probe connects and stays silent; a client speaks first.
-		socket.once("data", () => {
-			hellos++;
-			if (hold) held.push(socket);
-			else socket.destroy();
-		});
-	});
-	servers.push(server);
-	const listening = Promise.withResolvers<void>();
-	server.listen(endpoint, () => listening.resolve());
-	await listening.promise;
+	servers.push(
+		await IpcServer.listen(endpoint, { framing: "raw" }, connection => {
+			// The registry's liveness probe connects and stays silent; a client speaks first.
+			let spoke = false;
+			connection.startRaw(
+				() => {
+					if (spoke) return;
+					spoke = true;
+					hellos++;
+					if (hold) held.push(connection);
+					else connection.destroy();
+				},
+				() => {},
+			);
+		}),
+	);
 	const entry: SessionHostEntry = {
 		version: SESSION_HOST_REGISTRY_VERSION,
 		hostId,
@@ -218,7 +221,7 @@ async function standInHost(hold: boolean): Promise<StandIn> {
 		entry,
 		hellos: () => hellos,
 		dropClients: () => {
-			for (const socket of held.splice(0)) socket.destroy();
+			for (const connection of held.splice(0)) connection.destroy();
 		},
 	};
 }
