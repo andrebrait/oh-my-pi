@@ -244,8 +244,16 @@ export class HostedClientLink {
 		this.#reconnectTimeoutMs = options.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS;
 		this.#keepStartupFrame = options.keepStartupFrame === true;
 		this.#client = new RpcClient({
+			// A leave mid-reconnect may land while `start()` waits to spawn: no hello goes out after it.
 			spawn: () =>
-				connectSessionHost({ entry: options.entry, client: { kind: "tui" }, ui: true, resume: this.#resumePoint }),
+				this.#open
+					? connectSessionHost({
+							entry: options.entry,
+							client: { kind: "tui" },
+							ui: true,
+							resume: this.#resumePoint,
+						})
+					: Promise.reject(new Error("Left the session host")),
 		});
 	}
 
@@ -1065,8 +1073,10 @@ export class HostedClientLink {
 		if (!this.#open) return;
 		logger.warn("Session host connection lost; reconnecting", { hostId: this.hostId, error: error.message });
 		this.#ctx.showStatus(`Connection to session host ${this.hostId} lost; reconnecting…`, { dim: true });
+		// Detach, exit, or terminal shutdown may land at any await below: nothing is opened or reported after it.
+		const stopped = (): boolean => !this.#open || this.#ctx.isShuttingDown;
 		for (let attempt = 0; ; attempt++) {
-			if (!this.#open || this.#ctx.isShuttingDown) return;
+			if (stopped()) return;
 			const outcome = Promise.withResolvers<void>();
 			this.#reconnectAttempt = outcome;
 			try {
@@ -1074,8 +1084,9 @@ export class HostedClientLink {
 				await Promise.race([Bun.sleep(delay), outcome.promise]);
 				// A failed attempt may have applied frames: the resume point never passes what the view shows.
 				await this.#chain;
-				if (!this.#open || this.#ctx.isShuttingDown) return;
-				const hostAlive = await hostProcessAlive(this.#entry.pid);
+				if (stopped()) return;
+				// A plain probe keeps the schedule; a host still dying is caught by the next attempt.
+				const hostAlive = pidAlive(this.#entry.pid);
 				if (!hostAlive || Date.now() - lostAt >= this.#reconnectTimeoutMs) {
 					await this.#closeLost(hostAlive, error);
 					return;
@@ -1087,9 +1098,11 @@ export class HostedClientLink {
 						? undefined
 						: { hostId: this.hostId, epoch: this.#epoch, lastSeq };
 				await this.#client.start();
+				if (stopped()) throw new Error("Left the session host");
 				await outcome.promise;
 				// Per-connection settings do not survive a reconnect; writes stay refused until it is restored.
 				await this.#client.setAskDialog(true);
+				if (stopped()) throw new Error("Left the session host");
 				// The transport died after the reply applied: its close handler dropped this attempt.
 				if (this.#reconnectAttempt !== outcome) throw new Error("Session host connection lost again");
 			} catch (attemptError) {
@@ -1097,6 +1110,9 @@ export class HostedClientLink {
 					hostId: this.hostId,
 					error: String(attemptError),
 				});
+				// A transport that died inside `start()` reports no close: dialogs its snapshot presented end here.
+				this.#dialogLost ||= this.#dialogs.size > 0 || this.#awaiting.size > 0;
+				this.#abortDialogs();
 				await this.#client.stop();
 				continue;
 			}

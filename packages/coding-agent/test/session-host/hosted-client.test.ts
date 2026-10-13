@@ -1760,20 +1760,45 @@ describe("HostedClientLink reconnect", () => {
 		}
 	});
 
-	itPosix("never reconnects after detach or exit, even mid-reconnect", async () => {
+	for (const leave of ["detach", "exit"] as const) {
+		itPosix(`never reconnects after ${leave}, even mid-reconnect`, async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			try {
+				const view = await openView();
+				await view.connect(proxy.entry);
+
+				await loseConnection(view, proxy);
+				await view.hostLink[leave]();
+				proxy.accept();
+				// Real time on purpose: a reconnect attempt that should not exist has no event to await, and the schedule retries within 500 ms.
+				await Bun.sleep(500);
+
+				await fixture.waitForClients(host, 0);
+				expect(host.exited).toBe(false);
+				expect(view.closed).toEqual([]);
+				expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+			} finally {
+				proxy.close();
+			}
+		});
+	}
+
+	itPosix("stops reconnecting on detach while the host is reachable", async () => {
 		const host = await fixture.startHost();
 		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
 		try {
 			const view = await openView();
 			await view.connect(proxy.entry);
 
-			await loseConnection(view, proxy);
+			// The proxy keeps accepting: the detach races an attempt that can reach the host.
+			proxy.drop();
+			await waitFor(() => view.showStatus.mock.calls.some(call => String(call[0]).includes("reconnecting")));
+			// The detach waits out the reconnect loop, so anything it would still open is already open here.
 			await view.hostLink.detach();
-			proxy.accept();
-			// Real time on purpose: a reconnect attempt that should not exist has no event to await, and the schedule retries within 500 ms.
-			await Bun.sleep(500);
 
 			await fixture.waitForClients(host, 0);
+			expect(view.hostLink.reconnecting).toBe(false);
 			expect(view.closed).toEqual([]);
 			expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
 		} finally {
