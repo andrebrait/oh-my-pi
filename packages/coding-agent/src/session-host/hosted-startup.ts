@@ -4,7 +4,8 @@
  * ({@link HostedClientLink}). The terminal owns no model, tools, extensions, or session writer: the local session is
  * a lean passive replica, and the host runs with the launch flags this process was given.
  *
- * There is no reconnect and no in-process fallback. A host that cannot be reached is reported and the process exits.
+ * A lost connection is resumed by {@link HostedClientLink}; there is no in-process fallback. A host that stays
+ * unreachable is reported and the process exits; when the host exited, the terminal offers to reopen its session.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -402,9 +403,15 @@ export async function createHostedLocalSession(options: {
  * `init()`). Resolves once the first snapshot is on screen and `ctx.hostedClient` is set; rejects, leaving nothing
  * attached, when it cannot connect.
  *
- * A lost connection ends the process (`ctx.shutdown` with exit status 1): there is no reconnect.
+ * A lost connection is resumed by the link itself. When it ends for good the process ends (`ctx.shutdown` with exit
+ * status 1), except that a host that exited while serving a session file offers to reopen that session in a new host.
+ * `options.reconnectTimeoutMs` is passed to every link.
  */
-export async function attachHostedUi(ctx: InteractiveModeContext, hosted: HostedStartup): Promise<void> {
+export async function attachHostedUi(
+	ctx: InteractiveModeContext,
+	hosted: HostedStartup,
+	options: { reconnectTimeoutMs?: number } = {},
+): Promise<void> {
 	let current = hosted.entry;
 	let switching = false;
 
@@ -414,8 +421,14 @@ export async function attachHostedUi(ctx: InteractiveModeContext, hosted: Hosted
 			entry,
 			replicaDir: hostedReplicaDir(),
 			keepStartupFrame,
+			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			onClosed: reason => {
-				void ctx.shutdown({ exitCode: 1, farewell: reason.message });
+				if (ctx.hostedClient === link) ctx.hostedClient = undefined;
+				if (reason.sessionFile === undefined || switching || ctx.isShuttingDown) {
+					void ctx.shutdown({ exitCode: 1, farewell: reason.message });
+					return;
+				}
+				void reopen(reason.sessionFile, reason.message);
 			},
 		});
 		if (ctx.isShuttingDown) {
@@ -425,6 +438,32 @@ export async function attachHostedUi(ctx: InteractiveModeContext, hosted: Hosted
 		}
 		current = entry;
 		ctx.hostedClient = link;
+	};
+
+	/**
+	 * The host serving `sessionFile` exited: offer to reopen the session in a new host, or end with `farewell`. The
+	 * link already discarded its copy. `/attach` is refused while the offer is open.
+	 */
+	const reopen = async (sessionFile: string, farewell: string): Promise<void> => {
+		switching = true;
+		try {
+			// shortcut: the context has no shutdown signal to cancel this dialog; a close while it is open is only seen
+			// once it is answered. Add a signal if a close must dismiss it.
+			if (!(await ctx.showHookConfirm("Session host exited", "Reopen this session in a new host?"))) {
+				await ctx.shutdown({ exitCode: 1, farewell });
+				return;
+			}
+			if (ctx.isShuttingDown) return;
+			await connect(await ensureSessionHost(sessionFile, hosted.launch));
+			if (ctx.hostedClient) ctx.showStatus(`Reopened the session in host ${ctx.hostedClient.hostId}`);
+		} catch (error) {
+			await ctx.shutdown({
+				exitCode: 1,
+				farewell: `host exited; could not reopen the session: ${errorMessage(error)}`,
+			});
+		} finally {
+			switching = false;
+		}
 	};
 
 	/** The live host chosen in a selector; the one on screen is not offered. */

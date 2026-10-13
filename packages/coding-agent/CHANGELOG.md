@@ -48,6 +48,7 @@
 - `ask` extension UI responses accept `chat: true` (discuss instead of answering) and per-answer `note`, `noteImages`, and `customInputImages` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Added `RpcClient.onExtensionUiRequest()`, `RpcClient.sendExtensionUiResponse()`, and `RpcClient.setAskDialog()` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Added `RpcClient.promptToCompletion()`: sends a prompt (with optional steering mode and preconditions) and resolves once its work has settled ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+- Hosted sessions reconnect automatically after a lost connection and offer to reopen the session in a new host when its host exited
 
 ### Changed
 
