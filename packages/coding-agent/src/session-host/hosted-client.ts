@@ -432,7 +432,7 @@ export class HostedClientLink {
 		return !this.#left && this.#failure === undefined;
 	}
 
-	/** Whether a host dialog is on screen or awaiting its answer's delivery. */
+	/** Whether a host dialog is on screen or received and not yet presented. */
 	get #hasDialogs(): boolean {
 		return this.#dialogs.size > 0 || this.#awaiting.size > 0;
 	}
@@ -1146,10 +1146,15 @@ export class HostedClientLink {
 		await this.#client.stop();
 		await this.#discardLocalState();
 		logger.warn("Session host connection closed", { hostId: this.hostId, hostAlive, error: error.message });
+		// A fresh session the host never wrote has no file to reopen.
+		const sessionFile =
+			!hostAlive && this.#sessionFile !== undefined && (await Bun.file(this.#sessionFile).exists())
+				? this.#sessionFile
+				: undefined;
 		this.#notifyClosed(
 			hostAlive
 				? { hostAlive, message: `connection lost (host ${this.hostId} still running; omp attach ${this.hostId})` }
-				: { hostAlive, message: "host exited", sessionFile: this.#sessionFile },
+				: { hostAlive, message: "host exited", sessionFile },
 		);
 	}
 }
