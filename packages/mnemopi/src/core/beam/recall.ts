@@ -720,7 +720,11 @@ function scoreCandidate(
 		const tierWeight = degradationTier === 1 ? 1 : degradationTier === 2 ? 0.85 : 0.7;
 		score *= tierWeight;
 	}
-	score *= veracityWeight * currentContentAdjustment(searchableContent, options.currentSensitive === true);
+	score *= veracityWeight;
+	// ABLATION: Mnemosyne 4.0 `_current_state_recency_bonus` (beam.py ~3392) replaces Mnemopi's current-state time boost
+	// and x1.35/x0.72 content factors: +0.04 when a current-state query meets current-state content.
+	if (options.currentSensitive === true && /\b(?:current|currently|latest|newer|updated)\b/i.test(searchableContent))
+		score += 0.04;
 	const preview = clipRecallContent(content, options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS);
 	const result: RecallResult = {
 		...candidate.row,
@@ -911,9 +915,7 @@ export async function recall(
 ): Promise<RecallResult[]> {
 	if (topK <= 0) return [];
 	const temporalOptions = inferTemporalOptions(query, options);
-	if (queryAsksCurrent(query)) {
-		temporalOptions.queryTime ??= options.queryTime ?? new Date();
-		temporalOptions.temporalWeight ??= 0.45;
+	if (/\b(?:current|currently|latest|now|newer)\b/i.test(query)) {
 		temporalOptions.currentSensitive = true;
 	}
 	if (temporalOptions.queryEmbedding === undefined) {
