@@ -271,6 +271,9 @@ function lexicalGroupRelevance(queryGroups: readonly (readonly string[])[], cont
 	const cjkContent = queryGroups.some(group => group.some(hasCjk)) ? content.toLowerCase() : null;
 	let matched = 0;
 	let partial = 0;
+	// ABLATION: weighted substring credit (Mnemosyne 4.0 gives 0.4). A 4+ character query word inside a 4+ character
+	// content word, or the reverse, earns less than a listed inflection (0.5), so "redis" in "redistribution" counts a little.
+	let substring = 0;
 	for (const group of queryGroups) {
 		if (group.some(token => contentTokens.has(token) || (hasCjk(token) && cjkContent?.includes(token)))) {
 			matched += 1;
@@ -283,10 +286,20 @@ function lexicalGroupRelevance(queryGroups: readonly (readonly string[])[], cont
 			})
 		) {
 			partial += 1;
+		} else if (
+			group.some(token => {
+				if (token.length < 4 || hasCjk(token)) return false;
+				for (const contentToken of contentTokens) {
+					if (contentToken.length >= 4 && (contentToken.includes(token) || token.includes(contentToken))) return true;
+				}
+				return false;
+			})
+		) {
+			substring += 1;
 		}
 	}
-	if (queryGroups.length !== 1) return (matched + partial * 0.5) / queryGroups.length;
-	if (matched === 0) return partial > 0 ? 0.35 : 0;
+	if (queryGroups.length !== 1) return (matched + partial * 0.5 + substring * 0.3) / queryGroups.length;
+	if (matched === 0) return partial > 0 ? 0.35 : substring > 0 ? 0.2 : 0;
 	const token = queryGroups[0]?.[0];
 	let count = 0;
 	if (token && hasCjk(token) && cjkContent !== null) {
