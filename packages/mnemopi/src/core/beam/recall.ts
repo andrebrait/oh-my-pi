@@ -677,7 +677,7 @@ function scoreCandidate(
 	const searchableContent = asString(candidate.row.embed_text) || content;
 	const lexical = lexicalGroupRelevance(queryGroups, searchableContent);
 	const minRel = minimumRelevance(queryTokens);
-	if (lexical < minRel && candidate.signals.dense < 0.65) return null;
+	if (lexical < minRel && candidate.signals.dense < 0.62) return null; // ABLATION: was 0.65 (Mnemosyne 4.0 EM_VEC_ADMIT = 0.62)
 	const [vecWeight, ftsWeight, importanceWeight] = weights;
 	const importance = asNumber(candidate.row.importance, 0.5);
 	const decay =
