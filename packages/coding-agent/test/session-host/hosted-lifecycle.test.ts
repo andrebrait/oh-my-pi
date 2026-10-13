@@ -9,14 +9,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ensurePrivateDir } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { ensurePrivateDir, pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import type { InteractiveModeContext, ShutdownOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as prediction from "@oh-my-pi/pi-coding-agent/predict/client";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { HostedClientLink } from "@oh-my-pi/pi-coding-agent/session-host/hosted-client";
-import { attachHostedUi, hostedReplicaDir } from "@oh-my-pi/pi-coding-agent/session-host/hosted-startup";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
+	attachHostedUi,
+	ensureSessionHost,
+	type HostLaunch,
+	hostedReplicaDir,
+} from "@oh-my-pi/pi-coding-agent/session-host/hosted-startup";
+import {
+	listSessionHosts,
 	newHostId,
 	SESSION_HOST_REGISTRY_VERSION,
 	type SessionHostEntry,
@@ -412,12 +419,13 @@ class HostedMode {
 		return hosted;
 	}
 
-	/** The startup wiring of `omp attach`: the link is registered, and a lost connection ends the process. */
-	async attach(entry: SessionHostEntry): Promise<void> {
-		await attachHostedUi(this.mode, {
-			entry,
-			launch: { cwd: fixture.dir, args: [], registryDir: fixture.registryDir },
-		});
+	/** The startup wiring of `omp attach`: the link is registered, and a connection that ends ends the process. */
+	async attach(
+		entry: SessionHostEntry,
+		launch: HostLaunch = { cwd: fixture.dir, args: [], registryDir: fixture.registryDir },
+		options?: { reconnectTimeoutMs?: number },
+	): Promise<void> {
+		await attachHostedUi(this.mode, { entry, launch }, options);
 	}
 
 	/** What the process printed to stderr, without styling. */
@@ -459,9 +467,10 @@ describe("a hosted terminal's shutdown", () => {
 			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
 			proxies.push(proxy);
 			const hosted = await HostedMode.open();
-			await hosted.attach(proxy.entry);
+			await hosted.attach(proxy.entry, undefined, { reconnectTimeoutMs: 1000 });
 			hosted.mode.editor.setText("unsent words");
 
+			proxy.refuse();
 			proxy.drop();
 
 			expect(await hosted.exited.promise).toBe(1);
@@ -606,4 +615,101 @@ describe("a hosted terminal in Tern", () => {
 		expect(advertised().at(-1)).toBeUndefined();
 		expect(advertised().filter(file => file?.startsWith(hostedReplicaDir()))).toEqual([]);
 	}, 20_000);
+});
+
+/** A host that boots without network: a dummy key makes the model available, and discovery hits a closed port. */
+const MODEL_ARGS = [
+	"--no-extensions",
+	"--no-skills",
+	"--no-rules",
+	"--provider",
+	"anthropic",
+	"--model",
+	"claude-sonnet-4-5",
+];
+
+describe("a hosted terminal whose host process died", () => {
+	let launch: HostLaunch;
+	/** Every host a test started; a failed test must not leave a detached host running. */
+	const spawned: number[] = [];
+
+	beforeEach(async () => {
+		const dir = await fs.mkdtemp(path.join(fixture.dir, "spawned-"));
+		await Bun.write(
+			path.join(dir, "models.yml"),
+			"providers:\n  anthropic:\n    baseUrl: http://127.0.0.1:9\n    apiKey: test-dummy-key\n",
+		);
+		launch = {
+			cwd: dir,
+			args: MODEL_ARGS,
+			sessionDir: path.join(dir, "sessions"),
+			registryDir: fixture.registryDir,
+			env: { PI_CODING_AGENT_DIR: dir, HOME: dir, USERPROFILE: dir },
+		};
+	});
+
+	afterEach(async () => {
+		// Leave a reopened host before killing it, so the terminal's detach is not cut off mid-request.
+		for (const hosted of hostedModes.splice(0)) await hosted.close();
+		for (const pid of spawned.splice(0)) if (pidAlive(pid)) process.kill(pid, "SIGKILL");
+	});
+
+	/** A spawned host serving a session file that holds one user message, and a terminal attached to it. */
+	async function attachedToSpawnedHost(
+		reopen: boolean,
+	): Promise<{ hosted: HostedMode; entry: SessionHostEntry; file: string; statuses: () => string[] }> {
+		const manager = SessionManager.create(launch.cwd, launch.sessionDir);
+		manager.appendMessage({ role: "user", content: "a finished turn", timestamp: Date.now() });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		await manager.close();
+		if (!file) throw new Error("session was not given a file");
+		const entry = await ensureSessionHost(file, launch);
+		spawned.push(entry.pid);
+		const hosted = await HostedMode.open();
+		const showStatus = vi.spyOn(hosted.mode, "showStatus");
+		vi.spyOn(hosted.mode, "showHookConfirm").mockImplementation(async (title, message) => {
+			expect([title, message]).toEqual(["Session host exited", "Reopen this session in a new host?"]);
+			return reopen;
+		});
+		await hosted.attach(entry, launch);
+		expect(userTexts(hosted.local)).toEqual(["a finished turn"]);
+		return { hosted, entry, file, statuses: () => showStatus.mock.calls.map(([text]) => text) };
+	}
+
+	it("offers to reopen a session whose host died, and reopens it", async () => {
+		const { hosted, entry, file, statuses } = await attachedToSpawnedHost(true);
+
+		process.kill(entry.pid, "SIGKILL");
+
+		let reopened: SessionHostEntry | undefined;
+		await waitFor(async () => {
+			const hosts = await listSessionHosts(fixture.registryDir);
+			reopened = hosts.find(
+				host =>
+					host.hostId !== entry.hostId &&
+					host.sessionFile &&
+					path.resolve(host.sessionFile) === path.resolve(file),
+			);
+			return reopened !== undefined;
+		}, 120_000);
+		if (!reopened) throw new Error("no new host");
+		spawned.push(reopened.pid);
+		const newHostId = reopened.hostId;
+		await waitFor(() => hosted.mode.hostedClient?.hostId === newHostId, 30_000);
+
+		expect(userTexts(hosted.local)).toEqual(["a finished turn"]);
+		expect(statuses()).toContain(`Reopened the session in host ${newHostId}`);
+		expect(Bun.peek.status(hosted.exited.promise)).toBe("pending");
+	}, 150_000);
+
+	it("exits with status 1 when the reopen is declined", async () => {
+		const { hosted, entry } = await attachedToSpawnedHost(false);
+
+		process.kill(entry.pid, "SIGKILL");
+
+		expect(await hosted.exited.promise).toBe(1);
+		expect(hosted.printed).toContain("host exited");
+		expect(await listTree(hostedReplicaDir())).toEqual([]);
+	}, 150_000);
 });
