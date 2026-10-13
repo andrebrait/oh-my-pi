@@ -41,7 +41,13 @@ import { createInteractiveModeContext } from "../helpers/interactive-mode-contex
 import { createTestSession, isolateAgentDir } from "../helpers/rpc-server-harness";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
-import { SessionHostFixture, startProxy, type TestSessionHost, waitFor } from "../helpers/session-host-harness";
+import {
+	type HostProxy,
+	SessionHostFixture,
+	startProxy,
+	type TestSessionHost,
+	waitFor,
+} from "../helpers/session-host-harness";
 
 /** What the TUI's dialog presenter does: show, then settle with the user's answer or `undefined` when aborted. */
 interface FakeDialog {
@@ -68,7 +74,7 @@ interface ViewOptions {
 class View {
 	readonly events: AgentSessionEvent[] = [];
 	readonly dialogs: FakeDialog[] = [];
-	readonly closed: { hostAlive: boolean; message: string }[] = [];
+	readonly closed: { hostAlive: boolean; message: string; sessionFile?: string }[] = [];
 	readonly showStatus = vi.fn<(message: string) => void>();
 	readonly showError = vi.fn<(message: string) => void>();
 	readonly showWarning = vi.fn<(message: string) => void>();
@@ -1495,29 +1501,6 @@ describe("HostedClientLink with the real EventController and status line", () =>
 const itPosix = it.skipIf(process.platform === "win32");
 
 describe("HostedClientLink transport", () => {
-	itPosix("reports a lost connection with the host still running, without reconnecting", async () => {
-		const host = await fixture.startHost();
-		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
-		try {
-			const view = await openView();
-			await view.connect(proxy.entry);
-			await fixture.waitForClients(host, 1);
-
-			proxy.drop();
-			await waitFor(() => view.closed.length === 1);
-
-			expect(view.closed[0].hostAlive).toBe(true);
-			expect(view.closed[0].message).toBe(
-				`connection lost (host ${host.hostId} still running; omp attach ${host.hostId})`,
-			);
-			await fixture.waitForClients(host, 0);
-			expect(view.closed).toHaveLength(1);
-			expect(await fixture.entry(host)).toMatchObject({ clients: 0 });
-		} finally {
-			proxy.close();
-		}
-	});
-
 	it("never reports an explicit detach or exit as a lost connection", async () => {
 		const host = await fixture.startHost();
 		const a = await attach(host);
@@ -1629,6 +1612,176 @@ describe("HostedClientLink transport", () => {
 	});
 });
 
+describe("HostedClientLink reconnect", () => {
+	/** Cut the view's connection with the proxy refusing new ones, and wait until the link notices. */
+	async function loseConnection(view: View, proxy: HostProxy): Promise<void> {
+		proxy.refuse();
+		proxy.drop();
+		await waitFor(() => view.hostLink.reconnecting);
+	}
+
+	itPosix("resumes after a dropped connection and replays what it missed, once", async () => {
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			await seedTurn(host, "before");
+			await waitFor(() => entryShape(view.local).length === entryShape(host.session).length);
+			const replica = view.local.sessionFile;
+
+			await loseConnection(view, proxy);
+			await seedTurn(host, "during");
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+			await waitFor(() => entryShape(view.local).length === entryShape(host.session).length);
+
+			expect(view.closed).toEqual([]);
+			expect(entryShape(view.local)).toEqual(entryShape(host.session));
+			const during = view.local.messages.filter(
+				message => message.role === "user" && JSON.stringify(message.content).includes("during"),
+			);
+			expect(during).toHaveLength(1);
+			// Resumed in place: no snapshot wrote a new replica generation.
+			expect(view.local.sessionFile).toBe(replica);
+			const statuses = view.showStatus.mock.calls.map(call => call[0]);
+			const lost = statuses.indexOf(`Connection to session host ${host.hostId} lost; reconnecting…`);
+			expect(lost).toBeGreaterThanOrEqual(0);
+			expect(statuses.indexOf(`Reconnected to session host ${host.hostId}`)).toBeGreaterThan(lost);
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("falls back to a snapshot when the host replaced its session meanwhile", async () => {
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			const oldEpoch = view.hostLink.epoch;
+
+			await loseConnection(view, proxy);
+			const other = await fixture.client(host);
+			let hostEpoch = oldEpoch;
+			other.onHostFrame(frame => {
+				if (frame.type === "attached" || frame.type === "session_replaced") hostEpoch = frame.epoch;
+			});
+			await other.start();
+			await other.newSession();
+			await waitFor(() => hostEpoch > oldEpoch);
+			await other.detach();
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+
+			expect(view.closed).toEqual([]);
+			expect(view.hostLink.epoch).toBe(hostEpoch);
+			expect(view.local.sessionManager.getSessionId()).toBe(host.session.sessionManager.getSessionId());
+			await view.hostLink.prompt("x");
+			await waitFor(() => JSON.stringify(host.session.messages).includes('"x"'));
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("re-presents a dialog that was open when the connection dropped", async () => {
+		let ui: ExtensionUIContext | undefined;
+		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			const confirmed = ui!.confirm("Proceed?", "Really?");
+			await waitFor(() => view.dialogs.length === 1);
+
+			await loseConnection(view, proxy);
+			expect(view.dialogs[0].signal?.aborted).toBe(true);
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+			await waitFor(() => view.dialogs.length === 2);
+
+			expect(view.dialogs[1].title).toBe("Proceed?");
+			view.dialogs[1].answer(true);
+			expect(await confirmed).toBe(true);
+			expect(view.closed).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("rejects writes while reconnecting and sends nothing later", async () => {
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+
+			await loseConnection(view, proxy);
+			await expect(view.hostLink.prompt("lost")).rejects.toThrow(
+				"Reconnecting to the session host; try again once it is back",
+			);
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+			// A round trip on the new connection: anything sent ahead of it would have reached the host first.
+			await view.hostLink.availableModels();
+
+			expect(JSON.stringify(host.session.messages)).not.toContain('"lost"');
+			expect(view.closed).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("gives up when the host stays unreachable", async () => {
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			view.link = await HostedClientLink.connect({
+				ctx: view.ctx,
+				entry: proxy.entry,
+				replicaDir: view.replicaDir,
+				reconnectTimeoutMs: 1000,
+				onClosed: reason => view.closed.push(reason),
+			});
+
+			await loseConnection(view, proxy);
+			await waitFor(() => view.closed.length === 1);
+
+			expect(view.closed[0]).toEqual({
+				hostAlive: true,
+				message: `connection lost (host ${host.hostId} still running; omp attach ${host.hostId})`,
+			});
+			expect(view.hostLink.reconnecting).toBe(false);
+			expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+			await fixture.waitForClients(host, 0);
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("never reconnects after detach or exit, even mid-reconnect", async () => {
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+
+			await loseConnection(view, proxy);
+			await view.hostLink.detach();
+			proxy.accept();
+			// Real time on purpose: a reconnect attempt that should not exist has no event to await, and the schedule retries within 500 ms.
+			await Bun.sleep(500);
+
+			await fixture.waitForClients(host, 0);
+			expect(view.closed).toEqual([]);
+			expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+});
+
 describe("HostedClientLink with a host process", () => {
 	let dir: string;
 	let restoreAgentDir: () => void;
@@ -1671,6 +1824,8 @@ describe("HostedClientLink with a host process", () => {
 		process.kill(entry.pid, "SIGKILL");
 		await waitFor(() => view.closed.length === 1, 15_000);
 
-		expect(view.closed[0]).toEqual({ hostAlive: false, message: "host exited" });
+		expect(entry.sessionFile).toBeDefined();
+		expect(view.closed[0]).toEqual({ hostAlive: false, message: "host exited", sessionFile: entry.sessionFile });
+		expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
 	}, 150_000);
 });

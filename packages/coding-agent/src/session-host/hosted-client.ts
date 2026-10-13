@@ -76,11 +76,14 @@ export interface HostedClientOptions {
 	replicaDir: string;
 	/**
 	 * The link is closed without this client leaving ({@link HostedClientLink.detach} and
-	 * {@link HostedClientLink.exit} never call it): the transport ended, or a host frame could not be applied to
-	 * the local view. `hostAlive` is a probe of `entry.pid`; `message` says what happened and how to continue.
-	 * The link does not reconnect.
+	 * {@link HostedClientLink.exit} never call it): reconnecting after a lost transport gave up or found the host
+	 * gone, or a host frame could not be applied to the local view. `hostAlive` is a probe of `entry.pid`; `message`
+	 * says what happened and how to continue; `sessionFile` (only when the host exited) is the session the host had
+	 * open, per the last snapshot applied, undefined for an in-memory session.
 	 */
-	onClosed: (reason: { hostAlive: boolean; message: string }) => void;
+	onClosed: (reason: { hostAlive: boolean; message: string; sessionFile?: string }) => void;
+	/** How long reconnecting after a lost transport keeps trying while the host process lives. Default 30 s. */
+	reconnectTimeoutMs?: number;
 	/**
 	 * The first snapshot paints below the frame already on screen (the startup header) instead of clearing the
 	 * terminal history: set for the terminal's first attach, not for `/attach` switches.
@@ -94,6 +97,10 @@ const REPLICA_FILE_MODE = 0o600;
 /** The socket can close a few milliseconds before the OS finishes reaping a killed host. */
 const HOST_EXIT_GRACE_MS = 250;
 const HOST_EXIT_POLL_MS = 25;
+/** Delay before each reconnect attempt; the last repeats until the host is gone or the timeout passes. */
+const RECONNECT_DELAYS_MS = [0, 250, 500, 1000, 2000];
+const RECONNECT_TIMEOUT_MS = 30_000;
+const RECONNECTING_ERROR = "Reconnecting to the session host; try again once it is back";
 
 type DialogRequest = Extract<RpcExtensionUIRequest, { method: "select" | "confirm" | "input" | "editor" | "ask" }>;
 type OpenUrlRequest = Extract<RpcExtensionUIRequest, { method: "open_url" }>;
@@ -158,6 +165,7 @@ export class HostedClientLink {
 	readonly #entry: SessionHostEntry;
 	readonly #replicaDir: string;
 	readonly #onClosed: HostedClientOptions["onClosed"];
+	readonly #reconnectTimeoutMs: number;
 	readonly #keepStartupFrame: boolean;
 	readonly #client: RpcClient;
 	/** Distinguishes this client's replica files from every other client of the same host. */
@@ -167,7 +175,10 @@ export class HostedClientLink {
 	readonly #replicas = new Set<string>();
 	/** The origin this link published to `ctx.hostOrigin`: the only one it ever withdraws. */
 	#origin: RpcSessionOrigin | undefined;
-	/** The host's session file (none: an unsaved session), as Tern is told to restore it instead of the replica. */
+	/**
+	 * The host's session file (none: an unsaved session): what Tern is told to restore instead of the replica, and
+	 * what a reopen offers once the host exited.
+	 */
 	#sessionFile: string | undefined;
 	readonly #terminalSession: TerminalSessionSource = {
 		file: () => this.#sessionFile,
@@ -180,10 +191,18 @@ export class HostedClientLink {
 	#attached = false;
 	/** `connect` has resolved: from here on, a closed link reports through `onClosed`. */
 	#connected = false;
-	/** Explicit detach/exit, or a failed connect: nothing applies or reports any more. */
+	/** Explicit detach/exit, a failed connect, or a lost transport given up: nothing applies or reports any more. */
 	#left = false;
-	/** The transport ended unexpectedly; frames already received still apply. */
-	#lost = false;
+	/** The transport ended unexpectedly and the link is trying to get it back; writes are refused meanwhile. */
+	#reconnecting = false;
+	/** The running reconnect loop, which a leave waits out. */
+	#reconnectLoop: Promise<void> | undefined;
+	/** The current reconnect attempt: resolved once the host's reply is applied, rejected when it cannot be. */
+	#reconnectAttempt: PromiseWithResolvers<void> | undefined;
+	/** A dialog was aborted by the loss: the ring would not resend it, so the next attempt asks for a snapshot. */
+	#dialogLost = false;
+	/** What the next connection's `hello` resumes from; undefined asks for a snapshot. */
+	#resumePoint: { hostId: string; epoch: number; lastSeq: number } | undefined;
 	/** A frame failed to apply, so the view no longer matches the host: nothing else is applied. */
 	#failure: Error | undefined;
 	/** Session epoch of the view the user sees; sent as `ifEpoch` on writes. */
@@ -222,9 +241,11 @@ export class HostedClientLink {
 		this.#entry = options.entry;
 		this.#replicaDir = options.replicaDir;
 		this.#onClosed = options.onClosed;
+		this.#reconnectTimeoutMs = options.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS;
 		this.#keepStartupFrame = options.keepStartupFrame === true;
 		this.#client = new RpcClient({
-			spawn: () => connectSessionHost({ entry: options.entry, client: { kind: "tui" }, ui: true }),
+			spawn: () =>
+				connectSessionHost({ entry: options.entry, client: { kind: "tui" }, ui: true, resume: this.#resumePoint }),
 		});
 	}
 
@@ -283,6 +304,11 @@ export class HostedClientLink {
 		return this.#epoch;
 	}
 
+	/** The transport was lost and the link is getting it back: writes reject until it is. */
+	get reconnecting(): boolean {
+		return this.#reconnecting;
+	}
+
 	/**
 	 * Send input to the host. Rejects with an `RpcCommandError` (`code: "stale"` when the session moved on under
 	 * this view); the caller keeps the user's draft and the link never retries a write.
@@ -299,8 +325,9 @@ export class HostedClientLink {
 		await this.#client.promptToCompletion(text, { images, streamingBehavior: "steer", preconditions: this.#guard() });
 	}
 
-	/** Abort the host's current run. Never guarded: an abort must reach the session the host runs now. */
+	/** Abort the host's current run. Not epoch-guarded: an abort must reach the session the host runs now. */
 	async abort(): Promise<void> {
+		if (this.#reconnecting) throw new Error(RECONNECTING_ERROR);
 		await this.#client.abort();
 	}
 
@@ -351,7 +378,7 @@ export class HostedClientLink {
 		return (await this.#client.cycleThinkingLevel(this.#guard())) !== null;
 	}
 
-	/** Leave the session running and close this client. The caller exits or re-attaches; there is no reconnect. */
+	/** Leave the session running and close this client; a reconnect in progress stops without sending anything. */
 	async detach(): Promise<void> {
 		await this.#leave(() => this.#client.detach());
 	}
@@ -380,6 +407,8 @@ export class HostedClientLink {
 	}
 
 	#guard(): RpcPreconditions {
+		// Every guarded write starts here; while reconnecting its outcome could not be known, so it is never sent.
+		if (this.#reconnecting) throw new Error(RECONNECTING_ERROR);
 		return { ifEpoch: this.#epoch };
 	}
 
@@ -390,14 +419,20 @@ export class HostedClientLink {
 
 	/** Mark the leave before the request: nothing may report it as a lost connection, and no answer may follow it. */
 	async #leave(request: () => Promise<void>): Promise<void> {
-		if (!this.#open || this.#lost) return;
+		if (!this.#open) return;
 		this.#left = true;
+		// Mid-reconnect there is no connection to carry the request: nothing is sent.
+		const connected = !this.#reconnecting;
+		this.#reconnecting = false;
+		this.#reconnectAttempt?.reject(new Error("Left the session host"));
 		this.#abortDialogs();
 		this.#ctx.statusLine.setCollabStatus(null);
 		try {
-			await request();
+			if (connected) await request();
 		} finally {
 			await this.#client.stop();
+			// The loop stops a connection it opened meanwhile before it returns.
+			await this.#reconnectLoop;
 			// Whatever was mid-apply finishes before the caller touches the shared TUI state.
 			await this.#chain;
 			await this.#discardLocalState();
@@ -430,6 +465,8 @@ export class HostedClientLink {
 	async #failClosed(error: Error): Promise<void> {
 		if (!this.#open) return;
 		this.#failure = error;
+		this.#reconnecting = false;
+		this.#reconnectAttempt?.reject(error);
 		this.#abortDialogs();
 		await this.#client.stop();
 		await this.#discardLocalState();
@@ -445,7 +482,7 @@ export class HostedClientLink {
 		});
 	}
 
-	#notifyClosed(reason: { hostAlive: boolean; message: string }): void {
+	#notifyClosed(reason: Parameters<HostedClientOptions["onClosed"]>[0]): void {
 		try {
 			this.#onClosed(reason);
 		} catch (callbackError) {
@@ -464,11 +501,16 @@ export class HostedClientLink {
 				await this.#applySnapshot(frame.snapshot, frame.epoch, uiGeneration);
 				this.#attached = true;
 				this.#firstSnapshot.resolve();
+				this.#finishReconnect();
 				return;
 			}
 			case "resumed":
-				// This client never sends a `resume`, so the host has no reason to answer one.
-				throw new Error("Session host sent a resume reply to a fresh attach");
+				// Only the answer to this link's own `resume`, for the session the view still shows.
+				if (!this.#reconnecting || frame.epoch !== this.#epoch) {
+					throw new Error(`Session host sent a resume reply this client did not ask for (epoch ${frame.epoch})`);
+				}
+				this.#finishReconnect();
+				return;
 			case "entry": {
 				// A host that predates `leafId` sends none: the entry then becomes the leaf, as it always did.
 				const authoritative = frame.leafId === undefined ? undefined : { leafId: frame.leafId };
@@ -699,7 +741,7 @@ export class HostedClientLink {
 			this.#sessionFile = sessionFile;
 		} catch (error) {
 			// Leaving or losing the host fails the request too; those are reported by their own paths.
-			if (this.#open && !this.#lost) {
+			if (this.#open && !this.#reconnecting) {
 				logger.warn("Hosted client could not read the relocated session file", {
 					hostId: this.hostId,
 					error: String(error),
@@ -785,7 +827,7 @@ export class HostedClientLink {
 			this.#publishStatus();
 		} catch (error) {
 			// Leaving or losing the host fails the request too; those are reported by their own paths.
-			if (this.#open && !this.#lost) {
+			if (this.#open && !this.#reconnecting) {
 				logger.warn("Hosted client could not read the host's context usage", {
 					hostId: this.hostId,
 					error: String(error),
@@ -983,31 +1025,102 @@ export class HostedClientLink {
 	}
 
 	#handleTransportClosed(error: Error): void {
-		if (!this.#open || this.#lost) return;
-		this.#lost = true;
-		// Nothing can be answered over a dead transport.
-		this.#abortDialogs();
+		if (!this.#open) return;
 		if (!this.#connected) {
+			// Nothing can be answered over a dead transport.
+			this.#abortDialogs();
 			// `connect` is still waiting on this transport: its pending request or first snapshot fails with it.
 			this.#firstSnapshot.reject(error);
 			return;
 		}
-		void this.#reportLost(error);
+		if (this.#reconnecting) {
+			// A reconnect attempt's transport died before the link was back: the loop tries again.
+			const attempt = this.#reconnectAttempt;
+			this.#reconnectAttempt = undefined;
+			attempt?.reject(error);
+			this.#dialogLost ||= this.#dialogs.size > 0 || this.#awaiting.size > 0;
+			this.#abortDialogs();
+			return;
+		}
+		this.#reconnecting = true;
+		// A dialog aborted here gets no replay from the ring: resuming without `resume` makes the snapshot present it again.
+		this.#dialogLost = this.#dialogs.size > 0 || this.#awaiting.size > 0;
+		this.#abortDialogs();
+		this.#reconnectLoop = this.#reconnect(error);
 	}
 
-	async #reportLost(error: Error): Promise<void> {
-		// Frames that arrived before the close still render before the caller is told.
+	/** The host's reply to a reconnect attempt is applied; the loop still restores per-connection settings. */
+	#finishReconnect(): void {
+		this.#reconnectAttempt?.resolve();
+	}
+
+	/**
+	 * Get the transport back: resume from the host's replay ring, or take a fresh snapshot, until the host process is
+	 * gone or the timeout passes. Commands in flight at the loss already failed with it and are never resent.
+	 */
+	async #reconnect(error: Error): Promise<void> {
+		const lostAt = Date.now();
+		// Frames that arrived before the close still render before anything else happens.
 		await this.#chain;
 		if (!this.#open) return;
-		this.#abortDialogs();
+		logger.warn("Session host connection lost; reconnecting", { hostId: this.hostId, error: error.message });
+		this.#ctx.showStatus(`Connection to session host ${this.hostId} lost; reconnecting…`, { dim: true });
+		for (let attempt = 0; ; attempt++) {
+			if (!this.#open || this.#ctx.isShuttingDown) return;
+			const outcome = Promise.withResolvers<void>();
+			this.#reconnectAttempt = outcome;
+			try {
+				const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+				await Promise.race([Bun.sleep(delay), outcome.promise]);
+				// A failed attempt may have applied frames: the resume point never passes what the view shows.
+				await this.#chain;
+				if (!this.#open || this.#ctx.isShuttingDown) return;
+				const hostAlive = await hostProcessAlive(this.#entry.pid);
+				if (!hostAlive || Date.now() - lostAt >= this.#reconnectTimeoutMs) {
+					await this.#closeLost(hostAlive, error);
+					return;
+				}
+				// `start()` resets `lastSeq`: an attempt that decoded nothing stamped keeps the previous point.
+				const lastSeq = this.#client.lastSeq ?? this.#resumePoint?.lastSeq;
+				this.#resumePoint =
+					this.#dialogLost || lastSeq === undefined
+						? undefined
+						: { hostId: this.hostId, epoch: this.#epoch, lastSeq };
+				await this.#client.start();
+				await outcome.promise;
+				// Per-connection settings do not survive a reconnect; writes stay refused until it is restored.
+				await this.#client.setAskDialog(true);
+				// The transport died after the reply applied: its close handler dropped this attempt.
+				if (this.#reconnectAttempt !== outcome) throw new Error("Session host connection lost again");
+			} catch (attemptError) {
+				logger.debug("Session host reconnect attempt failed", {
+					hostId: this.hostId,
+					error: String(attemptError),
+				});
+				await this.#client.stop();
+				continue;
+			}
+			if (!this.#open) return;
+			this.#reconnecting = false;
+			this.#reconnectAttempt = undefined;
+			void this.#refreshHostContext();
+			this.#ctx.showStatus(`Reconnected to session host ${this.hostId}`, { dim: true });
+			return;
+		}
+	}
+
+	/** Reconnecting ended without the host: delete the local copy and report. */
+	async #closeLost(hostAlive: boolean, error: Error): Promise<void> {
+		this.#left = true;
+		this.#reconnecting = false;
+		this.#reconnectAttempt = undefined;
+		await this.#client.stop();
 		await this.#discardLocalState();
-		const hostAlive = await hostProcessAlive(this.#entry.pid);
 		logger.warn("Session host connection closed", { hostId: this.hostId, hostAlive, error: error.message });
-		this.#notifyClosed({
-			hostAlive,
-			message: hostAlive
-				? `connection lost (host ${this.hostId} still running; omp attach ${this.hostId})`
-				: "host exited",
-		});
+		this.#notifyClosed(
+			hostAlive
+				? { hostAlive, message: `connection lost (host ${this.hostId} still running; omp attach ${this.hostId})` }
+				: { hostAlive, message: "host exited", sessionFile: this.#sessionFile },
+		);
 	}
 }
