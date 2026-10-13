@@ -187,6 +187,10 @@ export interface HostProxy {
 	inject(frame: object): void;
 	/** Cut every client's connection, like a network failure. */
 	drop(): void;
+	/** Destroy every new client connection on accept, as if the host could not be reached. */
+	refuse(): void;
+	/** Forward new client connections again (the default). */
+	accept(): void;
 	close(): void;
 }
 
@@ -201,7 +205,12 @@ export async function startProxy(
 ): Promise<HostProxy> {
 	const socketPath = path.join(dir, "proxy.sock");
 	const clients = new Set<net.Socket>();
+	let refusing = false;
 	const server = net.createServer(client => {
+		if (refusing) {
+			client.destroy();
+			return;
+		}
 		const upstream = net.connect(entry.endpoint);
 		clients.add(client);
 		if (options.refuseExit === undefined) client.pipe(upstream);
@@ -227,6 +236,12 @@ export async function startProxy(
 		},
 		drop: (): void => {
 			for (const client of clients) client.destroy();
+		},
+		refuse: (): void => {
+			refusing = true;
+		},
+		accept: (): void => {
+			refusing = false;
 		},
 		close: (): void => void server.close(),
 	};

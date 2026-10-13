@@ -434,9 +434,15 @@ export class RpcClient {
 	#protocolVersion: RpcProtocolVersion = 1;
 	#extensionUiListeners: Set<RpcExtensionUiRequestListener> = new Set();
 	#abortController = new AbortController();
+	#lastSeq: number | undefined;
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
+	}
+
+	/** `seq` of the last decoded frame that carried one (a host's `attached` included); reset by every {@link start}. */
+	get lastSeq(): number | undefined {
+		return this.#lastSeq;
 	}
 
 	/**
@@ -457,6 +463,7 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#lastSeq = undefined;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -1675,6 +1682,7 @@ export class RpcClient {
 	// =========================================================================
 
 	#handleLine(data: unknown): void {
+		if (isRecord(data) && typeof data.seq === "number") this.#lastSeq = data.seq;
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
 			const id = data.id;
