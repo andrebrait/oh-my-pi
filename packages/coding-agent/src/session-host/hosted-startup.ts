@@ -454,6 +454,7 @@ export async function attachHostedUi(
 				return;
 			}
 			if (ctx.isShuttingDown) return;
+			ctx.showStatus("Reopening the session…");
 			await connect(await ensureSessionHost(sessionFile, hosted.launch));
 			if (ctx.hostedClient) ctx.showStatus(`Reopened the session in host ${ctx.hostedClient.hostId}`);
 		} catch (error) {

@@ -1769,7 +1769,12 @@ describe("HostedClientLink reconnect", () => {
 				await view.connect(proxy.entry);
 
 				await loseConnection(view, proxy);
-				await view.hostLink[leave]();
+				if (leave === "detach") await view.hostLink.detach();
+				// Nothing can carry the exit: the link leaves, and says the host it could not stop is still running.
+				else
+					await expect(view.hostLink.exit()).rejects.toThrow(
+						`connection lost; host ${host.hostId} still running (omp attach ${host.hostId})`,
+					);
 				proxy.accept();
 				// Real time on purpose: a reconnect attempt that should not exist has no event to await, and the schedule retries within 500 ms.
 				await Bun.sleep(500);
@@ -1783,6 +1788,66 @@ describe("HostedClientLink reconnect", () => {
 			}
 		});
 	}
+
+	itPosix("opts in to the ask dialog again on the connection it reconnected with", async () => {
+		let ui: ExtensionUIContext | undefined;
+		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			await waitFor(() => ui!.askDialog !== undefined);
+
+			await loseConnection(view, proxy);
+			// The host withdraws the dialog with the last connection that opted in.
+			await waitFor(() => ui!.askDialog === undefined);
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+			// Without the opt-in on the new connection the host stays on its select-per-question fallback.
+			await waitFor(() => ui!.askDialog !== undefined);
+
+			const asked = ui!.askDialog!([
+				{ id: "q1", question: "Which?", options: [{ label: "A" }, { label: "B" }] },
+				{ id: "q2", question: "And?", options: [{ label: "C" }, { label: "D" }] },
+			]);
+			await waitFor(() => view.dialogs.length === 1);
+			expect(view.dialogs[0].title).toBe("ask");
+			view.dialogs[0].answer({ kind: "chat" } satisfies ExtensionAskDialogResult);
+			expect(await asked).toEqual({ kind: "chat" });
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("reports the session file the host moved its session to, once the host is gone", async () => {
+		const host = await fixture.startHost();
+		await host.session.sessionManager.ensureOnDisk();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			// The link takes the host process for dead once the connection drops.
+			const gone = Bun.spawn(["true"]);
+			await gone.exited;
+			await view.connect({ ...proxy.entry, pid: gone.pid });
+			const relocated = vi.spyOn(view.ctx, "refreshTranscriptLinks");
+			const moved = path.join(fixture.dir, "moved-project");
+			await fs.mkdir(moved, { recursive: true });
+
+			// What `/move` and `/wt` call on the host.
+			await host.session.moveSession(moved, path.join(fixture.dir, "moved-sessions"));
+			const movedFile = host.session.sessionFile;
+			await waitFor(() => relocated.mock.calls.length > 0);
+			// The link's state request went out before the relocation was applied; this answer follows its answer.
+			await view.hostLink.availableModels();
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => view.closed.length === 1);
+
+			expect(view.closed[0]).toEqual({ hostAlive: false, message: "host exited", sessionFile: movedFile });
+		} finally {
+			proxy.close();
+		}
+	});
 
 	itPosix("stops reconnecting on detach while the host is reachable", async () => {
 		const host = await fixture.startHost();
