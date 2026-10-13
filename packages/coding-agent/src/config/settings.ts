@@ -44,6 +44,7 @@ import { applyHyperlinkSetting } from "../tui/hyperlink";
 import { replaceFileAtomically } from "../utils/atomic-file";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { isSearchProviderId, SEARCH_PROVIDER_ORDER } from "../web/search/types";
+import { validateAgentCompactionOverrides } from "./agent-compaction";
 import { stringifyYamlConfig } from "./config-file";
 import { validateAgentServiceTierOverrides } from "./service-tier";
 import {
@@ -664,6 +665,9 @@ export class Settings {
 	 * Triggers hooks for settings that have side effects.
 	 */
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		if (path === "task.agentCompactionOverrides") {
+			value = validateAgentCompactionOverrides(value) as SettingValue<P>;
+		}
 		const prev = this.get(path);
 		const segments = path.split(".");
 		this.#captureGlobalMutation(path, this.#modifiedPathMutations, getByPath(this.#global, segments));
@@ -686,6 +690,9 @@ export class Settings {
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		if (path === "task.agentCompactionOverrides") {
+			value = validateAgentCompactionOverrides(value) as SettingValue<P>;
+		}
 		if (path === "modelRoles") {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
@@ -2048,6 +2055,20 @@ export class Settings {
 		delete raw["inspect_image.mode"];
 		delete raw["inspect_image.timeoutMs"];
 
+		// Validate before layer merging can hide malformed policy fields. Quoted
+		// dotted keys follow the same nested-key precedence as other task settings.
+		if (Object.hasOwn(raw, "task.agentCompactionOverrides")) {
+			const policies = validateAgentCompactionOverrides(raw["task.agentCompactionOverrides"]);
+			if (!isRecord(raw.task)) raw.task = {};
+			if (!Object.hasOwn(raw.task as RawSettings, "agentCompactionOverrides")) {
+				(raw.task as RawSettings).agentCompactionOverrides = policies;
+			}
+			delete raw["task.agentCompactionOverrides"];
+		}
+		if (isRecord(raw.task) && Object.hasOwn(raw.task, "agentCompactionOverrides")) {
+			raw.task.agentCompactionOverrides = validateAgentCompactionOverrides(raw.task.agentCompactionOverrides);
+		}
+
 		const taskObj = raw.task as Record<string, unknown> | undefined;
 		const isolationObj = taskObj?.isolation as Record<string, unknown> | undefined;
 
@@ -3006,9 +3027,10 @@ export class Settings {
 		const result = { ...base };
 		for (const key of Object.keys(overrides)) {
 			const override = overrides[key];
-			const baseVal = base[key];
+			const baseVal = Object.hasOwn(base, key) ? base[key] : undefined;
 
 			if (override === undefined) continue;
+			let merged = override;
 
 			if (
 				typeof override === "object" &&
@@ -3018,10 +3040,15 @@ export class Settings {
 				baseVal !== null &&
 				!Array.isArray(baseVal)
 			) {
-				result[key] = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
-			} else {
-				result[key] = override;
+				merged = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
 			}
+			// Record keys such as agent names must remain own properties, including "__proto__".
+			Object.defineProperty(result, key, {
+				value: merged,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 		}
 		return result;
 	}

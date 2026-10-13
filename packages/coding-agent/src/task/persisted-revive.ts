@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
+import { validateAgentCompactionPolicy } from "../config/agent-compaction";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -80,6 +81,10 @@ export function createPersistedSubagentReviverFactory(
 			return undefined;
 		}
 		const init = peek.init;
+		// Replay the recorded selection, never a newly configured agent-name entry.
+		// Files predating this field inherit the unscoped compaction baseline.
+		const compactionPolicy =
+			init.compactionPolicy === undefined ? undefined : validateAgentCompactionPolicy(init.compactionPolicy);
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
 		// assuming a fixed level.
@@ -95,17 +100,22 @@ export function createPersistedSubagentReviverFactory(
 		// advisor-role model, anything else = the explicit pattern stamped onto
 		// this session's `modelRoles.advisor`. Absent = unadvised (the
 		// createSubagentSettings default).
-		const subagentSettings = createSubagentSettings(ctx.settings, {
-			...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
-			...(init.advisor
-				? {
-						"advisor.enabled": true,
-						...(init.advisor !== "on"
-							? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
-							: undefined),
-					}
-				: undefined),
-		});
+		const subagentSettings = createSubagentSettings(
+			ctx.settings,
+			{
+				...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+				...(init.advisor
+					? {
+							"advisor.enabled": true,
+							...(init.advisor !== "on"
+								? { modelRoles: { ...ctx.settings.getModelRoles(), advisor: init.advisor } }
+								: undefined),
+						}
+					: undefined),
+			},
+			undefined,
+			compactionPolicy,
+		);
 		const persistedModelPattern =
 			init.modelRole && init.modelRole !== "default"
 				? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]

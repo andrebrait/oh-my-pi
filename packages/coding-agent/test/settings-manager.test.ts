@@ -89,6 +89,45 @@ describe("Settings", () => {
 		await tempDir?.remove();
 	});
 
+	describe("agent compaction overrides", () => {
+		it("normalizes an empty YAML map without changing main compaction settings", async () => {
+			await writeSettings({
+				compaction: { methodOrder: ["remote"], asyncEnabled: true },
+				task: { agentCompactionOverrides: null },
+			});
+			const settings = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+			expect(settings.get("task.agentCompactionOverrides")).toEqual({});
+			expect(settings.get("compaction.methodOrder")).toEqual(["remote"]);
+			expect(settings.get("compaction.asyncEnabled")).toBe(true);
+		});
+
+		it("loads quoted dotted maps while keeping nested policy precedence", async () => {
+			await writeSettings({
+				"task.agentCompactionOverrides": { task: { asyncEnabled: false } },
+			});
+			const dotted = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+			expect(dotted.get("task.agentCompactionOverrides")).toEqual({ task: { asyncEnabled: false } });
+
+			await writeSettings({
+				"task.agentCompactionOverrides": { task: { asyncEnabled: false } },
+				task: { agentCompactionOverrides: { scout: { autoContinue: false } } },
+			});
+			const nested = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+			expect(nested.get("task.agentCompactionOverrides")).toEqual({ scout: { autoContinue: false } });
+		});
+
+		it("rejects invalid YAML policy fields before runtime overrides can hide them", async () => {
+			await writeSettings({ task: { agentCompactionOverrides: { task: { asyncEnabled: null } } } });
+			await expect(
+				Settings.loadReadOnly({
+					cwd: projectDir,
+					agentDir,
+					overrides: { "task.agentCompactionOverrides": { task: { asyncEnabled: false } } },
+				}),
+			).rejects.toThrow();
+		});
+	});
+
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");

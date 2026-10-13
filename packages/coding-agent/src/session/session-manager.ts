@@ -18,6 +18,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import type { AgentCompactionPolicy } from "../config/agent-compaction";
 import type { StructuredSubagentSchemaMode } from "../task/types";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
@@ -2412,6 +2413,7 @@ export class SessionManager {
 		spawns?: string;
 		readSummarize?: boolean;
 		advisor?: string;
+		compactionPolicy?: AgentCompactionPolicy;
 		isolated?: boolean;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
@@ -2978,6 +2980,7 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			compactionPolicy?: AgentCompactionPolicy;
 			isolated?: boolean;
 		} | null;
 	} | null> {
@@ -2996,6 +2999,7 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			compactionPolicy?: AgentCompactionPolicy;
 			isolated?: boolean;
 		} | null = null;
 		const visit = (entry: FileEntry): void => {
@@ -3018,6 +3022,7 @@ export class SessionManager {
 					readSummarize: entry.readSummarize,
 					spawns: entry.spawns,
 					advisor: entry.advisor,
+					compactionPolicy: entry.compactionPolicy,
 					isolated: entry.isolated,
 				};
 			}

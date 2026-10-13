@@ -54,6 +54,7 @@ import {
 	SEARCH_PROVIDER_CHOICES,
 	type SearchProviderId,
 } from "../web/search/types";
+import type { AgentCompactionPolicy } from "./agent-compaction";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -405,6 +406,7 @@ const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_AGENT_SERVICE_TIER_OVERRIDES: Record<string, ServiceTierInheritSettingValue> = {};
+const EMPTY_AGENT_COMPACTION_OVERRIDES: Record<string, AgentCompactionPolicy> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
@@ -5388,6 +5390,10 @@ export const SETTINGS_SCHEMA = {
 	"task.agentServiceTierOverrides": {
 		type: "record",
 		default: EMPTY_AGENT_SERVICE_TIER_OVERRIDES,
+	},
+	"task.agentCompactionOverrides": {
+		type: "record",
+		default: EMPTY_AGENT_COMPACTION_OVERRIDES,
 	},
 	"task.agentPrewalk": {
 		type: "record",

@@ -658,10 +658,26 @@ memory:
 | `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
 | `compaction.keepRecentTokens` | number  | `20000`                                  | Recent tokens always preserved.                                                                                                                                                                                                           |
 | `compaction.autoContinue`     | boolean | `true`                                   | Continue automatically after compaction.                                                                                                                                                                                                  |
+| `task.agentCompactionOverrides` | record | `{}` | Sparse exact-agent-name policies for task, eval, and Vibe workers. Each policy accepts only optional `methodOrder`, `asyncEnabled`, and `autoContinue`; omitted fields inherit the unmodified parent baseline. |
 | `memory.backend`              | enum    | `off`                                    | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys.                                                                                                                  |
 | `autolearn.enabled`           | boolean | `false`       | Experimental: after the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills under `~/.omp/agent/managed-skills`. Enables the `manage_skill` tool (and `learn` when a memory backend is active). |
 | `autolearn.autoContinue`      | boolean | `false`       | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn.                                                                                                           |
 | `autolearn.minToolCalls`      | number  | `5`           | Only nudge after a turn that used at least this many tools.                                                                                                                                                                               |
+
+To scope compaction behavior to the generic `task` agent without changing the main session or other agent types:
+
+```yaml
+task:
+  agentCompactionOverrides:
+    task:
+      methodOrder: [handoff]
+      asyncEnabled: false
+      autoContinue: true
+```
+
+Names match exactly and case-sensitively; there are no wildcard or model matches. An absent or YAML-empty (`null`) map means no overrides, and an empty policy (`{}`) inherits all three fields. `methodOrder` accepts the same methods as `compaction.methodOrder`, including an empty list; unknown fields, unsupported methods, and incorrect value types fail settings validation. Thresholds, context windows, reserve/retention settings, and compaction models are not configurable through this map.
+
+Policies apply only to the selected child, not to its parent, unrelated siblings, or differently named descendants. Explicit child-factory settings overrides take precedence. A new child session records its selected policy, including `{}` when none applies; revival uses that recorded policy rather than reselecting from the current map. Older sessions without a recorded policy inherit the baseline.
 
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 

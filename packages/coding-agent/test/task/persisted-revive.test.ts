@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import type { AgentCompactionPolicy } from "@oh-my-pi/pi-coding-agent/config/agent-compaction";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -13,6 +14,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -90,7 +92,13 @@ async function createPersistedSession(
 	restrictToolNames?: boolean,
 	modelRole?: string,
 	advisor?: string,
-	contract?: { tools?: string[]; readOnly?: boolean; agent?: string; isolated?: boolean },
+	contract?: {
+		tools?: string[];
+		readOnly?: boolean;
+		agent?: string;
+		isolated?: boolean;
+		compactionPolicy?: AgentCompactionPolicy;
+	},
 ): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const sessionFile = manager.getSessionFile();
@@ -106,6 +114,7 @@ async function createPersistedSession(
 		readOnly: contract?.readOnly,
 		agent: contract?.agent,
 		isolated: contract?.isolated,
+		compactionPolicy: contract?.compactionPolicy,
 	});
 	manager.appendMessage({
 		role: "assistant",
@@ -128,7 +137,7 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-function createFactory(cwd: string, eventBus?: EventBus) {
+function createFactory(cwd: string, eventBus?: EventBus, settings = Settings.isolated()) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -142,7 +151,7 @@ function createFactory(cwd: string, eventBus?: EventBus) {
 		session: parentSession,
 		authStorage: {} as never,
 		modelRegistry: { authStorage: {} } as ModelRegistry,
-		settings: Settings.isolated(),
+		settings,
 		enableLsp: true,
 		eventBus,
 	});
@@ -155,6 +164,90 @@ afterEach(async () => {
 });
 
 describe("persisted subagent revival", () => {
+	it("revives the recorded compaction policy rather than the current name override without leaking it to descendants", async () => {
+		const cwd = makeTempDir("@pi-compaction-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			agent: "task",
+			compactionPolicy: { methodOrder: ["handoff"], asyncEnabled: false, autoContinue: false },
+		});
+		const settings = Settings.isolated({
+			"compaction.methodOrder": ["remote", "soft"],
+			"compaction.asyncEnabled": true,
+			"compaction.autoContinue": true,
+			"task.agentCompactionOverrides": { task: { methodOrder: ["shake"], asyncEnabled: true } },
+		});
+		let revivedSettings: Settings | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			revivedSettings = options?.settings;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, settings)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		if (!revivedSettings) throw new Error("Expected revived settings");
+		expect(revivedSettings.get("compaction.methodOrder")).toEqual(["handoff"]);
+		expect(revivedSettings.get("compaction.asyncEnabled")).toBe(false);
+		expect(revivedSettings.get("compaction.autoContinue")).toBe(false);
+		const nested = createSubagentSettings(revivedSettings);
+		expect(nested.get("compaction.methodOrder")).toEqual(["remote", "soft"]);
+		expect(nested.get("compaction.asyncEnabled")).toBe(true);
+		expect(nested.get("compaction.autoContinue")).toBe(true);
+		expect(settings.get("compaction.asyncEnabled")).toBe(true);
+	});
+
+	it.each([
+		{ label: "legacy absent", compactionPolicy: undefined },
+		{ label: "recorded empty", compactionPolicy: {} },
+	])(
+		"inherits the unscoped baseline for $label policies, ignoring newly configured overrides",
+		async ({ compactionPolicy }) => {
+			const cwd = makeTempDir("@pi-compaction-inherit-revive-");
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+				agent: "task",
+				compactionPolicy,
+			});
+			const baseline = Settings.isolated({
+				"compaction.methodOrder": ["remote"],
+				"compaction.asyncEnabled": true,
+				"compaction.autoContinue": false,
+				"task.agentCompactionOverrides": {
+					task: { methodOrder: ["shake"], asyncEnabled: false, autoContinue: true },
+				},
+			});
+			const scopedParent = createSubagentSettings(baseline, undefined, undefined, {
+				methodOrder: ["handoff"],
+				asyncEnabled: false,
+				autoContinue: true,
+			});
+			let revivedSettings: Settings | undefined;
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				revivedSettings = options?.settings;
+				return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+			});
+			const ref = createRef(sessionFile);
+			const reviver = await createFactory(cwd, undefined, scopedParent)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+
+			expect(revivedSettings?.get("compaction.methodOrder")).toEqual(["remote"]);
+			expect(revivedSettings?.get("compaction.asyncEnabled")).toBe(true);
+			expect(revivedSettings?.get("compaction.autoContinue")).toBe(false);
+		},
+	);
+
+	it("rejects a persisted compaction policy containing forbidden settings before opening the session", async () => {
+		const cwd = makeTempDir("@pi-compaction-invalid-revive-");
+		const malformed: unknown = { thresholdTokens: 1 };
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			compactionPolicy: malformed as AgentCompactionPolicy,
+		});
+		const open = vi.spyOn(SessionManager, "open");
+		await expect(createFactory(cwd)(createRef(sessionFile))).rejects.toThrow();
+		expect(open).not.toHaveBeenCalled();
+	});
+
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);

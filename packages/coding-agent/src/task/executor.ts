@@ -13,6 +13,7 @@ import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-m
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
+import { type AgentCompactionPolicy, validateAgentCompactionPolicy } from "../config/agent-compaction";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
@@ -962,15 +963,28 @@ function inheritedSubagentServiceTiers(
 		: (inheritedServiceTier ?? {});
 }
 
+// A scoped policy belongs only to its selected agent, not to agents it spawns.
+const subagentCompactionBaselines = new WeakMap<Settings, Required<AgentCompactionPolicy>>();
+
 export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
 	inheritedServiceTier?: ServiceTierByFamily | null,
+	compactionPolicy?: AgentCompactionPolicy,
 ): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
 	}
+	const inheritedCompactionBaseline = subagentCompactionBaselines.get(baseSettings);
+	const compactionBaseline = inheritedCompactionBaseline ?? {
+		methodOrder: [...baseSettings.get("compaction.methodOrder")],
+		asyncEnabled: baseSettings.get("compaction.asyncEnabled"),
+		autoContinue: baseSettings.get("compaction.autoContinue"),
+	};
+	snapshot["compaction.methodOrder"] = [...(compactionPolicy?.methodOrder ?? compactionBaseline.methodOrder)];
+	snapshot["compaction.asyncEnabled"] = compactionPolicy?.asyncEnabled ?? compactionBaseline.asyncEnabled;
+	snapshot["compaction.autoContinue"] = compactionPolicy?.autoContinue ?? compactionBaseline.autoContinue;
 	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
 	// match the parent's live tiers when a live session supplied them, else the
 	// subagent's own configured tier.* settings). The result is stamped back onto
@@ -980,7 +994,7 @@ export function createSubagentSettings(
 	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
 	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
 	snapshot["tier.google"] = subagentTiers.google ?? "none";
-	return Settings.isolated(
+	const childSettings = Settings.isolated(
 		{
 			...snapshot,
 			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
@@ -1000,6 +1014,10 @@ export function createSubagentSettings(
 		},
 		{ storage: baseSettings.getStorage() },
 	);
+	if (compactionPolicy !== undefined || inheritedCompactionBaseline !== undefined) {
+		subagentCompactionBaselines.set(childSettings, compactionBaseline);
+	}
+	return childSettings;
 }
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
@@ -3081,10 +3099,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// no advisor (createSubagentSettings forces `advisor.enabled` off); an
 	// explicit model pattern lands on the child's `modelRoles.advisor` so role
 	// aliases and `:level` suffixes resolve inside the spawned session.
+	const advisorOverrides = settings.get("task.agentAdvisor");
 	const advisorSelection = resolveAgentAdvisorSelection({
-		settingsOverride: settings.get("task.agentAdvisor")[agent.name],
+		settingsOverride: Object.hasOwn(advisorOverrides, agent.name) ? advisorOverrides[agent.name] : undefined,
 		agentAdvisor: agent.advisor,
 	});
+	const compactionOverrides = settings.get("task.agentCompactionOverrides");
+	const compactionPolicy = validateAgentCompactionPolicy(
+		Object.hasOwn(compactionOverrides, agent.name) ? compactionOverrides[agent.name] : {},
+	);
 	const subagentSettings = createSubagentSettings(
 		settings,
 		{
@@ -3097,6 +3120,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: undefined),
 		},
 		options.parentServiceTier,
+		compactionPolicy,
 	);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(
@@ -3379,8 +3403,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn.
 			let prewalk: Prewalk | undefined;
+			const prewalkOverrides = settings.get("task.agentPrewalk");
 			const prewalkPattern = resolveAgentPrewalkPattern({
-				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
+				settingsOverride: Object.hasOwn(prewalkOverrides, agent.name) ? prewalkOverrides[agent.name] : undefined,
 				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
 			if (prewalkPattern) {
@@ -3679,6 +3704,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
 				advisor: advisorSelection ? (advisorSelection.model ?? "on") : undefined,
+				compactionPolicy,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
