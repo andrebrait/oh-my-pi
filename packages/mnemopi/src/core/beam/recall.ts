@@ -685,7 +685,10 @@ function scoreCandidate(
 		options.queryTime == null
 			? recencyDecay(candidate.row.timestamp, 72)
 			: temporalBoost(candidate.row.timestamp, parseQueryTime(options.queryTime), 72);
-	const keyword = Math.max(lexical, candidate.signals.fts * 0.6);
+	// ABLATION: Mnemosyne 4.0 working-memory relevance (beam.py ~9419): FTS rank only nudges the word-match score.
+	const keyword = candidate.signals.ftsMatched
+		? Math.max(lexical, 0.75 * lexical + 0.25 * candidate.signals.fts)
+		: lexical;
 	let baseScore: number;
 	if (candidate.tierLabel === "episodic") {
 		baseScore = Math.max(
