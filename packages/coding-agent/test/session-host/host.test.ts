@@ -644,6 +644,31 @@ describe("session host", () => {
 		await stopWith(host, [a, same, foreign]);
 	});
 
+	it("gives an RpcClient the seq of the last frame it decoded, from which a resume replays nothing", async () => {
+		const host = await startHost();
+		const client = await attachClient(host);
+		const observer = await rawClient({});
+		const attached = await observer.next(isHandshake);
+		const passer = await rawClient({});
+		await passer.next(isHandshake);
+		const count = (f: Record<string, unknown>): number => (Array.isArray(f.clients) ? f.clients.length : -1);
+		const joined = await observer.next(f => f.type === "clients_changed" && count(f) === 3);
+		passer.write({ id: "bye", type: "detach" });
+		// The last frame the host stamped: every client still attached receives it.
+		const left = await observer.next(
+			f => f.type === "clients_changed" && (f.seq as number) > (joined.seq as number) && count(f) === 2,
+		);
+
+		await waitFor(() => client.lastSeq === left.seq);
+
+		const resumed = await rawClient({
+			resume: { hostId: host.hostId, epoch: attached.epoch, lastSeq: client.lastSeq },
+		});
+		expect(await resumed.next(isHandshake)).toMatchObject({ type: "resumed", replayed: 0 });
+		await client.detach();
+		await stopWith(host, [observer, passer, resumed]);
+	});
+
 	it("tells attached clients when another client attaches and detaches", async () => {
 		const host = await startHost();
 		const a = await rawClient({ client: { kind: "test", label: "a" } });

@@ -482,6 +482,51 @@ describe("a hosted terminal's shutdown", () => {
 		20_000,
 	);
 
+	itPosix(
+		"/exit while reconnecting exits with status 1 and names the host it leaves running",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const hosted = await HostedMode.open();
+			await hosted.attach(proxy.entry);
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => hosted.mode.hostedClient?.reconnecting === true);
+
+			await executeBuiltinSlashCommand("/exit", { ctx: hosted.mode });
+
+			expect(await hosted.exited.promise).toBe(1);
+			expect(hosted.printed).toContain(`Could not stop session host ${host.hostId}`);
+			expect(hosted.printed).toContain(`omp attach ${host.hostId}`);
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+			await fixture.waitForClients(host, 0);
+			expect(host.exited).toBe(false);
+		},
+		20_000,
+	);
+
+	itPosix(
+		"/detach while reconnecting exits normally",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const hosted = await HostedMode.open();
+			await hosted.attach(proxy.entry);
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => hosted.mode.hostedClient?.reconnecting === true);
+
+			await executeBuiltinSlashCommand("/detach", { ctx: hosted.mode });
+
+			expect(await hosted.exited.promise).toBe(0);
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+			expect(host.exited).toBe(false);
+		},
+		20_000,
+	);
+
 	it("does not offer to resume the host's session when it quits before the link is registered", async () => {
 		const host = await fixture.startHost();
 		await seedTurn(host, "a finished turn");

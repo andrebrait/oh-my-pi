@@ -802,7 +802,9 @@ async function runInteractiveMode(
 		];
 		for (const { text, images } of prompts) {
 			const link = mode.hostedClient;
-			if (!link) break; // closed while connecting or sending: a shutdown is under way
+			// Unset once the link closed (a shutdown, or the offer to reopen a host that exited, is under way): the
+			// remaining prompts are dropped. A link that is reconnecting stays set and rejects the prompt instead.
+			if (!link) break;
 			try {
 				using _keepalive = new EventLoopKeepalive();
 				await link.promptToCompletion(text, images);

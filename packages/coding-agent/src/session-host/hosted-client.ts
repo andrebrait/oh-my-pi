@@ -391,9 +391,16 @@ export class HostedClientLink {
 		await this.#leave(() => this.#client.detach());
 	}
 
-	/** `detach`, or stop the host when this is its last client. */
+	/**
+	 * `detach`, or stop the host when this is its last client. Mid-reconnect nothing can carry the request: the link
+	 * leaves without stopping the host and rejects, naming the host that is still running.
+	 */
 	async exit(): Promise<void> {
+		const reconnecting = this.#reconnecting;
 		await this.#leave(() => this.#client.exit());
+		if (reconnecting) {
+			throw new Error(`connection lost; host ${this.hostId} still running (omp attach ${this.hostId})`);
+		}
 	}
 
 	async #attach(): Promise<void> {
@@ -423,6 +430,11 @@ export class HostedClientLink {
 	/** Whether the link still applies frames and reports through `onClosed`. */
 	get #open(): boolean {
 		return !this.#left && this.#failure === undefined;
+	}
+
+	/** Whether a host dialog is on screen or awaiting its answer's delivery. */
+	get #hasDialogs(): boolean {
+		return this.#dialogs.size > 0 || this.#awaiting.size > 0;
 	}
 
 	/** Mark the leave before the request: nothing may report it as a lost connection, and no answer may follow it. */
@@ -544,6 +556,7 @@ export class HostedClientLink {
 				// A relocation notice: the same session, now somewhere else. Links already on screen follow it.
 				if (frame.origin) {
 					this.#setOrigin(frame.origin);
+					// The host's session file moved with it: Tern's restore and a reopen after the host exits need the new path.
 					await this.#readRelocatedSessionFile();
 					await ctx.refreshTranscriptLinks();
 					if (!this.#open) return;
@@ -1046,13 +1059,13 @@ export class HostedClientLink {
 			const attempt = this.#reconnectAttempt;
 			this.#reconnectAttempt = undefined;
 			attempt?.reject(error);
-			this.#dialogLost ||= this.#dialogs.size > 0 || this.#awaiting.size > 0;
+			this.#dialogLost ||= this.#hasDialogs;
 			this.#abortDialogs();
 			return;
 		}
 		this.#reconnecting = true;
 		// A dialog aborted here gets no replay from the ring: resuming without `resume` makes the snapshot present it again.
-		this.#dialogLost = this.#dialogs.size > 0 || this.#awaiting.size > 0;
+		this.#dialogLost = this.#hasDialogs;
 		this.#abortDialogs();
 		this.#reconnectLoop = this.#reconnect(error);
 	}
@@ -1111,7 +1124,7 @@ export class HostedClientLink {
 					error: String(attemptError),
 				});
 				// A transport that died inside `start()` reports no close: dialogs its snapshot presented end here.
-				this.#dialogLost ||= this.#dialogs.size > 0 || this.#awaiting.size > 0;
+				this.#dialogLost ||= this.#hasDialogs;
 				this.#abortDialogs();
 				await this.#client.stop();
 				continue;
