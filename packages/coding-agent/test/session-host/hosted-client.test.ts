@@ -1892,7 +1892,7 @@ describe("HostedClientLink with a host process", () => {
 		await removeWithRetries(dir);
 	});
 
-	it("reports that the host exited when its process dies", async () => {
+	it("reports that the host exited when its process dies, with no session file before its first write", async () => {
 		const entry = await spawnSessionHost({
 			cwd: dir,
 			registryDir: path.join(dir, "registry"),
@@ -1914,8 +1914,10 @@ describe("HostedClientLink with a host process", () => {
 		process.kill(entry.pid, "SIGKILL");
 		await waitFor(() => view.closed.length === 1, 15_000);
 
+		// A fresh session: the host named a file but died before writing it, so there is nothing to reopen.
 		expect(entry.sessionFile).toBeDefined();
-		expect(view.closed[0]).toEqual({ hostAlive: false, message: "host exited", sessionFile: entry.sessionFile });
+		expect(await Bun.file(entry.sessionFile!).exists()).toBe(false);
+		expect(view.closed[0]).toEqual({ hostAlive: false, message: "host exited" });
 		expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
 	}, 150_000);
 });
