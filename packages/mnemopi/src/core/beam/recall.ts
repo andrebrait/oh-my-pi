@@ -599,7 +599,7 @@ function allVisibleIds(
 	const { where, params } = buildWhere(beam, "", options);
 	const rows = queryAll(beam, `SELECT id FROM ${table} WHERE ${where} ORDER BY timestamp DESC LIMIT ?`, [
 		...params,
-		DEFAULT_LIMIT,
+		1_000_000, // ABLATION: dense candidate pool unbounded (was DEFAULT_LIMIT = 500)
 	]);
 	return rows.map(row => asString(row.id)).filter(Boolean);
 }
