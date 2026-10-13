@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed recall missing older memories that match a query by meaning but share no words with it, once a bank holds more than 500 newer memories.
+
 ## [18.9.0] - 2026-10-11
 
 ### Added
