@@ -672,11 +672,12 @@ function scoreCandidate(
 	queryGroups: readonly (readonly string[])[],
 	weights: readonly [number, number, number],
 	options: RecallOptionsInternal,
+	minRelOverride?: number,
 ): RecallResult | null {
 	const content = asString(candidate.row.content);
 	const searchableContent = asString(candidate.row.embed_text) || content;
 	const lexical = lexicalGroupRelevance(queryGroups, searchableContent);
-	const minRel = minimumRelevance(queryTokens);
+	const minRel = minRelOverride ?? minimumRelevance(queryTokens);
 	if (lexical < minRel && candidate.signals.dense < 0.65) return null;
 	const [vecWeight, ftsWeight, importanceWeight] = weights;
 	const importance = asNumber(candidate.row.importance, 0.5);
@@ -939,8 +940,23 @@ export async function recall(
 		const tokenGroups = expandedTokenGroups(query, useSynonyms);
 		const candidates = collectMemoryCandidates(beam, query, topK, temporalOptions);
 		const scored: RecallResult[] = [];
+		// ABLATION: Mnemosyne 4.0 "broad multi-hit" rule (beam.py ~9399-9418). For 4+ word queries where at least
+		// 2 distinct query words match across the candidate set, a row needs only 1/n lexical relevance.
+		let minRelOverride: number | undefined;
+		if (tokenGroups.length >= 4) {
+			const matchedGroups = new Set<number>();
+			for (const candidate of candidates) {
+				const contentTokens = new Set(
+					tokenize(asString(candidate.row.embed_text) || asString(candidate.row.content)),
+				);
+				tokenGroups.forEach((group, index) => {
+					if (group.some(token => contentTokens.has(token))) matchedGroups.add(index);
+				});
+			}
+			if (matchedGroups.size >= 2) minRelOverride = 1 / tokenGroups.length;
+		}
 		for (const candidate of candidates) {
-			const result = scoreCandidate(candidate, tokens, tokenGroups, weights, temporalOptions);
+			const result = scoreCandidate(candidate, tokens, tokenGroups, weights, temporalOptions, minRelOverride);
 			if (result !== null) scored.push(result);
 		}
 		scored.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
