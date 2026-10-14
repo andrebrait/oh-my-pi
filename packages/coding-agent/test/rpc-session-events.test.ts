@@ -87,8 +87,10 @@ describe("RpcSessionEventForwarder", () => {
 	test("a delta stream carries each block once, at its start and end", () => {
 		const message = makeAssistantMessage();
 		const text = { type: "text" as const, text: "hello", textSignature: "sig-1" };
+		const thinking = { type: "thinking" as const, thinking: "hmm", thinkingSignature: "sig-2" };
+		const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
 		const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "file" } };
-		message.content = [text, toolCall] as unknown as typeof message.content;
+		message.content = [text, thinking, image, toolCall] as unknown as typeof message.content;
 		const frames: RpcProjectedSessionEventFrame[] = [];
 		const { forwarder, forward } = eventPipeline(frame => frames.push(frame));
 		forwarder.setFilter(null, "delta");
@@ -98,19 +100,29 @@ describe("RpcSessionEventForwarder", () => {
 		send({ type: "text_start", contentIndex: 0, partial: message });
 		send({ type: "text_delta", contentIndex: 0, delta: "hello", partial: message });
 		send({ type: "text_end", contentIndex: 0, content: "hello", partial: message });
-		send({ type: "toolcall_start", contentIndex: 1, partial: message });
-		send({ type: "toolcall_delta", contentIndex: 1, delta: "{}", partial: message });
-		send({ type: "toolcall_end", contentIndex: 1, toolCall, partial: message });
+		send({ type: "thinking_start", contentIndex: 1, partial: message });
+		send({ type: "thinking_delta", contentIndex: 1, delta: "hmm", partial: message });
+		send({ type: "thinking_end", contentIndex: 1, content: "hmm", partial: message });
+		send({ type: "image_end", contentIndex: 2, content: image, partial: message });
+		send({ type: "toolcall_start", contentIndex: 3, partial: message });
+		send({ type: "toolcall_delta", contentIndex: 3, delta: "{}", partial: message });
+		send({ type: "toolcall_end", contentIndex: 3, toolCall, partial: message });
 		const events = frames.flatMap(frame => (frame.type === "message_update" ? [frame.assistantMessageEvent] : []));
 
-		expect(events[0]).toEqual({ type: "start", message });
-		expect(events[1]).toEqual({ type: "text_start", contentIndex: 0, block: text });
-		expect(events[2]).toEqual({ type: "text_delta", contentIndex: 0, delta: "hello" });
-		expect(events[3]).toMatchObject({ block: { text: "hello", textSignature: "sig-1" } });
-		expect(events[4]).toEqual({ type: "toolcall_start", contentIndex: 1, block: toolCall });
-		expect(events[4]).toMatchObject({ block: { id: "call-1", name: "read" } });
-		expect(events[5]).toEqual({ type: "toolcall_delta", contentIndex: 1, delta: "{}" });
-		expect(events[6]).toMatchObject({ toolCall, block: toolCall });
+		expect(events).toEqual([
+			{ type: "start", message },
+			{ type: "text_start", contentIndex: 0, block: text },
+			{ type: "text_delta", contentIndex: 0, delta: "hello" },
+			{ type: "text_end", contentIndex: 0, content: "hello", block: text },
+			{ type: "thinking_start", contentIndex: 1, block: thinking },
+			{ type: "thinking_delta", contentIndex: 1, delta: "hmm" },
+			{ type: "thinking_end", contentIndex: 1, content: "hmm", block: thinking },
+			{ type: "image_end", contentIndex: 2, content: image, block: image },
+			{ type: "toolcall_start", contentIndex: 3, block: toolCall },
+			{ type: "toolcall_delta", contentIndex: 3, delta: "{}" },
+			{ type: "toolcall_end", contentIndex: 3, toolCall, block: toolCall },
+		]);
+		for (const event of events) expect(event).not.toHaveProperty("partial");
 	});
 
 	test("full projection is unchanged", () => {

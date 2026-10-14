@@ -36,7 +36,10 @@ import type { BtwHistoryRecord } from "../../session/btw-history";
 // RPC Commands (stdin)
 // ============================================================================
 
-/** `set_event_filter` projection: `"full"` keeps both accumulated snapshots in `message_update`, `"delta"` sends only the increment. */
+/**
+ * `message_update` projection (`set_event_filter`, or a socket hello's capabilities): `"full"` keeps both accumulated
+ * snapshots, `"delta"` replaces them with the block a start/end event touches (see {@link RpcDeltaAssistantMessageEvent}).
+ */
 export type RpcMessageUpdates = "full" | "delta";
 
 /**
