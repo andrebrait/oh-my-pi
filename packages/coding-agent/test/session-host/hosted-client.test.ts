@@ -1760,6 +1760,40 @@ describe("HostedClientLink reconnect", () => {
 		}
 	});
 
+	itPosix(
+		"gives up on time when the host accepts the connection and never answers",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			try {
+				const view = await openView();
+				view.link = await HostedClientLink.connect({
+					ctx: view.ctx,
+					entry: proxy.entry,
+					replicaDir: view.replicaDir,
+					reconnectTimeoutMs: 1000,
+					onClosed: reason => view.closed.push(reason),
+				});
+
+				proxy.hold();
+				proxy.drop();
+				const lostAt = Date.now();
+				await waitFor(() => view.closed.length === 1, 15_000);
+
+				// Without a bound on the attempt, the hung `start()` waits out the RPC ready timeout (30 s).
+				expect(Date.now() - lostAt).toBeLessThan(5_000);
+				expect(view.closed[0]).toEqual({
+					hostAlive: true,
+					message: `connection lost (host ${host.hostId} still running; omp attach ${host.hostId})`,
+				});
+				expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+			} finally {
+				proxy.close();
+			}
+		},
+		40_000,
+	);
+
 	for (const leave of ["detach", "exit"] as const) {
 		itPosix(`never reconnects after ${leave}, even mid-reconnect`, async () => {
 			const host = await fixture.startHost();

@@ -189,6 +189,8 @@ export interface HostProxy {
 	drop(): void;
 	/** Destroy every new client connection on accept, as if the host could not be reached. */
 	refuse(): void;
+	/** Accept new client connections and never answer them, as if the host had hung. */
+	hold(): void;
 	/** Forward new client connections again (the default). */
 	accept(): void;
 	close(): void;
@@ -205,10 +207,16 @@ export async function startProxy(
 ): Promise<HostProxy> {
 	const socketPath = path.join(dir, "proxy.sock");
 	const clients = new Set<net.Socket>();
-	let refusing = false;
+	let mode: "accept" | "refuse" | "hold" = "accept";
 	const server = net.createServer(client => {
-		if (refusing) {
+		if (mode === "refuse") {
 			client.destroy();
+			return;
+		}
+		if (mode === "hold") {
+			clients.add(client);
+			client.on("error", () => {});
+			client.on("close", () => clients.delete(client));
 			return;
 		}
 		const upstream = net.connect(entry.endpoint);
@@ -238,10 +246,13 @@ export async function startProxy(
 			for (const client of clients) client.destroy();
 		},
 		refuse: (): void => {
-			refusing = true;
+			mode = "refuse";
+		},
+		hold: (): void => {
+			mode = "hold";
 		},
 		accept: (): void => {
-			refusing = false;
+			mode = "accept";
 		},
 		close: (): void => void server.close(),
 	};

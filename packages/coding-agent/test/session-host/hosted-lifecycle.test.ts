@@ -340,6 +340,49 @@ describe("/attach in a hosted terminal", () => {
 		await choosing;
 		expect(terminal.link.hostId).toBe(second.hostId);
 	}, 20_000);
+
+	itPosix(
+		"is not ended by a link it left with /attach that finishes failing afterwards",
+		async () => {
+			const first = await fixture.startHost();
+			const second = await fixture.startHost();
+			await seedTurn(second, "on the second host");
+			const proxy = await startProxy(await fixture.entry(first), fixture.dir);
+			proxies.push(proxy);
+			const terminal = await attached(first, proxy.entry);
+			// The failing link deletes its copy before it reports: hold it there while /attach takes the view.
+			const held = Promise.withResolvers<void>();
+			const drop = SessionManager.prototype.dropSession;
+			const dropping = vi.spyOn(SessionManager.prototype, "dropSession").mockImplementationOnce(async function (
+				this: SessionManager,
+				file: string,
+			) {
+				await held.promise;
+				return drop.call(this, file);
+			});
+
+			// A replacement without a session header cannot be applied: the link fails closed.
+			proxy.inject({
+				type: "session_replaced",
+				seq: 1_000_000,
+				epoch: terminal.link.epoch + 1,
+				sessionFile: "unused",
+				reason: "new",
+				snapshot: { pendingUi: [], entries: [], clients: [] },
+			});
+			await waitFor(() => dropping.mock.calls.length === 1);
+			await terminal.slashAttach(second.hostId);
+			expect(terminal.link.hostId).toBe(second.hostId);
+			held.resolve();
+			// The link reports through `onClosed` in the same turn as this error.
+			await waitFor(() => terminal.errors.some(error => error.startsWith("Hosted session view stopped")));
+
+			expect(terminal.shutdowns).toEqual([]);
+			expect(terminal.link.hostId).toBe(second.hostId);
+			expect(terminal.transcript).toEqual(["on the second host"]);
+		},
+		20_000,
+	);
 });
 
 describe("/exit in a hosted terminal", () => {

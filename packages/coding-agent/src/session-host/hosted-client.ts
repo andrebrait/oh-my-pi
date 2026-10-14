@@ -1091,19 +1091,27 @@ export class HostedClientLink {
 		for (let attempt = 0; ; attempt++) {
 			if (stopped()) return;
 			const outcome = Promise.withResolvers<void>();
+			let attemptTimer: NodeJS.Timeout | undefined;
 			this.#reconnectAttempt = outcome;
 			try {
 				const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
-				await Promise.race([Bun.sleep(delay), outcome.promise]);
+				const left = (): number => this.#reconnectTimeoutMs - (Date.now() - lostAt);
+				await Promise.race([Bun.sleep(Math.min(delay, Math.max(0, left()))), outcome.promise]);
 				// A failed attempt may have applied frames: the resume point never passes what the view shows.
 				await this.#chain;
 				if (stopped()) return;
 				// A plain probe keeps the schedule; a host still dying is caught by the next attempt.
 				const hostAlive = pidAlive(this.#entry.pid);
-				if (!hostAlive || Date.now() - lostAt >= this.#reconnectTimeoutMs) {
+				if (!hostAlive || left() <= 0) {
 					await this.#closeLost(hostAlive, error);
 					return;
 				}
+				// A host that accepts and never answers would hold `start()` for its own ready timeout: the attempt
+				// gets only what is left of the reconnect timeout. `stop()` reports no close, so the attempt is failed here.
+				attemptTimer = setTimeout(() => {
+					outcome.reject(new Error("Session host did not answer before the reconnect timeout"));
+					void this.#client.stop();
+				}, left());
 				// `start()` resets `lastSeq`: an attempt that decoded nothing stamped keeps the previous point.
 				const lastSeq = this.#client.lastSeq ?? this.#resumePoint?.lastSeq;
 				this.#resumePoint =
@@ -1119,6 +1127,7 @@ export class HostedClientLink {
 				// The transport died after the reply applied: its close handler dropped this attempt.
 				if (this.#reconnectAttempt !== outcome) throw new Error("Session host connection lost again");
 			} catch (attemptError) {
+				clearTimeout(attemptTimer);
 				logger.debug("Session host reconnect attempt failed", {
 					hostId: this.hostId,
 					error: String(attemptError),
@@ -1129,6 +1138,7 @@ export class HostedClientLink {
 				await this.#client.stop();
 				continue;
 			}
+			clearTimeout(attemptTimer);
 			if (!this.#open) return;
 			this.#reconnecting = false;
 			this.#reconnectAttempt = undefined;
