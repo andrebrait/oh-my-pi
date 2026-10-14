@@ -15,7 +15,10 @@ interface Entry {
 	message: AssistantMessage;
 	/** By `contentIndex`. Holes are blocks the host added without an event; `message_end` brings them. */
 	blocks: Array<Block | undefined>;
-	/** Raw tool-call JSON so far, and its length at the last parse, by `contentIndex`. */
+	/**
+	 * Raw tool-call JSON so far, and its length at the last parse, by `contentIndex`; only for tool calls whose
+	 * `toolcall_start` this accumulator saw.
+	 */
 	toolJson: Map<number, { json: string; parsedLen: number }>;
 }
 
@@ -71,7 +74,11 @@ export class StreamingMessageAccumulator {
 			this.seed(messageId, delta.message);
 			return { ...event, message: delta.message };
 		}
-		if (delta.type === "done" || delta.type === "error") return { ...event, message: entry.message };
+		if (delta.type === "done" || delta.type === "error") {
+			const message = delta.type === "done" ? delta.message : delta.error;
+			this.seed(messageId, message);
+			return { ...event, message };
+		}
 
 		const index = delta.contentIndex;
 		const current = entry.blocks[index];
@@ -91,7 +98,13 @@ export class StreamingMessageAccumulator {
 				if (current?.type !== "toolCall") {
 					throw new Error(`toolcall_delta for a non-toolCall block in message ${messageId}`);
 				}
-				const state = entry.toolJson.get(index) ?? { json: "", parsedLen: 0 };
+				const state = entry.toolJson.get(index);
+				// Seeded mid-call (snapshot or full frame): the raw JSON before this delta is unknown, so keep the
+				// seeded arguments until `toolcall_end` brings the final block.
+				if (state === undefined) {
+					block = current;
+					break;
+				}
 				const json = state.json + delta.delta;
 				const parsed = parseStreamingJsonThrottled(json, state.parsedLen);
 				const toolCall = { ...current };

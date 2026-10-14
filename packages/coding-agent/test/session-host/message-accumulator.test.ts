@@ -270,4 +270,49 @@ describe("StreamingMessageAccumulator", () => {
 		resumed.apply(full[1]);
 		expect(messageOf(resumed.apply(delta[2]))).toEqual(later);
 	});
+
+	test("a tool call seeded mid-stream keeps its arguments until toolcall_end, without raw JSON", () => {
+		const message = makeAssistantMessage();
+		const half = { type: "toolCall" as const, id: "call-1", name: "edit", arguments: { path: "a.ts" } };
+		const done = { ...half, arguments: { path: "a.ts", line: 3 } };
+		const seeded = { ...message, content: [half] };
+		const final = { ...message, content: [done] };
+		const { delta } = project([
+			{ type: "message_start", message },
+			update(seeded, { type: "toolcall_delta", contentIndex: 0, delta: '"line":3}', partial: seeded }),
+			update(final, { type: "toolcall_end", contentIndex: 0, toolCall: done, partial: final }),
+		]);
+		const accumulator = new StreamingMessageAccumulator();
+		// What a client seeds from `snapshot.streaming`: decoded JSON, so the raw JSON so far is gone.
+		accumulator.seed("msg-1", JSON.parse(JSON.stringify(seeded)));
+		const mid = assistantOf(accumulator.apply(delta[1])).content[0];
+		expect(mid).toEqual(half);
+		expect(getStreamingPartialJson(mid)).toBeUndefined();
+		expect(assistantOf(accumulator.apply(delta[2])).content).toEqual([done]);
+	});
+
+	test("agent_end drops every entry", () => {
+		const message = makeAssistantMessage();
+		const { delta } = project([
+			{ type: "message_start", message },
+			{ type: "agent_end", messages: [] },
+			update(message, { type: "text_delta", contentIndex: 0, delta: "!", partial: message }),
+		]);
+		const accumulator = new StreamingMessageAccumulator();
+		accumulator.apply(delta[0]);
+		accumulator.apply(delta[1]);
+		expect(() => accumulator.apply(delta[2])).toThrow("Delta update for unknown message");
+	});
+
+	test("done replaces the message with the event's final one", () => {
+		const message = makeAssistantMessage();
+		const final = { ...message, stopReason: "length" as const, usage: { ...message.usage, output: 9 } };
+		const { delta } = project([
+			{ type: "message_start", message },
+			update(final, { type: "done", reason: "length", message: final }),
+		]);
+		const accumulator = new StreamingMessageAccumulator();
+		accumulator.apply(delta[0]);
+		expect(messageOf(accumulator.apply(delta[1]))).toEqual(final);
+	});
 });
