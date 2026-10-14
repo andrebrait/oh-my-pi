@@ -1118,6 +1118,8 @@ export class HostedClientLink {
 					this.#dialogLost || lastSeq === undefined
 						? undefined
 						: { hostId: this.hostId, epoch: this.#epoch, lastSeq };
+				// shortcut: `stop()` cannot interrupt `start()` before its transport exists (while it reaps or connects), so
+				// the bound covers the wait for the host's reply, not a hung connect; bound the connect if pipes need it.
 				await this.#client.start();
 				if (stopped()) throw new Error("Left the session host");
 				await outcome.promise;

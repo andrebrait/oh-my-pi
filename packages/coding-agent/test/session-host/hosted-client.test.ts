@@ -1794,6 +1794,42 @@ describe("HostedClientLink reconnect", () => {
 		40_000,
 	);
 
+	itPosix("keeps a reconnected link working after the reconnect timeout has passed", async () => {
+		const reconnectTimeoutMs = 1500;
+		const host = await fixture.startHost();
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			view.link = await HostedClientLink.connect({
+				ctx: view.ctx,
+				entry: proxy.entry,
+				replicaDir: view.replicaDir,
+				reconnectTimeoutMs,
+				onClosed: reason => view.closed.push(reason),
+			});
+
+			const lostAt = Date.now();
+			await loseConnection(view, proxy);
+			// One attempt fails before one succeeds: both arm the attempt bound.
+			await waitFor(() => proxy.refused() >= 1);
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+			// Real time on purpose: the bound is a wall-clock timer of the link against a real socket, and a bound
+			// left armed would stop this healthy connection once it fires.
+			await Bun.sleep(Math.max(0, lostAt + reconnectTimeoutMs + 250 - Date.now()));
+
+			await view.hostLink.prompt("after the timeout");
+			await waitFor(() =>
+				host.session.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("after the timeout"),
+				),
+			);
+			expect(view.closed).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+
 	for (const leave of ["detach", "exit"] as const) {
 		itPosix(`never reconnects after ${leave}, even mid-reconnect`, async () => {
 			const host = await fixture.startHost();

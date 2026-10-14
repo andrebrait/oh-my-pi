@@ -383,6 +383,49 @@ describe("/attach in a hosted terminal", () => {
 		},
 		20_000,
 	);
+
+	itPosix(
+		"is not ended by a link it left when that link finishes failing while /attach is still connecting",
+		async () => {
+			const host = await fixture.startHost();
+			await seedTurn(host, "already here");
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const target = await standInHost(true);
+			const terminal = await attached(host, proxy.entry);
+			const held = Promise.withResolvers<void>();
+			const drop = SessionManager.prototype.dropSession;
+			const dropping = vi.spyOn(SessionManager.prototype, "dropSession").mockImplementationOnce(async function (
+				this: SessionManager,
+				file: string,
+			) {
+				await held.promise;
+				return drop.call(this, file);
+			});
+
+			proxy.inject({
+				type: "session_replaced",
+				seq: 1_000_000,
+				epoch: terminal.link.epoch + 1,
+				sessionFile: "unused",
+				reason: "new",
+				snapshot: { pendingUi: [], entries: [], clients: [] },
+			});
+			await waitFor(() => dropping.mock.calls.length === 1);
+			const switching = terminal.slashAttach(target.entry.hostId);
+			// The terminal has left the failing link and waits on the target when that link reports.
+			await waitFor(() => target.hellos() === 1);
+			held.resolve();
+			await waitFor(() => terminal.errors.some(error => error.startsWith("Hosted session view stopped")));
+			target.dropClients();
+			await switching;
+
+			expect(terminal.shutdowns).toEqual([]);
+			expect(terminal.statuses).toContain(`Back on session host ${host.hostId}`);
+			expect(terminal.transcript).toEqual(["already here"]);
+		},
+		20_000,
+	);
 });
 
 describe("/exit in a hosted terminal", () => {
