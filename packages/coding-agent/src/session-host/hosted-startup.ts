@@ -10,7 +10,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getBaseConfigRoot, withFileLock } from "@oh-my-pi/pi-utils";
+import { getBaseConfigRoot, logger, withFileLock } from "@oh-my-pi/pi-utils";
 import type { Args } from "../cli/args";
 import { flagConsumesValue, PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
 import { CliUsageError } from "../cli/usage-error";
@@ -414,6 +414,8 @@ export async function attachHostedUi(
 ): Promise<void> {
 	let current = hosted.entry;
 	let switching = false;
+	/** The link this terminal shows. A link it already left may still finish closing; that must not end the terminal. */
+	let live: HostedClientLink | undefined;
 
 	const connect = async (entry: SessionHostEntry, keepStartupFrame = false): Promise<void> => {
 		const link = await HostedClientLink.connect({
@@ -423,6 +425,11 @@ export async function attachHostedUi(
 			keepStartupFrame,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			onClosed: reason => {
+				if (link !== live) {
+					logger.debug("Closed session host link was already replaced", { hostId: link.hostId });
+					return;
+				}
+				live = undefined;
 				if (ctx.hostedClient === link) ctx.hostedClient = undefined;
 				if (reason.sessionFile === undefined || switching || ctx.isShuttingDown) {
 					void ctx.shutdown({ exitCode: 1, farewell: reason.message });
@@ -437,6 +444,7 @@ export async function attachHostedUi(
 			return;
 		}
 		current = entry;
+		live = link;
 		ctx.hostedClient = link;
 	};
 
@@ -490,6 +498,7 @@ export async function attachHostedUi(
 	 */
 	const switchTo = async (entry: SessionHostEntry, previous: HostedClientLink): Promise<void> => {
 		const previousEntry = current;
+		live = undefined;
 		ctx.hostedClient = undefined;
 		try {
 			await previous.detach();
