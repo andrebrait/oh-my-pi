@@ -145,7 +145,7 @@ With `tui.hosted: true`, or under `omp attach`, `InteractiveMode` runs against a
 1. Built-in slash commands with a headless `handle` are sent to the host as the submitted text of a `prompt` (P2). A dedicated `slash_command` command is not implemented; see New commands.
 2. `handleTui` commands are triaged once into a parity table:
    - **view-local** (theme, hotkeys, copy, and similar): run in the client unchanged;
-   - **session-mutating** (tree, fork, `/move`, settings, MCP, jobs, plan, goal, loop): split into a headless `handle` on the host plus a client-side presenter;
+   - **session-mutating** (tree, fork, `/move`, settings, MCP, jobs, plan, goal, loop): split into a headless `handle` on the host plus a client-side presenter. Commands that replace the session or move its leaf (`/new`, `/fork`, `/tree`, `/branch`) instead call dedicated RPC commands (`new_session`, `fork`, `navigate_tree`), because the prompt-text route skips the host's session-change path (epoch, `session_replaced`, goal reattach);
    - **not yet ported**: show "unavailable when attached".
 3. Extension UI requests are answered with the existing TUI dialogs (`extension-ui-controller`).
 4. Client-machine inputs: clipboard images travel as prompt images, and `!cmd` uses the `bash` RPC command.

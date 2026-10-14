@@ -1471,7 +1471,8 @@ export class SelectorController {
 			this.ctx.showStatus("Already at this point");
 			return;
 		}
-		const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+		// Hosted views repaint from the host's replacement and take no in-place truncation.
+		const treeRewind = this.ctx.hostedClientMode ? undefined : this.#treeRewindBoundary(entryId, realLeafId);
 		try {
 			const host = this.#host();
 			// Hosted: the host moves its leaf; this view follows its `tree` replacement before the call returns.
@@ -1599,8 +1600,8 @@ export class SelectorController {
 					// Pure-rewind probe (before navigation mutates the leaf): when the
 					// target sits on the current leaf's path and no summary is added,
 					// the post-navigation transcript is a strict prefix of the rendered
-					// one and the tail can be dropped in place.
-					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+					// one and the tail can be dropped in place. Hosted views repaint from the host's replacement.
+					const treeRewind = this.ctx.hostedClientMode ? undefined : this.#treeRewindBoundary(entryId, realLeafId);
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and

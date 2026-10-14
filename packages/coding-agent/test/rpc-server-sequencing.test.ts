@@ -217,6 +217,32 @@ describe("RpcServer sequencing", () => {
 		expect(session.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 	});
 
+	it("lets a peer's tree navigation cancel input that an extension input hook still holds", async () => {
+		const atHook = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		await startServer(
+			{ handler: { content: ["ok"] } },
+			{
+				inputHook: async text => {
+					if (!text.startsWith("hold:")) return;
+					atHook.resolve();
+					await release.promise;
+				},
+			},
+		);
+		const first = session.sessionManager.appendMessage({ role: "user", content: "earlier", timestamp: 1 });
+		session.sessionManager.appendMessage(makeAssistantMessage());
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		a.write({ id: "held", type: "prompt", message: "hold: first" });
+		await atHook.promise;
+		// Accepted after a's input and moving the leaf: the held prompt was written for the branch it left.
+		expect(await b.command({ type: "navigate_tree", entryId: first })).toMatchObject({ success: true });
+		release.resolve();
+		expect(await a.next(f => f.type === "prompt_result" && f.id === "held")).toMatchObject({ status: "aborted" });
+		expect(session.sessionManager.getLeafId()).toBeNull();
+	});
+
 	it("refuses open_session onto a session another host owns, keeping the open session and asking about the resolved file", async () => {
 		await startServer({ handler: { content: ["ok"] } });
 		const a = new TestClient(server);

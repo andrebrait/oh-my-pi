@@ -176,15 +176,18 @@ export async function executeBuiltinSlashCommand(
 		// Decided before the arguments check below, whose `false` means "ordinary prompt": for a hosted client that
 		// would hand a command that cannot run here, or that takes no arguments, to the host's model.
 		const rule = HOSTED_LOCAL_COMMANDS[command.name];
-		const local = rule === true || (rule === "bare" && parsed.args.length === 0);
+		// Runs here only without arguments (`/fork`, `/tree`); with them it is a different, unavailable command.
+		const bare = rule === "bare";
+		const local = rule === true || (bare && parsed.args.length === 0);
 		const takesNoArgs = parsed.args.length > 0 && !command.allowArgs;
-		// `/new now`: the command runs here when bare, so its arguments are what is wrong.
-		const refusal =
-			!local && !command.handle && !(rule === "bare" && takesNoArgs)
-				? `/${rule === "bare" ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
-				: takesNoArgs
-					? `/${command.name} takes no arguments`
-					: undefined;
+		// Refused outright, except a bare-only command given arguments it never takes (`/new now`): that one runs
+		// here when bare, so its arguments are what is wrong.
+		const unavailable = !local && !command.handle && !(bare && takesNoArgs);
+		const refusal = unavailable
+			? `/${bare ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
+			: takesNoArgs
+				? `/${command.name} takes no arguments`
+				: undefined;
 		if (refusal !== undefined) {
 			runtime.ctx.showStatus(refusal);
 			// Nothing ran and nothing was sent: the submission goes back to the editor.

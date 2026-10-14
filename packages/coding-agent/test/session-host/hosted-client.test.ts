@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
 	ExtensionAskDialogResult,
@@ -1720,12 +1721,15 @@ describe("hosted tree navigation", () => {
 		const [, firstReply] = await twoTurns(host);
 		const view = await terminal(host);
 		const sessionFile = host.session.sessionFile;
+		const renders = view.renderCount;
 
 		// The rewind selector outlines the last reply; one up is the last prompt, and Enter rewinds past it.
 		view.selectors.showUserMessageSelector();
 		view.panel?.handleInput?.("\x1b[A");
 		view.panel?.handleInput?.("\r");
 		await statusShown(view, "Rewound to selected point");
+		// The host's replacement repaints the view once; the selector adds no repaint of its own.
+		expect(view.renderCount).toBe(renders + 1);
 
 		expect(view.showError).not.toHaveBeenCalled();
 		expect(host.session.sessionFile).toBe(sessionFile);
@@ -1787,6 +1791,41 @@ describe("hosted tree navigation", () => {
 		expect(view.showError).not.toHaveBeenCalled();
 		expect(host.session.sessionManager.getLeafId()).toBe(leafId);
 		expect(view.hostLink.epoch).toBe(epoch);
+	});
+
+	it("resolves a navigation once its own view shows the host's new leaf", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply] = await twoTurns(host);
+		const view = await terminal(host);
+		const epoch = view.hostLink.epoch;
+
+		await view.hostLink.navigateTree(firstReply!);
+
+		expect(view.local.sessionManager.getLeafId()).toBe(firstReply!);
+		expect(view.hostLink.epoch).toBe(epoch + 1);
+	});
+
+	it("a branch summary made from one terminal lands every terminal on the summary", async () => {
+		const summarizer = createMockModel({ handler: { content: ["The abandoned branch asked two."] } });
+		const host = await fixture.startHost({}, undefined, { sideStreamFn: summarizer.stream });
+		const [, firstReply] = await twoTurns(host);
+		const a = await terminal(host);
+		const b = await terminal(host);
+		const epoch = b.hostLink.epoch;
+
+		const list = openTree(a).getTreeList();
+		list.selectEntry(firstReply!);
+		list.confirm(true);
+		await statusShown(a, "Navigated to selected point");
+
+		expect(a.showError).not.toHaveBeenCalled();
+		const leaf = host.session.sessionManager.getEntry(host.session.sessionManager.getLeafId()!);
+		expect(leaf).toMatchObject({ type: "branch_summary", parentId: firstReply! });
+		const hostBranch = host.session.sessionManager.getBranch().map(entry => entry.id);
+		expect(a.local.sessionManager.getBranch().map(entry => entry.id)).toEqual(hostBranch);
+		await waitFor(() => b.hostLink.epoch > epoch);
+		expect(b.local.sessionManager.getBranch().map(entry => entry.id)).toEqual(hostBranch);
+		expect([...a.closed, ...b.closed]).toEqual([]);
 	});
 
 	it("a label set from the tree selector reaches every terminal", async () => {
