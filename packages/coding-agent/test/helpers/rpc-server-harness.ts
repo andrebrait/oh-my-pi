@@ -67,6 +67,8 @@ export async function createTestSession(
 		inMemory?: boolean;
 		/** A real extension `input` handler (through `ExtensionRunner`): runs for every user input, text as sent. */
 		inputHook?: (text: string) => Promise<void>;
+		/** Side requests (branch summaries) instead of the real provider stream. */
+		sideStreamFn?: StreamFn;
 	} = {},
 ): Promise<AgentSession> {
 	const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
@@ -106,6 +108,7 @@ export async function createTestSession(
 		modelRegistry,
 		extensionRunner,
 		passiveReplica: options.passiveReplica,
+		sideStreamFn: options.sideStreamFn,
 	});
 }
 

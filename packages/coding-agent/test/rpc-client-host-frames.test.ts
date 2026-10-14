@@ -211,6 +211,42 @@ describe("RpcClient host frames", () => {
 		expect(host.session.thinkingLevel).toBe(Effort.High);
 	});
 
+	it("navigates the host's tree and labels entries with preconditions; every client sees both", async () => {
+		const host = await fixture.startHost();
+		const a = await fixture.client(host);
+		const b = await fixture.client(host);
+		const bFrames: RpcHostFrame[] = [];
+		b.onHostFrame(frame => bFrames.push(frame));
+		await a.start();
+		await b.start();
+		await a.promptAndWait("one");
+		await a.promptAndWait("two");
+		await a.waitForSettled();
+		const manager = host.session.sessionManager;
+		const [firstUser, firstReply] = manager.getEntries().filter(entry => entry.type === "message");
+		const leafId = manager.getLeafId();
+		const { epoch } = bFrames[0] as RpcAttachedFrame;
+
+		await expect(a.navigateTree(firstReply!.id, {}, { ifLeaf: firstReply!.id })).rejects.toMatchObject({
+			code: "stale",
+			leafId,
+		});
+		expect(manager.getLeafId()).toBe(leafId);
+
+		expect(await a.navigateTree(firstReply!.id, {}, { ifEpoch: epoch, ifLeaf: leafId })).toMatchObject({
+			cancelled: false,
+		});
+		await waitFor(() => bFrames.some(f => f.type === "session_replaced"));
+		const replaced = bFrames.find((f): f is RpcSessionReplacedFrame => f.type === "session_replaced")!;
+		expect(replaced).toMatchObject({ epoch: epoch + 1, reason: "tree", snapshot: { leafId: firstReply!.id } });
+
+		await a.setLabel(firstUser!.id, "start", { ifEpoch: replaced.epoch });
+		await waitFor(() => bFrames.some(f => f.type === "entry" && f.entry.type === "label"));
+		expect(manager.getLabel(firstUser!.id)).toBe("start");
+		// Nothing to abort: still answered, with no precondition.
+		await a.abortBranchSummary();
+	});
+
 	it("tells close listeners once when the transport drops, but not for stop() or detach()", async () => {
 		const host = await fixture.startHost();
 		let transport: RpcAgentProcess | undefined;

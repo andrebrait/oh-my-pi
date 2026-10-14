@@ -213,6 +213,14 @@ export const stateDefs = {
 	),
 	BranchMessage: { entryId: "string", text: "string" },
 	BranchResult: { text: "string", cancelled: "boolean" },
+	NavigateTreeResult: {
+		cancelled: "boolean",
+		"aborted?": doc("boolean", "Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved."),
+		"editorText?": doc(
+			"string",
+			"The target was a user message: its text, for the editor; the leaf moved to its parent.",
+		),
+	},
 	TokenUsage: {
 		input: "number.integer",
 		output: "number.integer",

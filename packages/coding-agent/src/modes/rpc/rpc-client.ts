@@ -41,6 +41,7 @@ import type {
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcLiveFrame,
+	RpcNavigateTreeResult,
 	RpcOpenSessionResult,
 	RpcPreconditions,
 	RpcPromptResultFrame,
@@ -1360,6 +1361,30 @@ export class RpcClient {
 	async fork(entryId?: string, preconditions?: RpcPreconditions): Promise<{ cancelled: boolean }> {
 		const response = await this.#send({ type: "fork", entryId, ...writeGuard(preconditions) });
 		return this.#getData(response);
+	}
+
+	/**
+	 * Move the leaf to `entryId` in the same session file, optionally summarizing the branch it leaves.
+	 * Every sequenced client follows a `session_replaced` with reason `tree`.
+	 */
+	async navigateTree(
+		entryId: string,
+		options: { summarize?: boolean; customInstructions?: string } = {},
+		preconditions?: RpcPreconditions,
+	): Promise<RpcNavigateTreeResult> {
+		const command = { type: "navigate_tree", entryId, ...options, ...writeGuard(preconditions) } as const;
+		// A branch summary is a model call; it ends early only through `abortBranchSummary`.
+		return this.#getData(await this.#send(command, 600_000));
+	}
+
+	/** Stop a running `navigateTree` summary; that navigation resolves `{ cancelled: true, aborted: true }`. */
+	async abortBranchSummary(): Promise<void> {
+		this.#getData(await this.#send({ type: "abort_branch_summary" }));
+	}
+
+	/** Set an entry's label, or clear it with `undefined`. */
+	async setLabel(entryId: string, label: string | undefined, preconditions?: RpcPreconditions): Promise<void> {
+		this.#getData(await this.#send({ type: "set_label", entryId, label, ...writeGuard(preconditions) }));
 	}
 
 	/**

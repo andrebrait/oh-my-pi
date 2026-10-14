@@ -24,6 +24,7 @@
 - RPC: delta `message_update` frames (`messageUpdates: "delta"`) now carry the block on start/end events and the message on a restart, so a client can rebuild the streaming message; session-host clients can select the projection in their `hello` (`capabilities.messageUpdates`), which also covers a resume's replay
 - Hosted sessions stream replies as deltas and rebuild them in the client, so a long reply no longer sends the whole message again with every update
 - Hosted terminals run `/new`, the new-session key and `/fork` on the session host; every attached terminal follows, and a `/fork` from a view the host has moved past is refused instead of forking another branch
+- RPC: `navigate_tree` (move the leaf in the same session file, optionally summarizing the abandoned branch; session-host clients follow a `session_replaced` with reason `"tree"`), `abort_branch_summary` and `set_label`; `RpcClient.newSession`, `branch` and `fork` take preconditions
 
 ### Changed
 
