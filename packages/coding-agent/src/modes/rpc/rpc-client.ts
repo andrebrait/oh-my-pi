@@ -1002,8 +1002,8 @@ export class RpcClient {
 	 * @param parentSession - Optional parent session path for lineage tracking
 	 * @returns Object with `cancelled: true` if an extension cancelled the new session
 	 */
-	async newSession(parentSession?: string): Promise<{ cancelled: boolean }> {
-		const response = await this.#send({ type: "new_session", parentSession });
+	async newSession(parentSession?: string, preconditions?: RpcPreconditions): Promise<{ cancelled: boolean }> {
+		const response = await this.#send({ type: "new_session", parentSession, ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
@@ -1347,8 +1347,8 @@ export class RpcClient {
 	 * Branch from a specific message.
 	 * @returns Object with `text` (the message text) and `cancelled` (if extension cancelled)
 	 */
-	async branch(entryId: string): Promise<{ text: string; cancelled: boolean }> {
-		const response = await this.#send({ type: "branch", entryId });
+	async branch(entryId: string, preconditions?: RpcPreconditions): Promise<{ text: string; cancelled: boolean }> {
+		const response = await this.#send({ type: "branch", entryId, ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 
@@ -1357,8 +1357,8 @@ export class RpcClient {
 	 * `entryId`, or the whole session when omitted.
 	 * @returns Object with `cancelled: true` if an extension cancelled the fork
 	 */
-	async fork(entryId?: string): Promise<{ cancelled: boolean }> {
-		const response = await this.#send({ type: "fork", entryId });
+	async fork(entryId?: string, preconditions?: RpcPreconditions): Promise<{ cancelled: boolean }> {
+		const response = await this.#send({ type: "fork", entryId, ...writeGuard(preconditions) });
 		return this.#getData(response);
 	}
 

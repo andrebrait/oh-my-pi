@@ -111,6 +111,8 @@ class Terminal {
 	/** The user's answer to the host selector. */
 	readonly choice = Promise.withResolvers<string | undefined>();
 	readonly ctx: InteractiveModeContext;
+	/** While set, every host event waits in the view's handler, and the frames behind it wait too: the view lags the host. */
+	eventGate: PromiseWithResolvers<void> | undefined;
 
 	private constructor(readonly local: AgentSession) {
 		this.ctx = createInteractiveModeContext({
@@ -118,13 +120,15 @@ class Terminal {
 			sessionManager: local.sessionManager,
 			hostedClientMode: true,
 			eventController: {
-				handleEvent: async () => {},
+				handleEvent: async () => {
+					await this.eventGate?.promise;
+				},
 				resetTranscriptAnchors: () => {},
 				takeDisplaceableComponents: () => [],
 				restorePendingToolResults: () => {},
 			},
 			statusLine: { setCollabStatus: () => {} },
-			editor: { setText: () => {} },
+			editor: { setText: () => {}, setCollapsedText: () => {} },
 			showStatus: message => void this.statuses.push(message),
 			showError: message => void this.errors.push(message),
 			showHookSelector: async (_title, options) => {
@@ -162,6 +166,7 @@ class Terminal {
 	}
 
 	async close(): Promise<void> {
+		this.eventGate?.resolve();
 		await this.ctx.hostedClient?.detach();
 		await this.local.dispose();
 	}
@@ -426,6 +431,75 @@ describe("/attach in a hosted terminal", () => {
 		},
 		20_000,
 	);
+});
+
+describe("/new and /fork in a hosted terminal", () => {
+	it("/new on one terminal starts a new session on the host and every terminal follows", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "before new");
+		const a = await attached(host);
+		const b = await attached(host);
+		const sessionId = host.session.sessionManager.getSessionId();
+		const epochs = [a.link.epoch, b.link.epoch];
+		expect(a.transcript).toEqual(["before new"]);
+
+		await executeBuiltinSlashCommand("/new", { ctx: a.ctx });
+
+		expect(a.errors).toEqual([]);
+		expect(host.session.sessionManager.getSessionId()).not.toBe(sessionId);
+		await waitFor(() => a.link.epoch > epochs[0]! && b.link.epoch > epochs[1]!);
+		expect(a.transcript).toEqual([]);
+		expect(b.transcript).toEqual([]);
+	}, 20_000);
+
+	it("/fork forks the host session at the view's leaf", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "before fork");
+		const terminal = await attached(host);
+		const sessionFile = host.session.sessionFile;
+		const epoch = terminal.link.epoch;
+
+		await executeBuiltinSlashCommand("/fork", { ctx: terminal.ctx });
+
+		expect(terminal.errors).toEqual([]);
+		expect(host.session.sessionFile).not.toBe(sessionFile);
+		expect(userTexts(host.session)).toEqual(["before fork"]);
+		await waitFor(() => terminal.link.epoch > epoch);
+		expect(terminal.transcript).toEqual(["before fork"]);
+	}, 20_000);
+
+	it("/fork from a view the host has moved past is refused and changes nothing", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "first");
+		const a = await attached(host);
+		const epoch = a.link.epoch;
+		// A's view stays on its leaf while another client's turn lands on the host.
+		a.eventGate = Promise.withResolvers<void>();
+		await seedTurn(host, "from b");
+		const sessionFile = host.session.sessionFile;
+		const leafId = host.session.sessionManager.getLeafId();
+
+		await executeBuiltinSlashCommand("/fork", { ctx: a.ctx });
+
+		expect(a.errors).toEqual(["Session tree moved"]);
+		expect(host.session.sessionFile).toBe(sessionFile);
+		expect(host.session.sessionManager.getLeafId()).toBe(leafId);
+		a.eventGate.resolve();
+		await waitFor(() => a.transcript.length === 2);
+		expect(a.link.epoch).toBe(epoch);
+	}, 20_000);
+
+	it("/fork pane stays unavailable when attached", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "first");
+		const terminal = await attached(host);
+		const sessionFile = host.session.sessionFile;
+
+		await executeBuiltinSlashCommand("/fork pane", { ctx: terminal.ctx });
+
+		expect(terminal.statuses).toContain("/fork pane is unavailable when attached");
+		expect(host.session.sessionFile).toBe(sessionFile);
+	}, 20_000);
 });
 
 describe("/exit in a hosted terminal", () => {

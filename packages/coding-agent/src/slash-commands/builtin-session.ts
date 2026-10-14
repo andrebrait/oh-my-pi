@@ -1,4 +1,5 @@
 import { clearSubmittedText } from "./helpers/draft";
+import { runOnHost } from "./helpers/hosted";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
@@ -618,6 +619,12 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		subcommandOptional: true,
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
+			// Attached, only bare `/fork` reaches here: the host forks at the leaf this view shows.
+			if (runtime.ctx.hostedClientMode) {
+				clearSubmittedText(runtime);
+				await runOnHost(runtime.ctx, link => link.fork(), "Session forked");
+				return;
+			}
 			const args = command.args.trim();
 			let placement: "pane" | "window" | undefined;
 			if (args) {

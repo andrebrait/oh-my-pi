@@ -1,4 +1,5 @@
 import { clearSubmittedText } from "./helpers/draft";
+import { runOnHost } from "./helpers/hosted";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
@@ -182,7 +183,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleNewCommand();
+			// Attached: the host starts it through its session-change path, and every terminal follows.
+			if (runtime.ctx.hostedClientMode)
+				await runOnHost(runtime.ctx, link => link.newSession(), "New session started");
+			else await runtime.ctx.handleNewCommand();
 		},
 	},
 	{

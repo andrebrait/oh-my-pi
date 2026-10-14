@@ -133,9 +133,10 @@ export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = 
 
 /**
  * Builtins that keep running in this process while the UI is a client of a session host: they read or move only
- * what is on this screen or this machine (hotkeys, clipboard, links) or end this client.
+ * what is on this screen or this machine (hotkeys, clipboard, links) or end this client. `bare`: only without
+ * arguments, where the command sends the host its own RPC command (`/new`, `/fork`; `/fork pane` stays refused).
  */
-const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true>> = {
+const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true | "bare">> = {
 	hotkeys: true,
 	copy: true,
 	open: true,
@@ -143,6 +144,8 @@ const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true>> = {
 	attach: true,
 	exit: true,
 	quit: true,
+	new: "bare",
+	fork: "bare",
 };
 
 /**
@@ -169,11 +172,12 @@ export async function executeBuiltinSlashCommand(
 	if (runtime.ctx.hostedClientMode) {
 		// Decided before the arguments check below, whose `false` means "ordinary prompt": for a hosted client that
 		// would hand a command that cannot run here, or that takes no arguments, to the host's model.
-		const local = HOSTED_LOCAL_COMMANDS[command.name] === true;
+		const rule = HOSTED_LOCAL_COMMANDS[command.name];
+		const local = rule === true || (rule === "bare" && parsed.args.length === 0);
 		const takesNoArgs = parsed.args.length > 0 && !command.allowArgs;
 		const refusal =
 			!local && !command.handle
-				? `/${command.name} is unavailable when attached`
+				? `/${rule === "bare" ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
 				: takesNoArgs
 					? `/${command.name} takes no arguments`
 					: undefined;

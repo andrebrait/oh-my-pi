@@ -328,6 +328,11 @@ export class HostedClientLink {
 		return this.#epoch;
 	}
 
+	/** The leaf of the view on screen: the `ifLeaf` of every tree-changing write. */
+	get leafId(): string | null {
+		return this.#ctx.session.sessionManager.getLeafId();
+	}
+
 	/** The transport was lost and the link is getting it back: writes reject until it is. */
 	get reconnecting(): boolean {
 		return this.#reconnecting;
@@ -400,6 +405,18 @@ export class HostedClientLink {
 	/** Cycle the host's thinking level. `false`: the host's model has no thinking levels, so nothing changed. */
 	async cycleThinkingLevel(): Promise<boolean> {
 		return (await this.#client.cycleThinkingLevel(this.#guard())) !== null;
+	}
+
+	/** Start a new session on the host; this view and every peer follow its `session_replaced`. */
+	async newSession(): Promise<void> {
+		const { cancelled } = await this.#client.newSession(undefined, this.#guard());
+		if (cancelled) throw new Error("New session cancelled");
+	}
+
+	/** Fork the host session at the leaf this view shows; `stale` when the host's leaf moved past it. */
+	async fork(): Promise<void> {
+		const { cancelled } = await this.#client.fork(undefined, { ...this.#guard(), ifLeaf: this.leafId });
+		if (cancelled) throw new Error("Fork cancelled");
 	}
 
 	/** Leave the session running and close this client; a reconnect in progress stops without sending anything. */
