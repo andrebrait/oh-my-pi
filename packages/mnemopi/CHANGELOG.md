@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Recall on large memory banks is about 9× faster after the first recall in a session, because decoded memory embeddings are now kept between recalls instead of being re-read and parsed each time.
+
 ### Fixed
 
 - Fixed recall missing older memories that match a query by meaning but share no words with it, once a bank holds more than 500 newer memories.
