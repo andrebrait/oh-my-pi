@@ -21,6 +21,7 @@
 - Added `RpcClient.onExtensionUiRequest()`, `RpcClient.sendExtensionUiResponse()`, and `RpcClient.setAskDialog()` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Added `RpcClient.promptToCompletion()`: sends a prompt (with optional steering mode and preconditions) and resolves once its work has settled ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Hosted sessions reconnect automatically after a lost connection and offer to reopen the session in a new host when its host exited ([#15685](https://github.com/can1357/oh-my-pi/pull/15685) by [@andrebrait](https://github.com/andrebrait))
+- RPC: delta `message_update` frames (`messageUpdates: "delta"`) now carry the block on start/end events and the message on a restart, so a client can rebuild the streaming message; session-host clients can select the projection in their `hello` (`capabilities.messageUpdates`), which also covers a resume's replay
 
 ### Changed
 

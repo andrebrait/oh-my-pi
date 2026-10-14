@@ -72,14 +72,59 @@ describe("RpcSessionEventForwarder", () => {
 			const { partial: _partial, ...expected } = assistantMessageEvent as AssistantMessageEvent & {
 				partial?: unknown;
 			};
-			expect(frames.at(-1)).toEqual({
+			expect(frames.at(-1)).toMatchObject({
 				...event,
 				message: { role: "assistant" },
 				assistantMessageEvent: expected,
 				messageId: "msg-1",
 			});
+			expect(frames.at(-1)).toHaveProperty("message", { role: "assistant" });
+			expect(frames.at(-1)).not.toHaveProperty("assistantMessageEvent.partial");
 			expect(JSON.stringify(event)).toBe(before);
 		}
+	});
+
+	test("a delta stream carries each block once, at its start and end", () => {
+		const message = makeAssistantMessage();
+		const text = { type: "text" as const, text: "hello", textSignature: "sig-1" };
+		const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "file" } };
+		message.content = [text, toolCall] as unknown as typeof message.content;
+		const frames: RpcProjectedSessionEventFrame[] = [];
+		const { forwarder, forward } = eventPipeline(frame => frames.push(frame));
+		forwarder.setFilter(null, "delta");
+		const send = (assistantMessageEvent: AssistantMessageEvent) =>
+			forward({ type: "message_update", message, assistantMessageEvent });
+		send({ type: "start", partial: message });
+		send({ type: "text_start", contentIndex: 0, partial: message });
+		send({ type: "text_delta", contentIndex: 0, delta: "hello", partial: message });
+		send({ type: "text_end", contentIndex: 0, content: "hello", partial: message });
+		send({ type: "toolcall_start", contentIndex: 1, partial: message });
+		send({ type: "toolcall_delta", contentIndex: 1, delta: "{}", partial: message });
+		send({ type: "toolcall_end", contentIndex: 1, toolCall, partial: message });
+		const events = frames.flatMap(frame => (frame.type === "message_update" ? [frame.assistantMessageEvent] : []));
+
+		expect(events[0]).toEqual({ type: "start", message });
+		expect(events[1]).toEqual({ type: "text_start", contentIndex: 0, block: text });
+		expect(events[2]).toEqual({ type: "text_delta", contentIndex: 0, delta: "hello" });
+		expect(events[3]).toMatchObject({ block: { text: "hello", textSignature: "sig-1" } });
+		expect(events[4]).toEqual({ type: "toolcall_start", contentIndex: 1, block: toolCall });
+		expect(events[4]).toMatchObject({ block: { id: "call-1", name: "read" } });
+		expect(events[5]).toEqual({ type: "toolcall_delta", contentIndex: 1, delta: "{}" });
+		expect(events[6]).toMatchObject({ toolCall, block: toolCall });
+	});
+
+	test("full projection is unchanged", () => {
+		const message = makeAssistantMessage();
+		const frames: RpcProjectedSessionEventFrame[] = [];
+		const { forward } = eventPipeline(frame => frames.push(frame));
+		const event: AgentSessionEvent = {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ok", partial: message },
+		};
+		forward(event);
+		expect(frames).toEqual([{ ...event, messageId: "msg-1" }]);
+		expect(JSON.stringify(frames[0])).toBe(JSON.stringify({ ...event, messageId: "msg-1" }));
 	});
 
 	test("switching projection mid-message keeps identity and omission restores byte-identical full updates", () => {

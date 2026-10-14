@@ -368,6 +368,8 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		);
 		// Before attach(): `attached`, a resume's replay, and every later frame use v2 chunking instead of v1 shrinking.
 		if (protocolVersion === 2) conn.encoder.setProtocolVersion(2);
+		// Before attach() too, so the snapshot/replay that follows is already projected; unknown values stay "full".
+		if (isRecord(capabilities) && capabilities.messageUpdates === "delta") conn.events.setFilter(null, "delta");
 		// Same tick as connect(): no broadcast can fall between registration and the handshake frame.
 		server.attach(
 			conn,
