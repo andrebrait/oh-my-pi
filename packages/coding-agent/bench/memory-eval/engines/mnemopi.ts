@@ -123,10 +123,12 @@ export function mnemopiEngine(options: MnemopiEngineOptions = {}): EngineAdapter
 		open: async (_evalCase, { storeDir, protocol }) => {
 			opts = runtimeOptions(protocol);
 			beam = await scoped(async () => {
+				// Ablation: MEMEVAL_RECALL=polyphonic turns on polyphonic recall (omp setting mnemopi.polyphonicRecall).
+				const polyphonicRecall = Bun.env.MEMEVAL_RECALL === "polyphonic";
 				const config =
 					protocol === "with-sleep"
-						? { workingMemoryLimit: 0, workingMemoryTtlHours: 0 }
-						: { workingMemoryLimit: 0 };
+						? { workingMemoryLimit: 0, workingMemoryTtlHours: 0, polyphonicRecall }
+						: { workingMemoryLimit: 0, polyphonicRecall };
 				return new BeamMemory({ dbPath: path.join(storeDir, "mnemopi.db"), sessionId: "eval", config });
 			});
 		},
@@ -156,7 +158,8 @@ export function mnemopiEngine(options: MnemopiEngineOptions = {}): EngineAdapter
 			scoped(async () => {
 				const b = open();
 				await b.flushExtractions();
-				const rows = await b.recall(question.text, k);
+				// Ablation: the path omp's auto-recall uses (packages/coding-agent/src/mnemopi/state.ts).
+				const rows = await b.recallEnhanced(question.text, k, { includeFacts: true });
 				return rows.map(row => ({
 					engineId: row.id,
 					tier: tierOf(row.tier_label, row.summary_of),
