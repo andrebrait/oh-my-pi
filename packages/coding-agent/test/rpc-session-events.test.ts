@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessageEvent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent } from "@oh-my-pi/pi-ai";
 import { MAX_RPC_FRAME_BYTES, RpcFrameEncoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { RpcMessageIdStamper, RpcSessionEventForwarder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-events";
 import type { RpcProjectedSessionEventFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -194,6 +194,51 @@ describe("RpcSessionEventForwarder", () => {
 		forwarder.setFilter(null, "full");
 		forward(event);
 		expect(JSON.parse(lines[0]).type).toBe("rpc_chunk");
+	});
+
+	test("delta streaming stays linear in the message size", () => {
+		// The spec's burst probe: one 100 KB message in 2000 text blocks, 6000 `message_update`s.
+		const blockCount = 2000;
+		const text = "x".repeat(50);
+		const payload = blockCount * text.length;
+		const bytes = { full: 0, delta: 0 };
+		const encoders = { full: new RpcFrameEncoder(), delta: new RpcFrameEncoder() };
+		encoders.full.setProtocolVersion(2);
+		encoders.delta.setProtocolVersion(2);
+		const stamper = new RpcMessageIdStamper();
+		const full = new RpcSessionEventForwarder(frame => {
+			for (const line of encoders.full.encodeFrames(frame)) bytes.full += Buffer.byteLength(line);
+		});
+		const delta = new RpcSessionEventForwarder(frame => {
+			for (const line of encoders.delta.encodeFrames(frame)) bytes.delta += Buffer.byteLength(line);
+		});
+		delta.setFilter(null, "delta");
+		let updates = 0;
+		const send = (assistantMessageEvent: AssistantMessageEvent & { partial: AssistantMessage }) => {
+			const stamped = stamper.stamp({
+				type: "message_update",
+				message: assistantMessageEvent.partial,
+				assistantMessageEvent,
+			});
+			full.forward(stamped);
+			delta.forward(stamped);
+			updates++;
+		};
+		const base = makeAssistantMessage();
+		stamper.stamp({ type: "message_start", message: { ...base, content: [] } });
+		// Snapshots as the agent loop makes them: a new message per event, finished blocks shared by reference.
+		let content: AssistantMessage["content"] = [];
+		for (let contentIndex = 0; contentIndex < blockCount; contentIndex++) {
+			content = [...content, { type: "text", text: "" }];
+			send({ type: "text_start", contentIndex, partial: { ...base, content } });
+			content = content.with(contentIndex, { type: "text", text });
+			send({ type: "text_delta", contentIndex, delta: text, partial: { ...base, content } });
+			send({ type: "text_end", contentIndex, content: text, partial: { ...base, content } });
+		}
+
+		expect(updates).toBe(6000);
+		expect(bytes.delta).toBeLessThanOrEqual(3 * payload + updates * 400);
+		expect(bytes.full).toBeGreaterThanOrEqual(100 * bytes.delta);
 	});
 	test("keeps one messageId per message while an external record nests inside a streaming reply", () => {
 		const frames: RpcProjectedSessionEventFrame[] = [];

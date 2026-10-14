@@ -63,6 +63,7 @@ import {
 	type TerminalSessionSource,
 } from "../utils/title-generator";
 import { connectSessionHost } from "./client";
+import { StreamingMessageAccumulator } from "./message-accumulator";
 import type { SessionHostEntry } from "./registry";
 
 export interface HostedClientOptions {
@@ -210,6 +211,11 @@ export class HostedClientLink {
 	#answerSent = false;
 	/** What the next connection's `hello` resumes from; undefined asks for a snapshot. */
 	#resumePoint: { hostId: string; epoch: number; lastSeq: number } | undefined;
+	/**
+	 * Rebuilds streamed messages from the host's delta updates. Kept across reconnects, so a resume's replay applies
+	 * on top of it; a snapshot resets and re-seeds it.
+	 */
+	readonly #messages = new StreamingMessageAccumulator();
 	/** A frame failed to apply, so the view no longer matches the host: nothing else is applied. */
 	#failure: Error | undefined;
 	/** Session epoch of the view the user sees; sent as `ifEpoch` on writes. */
@@ -258,6 +264,7 @@ export class HostedClientLink {
 							entry: options.entry,
 							client: { kind: "tui" },
 							ui: true,
+							messageUpdates: "delta",
 							resume: this.#resumePoint,
 							// `stop()` cannot interrupt a dial: a reconnect's own is bounded by what is left of it.
 							timeoutMs: this.#reconnecting ? Math.max(0, this.#reconnectDeadline - Date.now()) : undefined,
@@ -419,7 +426,7 @@ export class HostedClientLink {
 			const generation = this.#receiveHostFrame(frame);
 			this.#enqueue(() => this.#applyHostFrame(frame, generation));
 		});
-		client.onSessionEvent(event => this.#enqueue(() => this.#applySessionEvent(event)));
+		client.onSessionEvent(event => this.#enqueue(() => this.#applySessionEvent(this.#messages.apply(event))));
 		client.onExtensionUiRequest(request => {
 			if (this.#open) this.#receiveUiRequest(request);
 		});
@@ -665,6 +672,7 @@ export class HostedClientLink {
 		ctx.clearTransientSessionUi();
 		ctx.eventController.resetTranscriptAnchors();
 		resetReplicaEventState(ctx);
+		this.#messages.reset();
 
 		this.#isStreaming = state.isStreaming;
 		this.#isCompacting = state.isCompacting;
@@ -692,7 +700,9 @@ export class HostedClientLink {
 		// The snapshot carries the in-flight message but no provider event for it: start it once and let the next
 		// real delta update it, instead of fabricating an update.
 		if (snapshot.streaming) {
-			await applyReplicaEvent(ctx, { type: "message_start", message: snapshot.streaming.message });
+			const { messageId, message } = snapshot.streaming;
+			if (message.role === "assistant") this.#messages.seed(messageId, message);
+			await applyReplicaEvent(ctx, { type: "message_start", message });
 		}
 		await ctx.reloadTodos();
 		if (!this.#open) return;

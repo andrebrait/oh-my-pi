@@ -2011,6 +2011,159 @@ describe("HostedClientLink reconnect", () => {
 	});
 });
 
+describe("HostedClientLink delta streaming", () => {
+	/**
+	 * The `message_update` frames a proxy passed to its clients. A dropped connection can cut a line short: such
+	 * fragments are not frames and are skipped.
+	 */
+	function updateFrames(proxy: HostProxy): Record<string, unknown>[] {
+		const frames: Record<string, unknown>[] = [];
+		for (const line of proxy.received()) {
+			if (!line.includes('"type":"message_update"')) continue;
+			try {
+				frames.push(JSON.parse(line));
+			} catch {}
+		}
+		return frames;
+	}
+
+	/**
+	 * Each streamed message the view handled, as JSON, except at block starts: the mock provider's start blocks are
+	 * already complete, while a delta link starts a block empty (as for a real provider) and fills it from the deltas.
+	 */
+	function streamedMessages(events: AgentSessionEvent[]): string[] {
+		return events.flatMap(event =>
+			event.type === "message_update" && !event.assistantMessageEvent.type.endsWith("_start")
+				? [JSON.stringify(event.message)]
+				: [],
+		);
+	}
+
+	/** The content of the last streamed message the view handled, and of the last assistant message that ended. */
+	function lastAssistant(view: View): { streamed: string; ended: string } {
+		const updates = view.eventsOf("message_update");
+		const ends = view.eventsOf("message_end").filter(event => event.message.role === "assistant");
+		return {
+			streamed: JSON.stringify(updates.at(-1)?.message),
+			ended: JSON.stringify(ends.at(-1)?.message),
+		};
+	}
+
+	const isTextDelta = (event: AgentSessionEvent): boolean =>
+		event.type === "message_update" && event.assistantMessageEvent.type === "text_delta";
+
+	itPosix("streams a reply as deltas and renders the same message as a full-mode client", async () => {
+		const host = await fixture.startHost({}, undefined, {
+			responses: [
+				{
+					content: [
+						{ type: "thinking", thinking: "plan" },
+						"first",
+						"second",
+						{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
+					],
+				},
+			],
+		});
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const full = await fixture.client(host);
+			const fullEvents: AgentSessionEvent[] = [];
+			full.onSessionEvent(event => void fullEvents.push(event));
+			await full.start();
+			const view = await openView();
+			await view.connect(proxy.entry);
+
+			await view.hostLink.prompt("go");
+			await waitFor(() => view.events.some(isAgentEnd) && fullEvents.some(isAgentEnd));
+
+			const updates = updateFrames(proxy);
+			expect(updates.length).toBeGreaterThan(10);
+			for (const frame of updates) expect(frame.message).toEqual({ role: "assistant" });
+			expect(streamedMessages(view.events).length).toBeGreaterThan(5);
+			expect(streamedMessages(view.events)).toEqual(streamedMessages(fullEvents));
+			expect(view.closed).toEqual([]);
+			expect(entryShape(view.local)).toEqual(entryShape(host.session));
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("keeps rebuilding a message across a resumed reconnect", async () => {
+		const release = Promise.withResolvers<void>();
+		const host = await fixture.startHost({}, release.promise, {
+			responses: [{ content: ["first", "second", "third"] }],
+		});
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			const replica = view.local.sessionFile;
+			await view.hostLink.prompt("go");
+			await waitFor(() => view.events.some(isTextDelta));
+
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => view.hostLink.reconnecting);
+			// The rest of the message lands in the host's ring while the view is away.
+			release.resolve();
+			await waitFor(() => !host.session.isStreaming);
+			proxy.accept();
+			await waitFor(() => view.events.some(isAgentEnd));
+
+			expect(view.closed).toEqual([]);
+			// Resumed in place: the replay applied on top of the message the link kept, no snapshot re-seeded it.
+			expect(view.local.sessionFile).toBe(replica);
+			const { streamed, ended } = lastAssistant(view);
+			expect(streamed).toContain("third");
+			expect(JSON.parse(streamed).content).toEqual(JSON.parse(ended).content);
+			const updates = updateFrames(proxy);
+			for (const frame of updates) expect(frame.message).toEqual({ role: "assistant" });
+			expect(entryShape(view.local)).toEqual(entryShape(host.session));
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("re-seeds a streaming message from the snapshot when the resume falls back", async () => {
+		let ui: ExtensionUIContext | undefined;
+		const release = Promise.withResolvers<void>();
+		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) }, release.promise, {
+			responses: [{ content: ["first", "second"] }],
+		});
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			const replica = view.local.sessionFile;
+			await view.hostLink.prompt("go");
+			await waitFor(() => view.events.some(isTextDelta));
+			// A dialog open when the connection drops makes the reconnect take a snapshot instead of a resume.
+			const confirmed = ui!.confirm("Proceed?", "Really?");
+			await waitFor(() => view.dialogs.length === 1);
+
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => view.hostLink.reconnecting);
+			proxy.accept();
+			await waitFor(() => view.dialogs.length === 2);
+			expect(view.local.sessionFile).not.toBe(replica);
+			release.resolve();
+			await waitFor(() => view.events.some(isAgentEnd));
+			view.dialogs[1].answer(true);
+			expect(await confirmed).toBe(true);
+
+			expect(view.closed).toEqual([]);
+			const { streamed, ended } = lastAssistant(view);
+			expect(streamed).toContain("second");
+			expect(JSON.parse(streamed).content).toEqual(JSON.parse(ended).content);
+			expect(entryShape(view.local)).toEqual(entryShape(host.session));
+		} finally {
+			proxy.close();
+		}
+	});
+});
+
 describe("HostedClientLink with a host process", () => {
 	let dir: string;
 	let restoreAgentDir: () => void;

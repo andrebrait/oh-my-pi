@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
@@ -58,17 +59,19 @@ export class SessionHostFixture {
 	}
 
 	/**
-	 * A host serving a fresh session whose mock model answers `ok`; `gate` holds each reply after its first delta until
-	 * it resolves; `inMemory` keeps the transcript in memory, with no session file or artifacts directory.
+	 * A host serving a fresh session whose mock model answers `responses` in turn, then `ok`; `gate` holds each reply
+	 * after its first delta until it resolves; `inMemory` keeps the transcript in memory, with no session file or
+	 * artifacts directory.
 	 */
 	async startHost(
 		options: Partial<SessionHostOptions> = {},
 		gate?: Promise<void>,
-		sessionOptions: { inMemory?: boolean } = {},
+		sessionOptions: { inMemory?: boolean; responses?: MockResponse[] } = {},
 	): Promise<TestSessionHost> {
 		const sessionDir = path.join(this.dir, `host-${++this.#hostCount}`);
 		await fs.mkdir(sessionDir, { recursive: true });
-		const session = await createTestSession(sessionDir, { handler: { content: ["ok"] } }, gate, sessionOptions);
+		const { responses, ...rest } = sessionOptions;
+		const session = await createTestSession(sessionDir, { responses, handler: { content: ["ok"] } }, gate, rest);
 		const hostId = newHostId();
 		const done = Promise.withResolvers<void>();
 		const host: TestSessionHost = {
@@ -199,6 +202,8 @@ export interface HostProxy {
 	mute(): void;
 	/** What {@link mute} kept from the host. */
 	muted(): string;
+	/** Every frame line the host sent through the proxy, over every connection, in arrival order. */
+	received(): string[];
 	close(): void;
 }
 
@@ -218,6 +223,7 @@ export async function startProxy(
 	let mode: "accept" | "refuse" | "hold" = "accept";
 	let refused = 0;
 	let muted = "";
+	let downstream = "";
 	const server = net.createServer(client => {
 		if (mode === "refuse") {
 			refused++;
@@ -232,6 +238,7 @@ export async function startProxy(
 		}
 		const upstream = net.connect(entry.endpoint);
 		clients.add(client);
+		upstream.on("data", (chunk: Buffer) => void (downstream += chunk.toString("utf8")));
 		if (options.refuseExit === undefined) {
 			client.pipe(upstream);
 			upstreams.set(client, upstream);
@@ -263,6 +270,7 @@ export async function startProxy(
 			mode = "refuse";
 		},
 		refused: (): number => refused,
+		received: (): string[] => downstream.split("\n").filter(line => line.length > 0),
 		hold: (): void => {
 			mode = "hold";
 		},
