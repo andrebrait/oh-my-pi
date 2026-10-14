@@ -141,6 +141,10 @@ describe("StreamingMessageAccumulator", () => {
 		for (const [index, frame] of delta.entries()) {
 			const rebuilt = accumulator.apply(frame);
 			expect(JSON.stringify(messageOf(rebuilt))).toBe(JSON.stringify(messageOf(full[index])));
+			// The vocalizer reads `.delta` off the event: it must reach the view as the host sent it.
+			if (frame.type === "message_update" && rebuilt.type === "message_update") {
+				expect(rebuilt.assistantMessageEvent).toEqual(frame.assistantMessageEvent);
+			}
 			deepFreeze(rebuilt);
 		}
 	});
@@ -148,17 +152,27 @@ describe("StreamingMessageAccumulator", () => {
 	test("does not double text when the host snapshots a start event after later deltas landed", async () => {
 		const { delta } = project(await run(false));
 		const accumulator = new StreamingMessageAccumulator();
-		let last: AssistantMessage | undefined;
-		const ended: Array<[unknown, unknown]> = [];
+		const textOf = (block: AssistantMessage["content"][number] | undefined): string | undefined =>
+			block?.type === "text" ? block.text : block?.type === "thinking" ? block.thinking : undefined;
+		let streamed: AssistantMessage[] = [];
+		let checked = 0;
 		for (const frame of delta) {
 			const rebuilt = deepFreeze(accumulator.apply(frame));
-			if (rebuilt.type === "message_update") last = assistantOf(rebuilt);
-			if (rebuilt.type === "message_end" && rebuilt.message.role === "assistant") {
-				ended.push([last?.content, rebuilt.message.content]);
+			if (rebuilt.type === "message_update") streamed.push(assistantOf(rebuilt));
+			if (rebuilt.type !== "message_end" || rebuilt.message.role !== "assistant") continue;
+			const final = rebuilt.message.content;
+			// Every update, not just the last (which the `*_end` block overwrites): a text never runs ahead of its end.
+			for (const message of streamed) {
+				for (const [index, block] of message.content.entries()) {
+					const text = textOf(block);
+					if (text === undefined) continue;
+					expect(textOf(final[index])?.startsWith(text)).toBe(true);
+					checked++;
+				}
 			}
+			streamed = [];
 		}
-		expect(ended).toHaveLength(2);
-		for (const [rebuilt, final] of ended) expect(JSON.stringify(rebuilt)).toBe(JSON.stringify(final));
+		expect(checked).toBeGreaterThan(10);
 	});
 
 	test("keeps raw tool-call JSON on the block and parses arguments while streaming", () => {
@@ -295,13 +309,14 @@ describe("StreamingMessageAccumulator", () => {
 		const message = makeAssistantMessage();
 		const { delta } = project([
 			{ type: "message_start", message },
-			{ type: "agent_end", messages: [] },
 			update(message, { type: "text_delta", contentIndex: 0, delta: "!", partial: message }),
 		]);
 		const accumulator = new StreamingMessageAccumulator();
 		accumulator.apply(delta[0]);
-		accumulator.apply(delta[1]);
-		expect(() => accumulator.apply(delta[2])).toThrow("Delta update for unknown message");
+		accumulator.apply({ type: "agent_end", messages: [] });
+		// The same messageId as before agent_end: only the clear makes it unknown.
+		expect(delta[1]).toMatchObject({ messageId: "msg-1" });
+		expect(() => accumulator.apply(delta[1])).toThrow("Delta update for unknown message msg-1");
 	});
 
 	test("done replaces the message with the event's final one", () => {
