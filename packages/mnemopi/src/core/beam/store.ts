@@ -150,6 +150,8 @@ function emitEvent(beam: BeamMemoryState, type: string, data: EventPayload): voi
 /** Drop cached recall results after a write that can change what recall returns. */
 function invalidateCaches(beam: BeamMemoryState): void {
 	beam.caches.queryCache?.invalidate();
+	// Duck-typed to avoid an import cycle; the subject dictionary's rowid stamp misses deletes/updates.
+	(beam.caches.polyphonicEngine as { invalidateDictionary?: () => void } | undefined)?.invalidateDictionary?.();
 }
 
 function findDuplicate(beam: BeamMemoryState, content: string): string | null {

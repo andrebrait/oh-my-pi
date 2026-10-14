@@ -3,8 +3,11 @@ import { logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { type Env, polyphonicRecallEnabled } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase } from "../db";
 import { backfillConsolidatedFacts, ensureVeracityConsolidator } from "./beam/consolidate";
+import { STOP_WORDS } from "./beam/recall";
 import type { BeamMemoryState, JsonValue, Metadata, RecallResult, RecallTierLabel } from "./beam/types";
-import { EpisodicGraph } from "./episodic-graph";
+import { EpisodicGraph, isPlausibleFactSubject } from "./episodic-graph";
+import { COMMON_SENTENCE_WORDS, GRAPH_COMMON_WORD_LEXICON, SUBJECT_PLACEHOLDERS } from "./graph-lexicon";
+import { mmrRerank } from "./mmr";
 import { VeracityConsolidator } from "./veracity-consolidation";
 
 export type PolyphonicVoice = "hybrid" | "vector" | "graph" | "fact" | "temporal";
@@ -66,6 +69,11 @@ interface PolyphonicEngineOptions {
 	readonly consolidator?: VeracityConsolidator;
 	readonly sessionId?: string | null;
 	readonly channelId?: string | null;
+	/**
+	 * Per-voice RRF weight override (PR #9840 injection seam); voices left out keep
+	 * {@link DEFAULT_VOICE_WEIGHTS}.
+	 */
+	readonly voiceWeights?: Partial<Record<PolyphonicVoice, number>>;
 }
 
 /** SQL visibility predicate shared by every voice and by hydration. */
@@ -115,10 +123,24 @@ interface TemporalRow {
 /** Reciprocal rank fusion constant: a voice's rank-`r` hit contributes `1 / (RRF_K + r)`. */
 export const POLYPHONIC_RRF_K = 60;
 export const POLYPHONIC_VOICES: readonly PolyphonicVoice[] = ["hybrid", "vector", "graph", "fact", "temporal"];
-/** Highest possible fused score: rank 1 in every voice. */
-export const POLYPHONIC_MAX_COMBINED_SCORE = POLYPHONIC_VOICES.length / (POLYPHONIC_RRF_K + 1);
+/**
+ * PR #9840 holdout-validated weights `.2/.4/.4/0` for vector/graph/fact/temporal. The PR
+ * engine has no `hybrid` voice, so it gets 0 here (its candidates still enter the pool
+ * with no score, as the PR's zero-weight temporal voice does).
+ */
+export const DEFAULT_VOICE_WEIGHTS: Readonly<Record<PolyphonicVoice, number>> = Object.freeze({
+	hybrid: 0,
+	vector: 0.2,
+	graph: 0.4,
+	fact: 0.4,
+	temporal: 0,
+});
+/** MMR relevance/novelty tradeoff, matching the linear path's default. */
+const MMR_LAMBDA = 0.7;
+/** Visible candidates considered per requested row before MMR selection. */
+const DIVERSITY_OVERFETCH = 8;
+const DIVERSITY_MIN_WINDOW = 64;
 const TEMPORAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const NEAR_DUPLICATE_JACCARD = 0.8;
 /**
  * Cosine a memory needs to count as a vector-voice hit: the bar linear recall applies
  * to candidates with no keyword match. Without it the voice's nearest neighbours pad
@@ -213,16 +235,6 @@ function cosineAgainstUnit(unit: Float32Array, raw: unknown): number | null {
 	return dot / Math.sqrt(normSq);
 }
 
-function extractEntities(text: string): string[] {
-	const seen = new Set<string>();
-	const matches = text.matchAll(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g);
-	for (const match of matches) {
-		const entity = match[0];
-		if (entity.length > 0) seen.add(entity);
-	}
-	return [...seen];
-}
-
 function queryTokens(query: string): string[] {
 	const tokens: string[] = [];
 	for (const match of query.toLowerCase().matchAll(/[\p{L}\p{N}_-]+/gu)) tokens.push(match[0]);
@@ -242,17 +254,14 @@ function factSubjectCandidates(query: string): string[] {
 	return [...seen];
 }
 
-function contentTokens(text: string): Set<string> {
-	const out = new Set<string>();
-	for (const token of queryTokens(text)) if (token.length >= 2) out.add(token);
-	return out;
-}
-
-function tokenJaccard(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
-	if (left.size === 0 || right.size === 0) return 0;
-	let intersection = 0;
-	for (const token of left) if (right.has(token)) intersection++;
-	return intersection / (left.size + right.size - intersection);
+/**
+ * `MEMEVAL_VOICE_WEIGHTS` (JSON, e.g. `{"hybrid":0.35}`) overrides voice weights for
+ * benchmark arms. shortcut: ablation-only seam, delete with this branch.
+ */
+function memevalVoiceWeights(env: Env = process.env): Partial<Record<PolyphonicVoice, number>> | undefined {
+	const raw = env.MEMEVAL_VOICE_WEIGHTS;
+	if (raw === undefined || raw.trim() === "") return undefined;
+	return JSON.parse(raw) as Partial<Record<PolyphonicVoice, number>>;
 }
 
 /** Milliseconds for the temporal voice anchor; `null` means "now, open-ended". */
@@ -277,13 +286,12 @@ export class PolyphonicRecallEngine {
 	readonly consolidator: VeracityConsolidator;
 	readonly sessionId: string;
 	readonly channelId: string | null;
-	readonly voiceWeights: Readonly<Record<PolyphonicVoice, number>> = Object.freeze({
-		hybrid: 0.35,
-		vector: 0.35,
-		graph: 0.25,
-		fact: 0.25,
-		temporal: 0.15,
-	});
+	readonly voiceWeights: Readonly<Record<PolyphonicVoice, number>>;
+	/** Memoised subject dictionary. See {@link subjectDictionary} and {@link invalidateDictionary}. */
+	#dictionary: readonly string[] | null = null;
+	#dictionaryStamp = "";
+	/** Memoised `PRAGMA table_info(facts)` probe for the optional `scope` column. */
+	#factsScopeColumn: boolean | null = null;
 
 	constructor(options: PolyphonicEngineOptions = {}) {
 		this.dbPath = options.dbPath ?? ":memory:";
@@ -293,6 +301,30 @@ export class PolyphonicRecallEngine {
 		this.consolidator = options.consolidator ?? new VeracityConsolidator(this.dbPath, this.db);
 		this.sessionId = options.sessionId ?? "default";
 		this.channelId = options.channelId ?? null;
+		const weights = { ...DEFAULT_VOICE_WEIGHTS, ...options.voiceWeights };
+		for (const voice of POLYPHONIC_VOICES) {
+			const weight = weights[voice];
+			if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) {
+				throw new Error(`voiceWeights.${voice} must be a finite non-negative number, got ${String(weight)}`);
+			}
+		}
+		this.voiceWeights = Object.freeze(weights);
+	}
+
+	/** Highest possible fused score: rank 1 in every voice, under this engine's weights. */
+	get maxCombinedScore(): number {
+		let total = 0;
+		for (const voice of POLYPHONIC_VOICES) total += this.voiceWeights[voice];
+		return total / (POLYPHONIC_RRF_K + 1);
+	}
+
+	/**
+	 * Drop the memoised subject dictionary. Called from `invalidateCaches()` in
+	 * `beam/store.ts` on every write, because the `MAX(rowid)` stamp only sees appends.
+	 */
+	invalidateDictionary(): void {
+		this.#dictionary = null;
+		this.#dictionaryStamp = "";
 	}
 
 	recall(
@@ -401,6 +433,183 @@ export class PolyphonicRecallEngine {
 		return [...byId.values()].sort((a, b) => b.score - a.score || a.memoryId.localeCompare(b.memoryId)).slice(0, 20);
 	}
 	/**
+	 * Subjects and gist participants this bank actually stores, filtered to plausible
+	 * entities and ordered longest-first for greedy non-overlapping matching. Replaces
+	 * query-side proper-case regex extraction (PR #9840). Memoised and rebuilt when either
+	 * source table grows.
+	 */
+	subjectDictionary(): readonly string[] {
+		let stamp = "";
+		try {
+			const row: unknown = this.db
+				.query("SELECT (SELECT MAX(rowid) FROM facts) AS f, (SELECT MAX(rowid) FROM gists) AS g")
+				.get();
+			if (row !== null && typeof row === "object" && "f" in row && "g" in row) {
+				stamp = `${String(row.f)}:${String(row.g)}`;
+			}
+		} catch {
+			stamp = "";
+		}
+		const cached = this.#dictionary;
+		if (cached !== null && stamp === this.#dictionaryStamp) return cached;
+
+		const seen = new Map<string, string>();
+		const consider = (raw: unknown): void => {
+			if (typeof raw !== "string") return;
+			const value = raw.trim();
+			if (value.length < 3) return;
+			const key = value.toLowerCase();
+			// Writer placeholders (`fact`, `entity`, ...) are field labels, not entities.
+			if (SUBJECT_PLACEHOLDERS[key] === true) return;
+			// Snake_case identifiers are metric keys; they never appear in a natural query.
+			if (value.includes("_")) return;
+			if (!isPlausibleFactSubject(value)) return;
+			if (!seen.has(key)) seen.set(key, value);
+		};
+		try {
+			for (const row of this.db.query("SELECT DISTINCT subject FROM facts").iterate()) {
+				if (row !== null && typeof row === "object" && "subject" in row) consider(row.subject);
+			}
+			// Gist participants come from a capitalisation regex, so single-word ones that are
+			// not corroborated by a `facts.subject` are filtered by the common-word lists.
+			const corroborated = new Set(seen.keys());
+			const participants = new Map<string, string>();
+			for (const row of this.db.query("SELECT participants_json FROM gists").iterate()) {
+				if (row === null || typeof row !== "object" || !("participants_json" in row)) continue;
+				const raw = row.participants_json;
+				if (typeof raw !== "string") continue;
+				try {
+					const parsed: unknown = JSON.parse(raw);
+					if (!Array.isArray(parsed)) continue;
+					for (const entry of parsed) {
+						if (typeof entry !== "string") continue;
+						const trimmed = entry.trim();
+						if (trimmed.length > 0) participants.set(trimmed.toLowerCase(), trimmed);
+					}
+				} catch {
+					// A malformed participants blob is skipped, not fatal.
+				}
+			}
+			const lexiconActive = !envDisabled("MNEMOPI_GRAPH_LEXICON");
+			for (const [key, display] of participants) {
+				if (!display.includes(" ") && !corroborated.has(key)) {
+					if (COMMON_SENTENCE_WORDS[key] === true) continue;
+					if (lexiconActive && GRAPH_COMMON_WORD_LEXICON[key] === true) continue;
+				}
+				consider(display);
+			}
+		} catch {
+			// Missing tables (a fresh bank) simply yield an empty dictionary.
+		}
+		const dictionary = [...seen.values()].sort((a, b) => b.length - a.length || a.localeCompare(b));
+		this.#dictionary = dictionary;
+		this.#dictionaryStamp = stamp;
+		return dictionary;
+	}
+
+	/** Greedy longest-first, whole-word, case-insensitive dictionary matches in `query`. */
+	matchStoredSubjects(query: string): string[] {
+		const dictionary = this.subjectDictionary();
+		if (dictionary.length === 0 || query.length === 0) return [];
+		const lowered = query.toLowerCase();
+		// Tracks which characters are already consumed so `Bash tool` wins over a nested match.
+		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
+		const taken = new Array<boolean>(lowered.length).fill(false);
+		const wordChar = /[\p{L}\p{N}_]/u;
+		const matches: string[] = [];
+		for (const subject of dictionary) {
+			const needle = subject.toLowerCase();
+			let from = 0;
+			for (;;) {
+				const at = lowered.indexOf(needle, from);
+				if (at < 0) break;
+				from = at + 1;
+				const afterIndex = at + needle.length;
+				const before = at === 0 ? "" : (lowered[at - 1] ?? "");
+				const after = lowered[afterIndex] ?? "";
+				if ((before !== "" && wordChar.test(before)) || (after !== "" && wordChar.test(after))) continue;
+				let overlaps = false;
+				for (let i = at; i < afterIndex; i++) {
+					if (taken[i] === true) {
+						overlaps = true;
+						break;
+					}
+				}
+				if (overlaps) continue;
+				for (let i = at; i < afterIndex; i++) taken[i] = true;
+				matches.push(subject);
+				break;
+			}
+		}
+		return matches;
+	}
+
+	/**
+	 * Lexical fact matches on `facts.object` text, mapped back through `facts.source_msg_id`
+	 * and reported as the `fact` voice. Flat extracted statements carry a placeholder subject,
+	 * so subject lookup can never reach them. (PR #9840 also searched `fts_memoria_facts`,
+	 * which this schema does not have.)
+	 */
+	factObjectMatches(query: string): VoiceRecallResult[] {
+		// Quoted word tokens only, so query punctuation never becomes an FTS5 operator.
+		const terms = [...new Set(query.toLowerCase().match(/[\p{L}\p{N}_]{3,}/gu) ?? [])]
+			.filter(term => !STOP_WORDS.has(term))
+			.slice(0, 8);
+		if (terms.length === 0) return [];
+		const expression = terms.map(term => `"${term}"`).join(" OR ");
+		const scope = this.#factsHaveScope()
+			? "(facts.session_id = ? OR facts.scope = 'global')"
+			: "facts.session_id = ?";
+		let rows: Array<{ memory_id: string | null; confidence: number | null; object: string | null }>;
+		try {
+			// Column-scoped so `subject`/`predicate` placeholders cannot match.
+			rows = this.db
+				.query(`
+					SELECT facts.source_msg_id AS memory_id, facts.confidence AS confidence, facts.object AS object
+					FROM fts_facts
+					JOIN facts ON facts.rowid = fts_facts.rowid
+					WHERE fts_facts MATCH ? AND facts.source_msg_id IS NOT NULL AND ${scope}
+					ORDER BY fts_facts.rank, fts_facts.rowid
+					LIMIT 25
+				`)
+				.all(`object : (${expression})`, this.sessionId) as typeof rows;
+		} catch {
+			return [];
+		}
+		const seeds: VoiceRecallResult[] = [];
+		rows.forEach((row, position) => {
+			const memoryId = (row.memory_id ?? "").trim();
+			if (memoryId.length === 0) return;
+			// Rank-aware: BM25 order decays the stored confidence.
+			seeds.push({
+				memoryId,
+				score: ((row.confidence ?? 0.5) * 0.45) / (1 + position),
+				voice: "fact",
+				metadata: { match_kind: "fact_object", fact_rank: position, fact_text: (row.object ?? "").slice(0, 120) },
+			});
+		});
+		return seeds;
+	}
+
+	/** Older banks have no `facts.scope` column. */
+	#factsHaveScope(): boolean {
+		if (this.#factsScopeColumn === null) {
+			let present = false;
+			try {
+				for (const row of this.db.query("PRAGMA table_info(facts)").iterate()) {
+					if (row !== null && typeof row === "object" && "name" in row && String(row.name) === "scope") {
+						present = true;
+						break;
+					}
+				}
+			} catch {
+				present = false;
+			}
+			this.#factsScopeColumn = present;
+		}
+		return this.#factsScopeColumn;
+	}
+	/**
 	 * Memories whose gist or KG facts name a query entity (seeds), plus memories reached
 	 * from the strongest seeds over `ctx` edges. The walk is one multi-source BFS: each
 	 * node expands at most once, every hop is one batched edge query, and seeds, frontier,
@@ -414,7 +623,7 @@ export class PolyphonicRecallEngine {
 			const existing = seeds.get(hit.memoryId);
 			if (existing === undefined || hit.score > existing.score) seeds.set(hit.memoryId, hit);
 		};
-		for (const entity of extractEntities(query)) {
+		for (const entity of this.matchStoredSubjects(query)) {
 			for (const gist of this.graph.findGistsByParticipant(entity)) {
 				const memoryId = gist.id.startsWith("gist_") ? gist.id.slice(5) : gist.id;
 				addSeed({ memoryId, score: 0.6, voice: "graph", metadata: { entity, gist: gist.text } });
@@ -470,6 +679,11 @@ export class PolyphonicRecallEngine {
 	factVoice(query: string): VoiceRecallResult[] {
 		if (envDisabled("MNEMOPI_VOICE_FACT")) return [];
 		const byId = new Map<string, VoiceRecallResult>();
+		// Lexical object-text matches first; consolidated facts only replace a weaker seed.
+		for (const seed of this.factObjectMatches(query)) {
+			const existing = byId.get(seed.memoryId);
+			if (existing === undefined || existing.score < seed.score) byId.set(seed.memoryId, seed);
+		}
 		for (const fact of this.consolidator.getConsolidatedFactsBySubjects(factSubjectCandidates(query), 0.5)) {
 			for (const source of fact.sources) {
 				const memoryId = source.trim();
@@ -536,10 +750,10 @@ export class PolyphonicRecallEngine {
 		return results;
 	}
 	/**
-	 * Reciprocal rank fusion. A voice may report the same memory several times (e.g. the
-	 * graph voice once per matching gist or fact); only its best rank counts, so each
-	 * voice contributes at most `1 / (RRF_K + 1)` and the fused score stays bounded by
-	 * {@link POLYPHONIC_MAX_COMBINED_SCORE}.
+	 * Weighted reciprocal rank fusion (PR #9840). A voice may report the same memory several
+	 * times (e.g. the graph voice once per matching gist or fact); only its best rank counts,
+	 * so each voice contributes at most `weight / (RRF_K + 1)` and the fused score stays
+	 * bounded by {@link PolyphonicRecallEngine.maxCombinedScore}.
 	 */
 	combineVoices(...voiceResults: readonly VoiceRecallResult[][]): Map<string, PolyphonicResult> {
 		const combined = new Map<string, PolyphonicResult>();
@@ -555,7 +769,7 @@ export class PolyphonicRecallEngine {
 					existing = { memoryId: result.memoryId, combinedScore: 0, voiceScores: {}, metadata: {} };
 					combined.set(result.memoryId, existing);
 				}
-				const contribution = 1 / (POLYPHONIC_RRF_K + ranked.size);
+				const contribution = this.voiceWeights[result.voice] / (POLYPHONIC_RRF_K + ranked.size);
 				existing.voiceScores[result.voice] = contribution;
 				existing.combinedScore += contribution;
 				Object.assign(existing.metadata, result.metadata);
@@ -564,31 +778,29 @@ export class PolyphonicRecallEngine {
 		return combined;
 	}
 	/**
-	 * Walk fused candidates best-first, hydrating each and skipping rows that are not
-	 * visible or whose content near-duplicates an already selected row, until `topK`
-	 * rows are selected.
+	 * Select a diverse top-`topK` (PR #9840): hydrate fused candidates best-first, skipping
+	 * invisible ones so they never occupy a window slot, until a window of
+	 * `max(topK * 8, 64)` visible rows is filled; then MMR-rerank that window on content.
 	 */
 	diversityRerank(
 		results: ReadonlyMap<string, PolyphonicResult>,
 		topK: number,
 		hydrate: (candidate: PolyphonicResult) => PolyphonicMemoryResult | null,
 	): PolyphonicMemoryResult[] {
+		const limit = Math.max(0, Math.trunc(topK));
+		if (limit === 0) return [];
+		// RRF score first, memory id as a stable tiebreak; `mmrRerank` sorts stably.
 		const sorted = [...results.values()].sort(
 			(a, b) => b.combinedScore - a.combinedScore || a.memoryId.localeCompare(b.memoryId),
 		);
-		const selected: PolyphonicMemoryResult[] = [];
-		const selectedTokens: Set<string>[] = [];
-		const limit = Math.max(0, Math.trunc(topK));
+		const windowSize = Math.max(limit * DIVERSITY_OVERFETCH, DIVERSITY_MIN_WINDOW);
+		const window: PolyphonicMemoryResult[] = [];
 		for (const candidate of sorted) {
-			if (selected.length >= limit) break;
+			if (window.length >= windowSize) break;
 			const hydrated = hydrate(candidate);
-			if (hydrated === null) continue;
-			const tokens = contentTokens(hydrated.content);
-			if (selectedTokens.some(prior => tokenJaccard(tokens, prior) > NEAR_DUPLICATE_JACCARD)) continue;
-			selected.push(hydrated);
-			selectedTokens.push(tokens);
+			if (hydrated !== null) window.push(hydrated);
 		}
-		return selected;
+		return mmrRerank(window, MMR_LAMBDA, limit);
 	}
 	assembleContext(results: readonly PolyphonicMemoryResult[], budget: number): PolyphonicMemoryResult[] {
 		const maxChars = Math.max(0, Math.trunc(budget)) * 4;
@@ -737,6 +949,7 @@ export function getPolyphonicEngine(beam: BeamMemoryState): PolyphonicRecallEngi
 			channelId: beam.channelId,
 			graph: beam.episodicGraph instanceof EpisodicGraph ? beam.episodicGraph : undefined,
 			consolidator: ensureVeracityConsolidator(beam),
+			voiceWeights: memevalVoiceWeights(),
 		});
 		beam.caches.polyphonicEngine = engine;
 	}

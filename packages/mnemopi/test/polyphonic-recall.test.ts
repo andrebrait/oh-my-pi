@@ -90,10 +90,13 @@ describe("PolyphonicRecallEngine", () => {
 		try {
 			const engine = seedPolyphonicFixture(beam);
 			const results = engine.recall("Alice recent", [1, 0], 10);
-			expect(results.map(result => result.id)).toEqual(["m2", "m1", "m3"]);
-			expect(results[0]?.voice_scores).toEqual({ vector: 1 / 61, graph: 1 / 61 });
-			expect(results[1]?.voice_scores).toEqual({ vector: 1 / 62, fact: 1 / 61 });
-			expect(results[2]?.voice_scores).toEqual({ temporal: 1 / 61 });
+			// PR #9840 weights (vector .2, graph .4, fact .4, temporal 0). m3 has no fused score but
+			// shares no words with m2, so MMR over raw RRF magnitudes picks it before m1.
+			expect(results.map(result => result.id)).toEqual(["m2", "m3", "m1"]);
+			expect(results[0]?.voice_scores).toEqual({ vector: 0.2 / 61, graph: 0.4 / 61 });
+			expect(results[2]?.voice_scores).toEqual({ vector: 0.2 / 62, fact: 0.4 / 61 });
+			expect(results[1]?.voice_scores).toEqual({ temporal: 0 });
+			expect(results[0]?.score).toBeGreaterThan(results[2]?.score ?? 0);
 			expect(results[0]?.score).toBeGreaterThan(results[1]?.score ?? 0);
 			expect(results[0]?.content).toContain("graph traversal");
 		} finally {
@@ -137,7 +140,7 @@ describe("PolyphonicRecallEngine", () => {
 			process.env.MNEMOPI_VOICE_TEMPORAL = "0";
 			const results = engine.recall("Alice recent", [1, 0], 10);
 			expect(results.map(result => result.id)).toEqual(["m1"]);
-			expect(results[0]?.voice_scores).toEqual({ fact: 1 / 61 });
+			expect(results[0]?.voice_scores).toEqual({ fact: 0.4 / 61 });
 		} finally {
 			closeQuietly(beam.db);
 		}
@@ -232,6 +235,31 @@ describe("PolyphonicRecallEngine", () => {
 			const results = engine.recall("Alice", null, 5);
 
 			expect(results.map(result => result.id)).toEqual(["wm-global-fact"]);
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("fact voice matches facts.object text in this session, ranked by BM25 order", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({ db: beam.db, sessionId: beam.sessionId });
+			const now = new Date().toISOString();
+			const insert = (factId: string, sessionId: string, object: string, source: string) =>
+				beam.db.run(
+					`INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
+						VALUES (?, ?, 'fact', 'entity', ?, ?, ?, 0.8)`,
+					[factId, sessionId, object, now, source],
+				);
+			insert("f1", beam.sessionId, "billing ledger lives in postgres", "m-ledger");
+			insert("f2", "other-session", "billing ledger copy", "m-foreign");
+			// Placeholder subject/predicate must not match: the query is column-scoped to `object`.
+			insert("f3", beam.sessionId, "unrelated text", "m-placeholder");
+
+			const hits = engine.factObjectMatches("where is the billing ledger? fact entity");
+			expect(hits.map(hit => hit.memoryId)).toEqual(["m-ledger"]);
+			expect(hits[0]?.score).toBeCloseTo(0.8 * 0.45);
+			expect(engine.factVoice("billing ledger").map(hit => hit.memoryId)).toEqual(["m-ledger"]);
 		} finally {
 			closeQuietly(beam.db);
 		}

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { closeQuietly, type DatabasePath, openDatabase, transaction } from "../db";
+import { ENTITY_EXTRACTION_STOP_WORDS } from "./entities";
 
 export interface Gist {
 	readonly id: string;
@@ -199,6 +200,41 @@ function lowerSet(values: readonly (string | null)[]): Set<string> {
 		if (normalized.length > 0) out.add(normalized);
 	}
 	return out;
+}
+
+const FACT_SUBJECT_CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
+const FACT_SUBJECT_MAX_WORDS = 4;
+
+/** Subordinators that leave a captured subject truncated mid-clause (PR #9840). */
+const DANGLING_FACT_SUBJECT_ENDINGS: Readonly<Record<string, true>> = {
+	while: true,
+	although: true,
+	though: true,
+	because: true,
+	since: true,
+	unless: true,
+	until: true,
+	whereas: true,
+	if: true,
+};
+
+/**
+ * Rejects fact subjects that are sentence fragments rather than plausible entity names:
+ * control characters, more than a handful of words, or a stop word / dangling
+ * conjunction at either end. Read-side only here: it filters the polyphonic subject
+ * dictionary and does not change what extraction stores.
+ */
+export function isPlausibleFactSubject(subject: string): boolean {
+	if (FACT_SUBJECT_CONTROL_CHAR_PATTERN.test(subject)) return false;
+	const words = subject
+		.trim()
+		.split(/\s+/)
+		.filter(word => word.length > 0);
+	if (words.length === 0 || words.length > FACT_SUBJECT_MAX_WORDS) return false;
+	const first = words[0]?.toLocaleLowerCase() ?? "";
+	if (ENTITY_EXTRACTION_STOP_WORDS.has(first)) return false;
+	const last = words[words.length - 1]?.toLocaleLowerCase() ?? "";
+	return !ENTITY_EXTRACTION_STOP_WORDS.has(last) && !Object.hasOwn(DANGLING_FACT_SUBJECT_ENDINGS, last);
 }
 
 const CONTENT_STOPWORDS = new Set([

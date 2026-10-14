@@ -4,7 +4,7 @@ import { hasCjk, matchesWordForm } from "../../util/regex";
 import { embedQuery } from "../embeddings";
 import { mmrRerank } from "../mmr";
 import { type OrchestratedRecallResult, orchestrateRecall } from "../orchestrator";
-import { POLYPHONIC_MAX_COMBINED_SCORE } from "../polyphonic-recall";
+import { getPolyphonicEngine } from "../polyphonic-recall";
 import { isQueryCacheEnabled, QueryCache } from "../query-cache";
 import { adjustWeights, classifyIntent } from "../query-intent";
 import { getSynonyms, STOP_WORDS as QUERY_STOP_WORDS } from "../synonyms";
@@ -103,7 +103,7 @@ export function clipRecallContent(
 }
 
 const DEFAULT_LIMIT = 500;
-const STOP_WORDS = new Set([
+export const STOP_WORDS = new Set([
 	"a",
 	"an",
 	"and",
@@ -1130,6 +1130,7 @@ async function polyphonicRecallEnhanced(
 		// `recallEnhanced` promises `topK` rows, not a token budget.
 		contextBudget: Number.POSITIVE_INFINITY,
 	});
+	const maxCombinedScore = getPolyphonicEngine(beam).maxCombinedScore;
 	const previewChars = options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS;
 	const results: RecallResult[] = [];
 	for (const result of fused) {
@@ -1137,7 +1138,7 @@ async function polyphonicRecallEnhanced(
 		if (!matchesRecallFilters(result, options)) continue;
 		const mapped: RecallResult = {
 			...result,
-			score: round4((result.combined_score ?? 0) / POLYPHONIC_MAX_COMBINED_SCORE),
+			score: round4((result.combined_score ?? 0) / maxCombinedScore),
 		};
 		// Rows reached only through the graph/fact/temporal/vector voices are hydrated in full.
 		if (typeof mapped.truncated !== "boolean") {

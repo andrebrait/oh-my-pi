@@ -112,7 +112,7 @@ describe("orchestrateRecall", () => {
 			expect(beam.linearCalls).toBe(0);
 			expect(beam.enhancedCalls).toBe(0);
 			expect(results[0]?.id).toBe("m-poly");
-			expect(results[0]?.voice_scores).toEqual({ graph: 1 / 61 });
+			expect(results[0]?.voice_scores).toEqual({ graph: 0.4 / 61 });
 		} finally {
 			closeQuietly(beam.db);
 		}

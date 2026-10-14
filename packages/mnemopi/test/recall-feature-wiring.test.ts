@@ -92,7 +92,8 @@ describe("polyphonic recall wiring", () => {
 		expect(dense?.voice_scores?.graph).toBeGreaterThan(0);
 		expect(dense?.voice_scores?.graph).toBeLessThanOrEqual(1 / 61);
 		for (const result of results) {
-			expect(result.score).toBeGreaterThan(0);
+			// Rows reached only through zero-weight voices (PR #9840: hybrid, temporal) fuse to 0.
+			expect(result.score).toBeGreaterThanOrEqual(0);
 			expect(result.score).toBeLessThanOrEqual(1);
 		}
 	});
