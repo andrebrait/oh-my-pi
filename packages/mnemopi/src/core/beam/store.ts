@@ -8,6 +8,7 @@ import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
 import { storeExtractedFactCategories } from "./consolidate";
+import { clearCachedEmbeddings, forgetCachedEmbeddings } from "./embedding-cache";
 import { type EmbedItem, scheduleEmbedding, vecAvailable, vecInsert } from "./helpers";
 import type {
 	BeamEvent,
@@ -201,6 +202,7 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 
 	db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
 	db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${placeholders})`, [...ids]);
+	forgetCachedEmbeddings(db, ids);
 	for (const table of MEMORIA_SOURCE_TABLES) {
 		db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${placeholders})`, [...ids]);
 	}
@@ -466,6 +468,7 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 						);
 					}
 				});
+				clearCachedEmbeddings(beam.db);
 				beam.caches.queryCache?.invalidate();
 
 				logger.info("mnemopi: embedding model changed, rebuilt", {
