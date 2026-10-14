@@ -672,7 +672,7 @@ function scoreCandidate(
 	} else {
 		const kwShare = (1 - importanceWeight) * 0.6;
 		baseScore = keyword * kwShare + importance * importanceWeight + keyword * keyword * 0.08;
-		if (candidate.signals.dense > 0) baseScore = baseScore * 0.8 + candidate.signals.dense * 0.2;
+		if (candidate.signals.dense > 0) baseScore = baseScore * 0.5 + candidate.signals.dense * 0.5;
 	}
 	let score = baseScore * (0.7 + 0.3 * decay);
 	const temporalWeight = options.temporalWeight ?? 0;
