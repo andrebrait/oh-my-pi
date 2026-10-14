@@ -1678,25 +1678,33 @@ export class RpcServer {
 				}
 				await this.#btw.close();
 				const leafBefore = session.sessionManager.getLeafId();
-				const result = await session.navigateTree(command.entryId, {
-					summarize: command.summarize === true,
-					customInstructions:
-						typeof command.customInstructions === "string" ? command.customInstructions : undefined,
-					// Only to detect a re-answer, which moves nothing yet: refused below, since it needs a picker here.
-					allowAskReopen: true,
-				});
+				// A goal continuation waiting to start is held until the navigation ends, then resumes (same session).
+				const result = await this.#withGoalReattach(
+					async () => {
+						const navigated = await session.navigateTree(command.entryId, {
+							summarize: command.summarize === true,
+							customInstructions:
+								typeof command.customInstructions === "string" ? command.customInstructions : undefined,
+							// Only to detect a re-answer, which moves nothing yet: refused below, since it needs a picker here.
+							allowAskReopen: true,
+						});
+						// The leaf moves without an entry frame, so clients follow the snapshot of a `tree` replacement.
+						if (!navigated.cancelled && session.sessionManager.getLeafId() !== leafBefore) {
+							this.#inputGate.commitSessionChange(command);
+							this.#replacing = this.#replace("tree", this.#goalReattached);
+						}
+						return navigated;
+					},
+					() => false,
+					true,
+				);
+				await this.#replacing;
 				if (result.reopenAsk) {
 					return rpcError(
 						id,
 						"navigate_tree",
 						"Re-answering an ask is not available over RPC; select another entry",
 					);
-				}
-				// The leaf moves without an entry frame, so clients follow the snapshot of a `tree` replacement.
-				if (!result.cancelled && session.sessionManager.getLeafId() !== leafBefore) {
-					this.#inputGate.commitSessionChange(command);
-					this.#replacing = this.#replace("tree");
-					await this.#replacing;
 				}
 				return rpcSuccess(id, "navigate_tree", {
 					cancelled: result.cancelled,

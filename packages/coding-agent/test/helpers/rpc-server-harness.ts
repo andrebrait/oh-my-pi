@@ -69,6 +69,8 @@ export async function createTestSession(
 		inputHook?: (text: string) => Promise<void>;
 		/** Side requests (branch summaries) instead of the real provider stream. */
 		sideStreamFn?: StreamFn;
+		/** Settings on top of the harness defaults. */
+		settings?: Readonly<Record<string, unknown>>;
 	} = {},
 ): Promise<AgentSession> {
 	const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
@@ -104,7 +106,7 @@ export async function createTestSession(
 	return new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated({ "compaction.enabled": false }),
+		settings: Settings.isolated({ "compaction.enabled": false, ...options.settings }),
 		modelRegistry,
 		extensionRunner,
 		passiveReplica: options.passiveReplica,

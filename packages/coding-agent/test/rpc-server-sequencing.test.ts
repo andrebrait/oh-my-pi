@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -473,6 +473,12 @@ describe("RpcServer sequencing", () => {
 			).toMatchObject({ success: true, data: { cancelled: false } });
 
 			const replaced = await b.next(f => f.type === "session_replaced");
+			// The requesting client gets the replacement before its response.
+			const order = (match: (f: Record<string, unknown>) => boolean) => a.frames.findIndex(match);
+			expect(order(f => f.type === "session_replaced")).toBeGreaterThanOrEqual(0);
+			expect(order(f => f.type === "session_replaced")).toBeLessThan(
+				order(f => f.type === "response" && f.command === "navigate_tree"),
+			);
 			expect(replaced).toMatchObject({
 				epoch: before + 1,
 				reason: "tree",
@@ -552,6 +558,56 @@ describe("RpcServer sequencing", () => {
 			expect(await navigated).toMatchObject({ success: true, data: { cancelled: true, aborted: true } });
 			expect(session.sessionManager.getLeafId()).toBe(leaf);
 			expect(server.epoch).toBe(epoch);
+		});
+
+		it("holds a waiting goal continuation during the navigation and runs it afterwards", async () => {
+			const summarizing = Promise.withResolvers<void>();
+			await startServer(
+				{ handler: { content: ["ok"] } },
+				{
+					settings: { "goal.continuationModes": ["rpc"] },
+					sideStreamFn: async (_model, _context, options) => {
+						summarizing.resolve();
+						const { promise, reject } = Promise.withResolvers<never>();
+						options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+						return promise;
+					},
+				},
+			);
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			const [, firstReply] = await twoTurns(a);
+			expect(await a.command({ type: "goal", op: "create", objective: "keep going" })).toMatchObject({
+				success: true,
+			});
+			// The continuation decided at the next yield waits here: decided, not yet started.
+			const idle = Promise.withResolvers<void>();
+			const waiting = Promise.withResolvers<void>();
+			const waitForIdle = spyOn(session, "waitForIdle").mockImplementation(() => {
+				waiting.resolve();
+				return idle.promise;
+			});
+			await a.command({ type: "prompt", message: "go" });
+			await a.next(f => f.type === "agent_end" && a.frames.filter(x => x.type === "agent_end").length === 3);
+			await waiting.promise;
+			waitForIdle.mockRestore();
+
+			const navigated = a.command({ type: "navigate_tree", entryId: firstReply, summarize: true });
+			await summarizing.promise;
+			// Mid-navigation the continuation's wait ends; it must neither start nor be lost.
+			idle.resolve();
+			await idle.promise;
+			await a.command({ type: "abort_branch_summary" });
+			expect(await navigated).toMatchObject({ success: true, data: { cancelled: true, aborted: true } });
+
+			const response = a.frames.findIndex(f => f.type === "response" && f.command === "navigate_tree");
+			const startsBefore = a.frames.slice(0, response).filter(f => f.type === "agent_start").length;
+			await a.next(
+				f => f.type === "agent_start" && a.frames.filter(x => x.type === "agent_start").length > startsBefore,
+			);
+			// Three turns (two seeded, "go") started before the response; the continuation only after it.
+			expect(startsBefore).toBe(3);
+			await a.command({ type: "goal", op: "drop" });
 		});
 
 		it("refuses to re-answer an ask, changing nothing", async () => {
