@@ -37,6 +37,11 @@ import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { formatContextUsage } from "@oh-my-pi/pi-tui/chrome/context-thresholds";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
+import type { Component } from "@oh-my-pi/pi-tui";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 import { createTestSession, isolateAgentDir } from "../helpers/rpc-server-harness";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
@@ -103,6 +108,12 @@ class View {
 	statusLine: StatusLineComponent | undefined;
 	readonly ctx: InteractiveModeContext;
 	link: HostedClientLink | undefined;
+	/** What a selector put in the editor as a draft (a rewound prompt). */
+	readonly drafts: { text: string; images: readonly ImageContent[] | undefined }[] = [];
+	/** The overlay the view shows now (the rewind selector), or the last panel a selector opened (the tree). */
+	panel: Component | undefined;
+	/** The real tree and rewind selectors over this view; their panels land in {@link panel}. */
+	readonly selectors: SelectorController;
 
 	private constructor(
 		readonly local: AgentSession,
@@ -139,7 +150,19 @@ class View {
 				restorePendingToolResults: () => {},
 			},
 			statusLine: { setCollabStatus: this.setCollabStatus },
-			editor: { setText: this.setEditorText },
+			editor: {
+				setText: this.setEditorText,
+				setDraft: (text, images) => void this.drafts.push({ text, images }),
+			},
+			ui: {
+				terminal: { rows: 40 },
+				showOverlay: component => {
+					this.panel = component;
+					return { hide: () => {}, setHidden: () => {}, isHidden: () => false };
+				},
+			},
+			showTreeSelector: () => this.selectors.showTreeSelector(),
+			showUserMessageSelector: () => this.selectors.showUserMessageSelector(),
 			renderInitialMessages: async () => {
 				this.renderCount++;
 				this.rendered.push(
@@ -168,6 +191,10 @@ class View {
 			showHookEditor: (title, _prefill, dialogOptions) => present<string>(title, dialogOptions?.signal),
 			showAskDialog: (_questions, dialogOptions) => present<ExtensionAskDialogResult>("ask", dialogOptions?.signal),
 		});
+		this.selectors = new SelectorController(this.ctx);
+		this.selectors.showSelector = create => {
+			this.panel = create(() => {}).component;
+		};
 		if (realEvents) this.ctx.eventController = new EventController(this.ctx);
 		if (realStatusLine) {
 			this.statusLine = new StatusLineComponent(local, statusLineHost);
@@ -259,6 +286,27 @@ async function seedTurn(host: TestSessionHost, text: string): Promise<void> {
 	await client.start();
 	await client.promptAndWait(text);
 	await client.detach();
+}
+
+const PIXEL: ImageContent = {
+	type: "image",
+	data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	mimeType: "image/png",
+};
+
+/** Two finished turns on the host, the second with an image; returns the [user, reply, user, reply] entry ids. */
+async function twoTurns(host: TestSessionHost): Promise<string[]> {
+	const client = await fixture.client(host);
+	await client.start();
+	await client.promptAndWait("one");
+	await client.promptAndWait("two", [PIXEL]);
+	await client.detach();
+	return host.session.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.id] : []));
+}
+
+/** The view has applied everything up to the host's current leaf. */
+async function caughtUp(view: View, host: TestSessionHost): Promise<void> {
+	await waitFor(() => view.local.sessionManager.getLeafId() === host.session.sessionManager.getLeafId());
 }
 
 /** A session's entries as a snapshot delivers them: serialized, without the host's in-memory bookkeeping. */
@@ -1612,6 +1660,161 @@ describe("HostedClientLink transport", () => {
 	});
 });
 
+describe("hosted tree navigation", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+	// The selectors read the process-wide settings (filter mode, branch summary prompt).
+	beforeEach(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+	});
+	afterEach(() => resetSettingsForTest());
+
+	/** A terminal attached as `omp attach` attaches it (the link is the context's host), caught up with the host. */
+	async function terminal(host: TestSessionHost): Promise<View> {
+		const view = await attach(host);
+		view.ctx.hostedClient = view.hostLink;
+		await caughtUp(view, host);
+		return view;
+	}
+
+	/** Open the view's tree selector, as `/tree` or the tree key does. */
+	function openTree(view: View): TreeSelectorComponent {
+		view.selectors.showTreeSelector();
+		const { panel } = view;
+		if (!(panel instanceof TreeSelectorComponent)) throw new Error("the tree selector did not open");
+		return panel;
+	}
+
+	const statusShown = (view: View, text: string): Promise<void> =>
+		waitFor(() => view.showStatus.mock.calls.some(([message]) => message === text));
+
+	it("/tree on one terminal moves the host's leaf and every terminal shows the branch", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply] = await twoTurns(host);
+		const a = await terminal(host);
+		const b = await terminal(host);
+		const sessionFile = host.session.sessionFile;
+		const epochs = [a.hostLink.epoch, b.hostLink.epoch];
+
+		await executeBuiltinSlashCommand("/tree", { ctx: a.ctx });
+		if (!(a.panel instanceof TreeSelectorComponent)) throw new Error("/tree did not open the tree selector");
+		a.panel.getTreeList().activateEntry(firstReply!);
+		await statusShown(a, "Navigated to selected point");
+
+		expect(a.showError).not.toHaveBeenCalled();
+		expect(host.session.sessionManager.getLeafId()).toBe(firstReply!);
+		expect(host.session.sessionFile).toBe(sessionFile);
+		expect(a.local.sessionManager.getLeafId()).toBe(firstReply!);
+		expect(a.hostLink.epoch).toBeGreaterThan(epochs[0]!);
+		await waitFor(() => b.hostLink.epoch > epochs[1]!);
+		expect(b.local.sessionManager.getLeafId()).toBe(firstReply!);
+		// Same session: the views keep it, they do not see a different one.
+		expect(a.local.sessionManager.getSessionId()).toBe(host.session.sessionManager.getSessionId());
+		expect(a.closed).toEqual([]);
+	});
+
+	it("rewinding from the transcript navigates in the same session file, not a new one", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply] = await twoTurns(host);
+		const view = await terminal(host);
+		const sessionFile = host.session.sessionFile;
+
+		// The rewind selector outlines the last reply; one up is the last prompt, and Enter rewinds past it.
+		view.selectors.showUserMessageSelector();
+		view.panel?.handleInput?.("\x1b[A");
+		view.panel?.handleInput?.("\r");
+		await statusShown(view, "Rewound to selected point");
+
+		expect(view.showError).not.toHaveBeenCalled();
+		expect(host.session.sessionFile).toBe(sessionFile);
+		expect(host.session.sessionManager.getLeafId()).toBe(firstReply!);
+		expect(view.local.sessionManager.getLeafId()).toBe(firstReply!);
+		// The prompt comes back for editing with its image, from this view's copy of the entry.
+		expect(view.drafts.map(draft => [draft.text, draft.images?.map(image => image.type)])).toEqual([
+			["two", ["image"]],
+		]);
+	});
+
+	it("a stale tree navigation shows the error and keeps the view", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply] = await twoTurns(host);
+		const view = await terminal(host);
+		const epoch = view.hostLink.epoch;
+		// The view still shows the old leaf while another client's turn lands on the host.
+		view.eventGate = Promise.withResolvers<void>();
+		try {
+			await seedTurn(host, "three");
+			const leafId = host.session.sessionManager.getLeafId();
+			expect(view.hostLink.leafId).not.toBe(leafId);
+
+			openTree(view).getTreeList().activateEntry(firstReply!);
+			await waitFor(() => view.showError.mock.calls.length > 0);
+
+			expect(view.showError).toHaveBeenCalledWith("Session tree moved");
+			expect(host.session.sessionManager.getLeafId()).toBe(leafId);
+			expect(view.hostLink.epoch).toBe(epoch);
+		} finally {
+			view.eventGate.resolve();
+		}
+		await caughtUp(view, host);
+	});
+
+	it("Esc during a branch summary aborts it on the host", async () => {
+		const summarizing = Promise.withResolvers<void>();
+		const host = await fixture.startHost({}, undefined, {
+			// The summary request hangs until it is aborted.
+			sideStreamFn: async (_model, _context, options) => {
+				summarizing.resolve();
+				const { promise, reject } = Promise.withResolvers<never>();
+				options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				return promise;
+			},
+		});
+		const [, firstReply] = await twoTurns(host);
+		const view = await terminal(host);
+		const leafId = host.session.sessionManager.getLeafId();
+		const epoch = view.hostLink.epoch;
+
+		const list = openTree(view).getTreeList();
+		list.selectEntry(firstReply!);
+		list.confirm(true);
+		await summarizing.promise;
+		view.ctx.editor.onEscape?.();
+		await statusShown(view, "Branch summarization cancelled");
+
+		expect(view.showError).not.toHaveBeenCalled();
+		expect(host.session.sessionManager.getLeafId()).toBe(leafId);
+		expect(view.hostLink.epoch).toBe(epoch);
+	});
+
+	it("a label set from the tree selector reaches every terminal", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply, secondUser] = await twoTurns(host);
+		// Back to the first reply, then a third turn: the second prompt is now off the branch.
+		const client = await fixture.client(host);
+		await client.start();
+		await client.navigateTree(firstReply!);
+		await client.promptAndWait("three");
+		await client.detach();
+		const a = await terminal(host);
+		const b = await terminal(host);
+		await caughtUp(b, host);
+
+		const panel = openTree(a);
+		panel.getTreeList().selectEntry(secondUser!);
+		panel.getTreeList().editLabel();
+		for (const key of "old") panel.handleInput(key);
+		panel.handleInput("\r");
+
+		await waitFor(() => host.session.sessionManager.getLabel(secondUser!) === "old");
+		await waitFor(() => b.local.sessionManager.getLabel(secondUser!) === "old");
+		await waitFor(() => a.local.sessionManager.getLabel(secondUser!) === "old");
+		expect(a.showError).not.toHaveBeenCalled();
+	});
+});
+
 describe("HostedClientLink reconnect", () => {
 	/** Cut the view's connection with the proxy refusing new ones, and wait until the link notices. */
 	async function loseConnection(view: View, proxy: HostProxy): Promise<void> {
@@ -2005,6 +2208,32 @@ describe("HostedClientLink reconnect", () => {
 			expect(view.hostLink.reconnecting).toBe(false);
 			expect(view.closed).toEqual([]);
 			expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+
+	itPosix("shows a tree navigation made while it was disconnected once it reconnects", async () => {
+		const host = await fixture.startHost();
+		const [, firstReply] = await twoTurns(host);
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			await caughtUp(view, host);
+			const epoch = view.hostLink.epoch;
+
+			await loseConnection(view, proxy);
+			const other = await fixture.client(host);
+			await other.start();
+			await other.navigateTree(firstReply!);
+			await other.detach();
+			proxy.accept();
+			await waitFor(() => !view.hostLink.reconnecting);
+
+			expect(view.closed).toEqual([]);
+			expect(view.hostLink.epoch).toBeGreaterThan(epoch);
+			expect(view.local.sessionManager.getLeafId()).toBe(firstReply!);
 		} finally {
 			proxy.close();
 		}

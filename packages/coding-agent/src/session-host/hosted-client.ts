@@ -29,6 +29,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import { transcriptEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { sanitizeDisplayLine, sanitizeDisplayText } from "@oh-my-pi/pi-tui/overlays/extensions/display-text";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
 import { clearAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
@@ -41,6 +42,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHostFrame,
+	RpcNavigateTreeResult,
 	RpcPreconditions,
 	RpcQueueAttachments,
 	RpcSessionOrigin,
@@ -48,6 +50,7 @@ import type {
 } from "../modes/rpc/rpc-types";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSessionEvent } from "../session/agent-session";
+import { isTranscriptEntry } from "../session/session-context";
 import {
 	applyReplicaEvent,
 	applyReplicaHostState,
@@ -421,6 +424,41 @@ export class HostedClientLink {
 	async fork(): Promise<void> {
 		const { cancelled } = await this.#client.fork(undefined, { ...this.#guard(), ifLeaf: this.leafId });
 		if (cancelled) throw new Error("Fork failed (session not persisted or cancelled)");
+		await this.#chain;
+	}
+
+	/**
+	 * Move the host's leaf in the same session file, from the leaf this view shows (`stale` when the host moved past
+	 * it). Resolves once this view shows the host's `tree` replacement. A user-message target's images come from this
+	 * view's copy of the entry, as an in-process rewind restores them.
+	 */
+	async navigateTree(
+		entryId: string,
+		options: { summarize?: boolean; customInstructions?: string } = {},
+	): Promise<RpcNavigateTreeResult & { editorImages?: ImageContent[] }> {
+		const result = await this.#client.navigateTree(entryId, options, { ...this.#guard(), ifLeaf: this.leafId });
+		await this.#chain;
+		const entry = this.#ctx.session.sessionManager.getEntry(entryId);
+		const message =
+			result.editorText !== undefined && entry && isTranscriptEntry(entry)
+				? transcriptEntryMessage(entry)
+				: undefined;
+		const content = message?.role === "user" || message?.role === "custom" ? message.content : undefined;
+		const images = Array.isArray(content)
+			? content.filter((block): block is ImageContent => block.type === "image")
+			: [];
+		return images.length > 0 ? { ...result, editorImages: images } : result;
+	}
+
+	/** Stop the host's branch summary for a `navigateTree` in flight. Not epoch-guarded, as {@link abort}. */
+	async abortBranchSummary(): Promise<void> {
+		if (this.#reconnecting) throw new Error(RECONNECTING_ERROR);
+		await this.#client.abortBranchSummary();
+	}
+
+	/** Label an entry on the host (clear with `undefined`); resolves once this view shows the label. */
+	async setLabel(entryId: string, label: string | undefined): Promise<void> {
+		await this.#client.setLabel(entryId, label, this.#guard());
 		await this.#chain;
 	}
 

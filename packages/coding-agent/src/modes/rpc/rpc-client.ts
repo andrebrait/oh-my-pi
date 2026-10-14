@@ -1348,8 +1348,8 @@ export class RpcClient {
 	 * Branch from a specific message.
 	 * @returns Object with `text` (the message text) and `cancelled` (if extension cancelled)
 	 */
-	async branch(entryId: string, preconditions?: RpcPreconditions): Promise<{ text: string; cancelled: boolean }> {
-		const response = await this.#send({ type: "branch", entryId, ...writeGuard(preconditions) });
+	async branch(entryId: string): Promise<{ text: string; cancelled: boolean }> {
+		const response = await this.#send({ type: "branch", entryId });
 		return this.#getData(response);
 	}
 

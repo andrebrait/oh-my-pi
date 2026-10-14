@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -61,12 +62,12 @@ export class SessionHostFixture {
 	/**
 	 * A host serving a fresh session whose mock model answers `responses` in turn, then `ok`; `gate` holds each reply
 	 * after its first delta until it resolves; `inMemory` keeps the transcript in memory, with no session file or
-	 * artifacts directory.
+	 * artifacts directory; `sideStreamFn` answers side requests (branch summaries).
 	 */
 	async startHost(
 		options: Partial<SessionHostOptions> = {},
 		gate?: Promise<void>,
-		sessionOptions: { inMemory?: boolean; responses?: MockResponse[] } = {},
+		sessionOptions: { inMemory?: boolean; responses?: MockResponse[]; sideStreamFn?: StreamFn } = {},
 	): Promise<TestSessionHost> {
 		const sessionDir = path.join(this.dir, `host-${++this.#hostCount}`);
 		await fs.mkdir(sessionDir, { recursive: true });
