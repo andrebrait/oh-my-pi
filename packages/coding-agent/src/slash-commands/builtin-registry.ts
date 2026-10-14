@@ -175,8 +175,9 @@ export async function executeBuiltinSlashCommand(
 		const rule = HOSTED_LOCAL_COMMANDS[command.name];
 		const local = rule === true || (rule === "bare" && parsed.args.length === 0);
 		const takesNoArgs = parsed.args.length > 0 && !command.allowArgs;
+		// `/new now`: the command runs here when bare, so its arguments are what is wrong.
 		const refusal =
-			!local && !command.handle
+			!local && !command.handle && !(rule === "bare" && takesNoArgs)
 				? `/${rule === "bare" ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
 				: takesNoArgs
 					? `/${command.name} takes no arguments`

@@ -1,4 +1,4 @@
-import { clearSubmittedText } from "./helpers/draft";
+import { clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
 import { runOnHost } from "./helpers/hosted";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
@@ -622,7 +622,10 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			// Attached, only bare `/fork` reaches here: the host forks at the leaf this view shows.
 			if (runtime.ctx.hostedClientMode) {
 				clearSubmittedText(runtime);
-				await runOnHost(runtime.ctx, link => link.fork(), "Session forked");
+				// Refused (`stale`, `session_busy`): the input goes back for the user to resend.
+				if (!(await runOnHost(runtime.ctx, link => link.fork(), "Session forked"))) {
+					restoreDetachedDraft(runtime.ctx.editor, command.text);
+				}
 				return;
 			}
 			const args = command.args.trim();

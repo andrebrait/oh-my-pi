@@ -407,16 +407,21 @@ export class HostedClientLink {
 		return (await this.#client.cycleThinkingLevel(this.#guard())) !== null;
 	}
 
-	/** Start a new session on the host; this view and every peer follow its `session_replaced`. */
+	/**
+	 * Start a new session on the host; this view and every peer follow its `session_replaced`. Resolves once this
+	 * view shows it: the host sends the replacement before its response, so it is already on the apply chain.
+	 */
 	async newSession(): Promise<void> {
 		const { cancelled } = await this.#client.newSession(undefined, this.#guard());
 		if (cancelled) throw new Error("New session cancelled");
+		await this.#chain;
 	}
 
-	/** Fork the host session at the leaf this view shows; `stale` when the host's leaf moved past it. */
+	/** Fork the host session at the leaf this view shows; `stale` when the host's leaf moved past it. Resolves as {@link newSession}. */
 	async fork(): Promise<void> {
 		const { cancelled } = await this.#client.fork(undefined, { ...this.#guard(), ifLeaf: this.leafId });
-		if (cancelled) throw new Error("Fork cancelled");
+		if (cancelled) throw new Error("Fork failed (session not persisted or cancelled)");
+		await this.#chain;
 	}
 
 	/** Leave the session running and close this client; a reconnect in progress stops without sending anything. */

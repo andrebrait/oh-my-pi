@@ -110,6 +110,8 @@ class Terminal {
 	readonly offered: string[][] = [];
 	/** The user's answer to the host selector. */
 	readonly choice = Promise.withResolvers<string | undefined>();
+	/** Every text a command handed back to the editor. */
+	readonly editorRestores: string[] = [];
 	readonly ctx: InteractiveModeContext;
 	/** While set, every host event waits in the view's handler, and the frames behind it wait too: the view lags the host. */
 	eventGate: PromiseWithResolvers<void> | undefined;
@@ -128,7 +130,13 @@ class Terminal {
 				restorePendingToolResults: () => {},
 			},
 			statusLine: { setCollabStatus: () => {} },
-			editor: { setText: () => {}, setCollapsedText: () => {} },
+			editor: {
+				setText: () => {},
+				setCollapsedText: text => void this.editorRestores.push(text),
+				getExpandedText: () => "",
+				pendingImages: [],
+				pendingImageLinks: [],
+			},
 			showStatus: message => void this.statuses.push(message),
 			showError: message => void this.errors.push(message),
 			showHookSelector: async (_title, options) => {
@@ -447,9 +455,23 @@ describe("/new and /fork in a hosted terminal", () => {
 
 		expect(a.errors).toEqual([]);
 		expect(host.session.sessionManager.getSessionId()).not.toBe(sessionId);
-		await waitFor(() => a.link.epoch > epochs[0]! && b.link.epoch > epochs[1]!);
+		// The command returns once its own view shows the new session; the peer follows on its own time.
+		expect(a.link.epoch).toBeGreaterThan(epochs[0]!);
 		expect(a.transcript).toEqual([]);
+		await waitFor(() => b.link.epoch > epochs[1]!);
 		expect(b.transcript).toEqual([]);
+	}, 20_000);
+
+	it("/new with arguments says it takes none and keeps the input", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attached(host);
+		const sessionId = host.session.sessionManager.getSessionId();
+
+		await executeBuiltinSlashCommand("/new now", { ctx: terminal.ctx });
+
+		expect(terminal.statuses).toContain("/new takes no arguments");
+		expect(terminal.editorRestores).toEqual(["/new now"]);
+		expect(host.session.sessionManager.getSessionId()).toBe(sessionId);
 	}, 20_000);
 
 	it("/fork forks the host session at the view's leaf", async () => {
@@ -464,7 +486,7 @@ describe("/new and /fork in a hosted terminal", () => {
 		expect(terminal.errors).toEqual([]);
 		expect(host.session.sessionFile).not.toBe(sessionFile);
 		expect(userTexts(host.session)).toEqual(["before fork"]);
-		await waitFor(() => terminal.link.epoch > epoch);
+		expect(terminal.link.epoch).toBeGreaterThan(epoch);
 		expect(terminal.transcript).toEqual(["before fork"]);
 	}, 20_000);
 
@@ -478,10 +500,13 @@ describe("/new and /fork in a hosted terminal", () => {
 		await seedTurn(host, "from b");
 		const sessionFile = host.session.sessionFile;
 		const leafId = host.session.sessionManager.getLeafId();
+		expect(a.link.leafId).not.toBe(leafId);
 
 		await executeBuiltinSlashCommand("/fork", { ctx: a.ctx });
 
 		expect(a.errors).toEqual(["Session tree moved"]);
+		// Nothing ran: the command goes back to the editor for the user to resend.
+		expect(a.editorRestores).toEqual(["/fork"]);
 		expect(host.session.sessionFile).toBe(sessionFile);
 		expect(host.session.sessionManager.getLeafId()).toBe(leafId);
 		a.eventGate.resolve();
