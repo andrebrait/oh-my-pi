@@ -44,7 +44,8 @@ export function assertMnemopiEnvClean(): void {
 }
 
 function tierOf(label: string | undefined, summaryOf: string | undefined): RecallHit["tier"] {
-	const tier = label ?? (summaryOf ? "episodic" : "working");
+	// Ablation: fact rows (with-sleep + includeFacts) take a recall slot; they map to messages only by content fallback.
+	const tier = label === "fact" ? "working" : (label ?? (summaryOf ? "episodic" : "working"));
 	if (tier !== "working" && tier !== "episodic") throw new Error(`unexpected mnemopi recall tier "${tier}"`);
 	return tier;
 }
