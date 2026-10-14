@@ -69,6 +69,8 @@ export function mnemosyneEngine(options: MnemosyneEngineOptions = {}): EngineAda
 			MNEMOSYNE_EMBEDDING_MODEL: EMBEDDING_MODEL,
 			MNEMOSYNE_LLM_ENABLED: "false",
 			...(protocol === "fts-only" ? { MNEMOSYNE_NO_EMBEDDINGS: "1" } : {}),
+			// Ablation: MEMEVAL_RECALL=polyphonic turns on Mnemosyne's polyphonic recall.
+			...(Bun.env.MEMEVAL_RECALL === "polyphonic" ? { MNEMOSYNE_POLYPHONIC_RECALL: "1" } : {}),
 		});
 		served = protocol;
 		return proc;
