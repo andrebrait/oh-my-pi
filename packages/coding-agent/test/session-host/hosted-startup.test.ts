@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
@@ -154,6 +155,7 @@ describe("hostLaunchArgs", () => {
 		fs.mkdirSync(launchCwd);
 		fs.writeFileSync(path.join(launchCwd, "overlay.yml"), "{}\n");
 		fs.writeFileSync(path.join(launchCwd, "prompt.md"), "be brief\n");
+		fs.writeFileSync(path.join(launchCwd, "append.md"), "and kind\n");
 		const at = (name: string): string => path.join(launchCwd, name);
 
 		const args = hostLaunchArgs(
@@ -169,6 +171,8 @@ describe("hostLaunchArgs", () => {
 				"--extension",
 				"~/ext.ts",
 				"--hook",
+				"hook.ts",
+				"--hook",
 				"/abs/hook.ts",
 				"--plugin-dir",
 				"plugins",
@@ -176,6 +180,8 @@ describe("hostLaunchArgs", () => {
 				"tpl.md",
 				"--system-prompt",
 				"prompt.md",
+				"--append-system-prompt",
+				"append.md",
 				"--append-system-prompt",
 				"be brief",
 				"--model",
@@ -195,7 +201,9 @@ describe("hostLaunchArgs", () => {
 			"-e",
 			at("ext.ts"),
 			"--extension",
-			"~/ext.ts",
+			path.join(os.homedir(), "ext.ts"),
+			"--hook",
+			at("hook.ts"),
 			"--hook",
 			"/abs/hook.ts",
 			"--plugin-dir",
@@ -204,6 +212,8 @@ describe("hostLaunchArgs", () => {
 			at("tpl.md"),
 			"--system-prompt",
 			at("prompt.md"),
+			"--append-system-prompt",
+			at("append.md"),
 			"--append-system-prompt",
 			"be brief",
 			"--model",
@@ -222,6 +232,59 @@ describe("hostLaunchArgs", () => {
 	});
 });
 
+describe("hostLaunchArgs input semantics", () => {
+	it("keeps inline prompt text whose lookup as a file fails, instead of turning it into a path", () => {
+		const launchCwd = path.join(dir, "launch");
+		fs.mkdirSync(launchCwd);
+		fs.writeFileSync(path.join(launchCwd, "plain-file"), "x\n");
+		const tooLong = `${"a long single-line prompt ".repeat(20)}ends here`;
+		expect(tooLong.length).toBeGreaterThan(300);
+		const underAFile = "plain-file/looks-like-a-path";
+		expect(
+			hostLaunchArgs(
+				["--system-prompt", tooLong, "--append-system-prompt", underAFile, "--system-prompt", "x".repeat(5_000)],
+				launchCwd,
+			),
+		).toEqual([
+			"--system-prompt",
+			tooLong,
+			"--append-system-prompt",
+			underAFile,
+			"--system-prompt",
+			"x".repeat(5_000),
+		]);
+	});
+
+	it("reads extension paths as the loader does: file://, @ and : prefixes are normalized", () => {
+		const launchCwd = path.join(dir, "launch");
+		const at = (name: string): string => path.join(launchCwd, name);
+		expect(
+			hostLaunchArgs(
+				[
+					"-e",
+					`file://${at("a.ts")}`,
+					"--extension",
+					`@${at("b.ts")}`,
+					"--hook",
+					`:${at("c.ts")}`,
+					`--extension=file://${at("d.ts")}`,
+				],
+				launchCwd,
+			),
+		).toEqual(["-e", at("a.ts"), "--extension", at("b.ts"), "--hook", at("c.ts"), `--extension=${at("d.ts")}`]);
+	});
+
+	it("reads --config as Settings does: only ~ and ~/ name the home directory", () => {
+		const launchCwd = path.join(dir, "launch");
+		expect(hostLaunchArgs(["--config", "~/o.yml", "--config", "~o.yml"], launchCwd)).toEqual([
+			"--config",
+			path.join(os.homedir(), "o.yml"),
+			"--config",
+			path.join(launchCwd, "~o.yml"),
+		]);
+	});
+});
+
 describe("createHostLaunch", () => {
 	it("reads this terminal's session directory where the launch did, as the host it starts does", () => {
 		const sessionCwd = path.join(dir, "resumed-project");
@@ -231,6 +294,7 @@ describe("createHostLaunch", () => {
 			launchCwd: dir,
 			sessionDir: "sessions",
 			envSessionDir: undefined,
+			envConfigFiles: undefined,
 		});
 		expect(hosted).toStrictEqual({
 			cwd: sessionCwd,
@@ -239,8 +303,14 @@ describe("createHostLaunch", () => {
 			env: undefined,
 		});
 		expect(
-			createHostLaunch({ rawArgs: [], cwd: sessionCwd, launchCwd: dir, sessionDir: undefined, envSessionDir: "" })
-				.sessionDir,
+			createHostLaunch({
+				rawArgs: [],
+				cwd: sessionCwd,
+				launchCwd: dir,
+				sessionDir: undefined,
+				envSessionDir: "",
+				envConfigFiles: ":",
+			}).sessionDir,
 		).toBe(undefined);
 	});
 
@@ -251,9 +321,32 @@ describe("createHostLaunch", () => {
 			launchCwd: dir,
 			sessionDir: "sessions",
 			envSessionDir: "sessions",
+			envConfigFiles: undefined,
 		});
 		expect(hosted.sessionDir).toBe(sessionsDir);
 		expect(hosted.env).toEqual({ PI_CODING_AGENT_SESSION_DIR: sessionsDir });
+	});
+
+	it("hands the host PI_CONFIG_FILES resolved entry by entry, since the host reads it from another directory", () => {
+		const options = {
+			rawArgs: [],
+			cwd: path.join(dir, "resumed-project"),
+			launchCwd: dir,
+			sessionDir: undefined,
+			envSessionDir: "sessions",
+		};
+		const hosted = createHostLaunch({
+			...options,
+			envConfigFiles: `a.yml${path.delimiter}${path.delimiter}/abs/b.yml`,
+		});
+		expect(hosted.env).toEqual({
+			PI_CODING_AGENT_SESSION_DIR: sessionsDir,
+			PI_CONFIG_FILES: [path.join(dir, "a.yml"), "/abs/b.yml"].join(path.delimiter),
+		});
+		// Only empty entries: `Settings` reads no overlay, and the inherited value already says so.
+		expect(createHostLaunch({ ...options, envSessionDir: undefined, envConfigFiles: path.delimiter }).env).toBe(
+			undefined,
+		);
 	});
 });
 
@@ -504,6 +597,92 @@ describe("the opt-in gate", () => {
 			authStorage.close();
 		}
 	}, 30_000);
+	it("starts the host of a resume into another project with the launch directory's configuration and sessions", async () => {
+		const launchDir = path.join(dir, "launch");
+		const projectDir = path.join(dir, "resumed-project");
+		const launchSessions = path.join(launchDir, "sessions");
+		fs.mkdirSync(launchSessions, { recursive: true });
+		fs.mkdirSync(projectDir);
+		// What is asked for from the launch directory, and decoys under the same names where the host will run.
+		const overlay = (model: string, thinking: string): string =>
+			`modelRoles:\n  default: anthropic/${model}\ndefaultThinkingLevel: ${thinking}\n`;
+		fs.writeFileSync(path.join(launchDir, "flag.yml"), "defaultThinkingLevel: low\n");
+		fs.writeFileSync(path.join(launchDir, "env.yml"), "modelRoles:\n  default: anthropic/claude-haiku-4-5\n");
+		fs.writeFileSync(path.join(projectDir, "flag.yml"), overlay("claude-sonnet-4-5", "high"));
+		fs.writeFileSync(path.join(projectDir, "env.yml"), overlay("claude-sonnet-4-5", "high"));
+		const manager = SessionManager.create(projectDir, launchSessions);
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("session was not given a file");
+		await manager.close();
+
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		const settings = Settings.isolated({ "tui.hosted": true, "startup.checkUpdate": false });
+		const originalProjectDir = getProjectDir();
+		const saved = {
+			agentDir: process.env.PI_CODING_AGENT_DIR,
+			sessionDir: process.env.PI_CODING_AGENT_SESSION_DIR,
+			configFiles: process.env.PI_CONFIG_FILES,
+		};
+		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const stop = new Error("hosted terminal session reached");
+		process.env.PI_CODING_AGENT_DIR = dir;
+		process.env.PI_CODING_AGENT_SESSION_DIR = "sessions";
+		process.env.PI_CONFIG_FILES = "env.yml";
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		const rawArgs = [...MODEL_ARGS.slice(0, 3), "--cwd", launchDir, "--config", "flag.yml", "--resume", file];
+		try {
+			// The host is started for real; the terminal stops where it would build its replica.
+			await expect(
+				runRootCommand(parseArgs(rawArgs), rawArgs, {
+					settings,
+					discoverAuthStorage: async () => authStorage,
+					createAgentSession: async () => {
+						throw stop;
+					},
+				}),
+			).rejects.toBe(stop);
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			expect(hosts.map(host => host.cwd)).toEqual([projectDir]);
+
+			const client = new RpcClient({
+				spawn: () => connectSessionHost({ entry: hosts[0], client: { kind: "test" }, ui: false }),
+			});
+			await client.start();
+			try {
+				const state = await client.getState();
+				expect(state.model?.id).toBe("claude-haiku-4-5");
+				expect(state.thinkingLevel).toBe(Effort.Low);
+				await client.newSession();
+				expect(path.dirname((await client.getState()).sessionFile ?? "")).toBe(launchSessions);
+				expect(fs.existsSync(path.join(projectDir, "sessions"))).toBe(false);
+			} finally {
+				await client.exit().catch(() => undefined);
+				await client.stop();
+			}
+		} finally {
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			if (stdinTTY) Object.defineProperty(process.stdin, "isTTY", stdinTTY);
+			else Reflect.deleteProperty(process.stdin, "isTTY");
+			if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			for (const [name, value] of [
+				["PI_CODING_AGENT_DIR", saved.agentDir],
+				["PI_CODING_AGENT_SESSION_DIR", saved.sessionDir],
+				["PI_CONFIG_FILES", saved.configFiles],
+			] as const) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			setProjectDir(originalProjectDir);
+			authStorage.close();
+		}
+	}, 60_000);
+
 	it("rejects a missing attachment without leaving a detached host", async () => {
 		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
 		const settings = Settings.isolated({ "tui.hosted": true, "startup.checkUpdate": false });
