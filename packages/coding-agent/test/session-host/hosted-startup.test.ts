@@ -285,6 +285,19 @@ describe("hostLaunchArgs input semantics", () => {
 	});
 });
 
+describe("hostLaunchArgs --add-dir", () => {
+	it("reads --add-dir as the workspace does: only ~ and ~/ name the home directory", () => {
+		const launchCwd = path.join(dir, "launch");
+		expect(hostLaunchArgs(["--add-dir", "~/lib", "--add-dir=~lib", "--add-dir", "src"], launchCwd)).toEqual([
+			"--add-dir",
+			path.join(os.homedir(), "lib"),
+			`--add-dir=${path.join(launchCwd, "~lib")}`,
+			"--add-dir",
+			path.join(launchCwd, "src"),
+		]);
+	});
+});
+
 describe("createHostLaunch", () => {
 	it("reads this terminal's session directory where the launch did, as the host it starts does", () => {
 		const sessionCwd = path.join(dir, "resumed-project");

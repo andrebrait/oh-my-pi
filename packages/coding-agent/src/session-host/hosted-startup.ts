@@ -23,6 +23,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import { resolveResumableSession } from "../session/session-listing";
 import { readSessionHeaderId } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
+import { normalizeWorkspaceDirectory } from "../session/session-workspace";
 import { FileSessionStorage } from "../session/session-storage";
 import { errorMessage } from "../slash-commands/helpers/parse";
 import type { EventBus } from "../utils/event-bus";
@@ -91,9 +92,6 @@ type PathReader = (value: string, launchCwd: string) => string;
 
 const againstLaunchCwd: PathReader = (value, launchCwd) => path.resolve(launchCwd, value);
 
-/** A reader that expands a leading `~` itself: the host does, so the value is left for it. */
-const tildeForHost: PathReader = (value, launchCwd) => (value.startsWith("~") ? value : path.resolve(launchCwd, value));
-
 /** `Settings` reads `--config` / `PI_CONFIG_FILES` entries as `path.resolve(cwd, expandTilde(entry))`. */
 const settingsFile: PathReader = (value, launchCwd) => path.resolve(launchCwd, expandTilde(value));
 
@@ -112,7 +110,7 @@ const extensionFile: PathReader = (value, launchCwd) => {
  */
 const PATH_FLAGS: Readonly<Record<string, PathReader>> = {
 	"--config": settingsFile,
-	"--add-dir": tildeForHost,
+	"--add-dir": normalizeWorkspaceDirectory,
 	"--extension": extensionFile,
 	"-e": extensionFile,
 	"--hook": extensionFile,
