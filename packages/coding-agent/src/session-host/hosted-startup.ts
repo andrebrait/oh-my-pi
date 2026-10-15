@@ -85,29 +85,35 @@ const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
 	"--host-registry-dir": true,
 };
 
-/** Launch flags whose value is a path. `--trusted-extension` is absolute by validation; `--cwd` is dropped. */
-const PATH_FLAGS: Readonly<Record<string, true>> = {
+/**
+ * Launch flags whose value is a path, mapped to whether their reader expands a leading `~` (such a value is left for
+ * the host to expand; elsewhere `~` is an ordinary relative directory name). `--trusted-extension` is absolute by
+ * validation; `--cwd` is dropped.
+ */
+const PATH_FLAGS: Readonly<Record<string, boolean>> = {
 	"--config": true,
 	"--add-dir": true,
-	"--session-dir": true,
-	"--export": true,
 	"--extension": true,
 	"-e": true,
 	"--hook": true,
-	"--plugin-dir": true,
-	"--system-prompt-template": true,
+	"--session-dir": false,
+	"--export": false,
+	"--plugin-dir": false,
+	"--system-prompt-template": false,
 };
 
-/** Launch flags whose value is inline text or a file path (`resolvePromptInput`). */
+/** Launch flags whose value is inline text or a file path (`resolvePromptInput`, which does not expand `~`). */
 const TEXT_OR_PATH_FLAGS: Readonly<Record<string, true>> = {
 	"--system-prompt": true,
 	"--append-system-prompt": true,
 };
 
-/** `value` of `flag` made independent of the directory it is read in; `~` stays for the host to expand. */
+/** `value` of `flag` made independent of the directory it is read in. */
 function launchPathValue(flag: string, value: string, launchCwd: string): string {
-	if (!value || value.startsWith("~")) return value;
-	if (Object.hasOwn(PATH_FLAGS, flag)) return path.resolve(launchCwd, value);
+	if (!value) return value;
+	if (Object.hasOwn(PATH_FLAGS, flag)) {
+		return PATH_FLAGS[flag] && value.startsWith("~") ? value : path.resolve(launchCwd, value);
+	}
 	if (!Object.hasOwn(TEXT_OR_PATH_FLAGS, flag) || value.includes("\n")) return value;
 	const file = path.resolve(launchCwd, value);
 	return fs.statSync(file, { throwIfNoEntry: false })?.isFile() ? file : value;
