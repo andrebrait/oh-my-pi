@@ -148,6 +148,24 @@ export function hostLaunchArgs(rawArgs: readonly string[], launchCwd: string): s
 }
 
 /**
+ * How this terminal starts and finds hosts: new ones run in `cwd` with {@link hostLaunchArgs}, and its own session
+ * directory is read from `launchCwd` as the host's `--session-dir` is, though a resume moved this process to `cwd`.
+ */
+export function createHostLaunch(options: {
+	rawArgs: readonly string[];
+	cwd: string;
+	launchCwd: string;
+	sessionDir: string | undefined;
+}): HostLaunch {
+	const { rawArgs, cwd, launchCwd, sessionDir } = options;
+	return {
+		cwd,
+		args: hostLaunchArgs(rawArgs, launchCwd),
+		sessionDir: sessionDir && launchPathValue("--session-dir", sessionDir, launchCwd),
+	};
+}
+
+/**
  * Refuse launch options a host cannot honor. They are errors, never silently dropped: dropping `--fork` would open
  * the original session, dropping `--goal` would start the session without the goal asked for (and running it here
  * would start local goal mode, which a terminal that only mirrors a host never does), and a flag only an extension
