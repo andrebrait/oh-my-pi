@@ -6,9 +6,11 @@ import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
+import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { INTERRUPTED_TURN_ERROR } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
 import {
 	assertHostedLaunchSupported,
 	ensureHostForResolvedSession,
@@ -279,6 +281,34 @@ describe("starting hosts", () => {
 		// Restoring closes the cut-off turn with the interrupted-turn record before retrying it; a plain resume never does.
 		await waitFor(async () => (await Bun.file(file).text()).includes(INTERRUPTED_TURN_ERROR), 30_000);
 	}, 150_000);
+
+	it("never restores a session a host opens on a plain resume", async () => {
+		const plainFile = await interruptedSession();
+		const plain = await ensureHostForResolvedSession(
+			await SessionManager.open(plainFile, sessionsDir),
+			launch(MODEL_ARGS),
+		);
+		hostPids.push(plain.pid);
+		const client = new RpcClient({
+			spawn: () => connectSessionHost({ entry: plain, client: { kind: "test" }, ui: false }),
+		});
+		await client.start();
+		// Answered once extension startup finished: the point a restore would start from.
+		await client.getState();
+
+		// A restoring host started only now records the interrupted turn: by then, a restore the plain host had started would have too.
+		const restoredFile = await interruptedSession();
+		const restored = await ensureHostForResolvedSession(
+			await SessionManager.open(restoredFile, sessionsDir),
+			launch(MODEL_ARGS),
+			{ restore: true },
+		);
+		hostPids.push(restored.pid);
+		await waitFor(async () => (await Bun.file(restoredFile).text()).includes(INTERRUPTED_TURN_ERROR), 30_000);
+
+		expect(await Bun.file(plainFile).text()).not.toContain(INTERRUPTED_TURN_ERROR);
+		await client.detach();
+	}, 150_000);
 });
 
 describe("the opt-in gate", () => {
@@ -325,6 +355,44 @@ describe("the opt-in gate", () => {
 			authStorage.close();
 		}
 	});
+
+	it("refuses a hosted --restore that carries a prompt, before starting a host", async () => {
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		const settings = Settings.isolated({ "tui.hosted": true, "startup.checkUpdate": false });
+		const file = await interruptedSession();
+		const rawArgs = [...MODEL_ARGS, "--session-dir", sessionsDir, "--restore", file, "keep going"];
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		// A host this launch wrongly started reads its configuration from `dir`, never the developer's.
+		process.env.PI_CODING_AGENT_DIR = dir;
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		try {
+			await expect(
+				runRootCommand(parseArgs(rawArgs), rawArgs, {
+					settings,
+					discoverAuthStorage: async () => authStorage,
+					createAgentSession: async () => {
+						throw new Error("hosted terminal session reached");
+					},
+				}),
+			).rejects.toThrow("--restore takes no prompt");
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			expect(hosts).toEqual([]);
+		} finally {
+			const hosts = await listSessionHosts();
+			hostPids.push(...hosts.map(host => host.pid));
+			if (stdinTTY) Object.defineProperty(process.stdin, "isTTY", stdinTTY);
+			else Reflect.deleteProperty(process.stdin, "isTTY");
+			if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			authStorage.close();
+		}
+	}, 30_000);
 	it("rejects a missing attachment without leaving a detached host", async () => {
 		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
 		const settings = Settings.isolated({ "tui.hosted": true, "startup.checkUpdate": false });

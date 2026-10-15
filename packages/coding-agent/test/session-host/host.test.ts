@@ -290,6 +290,58 @@ describe("session host", () => {
 		await session.dispose();
 	});
 
+	it("runs its restore once, after extension startup finished, without waiting for a client", async () => {
+		const sessionDir = path.join(dir, "restore-order");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const startup = Promise.withResolvers<void>();
+		let started = false;
+		const session = await createExtensionSession(sessionDir, "slow-start", pi => {
+			pi.on("session_start", async () => {
+				await startup.promise;
+				started = true;
+			});
+		});
+		const calls: { started: boolean; clients: number }[] = [];
+		const host = await serveSession(session, {
+			restore: async () => {
+				calls.push({ started, clients: (await onlyEntry()).clients });
+				return { turn: false, subagents: [] };
+			},
+		});
+		// Published, but extension startup is still running.
+		expect(calls).toEqual([]);
+
+		startup.resolve();
+		await waitFor(() => calls.length === 1);
+		// A client attaching later does not run it again.
+		const a = await rawClient({});
+		await a.next(isHandshake);
+
+		expect(calls).toEqual([{ started: true, clients: 0 }]);
+		await stopWith(host, [a]);
+	});
+
+	it("tells attached clients when its restore fails", async () => {
+		const attached = Promise.withResolvers<void>();
+		const host = await startHost({
+			restore: async () => {
+				await attached.promise;
+				throw new Error("subagent transcript unreadable");
+			},
+		});
+		const a = await rawClient({});
+		await a.next(isHandshake);
+		attached.resolve();
+
+		const notice = await a.next(frame => frame.type === "notice");
+		expect(notice).toMatchObject({
+			level: "warning",
+			source: "restore",
+			message: "Could not restore the interrupted session: subagent transcript unreadable",
+		});
+		await stopWith(host, [a]);
+	});
+
 	it("rejects a valid hello whose line overruns the hello size limit", async () => {
 		const host = await startHost();
 		const { endpoint, token } = await onlyEntry();
