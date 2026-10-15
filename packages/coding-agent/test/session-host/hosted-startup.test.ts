@@ -162,7 +162,7 @@ describe("hostLaunchArgs", () => {
 				"--config=sub/../overlay.yml",
 				"--add-dir",
 				"src",
-				"--session-dir=sessions",
+				"--session-dir=~/sessions",
 				"-e",
 				"ext.ts",
 				"--extension",
@@ -189,7 +189,8 @@ describe("hostLaunchArgs", () => {
 			`--config=${at("overlay.yml")}`,
 			"--add-dir",
 			at("src"),
-			`--session-dir=${at("sessions")}`,
+			// The session directory reader does not expand `~`: a non-hosted launch reads it as a relative directory.
+			`--session-dir=${at("~/sessions")}`,
 			"-e",
 			at("ext.ts"),
 			"--extension",
