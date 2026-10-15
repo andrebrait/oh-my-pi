@@ -14,8 +14,9 @@ import type { Args } from "../cli/args";
 import { flagConsumesValue, PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
 import { CliUsageError } from "../cli/usage-error";
 import type { ModelRegistry } from "../config/model-registry";
-import type { Settings } from "../config/settings";
+import { expandTilde, type Settings } from "../config/settings";
 import { ensurePrivateDir } from "../ipc/private-endpoint";
+import { resolvePath } from "../extensibility/utils";
 import type { InteractiveModeContext } from "../modes/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
@@ -85,21 +86,39 @@ const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
 	"--host-registry-dir": true,
 };
 
+/** Makes a launch path value independent of the directory it is read in. */
+type PathReader = (value: string, launchCwd: string) => string;
+
+const againstLaunchCwd: PathReader = (value, launchCwd) => path.resolve(launchCwd, value);
+
+/** A reader that expands a leading `~` itself: the host does, so the value is left for it. */
+const tildeForHost: PathReader = (value, launchCwd) => (value.startsWith("~") ? value : path.resolve(launchCwd, value));
+
+/** `Settings` reads `--config` / `PI_CONFIG_FILES` entries as `path.resolve(cwd, expandTilde(entry))`. */
+const settingsFile: PathReader = (value, launchCwd) => path.resolve(launchCwd, expandTilde(value));
+
+/** Extension loading normalizes `file://`, `@`, `:` prefixes and `~` with `resolvePath`; what it rejects is left to the host. */
+const extensionFile: PathReader = (value, launchCwd) => {
+	try {
+		return resolvePath(value, launchCwd);
+	} catch {
+		return value;
+	}
+};
+
 /**
- * Launch flags whose value is a path, mapped to whether their reader expands a leading `~` (such a value is left for
- * the host to expand; elsewhere `~` is an ordinary relative directory name). `--trusted-extension` is absolute by
- * validation; `--cwd` is dropped.
+ * Launch flags whose value is a path, with how their reader reads it. Readers that do not expand `~` take it as an
+ * ordinary relative directory name. `--trusted-extension` is absolute by validation; `--cwd` is dropped.
  */
-const PATH_FLAGS: Readonly<Record<string, boolean>> = {
-	"--config": true,
-	"--add-dir": true,
-	"--extension": true,
-	"-e": true,
-	"--hook": true,
-	"--session-dir": false,
-	"--export": false,
-	"--plugin-dir": false,
-	"--system-prompt-template": false,
+const PATH_FLAGS: Readonly<Record<string, PathReader>> = {
+	"--config": settingsFile,
+	"--add-dir": tildeForHost,
+	"--extension": extensionFile,
+	"-e": extensionFile,
+	"--hook": extensionFile,
+	"--session-dir": againstLaunchCwd,
+	"--plugin-dir": againstLaunchCwd,
+	"--system-prompt-template": againstLaunchCwd,
 };
 
 /** Launch flags whose value is inline text or a file path (`resolvePromptInput`, which does not expand `~`). */
@@ -108,15 +127,25 @@ const TEXT_OR_PATH_FLAGS: Readonly<Record<string, true>> = {
 	"--append-system-prompt": true,
 };
 
+/**
+ * Whether `file` is a file, for a value that may be inline text instead. A lookup that fails (`ENAMETOOLONG` for long
+ * text, `ENOTDIR` for text that looks like `a/b` under a file, ...) means it is text, as in `resolvePromptInput`.
+ */
+function isFile(file: string): boolean {
+	try {
+		return fs.statSync(file, { throwIfNoEntry: false })?.isFile() === true;
+	} catch {
+		return false;
+	}
+}
+
 /** `value` of `flag` made independent of the directory it is read in. */
 function launchPathValue(flag: string, value: string, launchCwd: string): string {
 	if (!value) return value;
-	if (Object.hasOwn(PATH_FLAGS, flag)) {
-		return PATH_FLAGS[flag] && value.startsWith("~") ? value : path.resolve(launchCwd, value);
-	}
+	if (Object.hasOwn(PATH_FLAGS, flag)) return PATH_FLAGS[flag](value, launchCwd);
 	if (!Object.hasOwn(TEXT_OR_PATH_FLAGS, flag) || value.includes("\n")) return value;
 	const file = path.resolve(launchCwd, value);
-	return fs.statSync(file, { throwIfNoEntry: false })?.isFile() ? file : value;
+	return isFile(file) ? file : value;
 }
 
 /**
@@ -150,7 +179,8 @@ export function hostLaunchArgs(rawArgs: readonly string[], launchCwd: string): s
 /**
  * How this terminal starts and finds hosts: new ones run in `cwd` with {@link hostLaunchArgs}, and its own session
  * directory is read from `launchCwd` as the host's `--session-dir` is, though a resume moved this process to `cwd`.
- * `envSessionDir` (`PI_CODING_AGENT_SESSION_DIR`) reaches the host resolved the same way, as the host inherits it.
+ * The environment variables that twin path flags (`PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_FILES`) reach the host
+ * resolved the same way, as the host inherits them and reads them from `cwd`. Unset or empty ones are left alone.
  */
 export function createHostLaunch(options: {
 	rawArgs: readonly string[];
@@ -158,15 +188,21 @@ export function createHostLaunch(options: {
 	launchCwd: string;
 	sessionDir: string | undefined;
 	envSessionDir: string | undefined;
+	envConfigFiles: string | undefined;
 }): HostLaunch {
-	const { rawArgs, cwd, launchCwd, sessionDir, envSessionDir } = options;
+	const { rawArgs, cwd, launchCwd, sessionDir, envSessionDir, envConfigFiles } = options;
+	const env: Record<string, string> = {};
+	if (envSessionDir) env.PI_CODING_AGENT_SESSION_DIR = launchPathValue("--session-dir", envSessionDir, launchCwd);
+	// Split as `Settings` does, so an entry is never merged with or dropped from its neighbors.
+	const configFiles = envConfigFiles?.split(path.delimiter).filter(Boolean) ?? [];
+	if (configFiles.length > 0) {
+		env.PI_CONFIG_FILES = configFiles.map(file => launchPathValue("--config", file, launchCwd)).join(path.delimiter);
+	}
 	return {
 		cwd,
 		args: hostLaunchArgs(rawArgs, launchCwd),
 		sessionDir: sessionDir && launchPathValue("--session-dir", sessionDir, launchCwd),
-		env: envSessionDir
-			? { PI_CODING_AGENT_SESSION_DIR: launchPathValue("--session-dir", envSessionDir, launchCwd) }
-			: undefined,
+		env: Object.keys(env).length > 0 ? env : undefined,
 	};
 }
 
