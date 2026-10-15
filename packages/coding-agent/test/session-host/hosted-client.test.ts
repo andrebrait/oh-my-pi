@@ -12,6 +12,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import { cfgDisplaySmoothStreaming } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -1205,6 +1206,45 @@ describe("HostedClientLink", () => {
 		// The failed attach left no local copy of the transcript behind.
 		expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
 	});
+
+	it("rejects an attach whose snapshot is over the transport limit, and leaves no client or replica behind", async () => {
+		const host = await fixture.startHost();
+		// One message past the reassembly limit: the host can only send `rpc_frame_error` in place of `attached`.
+		host.session.sessionManager.appendMessage({
+			role: "user",
+			content: "x".repeat(MAX_RPC_REASSEMBLED_BYTES),
+			timestamp: Date.now(),
+		});
+		const view = await openView();
+
+		await expect(view.connect(await fixture.entry(host))).rejects.toThrow(
+			"The session is too large to attach: the host's snapshot exceeds the 64 MiB RPC frame limit",
+		);
+
+		expect(view.link).toBeUndefined();
+		await fixture.waitForClients(host, 0);
+		expect(visibleFiles(await fs.readdir(view.replicaDir))).toEqual([]);
+	}, 60_000);
+
+	it("fails closed when a host frame over the transport limit was dropped after attach", async () => {
+		const host = await fixture.startHost();
+		const a = await attach(host);
+		const replicaFile = a.local.sessionFile!;
+
+		host.session.sessionManager.appendMessage({
+			role: "user",
+			content: "x".repeat(MAX_RPC_REASSEMBLED_BYTES),
+			timestamp: Date.now(),
+		});
+		await waitFor(() => a.closed.length === 1, 30_000);
+
+		expect(a.closed[0].message).toBe(
+			`session view update failed: the host dropped a frame of type entry over the 64 MiB RPC frame limit (host ${host.hostId} still running; omp attach ${host.hostId})`,
+		);
+		await fixture.waitForClients(host, 0);
+		expect(host.exited).toBe(false);
+		expect(await Bun.file(replicaFile).exists()).toBe(false);
+	}, 60_000);
 
 	it("deletes only the replica files it created, as it supersedes them and when it leaves", async () => {
 		const host = await fixture.startHost();
