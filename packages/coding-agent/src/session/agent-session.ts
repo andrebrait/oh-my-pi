@@ -105,6 +105,7 @@ import {
 	Snowflake,
 	stringProperty,
 	toError,
+	untilAborted,
 	withTimeout,
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
@@ -1447,6 +1448,40 @@ export class AgentSession implements SettingsScope {
 			this.#irc.queueAside(records);
 			return;
 		}
+		// Idle compaction rewrites history without owning a turn. Wait it out without claiming
+		// the session (an in-flight wake would make input typed meanwhile find it busy), then
+		// decide afresh.
+		const idleCompaction = this.#maintenance.waitForIdleCompaction();
+		if (idleCompaction) {
+			const promptGeneration = this.#promptGeneration;
+			const sessionGeneration = this.#sessionGeneration;
+			void idleCompaction
+				.then(async () => {
+					// A session change cleared the old transcript's pending IRC; these records go with it.
+					if (
+						this.#sessionGeneration !== sessionGeneration &&
+						(await this.#sessionGenerationChanged(sessionGeneration))
+					) {
+						return;
+					}
+					if (this.#isDisposed || this.#promptGeneration !== promptGeneration) {
+						// An abort or disposal supersedes the wake: the records wait for the next turn.
+						this.#irc.queueAside(records);
+						return;
+					}
+					if (this.hasAdmittedSubmission) {
+						// Input admitted during the compaction goes first. Prompt setup folds pending IRC
+						// into its turn; whatever is still pending once it settles wakes as usual.
+						this.#irc.queueAside(records);
+						await this.waitForAdmittedSubmissions();
+						this.#resumeStrandedIrcAsides();
+						return;
+					}
+					this.#wakeForIrc(records);
+				})
+				.catch(error => logger.warn("IRC wake after idle compaction failed", { error: String(error) }));
+			return;
+		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
 		// already-resumable follow-up can ride the wake turn normally without reordering.
 		const parkedFollowUps =
@@ -1474,15 +1509,11 @@ export class AgentSession implements SettingsScope {
 		const generation = this.#promptGeneration;
 		const inFlightEpoch = this.#beginInFlight();
 		let turnError: unknown;
-		// Idle compaction rewrites history without owning a turn, so the wake waits it out
-		// first. A pooled-turn yield transition (item-set mutation + prompt rebuild) may be
+		// A pooled-turn yield transition (item-set mutation + prompt rebuild) may be
 		// in flight when the wake lands. Starting the turn on the stale prompt would
 		// advertise one yield schema while the runtime enforces the other, so join
 		// the transition before building the turn from a consistent contract.
-		const idleCompaction = this.#maintenance.waitForIdleCompaction();
-		void (
-			idleCompaction ? idleCompaction.then(() => this.whenWorkPoolYieldSettled()) : this.whenWorkPoolYieldSettled()
-		)
+		void this.whenWorkPoolYieldSettled()
 			.then(() => {
 				// Synchronous ownership check, atomic with the dispatch below:
 				// agent.prompt() claims streaming with no await in between, and the
@@ -2112,10 +2143,20 @@ export class AgentSession implements SettingsScope {
 				const keepalive = new EventLoopKeepalive();
 				try {
 					this.#schedulePostPromptTask(
-						async () => {
+						async signal => {
 							try {
 								// Idle compaction rewrites history without owning a turn; flush into the compacted context.
-								await this.#maintenance.waitForIdleCompaction();
+								// Cancellation (abort, session change, disposal) stops the wait at once instead of holding
+								// their post-prompt drain behind the compaction; abort re-requests the flush once it settles.
+								const idleCompaction = this.#maintenance.waitForIdleCompaction();
+								if (idleCompaction) {
+									try {
+										await untilAborted(signal, idleCompaction);
+									} catch {
+										this.yieldQueue.cancelIdleFlushScheduling();
+										return;
+									}
+								}
 								await run();
 							} finally {
 								keepalive[Symbol.dispose]();
@@ -9145,7 +9186,14 @@ export class AgentSession implements SettingsScope {
 		// Captured before the awaits below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		// A message that may start a turn waits out idle compaction, as prompt() does; plain appends do not.
-		if (options?.triggerTurn || options?.deliverAs === "aside") await this.#maintenance.waitForIdleCompaction();
+		const idleCompaction =
+			options?.triggerTurn || options?.deliverAs === "aside" ? this.#maintenance.waitForIdleCompaction() : undefined;
+		if (idleCompaction) {
+			const promptGeneration = this.#promptGeneration;
+			await idleCompaction;
+			// An abort, session change or disposal during the wait supersedes the turn this would start.
+			if (this.#isDisposed || this.#promptGeneration !== promptGeneration) return false;
+		}
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
 		const details =

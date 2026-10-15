@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { Agent, AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import { Agent, AgentBusyError, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -20,6 +20,7 @@ import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { activateTodoTool, createAssistantMessage } from "./helpers/agent-session-setup";
+import { flush as flushEventLoop, until } from "./helpers/fake-clock";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 import {
@@ -1365,6 +1366,79 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(order).toEqual(["compaction ended", "prompt admitted", "model request"]);
 	});
 
+	/**
+	 * Parks an idle compaction inside its `session_before_compact` hook over a two-turn branch. Every model
+	 * request records whether the agent context already held the compaction summary when it went out.
+	 */
+	async function holdIdleCompaction() {
+		vi.useRealTimers();
+		// The idle flush's 1 ms delay resolves at once, so a wrongly admitted turn starts within one event-loop yield.
+		mockSchedulerWaitWithClock();
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		sessionManager.appendMessage(createAssistantMessage("previous answer"));
+		sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() });
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const mock = createMockModel({ handler: { content: ["next answer"] } });
+		const compactedAtRequest: boolean[] = [];
+		session.agent.streamFn = (model, context, options) => {
+			compactedAtRequest.push(session.agent.state.messages.some(message => message.role === "compactionSummary"));
+			return mock.stream(model, context, options);
+		};
+		session.agent.getApiKey = () => "test-key";
+
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		const entered = Promise.withResolvers<void>();
+		const order: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") entered.resolve();
+			if (event.type === "auto_compaction_end") order.push("compaction ended");
+			if (event.type === "agent_start") order.push("agent_start");
+		});
+		const compacted = session.runIdleCompaction();
+		await entered.promise;
+		return {
+			order,
+			compactedAtRequest,
+			/** Let the hook return and wait for the compaction pass to end. */
+			async finish(): Promise<void> {
+				gate.resolve();
+				await compacted;
+			},
+		};
+	}
+
+	const queueLaunchCompletion = (session: AgentSession): Promise<void> => {
+		const owner = session.sessionManager.getSessionId();
+		return session.queueLaunchCompletion({
+			event: "daemon-completed",
+			completionId: "idle-completion",
+			owner,
+			daemon: {
+				name: "worker",
+				id: "daemon-id",
+				state: "exited",
+				createdAt: 1,
+				startedAt: 1,
+				exitedAt: 2,
+				exitCode: 0,
+				restartCount: 0,
+				outputBytes: 0,
+				owner,
+				persist: false,
+				detached: false,
+			},
+		});
+	};
+
+	const textOf = (message: AgentMessage): string =>
+		"content" in message
+			? typeof message.content === "string"
+				? message.content
+				: message.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("")
+			: "";
+
 	// Paths that start a turn from idle without passing prompt()'s admission barrier.
 	const idleTurnStarters: Array<[name: string, start: (session: AgentSession) => Promise<unknown>]> = [
 		[
@@ -1376,80 +1450,164 @@ describe("AgentSession auto-compaction queue resume", () => {
 				),
 		],
 		[
+			"an idle aside",
+			session =>
+				session.sendCustomMessage(
+					{ customType: "extension-aside", content: "note this", display: false },
+					{ deliverAs: "aside" },
+				),
+		],
+		[
 			"an IRC wake",
 			session =>
 				session.deliverIrcMessage({ id: "m1", from: "peer", to: MAIN_AGENT_ID, body: "ping", ts: Date.now() }),
 		],
-		[
-			"a launch completion",
-			session => {
-				const owner = session.sessionManager.getSessionId();
-				return session.queueLaunchCompletion({
-					event: "daemon-completed",
-					completionId: "idle-completion",
-					owner,
-					daemon: {
-						name: "worker",
-						id: "daemon-id",
-						state: "exited",
-						createdAt: 1,
-						startedAt: 1,
-						exitedAt: 2,
-						exitCode: 0,
-						restartCount: 0,
-						outputBytes: 0,
-						owner,
-						persist: false,
-						detached: false,
-					},
-				});
-			},
-		],
+		["a launch completion", queueLaunchCompletion],
 	];
 
 	for (const [name, start] of idleTurnStarters) {
 		it(`holds ${name} until idle compaction finishes, then runs one turn on the compacted context`, async () => {
-			vi.useRealTimers();
-			// The idle flush's 1 ms delay resolves at once, so a wrongly admitted turn starts within one event-loop yield.
-			mockSchedulerWaitWithClock();
-			cfgCompactionKeepRecentTokens.set(session.settings, 1);
-			sessionManager.appendMessage(createAssistantMessage("previous answer"));
-			sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() });
-			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
-			const mock = createMockModel({ responses: [{ content: ["next answer"] }] });
-			const compactedAtRequest: boolean[] = [];
-			session.agent.streamFn = (model, context, options) => {
-				compactedAtRequest.push(session.agent.state.messages.some(message => message.role === "compactionSummary"));
-				return mock.stream(model, context, options);
-			};
-			session.agent.getApiKey = () => "test-key";
-
-			const gate = Promise.withResolvers<void>();
-			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
-				gate.promise;
-			const entered = Promise.withResolvers<void>();
-			const order: string[] = [];
-			session.subscribe(event => {
-				if (event.type === "auto_compaction_start") entered.resolve();
-				if (event.type === "auto_compaction_end") order.push("compaction ended");
-				if (event.type === "agent_start") order.push("agent_start");
-			});
-			const compacted = session.runIdleCompaction();
-			await entered.promise;
-
+			const held = await holdIdleCompaction();
 			const started = start(session);
 			try {
 				await scheduler.yield();
-				expect(order).toEqual([]);
+				expect(held.order).toEqual([]);
 			} finally {
-				gate.resolve();
-				await Promise.all([compacted, started]);
-				await session.waitForIdle();
+				await held.finish();
 			}
-			expect(order).toEqual(["compaction ended", "agent_start"]);
-			expect(compactedAtRequest).toEqual([true]);
+			await started;
+			await until(() => held.order.includes("agent_start"), `${name} to start its turn`);
+			await session.waitForIdle();
+			await flushEventLoop();
+			expect(held.order).toEqual(["compaction ended", "agent_start"]);
+			expect(held.compactedAtRequest).toEqual([true]);
 		});
 	}
+
+	const supersessions: Array<[name: string, supersede: (session: AgentSession) => Promise<unknown>]> = [
+		["a new session", session => session.newSession()],
+		["an abort", session => session.abort()],
+		["disposal", session => session.dispose()],
+	];
+	for (const [starter, start] of idleTurnStarters) {
+		for (const [supersession, supersede] of supersessions) {
+			// abort() re-requests the yield queue's idle flush, so a launch completion still lands; see the abort test below.
+			if (start === queueLaunchCompletion && supersession === "an abort") continue;
+			it(`starts no turn for ${starter} held by idle compaction once ${supersession} superseded it`, async () => {
+				const held = await holdIdleCompaction();
+				void start(session).catch(() => {});
+				await scheduler.yield();
+				let superseded = false;
+				const superseding = supersede(session).then(() => {
+					superseded = true;
+				});
+				try {
+					await until(() => superseded, `${supersession} to settle while idle compaction holds`);
+				} finally {
+					await held.finish();
+					await superseding;
+				}
+				await flushEventLoop();
+				await session.waitForIdle();
+				await flushEventLoop();
+				// A disposed session no longer publishes events, so the model is the witness that no turn ran.
+				expect(held.order).not.toContain("agent_start");
+				expect(held.compactedAtRequest).toEqual([]);
+			});
+		}
+	}
+
+	it("lets an abort settle while a launch completion waits out idle compaction, and delivers it afterwards", async () => {
+		const held = await holdIdleCompaction();
+		const delivered = queueLaunchCompletion(session);
+		// The idle flush reaches the barrier first; abort() must not wait for the compaction behind it.
+		await scheduler.yield();
+		let aborted = false;
+		const aborting = session.abort().then(() => {
+			aborted = true;
+		});
+		try {
+			await until(() => aborted, "the abort to settle while idle compaction holds");
+			expect(held.order).toEqual([]);
+		} finally {
+			await held.finish();
+			await aborting;
+		}
+		await delivered;
+		await session.waitForIdle();
+		expect(held.order).toEqual(["compaction ended", "agent_start"]);
+	});
+
+	it("lets input typed while an IRC wake waits out idle compaction start its turn, carrying the IRC message", async () => {
+		const held = await holdIdleCompaction();
+		await session.deliverIrcMessage({ id: "m1", from: "peer", to: MAIN_AGENT_ID, body: "ping", ts: Date.now() });
+		// No streaming behavior: an RPC/SDK prompt that must not find the session busy with a wake that has not started.
+		const prompted = session.prompt("typed meanwhile");
+		try {
+			await scheduler.yield();
+			expect(held.order).toEqual([]);
+		} finally {
+			await held.finish();
+		}
+		expect(await prompted).toBe(true);
+		await session.waitForIdle();
+		await flushEventLoop();
+		expect(held.order).toEqual(["compaction ended", "agent_start"]);
+		expect(held.compactedAtRequest).toEqual([true]);
+		const delivered = session.agent.state.messages.flatMap(message =>
+			message.role === "custom" && message.customType === "irc:incoming"
+				? ["irc"]
+				: message.role === "user" && textOf(message) === "typed meanwhile"
+					? ["prompt"]
+					: [],
+		);
+		expect(delivered).toEqual(["irc", "prompt"]);
+	});
+
+	it("starts held custom messages and a prompt in the order they arrived", async () => {
+		const held = await holdIdleCompaction();
+		const sends = ["first", "second"].map(name =>
+			session.sendCustomMessage(
+				{ customType: `nudge-${name}`, content: `nudge ${name}`, display: false },
+				{ triggerTurn: true },
+			),
+		);
+		const prompted = session.prompt("typed third", { streamingBehavior: "followUp" });
+		try {
+			await scheduler.yield();
+			expect(held.order).toEqual([]);
+		} finally {
+			await held.finish();
+		}
+		await Promise.all([...sends, prompted]);
+		await session.waitForIdle();
+		const arrived = session.agent.state.messages.flatMap(message =>
+			message.role === "custom" && message.customType.startsWith("nudge-")
+				? [message.customType]
+				: message.role === "user" && textOf(message) === "typed third"
+					? ["prompt"]
+					: [],
+		);
+		expect(arrived).toEqual(["nudge-first", "nudge-second", "prompt"]);
+	});
+
+	it("appends a custom message that starts no turn without waiting for idle compaction", async () => {
+		const held = await holdIdleCompaction();
+		let appended = false;
+		const appending = session
+			.sendCustomMessage({ customType: "extension-note", content: "noted", display: false })
+			.then(started => {
+				appended = true;
+				return started;
+			});
+		try {
+			await until(() => appended, "the append to resolve while idle compaction holds");
+		} finally {
+			await held.finish();
+		}
+		expect(await appending).toBe(false);
+		expect(held.order).toEqual(["compaction ended"]);
+	});
 
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
 		// Give the branch something to summarize so auto-compaction reaches the

@@ -1621,6 +1621,33 @@ describe("a hosted client's automation", () => {
 					expect(journal(session)).toEqual([RECAP]);
 				}, 30_000);
 			}
+
+			it("holds the recap while a goal continuation the session took still owes its turn, and recaps once that turn ends", async () => {
+				const { mode, session, models } = await openRecapMode(false);
+				await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
+				vi.useFakeTimers();
+				const input = mode.getUserInput();
+				await runTurn(session);
+				await elapse(800);
+				const continuation = await wait(input);
+				expect(continuation.customType).toBe("goal-continuation");
+
+				// The session takes it, queued into a turn that has not ended yet: its `agent_end` is still to come.
+				vi.spyOn(session, "promptCustomMessage").mockImplementationOnce(() => Promise.resolve(true));
+				await wait(submitInteractiveInput(mode, session, continuation));
+				await flush();
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(models.side.calls).toHaveLength(0);
+
+				// That turn ends, and the stretch it closes is recapped.
+				await runTurn(session);
+				await elapse(RECAP_DELAY_MS);
+				await until(() => shown(mode, RECAP) > 0, "the recap on screen");
+				await elapse(3 * RECAP_DELAY_MS);
+				expect(models.main.calls).toHaveLength(2);
+				expect(models.side.calls).toHaveLength(1);
+				expect(journal(session)).toEqual([RECAP]);
+			}, 30_000);
 		});
 	});
 });
