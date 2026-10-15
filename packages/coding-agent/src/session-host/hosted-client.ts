@@ -36,6 +36,7 @@ import { logger, toError } from "@oh-my-pi/pi-utils";
 import type { ExtensionUISelectItem } from "../extensibility/extensions/types";
 import { ensurePrivateDir, pidAlive } from "../ipc/private-endpoint";
 import { RpcClient } from "../modes/rpc/rpc-client";
+import { MAX_RPC_REASSEMBLED_BYTES } from "../modes/rpc/rpc-frame";
 import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -502,6 +503,15 @@ export class HostedClientLink {
 			case "command_output":
 				ctx.showStatus(sanitizeDisplayText(frame.text));
 				return;
+			case "rpc_frame_error": {
+				// The dropped frame never reaches this view, so it can no longer match the host.
+				const limit = `${MAX_RPC_REASSEMBLED_BYTES / (1024 * 1024)} MiB RPC frame limit`;
+				throw new Error(
+					frame.originalType === "attached"
+						? `The session is too large to attach: the host's snapshot exceeds the ${limit}`
+						: `the host dropped a frame of type ${frame.originalType ?? "unknown"} over the ${limit}`,
+				);
+			}
 		}
 	}
 

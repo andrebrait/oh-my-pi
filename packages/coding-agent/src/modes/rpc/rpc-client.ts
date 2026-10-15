@@ -320,6 +320,11 @@ function isSessionHostFrame(value: unknown): value is RpcHostFrame {
 						typeof value.origin.localRoot === "string" &&
 						typeof value.origin.sessionId === "string"))
 			);
+		case "rpc_frame_error":
+			return (
+				typeof value.error === "string" &&
+				(value.originalType === undefined || typeof value.originalType === "string")
+			);
 		default:
 			return false;
 	}

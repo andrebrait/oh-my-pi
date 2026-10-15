@@ -486,7 +486,17 @@ export interface RpcSessionInfoUpdateFrame {
 	seq?: number;
 }
 
-/** Every frame `RpcClient.onHostFrame` delivers: the session-host handshake, replica updates, and state notices. */
+/** Sent in place of a frame over the transport limit, which is dropped; `originalType` is the dropped frame's `type`. */
+export interface RpcFrameErrorFrame {
+	type: "rpc_frame_error";
+	originalType?: string;
+	error: string;
+}
+
+/**
+ * Every frame `RpcClient.onHostFrame` delivers: the session-host handshake, replica updates, state notices, and the
+ * notice of a frame the transport dropped.
+ */
 export type RpcHostFrame =
 	| RpcAttachedFrame
 	| RpcResumedFrame
@@ -495,7 +505,8 @@ export type RpcHostFrame =
 	| RpcClientsChangedFrame
 	| RpcCommandOutputFrame
 	| RpcConfigUpdateFrame
-	| RpcSessionInfoUpdateFrame;
+	| RpcSessionInfoUpdateFrame
+	| RpcFrameErrorFrame;
 
 export interface RpcReadyFrame {
 	type: "ready";

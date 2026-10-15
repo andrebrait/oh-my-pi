@@ -287,7 +287,7 @@ In Tern, a hosted terminal reports the host's session file and directory, never 
 
 #### Connection loss
 
-The terminal does not reconnect automatically. When the connection ends unexpectedly (the host exits or is killed, the socket breaks, or a host update cannot be applied), the terminal prints what happened, including whether the host process is still running, and exits with status 1. Rejoin with `omp attach <hostId>`. A command whose outcome is unknown after a loss is never sent again on its own. `/detach` and `/exit` never reconnect. Automatic reconnect is a required follow-up before hosted sessions can become the default.
+The terminal does not reconnect automatically. When the connection ends unexpectedly (the host exits or is killed, the socket breaks, a host update cannot be applied, or the host had to drop an update larger than the 64 MiB RPC frame limit), the terminal prints what happened, including whether the host process is still running, and exits with status 1. Rejoin with `omp attach <hostId>`. A session whose snapshot alone exceeds that limit cannot be attached: the attach fails with that reason and leaves the host running. A command whose outcome is unknown after a loss is never sent again on its own. `/detach` and `/exit` never reconnect. Automatic reconnect is a required follow-up before hosted sessions can become the default.
 
 #### What works when attached
 
