@@ -27,7 +27,10 @@ export interface GoalModeOptions {
 	mode: GoalContinuationMode;
 	/** Wait before a decided continuation is admitted (0: the next macrotask). */
 	delayMs: number;
-	/** Owner-side condition that holds continuation back (for example a draft being composed); see {@link GoalModeController.reschedule}. */
+	/**
+	 * Owner-side condition that holds continuation back (for example a draft being composed). Checked when the
+	 * wait ends: while it holds, the continuation waits another `delayMs` (with `delayMs` 0 it is dropped).
+	 */
 	isBlocked?: () => boolean;
 	/** Called when a pending continuation is abandoned (a gate closed while it waited), so settle reporting can re-check. */
 	onContinuationDropped?: () => void;
@@ -169,8 +172,10 @@ export class GoalModeController {
 		this.#continuationGeneration++;
 	}
 
-	/** Re-check continuation after an owner's {@link GoalModeOptions.isBlocked} condition cleared. */
+	/** Re-check continuation now, after something other than the session's own events may have allowed it. */
 	reschedule(): void {
+		// A run in flight decides at its own end, after the full wait.
+		if (this.#session.isStreaming) return;
 		this.#scheduleContinuation();
 	}
 
@@ -566,13 +571,12 @@ export class GoalModeController {
 
 	/**
 	 * Whether goal continuation is wanted at all, independent of whether the session
-	 * is momentarily busy. Every gate is read from the live session.
+	 * is momentarily busy or the owner holds it back. Every gate is read from the live session.
 	 */
 	#continuationWanted(): boolean {
 		const session = this.#session;
 		if (!cfgGoalContinuationModes.get(session.settings).includes(this.#options.mode)) return false;
 		if (this.#abortStopped || this.#suppressContinuation || session.isDisposed) return false;
-		if (this.#options.isBlocked?.()) return false;
 		if (session.getPlanModeState()?.enabled) return false;
 		const state = session.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") return false;
@@ -586,7 +590,8 @@ export class GoalModeController {
 	 * Decide at a yield to continue the goal; admit the continuation once the yielding
 	 * run has fully unwound. While waiting, {@link continuationPending} is true, so no
 	 * settle report calls the session settled. At admission every gate is re-read:
-	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
+	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it;
+	 * an owner's {@link GoalModeOptions.isBlocked} alone makes it wait another delay.
 	 */
 	#scheduleContinuation(): void {
 		if (this.#sessionChanges > 0) {
@@ -598,24 +603,32 @@ export class GoalModeController {
 		this.#continuationScheduled = true;
 		const generation = this.#continuationGeneration;
 		void (async () => {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			if (this.#options.delayMs > 0) this.#continuationTimer = setTimeout(resolve, this.#options.delayMs);
-			else setImmediate(resolve);
-			await promise;
-			this.#continuationTimer = undefined;
-			await this.#session.waitForIdle();
-			if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
-				this.#options.onContinuationDropped?.();
-				return;
-			}
-			this.#continuationScheduled = false;
 			const session = this.#session;
-			const idle =
-				!session.isStreaming &&
-				!session.hasAdmittedSubmission &&
-				session.queuedMessageCount === 0 &&
-				!session.isSessionTransitioning;
-			const prompt = idle && this.#continuationWanted() ? session.goalRuntime.buildContinuationPrompt() : undefined;
+			let prompt: string | undefined;
+			for (;;) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const timer = this.#options.delayMs > 0 ? setTimeout(resolve, this.#options.delayMs) : undefined;
+				if (timer) this.#continuationTimer = timer;
+				else setImmediate(resolve);
+				await promise;
+				// Only its own handle: a newer continuation may own the field by now.
+				if (this.#continuationTimer === timer) this.#continuationTimer = undefined;
+				await session.waitForIdle();
+				if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
+					this.#options.onContinuationDropped?.();
+					return;
+				}
+				const idle =
+					!session.isStreaming &&
+					!session.hasAdmittedSubmission &&
+					session.queuedMessageCount === 0 &&
+					!session.isSessionTransitioning;
+				const wanted = idle && this.#continuationWanted();
+				if (wanted && this.#options.delayMs > 0 && this.#options.isBlocked?.()) continue;
+				this.#continuationScheduled = false;
+				prompt = wanted && !this.#options.isBlocked?.() ? session.goalRuntime.buildContinuationPrompt() : undefined;
+				break;
+			}
 			if (!prompt) {
 				this.#options.onContinuationDropped?.();
 				return;

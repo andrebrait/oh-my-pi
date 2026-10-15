@@ -755,8 +755,6 @@ export class InputController {
 		this.#setupEnhancedPaste();
 
 		this.ctx.editor.onChange = (text: string) => {
-			// A draft holds goal continuation back; emptying it lets a waiting goal continue.
-			if (this.#draftText?.trim() && !text.trim()) this.ctx.session.goalMode?.reschedule();
 			this.#draftText = text;
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;

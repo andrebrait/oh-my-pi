@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { once } from "node:events";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
@@ -842,6 +842,34 @@ describe("session host goal mode", () => {
 		// The continuation made no progress, so the loop stopped after it.
 		expect(continuations(host.session)).toBe(1);
 		expect(host.session.getGoalModeState()?.goal.status).toBe("active");
+		await host.stop();
+	});
+
+	it("a session host admits a decided continuation after 800 ms, not before", async () => {
+		const host = await startHost();
+		await (await attachClient(host)).detach();
+		await waitFor(async () => (await onlyEntry()).clients === 0);
+		const goalMode = host.session.goalMode;
+		if (!goalMode) throw new Error("the host did not enable goal mode");
+		const admitted: string[] = [];
+		const prompt = spyOn(host.session, "promptCustomMessage").mockImplementation(async message => {
+			admitted.push(message.customType);
+			return true;
+		});
+		const nextMacrotask = () => new Promise<void>(resolve => setImmediate(resolve));
+		vi.useFakeTimers();
+		try {
+			await goalMode.handle({ op: "create", objective: "keep going" });
+			vi.advanceTimersByTime(799);
+			await nextMacrotask();
+			expect(admitted).toEqual([]);
+			vi.advanceTimersByTime(1);
+			await nextMacrotask();
+			expect(admitted).toEqual(["goal-continuation"]);
+		} finally {
+			vi.useRealTimers();
+			prompt.mockRestore();
+		}
 		await host.stop();
 	});
 

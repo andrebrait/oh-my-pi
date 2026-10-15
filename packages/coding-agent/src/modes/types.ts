@@ -29,7 +29,7 @@ import type {
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
-import type { AgentSession } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import type { HostedClientLink } from "../session-host/hosted-client";
@@ -636,6 +636,8 @@ export interface InteractiveModeContext {
 	isGuidedGoalInterviewActive(): boolean;
 	/** Repaint the goal segment of the status line from the session's goal state. */
 	updateGoalModeStatus(): void;
+	/** Present a goal-related session event (`goal_updated`, `agent_end`): the status line and the guided-interview flag. */
+	handleGoalSessionEvent(event: AgentSessionEvent): void;
 	handleLoopCommand(args?: string): Promise<string | undefined>;
 	setLoopPrompt(prompt: string): void;
 	armLoopAutoSubmit(): void;

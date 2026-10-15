@@ -149,7 +149,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "set_slow_mode", enabled: boolean }`
-- `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
+- `{ id?, type: "goal", op: "get" | "create" | "replace" | "resume" | "pause" | "drop" | "budget" | "guided", objective?: string, token_budget?: number, submitObjective?: boolean, images?: ImageContent[], rough?: string }`
 - `{ id?, type: "set_ask_dialog", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_entries", since?: string }`

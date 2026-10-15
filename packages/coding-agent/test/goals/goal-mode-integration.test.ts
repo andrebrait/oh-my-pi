@@ -8,6 +8,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { Text } from "@oh-my-pi/pi-tui";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -576,21 +577,23 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(content).not.toContain("Run focused checks");
 	});
 
-	it("a draft holds a goal continuation back; emptying it lets the goal continue once", async () => {
-		vi.spyOn(vcs, "repo").mockReturnValue(null);
-		vi.spyOn(vcs, "git").mockReturnValue(null);
-		await harness.mode.init({ suppressWelcomeIntro: true });
+	/** The controller decides to continue (as at a goal turn's end) with fake timers on and the terminal waiting for input. */
+	async function decideContinuation(): Promise<void> {
+		vi.useFakeTimers();
+		await armInputWaiter(harness.mode);
+		harness.session.goalMode?.reschedule();
+	}
+
+	it("admits a decided continuation after 800 ms, not before", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
+		await decideContinuation();
 
-		harness.mode.editor.setText("half-typed reply");
-		await armInputWaiter(harness.mode);
-		await passContinuationWindow();
+		vi.advanceTimersByTime(799);
+		await nextMacrotask();
 		expect(admitted).toEqual([]);
-
-		harness.mode.editor.setText("");
-		await passContinuationWindow();
+		vi.advanceTimersByTime(1);
+		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
 		expect(harness.session.promptCustomMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ customType: "goal-continuation", display: false, attribution: "agent" }),
@@ -598,20 +601,82 @@ describe("InteractiveMode goal mode integration", () => {
 		);
 	});
 
-	it("a pending submission holds a goal continuation back until it settles", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
+	const holds: Array<{ name: string; hold: (mode: InteractiveMode) => () => void }> = [
+		{
+			name: "a draft",
+			hold: mode => {
+				mode.editor.setText("half-typed reply");
+				return () => mode.editor.setText("");
+			},
+		},
+		{
+			name: "a pasted image",
+			hold: mode => {
+				mode.editor.pendingImages = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+				return () => {
+					mode.editor.pendingImages = [];
+				};
+			},
+		},
+		{
+			name: "a pending submission",
+			hold: mode => {
+				const submission = mode.startPendingSubmission({ text: "next step" });
+				return () => mode.finishPendingSubmission(submission);
+			},
+		},
+		{
+			name: "loop mode",
+			hold: mode => {
+				mode.loopModeEnabled = true;
+				return () => {
+					mode.loopModeEnabled = false;
+				};
+			},
+		},
+		{
+			name: "paused plan mode",
+			hold: mode => {
+				mode.planModePaused = true;
+				return () => {
+					mode.planModePaused = false;
+				};
+			},
+		},
+		{
+			name: "an overlay such as the model selector",
+			hold: mode => {
+				mode.ui.showOverlay(new Text("selector", 0, 0));
+				return () => mode.ui.hideOverlay();
+			},
+		},
+		{
+			name: "an extension dialog",
+			hold: mode => {
+				const dialog = new AbortController();
+				void mode.showHookSelector("Pick one", ["a", "b"], { signal: dialog.signal });
+				return () => dialog.abort();
+			},
+		},
+	];
 
-		const submission = harness.mode.startPendingSubmission({ text: "next step" });
-		await armInputWaiter(harness.mode);
-		await passContinuationWindow();
-		expect(admitted).toEqual([]);
+	for (const { name, hold } of holds) {
+		it(`${name} holds a goal continuation back; once it clears the goal continues within one delay`, async () => {
+			await harness.mode.handleGoalModeCommand("Ship the release");
+			const admitted = recordContinuations(harness.session);
+			const release = hold(harness.mode);
+			await decideContinuation();
+			await passContinuationWindow();
+			await passContinuationWindow();
+			expect(admitted).toEqual([]);
 
-		harness.mode.finishPendingSubmission(submission);
-		await passContinuationWindow();
-		expect(admitted).toEqual(["goal-continuation"]);
-	});
+			release();
+			await passContinuationWindow();
+			expect(admitted).toEqual(["goal-continuation"]);
+			await passContinuationWindow();
+			expect(admitted).toEqual(["goal-continuation"]);
+		});
+	}
 
 	it("waits for input rather than continuing an active goal with only blocked work", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
@@ -625,9 +690,7 @@ describe("InteractiveMode goal mode integration", () => {
 			},
 		]);
 		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-
-		await armInputWaiter(harness.mode);
+		await decideContinuation();
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
 	});
@@ -637,9 +700,7 @@ describe("InteractiveMode goal mode integration", () => {
 		const pending = [{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" as const }] }];
 		harness.session.setTodoPhases(pending);
 		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-
-		await armInputWaiter(harness.mode);
+		await decideContinuation();
 		harness.session.setTodoPhases([
 			{
 				name: "Approval",
@@ -648,6 +709,7 @@ describe("InteractiveMode goal mode integration", () => {
 		]);
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
+		expect(harness.session.goalMode?.continuationPending).toBe(false);
 
 		harness.session.setTodoPhases(pending);
 		harness.session.goalMode?.reschedule();
@@ -667,9 +729,7 @@ describe("InteractiveMode goal mode integration", () => {
 			},
 		]);
 		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-
-		await armInputWaiter(harness.mode);
+		await decideContinuation();
 		await passContinuationWindow();
 		expect(admitted).toEqual(["goal-continuation"]);
 	});
@@ -677,32 +737,13 @@ describe("InteractiveMode goal mode integration", () => {
 	it("Esc pauses the goal and voids a waiting continuation", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-
-		await armInputWaiter(harness.mode);
+		await decideContinuation();
 		expect(harness.session.goalMode?.continuationPending).toBe(true);
 		await harness.session.abort({ reason: USER_INTERRUPT_LABEL });
 		await passContinuationWindow();
 
 		expect(admitted).toEqual([]);
 		expect(harness.mode.goalModePaused).toBe(true);
-	});
-
-	it("an open dialog holds a goal continuation back; closing it lets the goal continue once", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-		const dialog = new AbortController();
-		const choice = harness.mode.showHookSelector("Pick one", ["a", "b"], { signal: dialog.signal });
-
-		await armInputWaiter(harness.mode);
-		await passContinuationWindow();
-		expect(admitted).toEqual([]);
-
-		dialog.abort();
-		await choice;
-		await passContinuationWindow();
-		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	it("waits until the terminal waits for input", async () => {
@@ -717,6 +758,43 @@ describe("InteractiveMode goal mode integration", () => {
 		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	it("a reschedule during a run waits for that run to end", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		vi.useFakeTimers();
+		await armInputWaiter(harness.mode);
+		Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
+
+		harness.session.goalMode?.reschedule();
+		expect(harness.session.goalMode?.continuationPending).toBe(false);
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
+	});
+
+	it("an active goal left by a switch to a plan-mode session keeps the plan-mode tools", async () => {
+		vi.spyOn(vcs, "repo").mockReturnValue(null);
+		vi.spyOn(vcs, "git").mockReturnValue(null);
+		for (const tool of await createTools(harness.toolSession, ["write"])) harness.toolRegistry.set(tool.name, tool);
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		expect(await toolNamesFor(harness)).toContain("goal");
+		const target = SessionManager.create(harness.tempDir.path(), harness.tempDir.path());
+		target.appendModeChange("plan", { planFilePath: "local://PLAN.md" });
+		target.appendMessage({ role: "user", content: "plan this", timestamp: Date.now() });
+		await target.ensureOnDisk();
+		const targetFile = target.getSessionFile();
+		await target.close();
+		if (!targetFile) throw new Error("the target session has no file");
+
+		await harness.session.switchSession(targetFile);
+
+		expect(harness.mode.planModeEnabled).toBe(true);
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		const tools = await toolNamesFor(harness);
+		expect(tools).toContain("write");
+		expect(tools).not.toContain("goal");
 	});
 
 	it("stops repeated goal continuations when identical tool evidence adds no new signal", async () => {

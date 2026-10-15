@@ -1476,8 +1476,6 @@ export class ExtensionUiController {
 				hide?.();
 				this.#dialogActive = false;
 				this.#advanceDialogQueue();
-				// An open dialog holds a goal continuation back; the editor is back in view.
-				this.ctx.session.goalMode?.reschedule();
 			}
 			resolve(value);
 		};
