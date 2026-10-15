@@ -39,8 +39,8 @@ export interface RpcGoalCommand {
 	op: RpcGoalOp;
 	/** `create`/`replace`. */
 	objective?: string;
-	/** `create`/`replace`: optional positive budget. `budget`: the new budget, `null` clears it. */
-	token_budget?: number | null;
+	/** `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it. */
+	token_budget?: number;
 	/** `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation. */
 	submitObjective?: boolean;
 	/** Images submitted with the objective (`submitObjective`) or with the `guided` interview kickoff. */
@@ -347,14 +347,11 @@ export class GoalModeController {
 	}
 
 	async #budget(command: RpcGoalCommand): Promise<RpcGoalResult> {
-		const budget = command.token_budget;
-		if (budget !== null && (budget === undefined || !Number.isInteger(budget) || budget <= 0)) {
-			throw new Error("token_budget must be a positive integer, or null to clear it");
-		}
+		const budget = optionalTokenBudget(command.token_budget);
 		const current = this.#session.getGoalModeState();
 		if (!current?.enabled) throw new Error("No active goal.");
 		if (current.goal.status === "complete") throw new Error("Goal is already complete.");
-		await this.#session.goalRuntime.onBudgetMutated(budget ?? undefined);
+		await this.#session.goalRuntime.onBudgetMutated(budget);
 		// A raised budget may let a budget-limited goal continue.
 		this.#resetContinuation();
 		this.#scheduleContinuation();
@@ -635,12 +632,10 @@ export class GoalModeController {
 	}
 }
 
-/** A `create`/`replace` budget: absent, or a positive integer. */
-function optionalTokenBudget(value: number | null | undefined): number | undefined {
+/** A `token_budget`: absent, or a positive integer. */
+function optionalTokenBudget(value: number | undefined): number | undefined {
 	if (value === undefined) return undefined;
-	if (value === null || !Number.isInteger(value) || value <= 0) {
-		throw new Error("token_budget must be a positive integer when provided");
-	}
+	if (!Number.isInteger(value) || value <= 0) throw new Error("token_budget must be a positive integer when provided");
 	return value;
 }
 

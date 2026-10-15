@@ -124,8 +124,8 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 			op: "GoalOp",
 			"objective?": doc("string", "`create`/`replace`: the objective."),
 			"token_budget?": doc(
-				"number.integer | null",
-				"`create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.",
+				"number.integer",
+				"`create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.",
 			),
 			"submitObjective?": doc(
 				"boolean",

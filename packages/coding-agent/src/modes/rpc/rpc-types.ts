@@ -90,7 +90,7 @@ type RpcCommandBody =
 			type: "goal";
 			op: RpcGoalOp;
 			objective?: string;
-			token_budget?: number | null;
+			token_budget?: number;
 			submitObjective?: boolean;
 			images?: ImageContent[];
 			rough?: string;

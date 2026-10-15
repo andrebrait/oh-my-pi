@@ -396,7 +396,7 @@ describe("RPC goal command", () => {
 		expect([...results.values()]).toEqual([false]);
 	}, 30_000);
 
-	test("replace submits the new objective once, budget null clears it, guided is refused over an active goal", async () => {
+	test("replace submits the new objective once, budget without a value clears it, guided is refused over an active goal", async () => {
 		const rpc = await start({ continuation: false, script: "idle" });
 		await rpc.goal("create", { objective: "first objective", tokenBudget: 5000 });
 		await untilSettled(rpc, "Replace", () =>
@@ -409,7 +409,7 @@ describe("RPC goal command", () => {
 		expect((await rpc.getState()).goal?.goal).toMatchObject({ objective: "second objective", status: "active" });
 
 		expect((await rpc.goal("budget", { tokenBudget: 9000 })).goal?.tokenBudget).toBe(9000);
-		expect((await rpc.goal("budget", { tokenBudget: null })).goal?.tokenBudget).toBeUndefined();
+		expect((await rpc.goal("budget")).goal?.tokenBudget).toBeUndefined();
 		expect(await rejectionOf(rpc.goal("guided", { rough: "another" }))).toMatchObject({ command: "goal" });
 		await rpc.goal("pause");
 		expect(await rejectionOf(rpc.goal("budget", { tokenBudget: 100 }))).toMatchObject({

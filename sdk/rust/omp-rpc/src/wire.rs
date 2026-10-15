@@ -5393,7 +5393,7 @@ pub struct GoalParams {
 	/// `create`/`replace`: the objective.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub objective: Option<String>,
-	/// `create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.
+	/// `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub token_budget: Option<i64>,
 	/// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.
@@ -6527,7 +6527,7 @@ pub struct GoalCommand {
 	/// `create`/`replace`: the objective.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub objective: Option<String>,
-	/// `create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.
+	/// `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub token_budget: Option<i64>,
 	/// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.

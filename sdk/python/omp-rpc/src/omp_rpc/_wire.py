@@ -3457,7 +3457,7 @@ class WireClient:
         params["enabled"] = enabled
         return required(expect_object(self._command("set_slow_mode", params), "set_slow_mode"), "enabled", decode_bool, "set_slow_mode")
 
-    def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None | None = None, submit_objective: bool | None = None, images: Sequence[ImageContent] | None = None, rough: str | None = None) -> GoalResult:
+    def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None = None, submit_objective: bool | None = None, images: Sequence[ImageContent] | None = None, rough: str | None = None) -> GoalResult:
         """Read or change goal mode with the lifecycle of the interactive `/goal` command."""
         params: dict[str, object] = {}
         params["op"] = op

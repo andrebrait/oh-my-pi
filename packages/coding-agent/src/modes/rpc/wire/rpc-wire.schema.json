@@ -6571,15 +6571,8 @@
 					"description": "`create`/`replace`: the objective."
 				},
 				"token_budget": {
-					"anyOf": [
-						{
-							"type": "integer"
-						},
-						{
-							"type": "null"
-						}
-					],
-					"description": "`create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it."
+					"type": "integer",
+					"description": "`create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it."
 				},
 				"submitObjective": {
 					"type": "boolean",

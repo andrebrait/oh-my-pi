@@ -250,16 +250,17 @@ describe("goal ops", () => {
 		});
 	});
 
-	test("budget changes an active goal's budget and null clears it; a paused goal or a bad budget is refused", async () => {
+	test("budget changes an active goal's budget and an omitted one clears it; a paused goal or a bad budget is refused", async () => {
 		await withGoalSession(false, async (_session, goalMode) => {
 			await goalMode.handle({ op: "create", objective: "budgeted", token_budget: 5000 });
 			expect((await goalMode.handle({ op: "budget", token_budget: 9000 })).goal?.tokenBudget).toBe(9000);
-			expect((await goalMode.handle({ op: "budget", token_budget: null })).goal?.tokenBudget).toBeUndefined();
+			expect((await goalMode.handle({ op: "budget" })).goal?.tokenBudget).toBeUndefined();
 			await expect(goalMode.handle({ op: "budget", token_budget: 0 })).rejects.toThrow(
-				"token_budget must be a positive integer, or null to clear it",
+				"token_budget must be a positive integer when provided",
 			);
-			await expect(goalMode.handle({ op: "budget" })).rejects.toThrow(
-				"token_budget must be a positive integer, or null to clear it",
+			// A JSON client may still send `null`; it is not a clear.
+			await expect(goalMode.handle(JSON.parse('{"op":"budget","token_budget":null}'))).rejects.toThrow(
+				"token_budget must be a positive integer when provided",
 			);
 			await goalMode.handle({ op: "pause" });
 			await expect(goalMode.handle({ op: "budget", token_budget: 100 })).rejects.toThrow("No active goal.");

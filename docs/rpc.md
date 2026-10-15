@@ -565,10 +565,12 @@ including those made by the agent's `goal` tool.
 - `create` and `replace` take `submitObjective: true` (and optional `images`): the
   objective is then submitted as a user prompt, visible once, as the goal's first
   turn instead of a hidden continuation. The command answers once the prompt is
-  admitted, not when its turn ends.
-- `budget` sets the active goal's `token_budget` (a positive integer); `null` clears
-  it. It is refused for a paused or completed goal. A raised budget lets a
-  budget-limited goal continue.
+  admitted, not when its turn ends. Such a prompt (like the `guided` kickoff) is not
+  a `prompt` command: no `prompt_result` reports it; its turn still emits the usual
+  events, `agent_end`, and `session_settled`.
+- `budget` sets the active goal's `token_budget` (a positive integer); without
+  `token_budget` it clears the budget. It is refused for a paused or completed goal.
+  A raised budget lets a budget-limited goal continue.
 - `guided` starts the `/guided-goal` interview: it adds the `goal` tool before any
   goal exists, so the agent can finish with `goal create`, and sends the interview
   as a hidden message (optional `rough` idea and `images`), queued behind a run in

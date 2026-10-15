@@ -1050,14 +1050,14 @@ export class RpcClient {
 	 * Read or change goal mode. `get` never mutates or starts a turn. `create`/`replace`/`resume`
 	 * start a hidden continuation turn only when the server's mode is in `goal.continuationModes`
 	 * (`"rpc"` for `--mode rpc`, `"interactive"` (the default) for a session host); with
-	 * `submitObjective` the objective is sent as a user prompt instead. `budget` with
-	 * `tokenBudget: null` clears the budget. `guided` starts the guided-goal interview.
+	 * `submitObjective` the objective is sent as a user prompt instead. `budget` without
+	 * `tokenBudget` clears the budget. `guided` starts the guided-goal interview.
 	 */
 	async goal(
 		op: RpcGoalOp,
 		options?: {
 			objective?: string;
-			tokenBudget?: number | null;
+			tokenBudget?: number;
 			submitObjective?: boolean;
 			images?: ImageContent[];
 			rough?: string;

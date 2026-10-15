@@ -7987,7 +7987,7 @@ type GoalCommand struct {
 	Op GoalOp `json:"op"`
 	// `create`/`replace`: the objective.
 	Objective *string `json:"objective,omitempty"`
-	// `create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.
+	// `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.
 	TokenBudget *int64 `json:"token_budget,omitempty"`
 	// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.
 	SubmitObjective *bool `json:"submitObjective,omitempty"`
