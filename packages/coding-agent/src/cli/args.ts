@@ -147,12 +147,13 @@ export function validateGoalLaunch(args: Args, interactive: boolean): void {
 
 /**
  * Reject a `--restore` launch that cannot go on with an interrupted session: it
- * needs the interactive TUI and exactly the session it names. Judged on the
- * startup parse, before session resolution, like {@link validateGoalLaunch}.
+ * needs the interactive TUI (or a session host a hosted TUI started) and exactly
+ * the session it names. Judged on the startup parse, before session resolution,
+ * like {@link validateGoalLaunch}.
  */
 export function validateRestoreLaunch(args: Args, interactive: boolean): void {
 	if (!args.restore) return;
-	if (!interactive) {
+	if (!interactive && args.mode !== "host") {
 		throw new CliUsageError("--restore requires an interactive terminal (not --print or --mode).");
 	}
 	if (args.continue || args.fork || args.fromClaude || args.fromCodex || args.noSession || args.goal !== undefined) {

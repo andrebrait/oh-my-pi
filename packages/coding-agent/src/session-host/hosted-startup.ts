@@ -143,11 +143,14 @@ async function openedByAnotherProcess(sessionFile: string): Promise<boolean> {
  *
  * `launchFlagsMustApply`: the caller asked for these launch flags, and a host that already runs the session was
  * started without them. Attaching would silently drop them (a narrower tool set, an approval mode), so it is refused.
+ *
+ * `restore` (`--restore`): a host this call starts goes on with what the session's last process left unfinished. A
+ * host that already runs the session is attached to as it is: its process is alive, so nothing was interrupted.
  */
 export async function ensureSessionHost(
 	sessionFile: string | undefined,
 	launch: HostLaunch,
-	options: { launchFlagsMustApply?: boolean } = {},
+	options: { launchFlagsMustApply?: boolean; restore?: boolean } = {},
 ): Promise<SessionHostEntry> {
 	const registryDir = path.resolve(launch.registryDir ?? sessionHostsDir());
 	if (sessionFile === undefined) {
@@ -181,6 +184,7 @@ export async function ensureSessionHost(
 			return spawnSessionHost({
 				cwd: launch.cwd,
 				sessionFile: file,
+				restore: options.restore,
 				args: [...launch.args],
 				registryDir,
 				env: launch.env,
@@ -191,17 +195,18 @@ export async function ensureSessionHost(
 }
 
 /**
- * The host for the session `sessionManager` resolved to (the startup flags: `--resume`, `--continue`, `autoResume`,
- * or a new session). The manager only identifies the session: it is closed here so this process holds no lease on
- * the file the host is about to own.
+ * The host for the session `sessionManager` resolved to (the startup flags: `--resume`, `--restore`, `--continue`,
+ * `autoResume`, or a new session). The manager only identifies the session: it is closed here so this process holds
+ * no lease on the file the host is about to own.
  */
 export async function ensureHostForResolvedSession(
 	sessionManager: SessionManager | undefined,
 	launch: HostLaunch,
+	options: { restore?: boolean } = {},
 ): Promise<SessionHostEntry> {
 	const sessionFile = sessionManager?.isSessionOnDisk() ? sessionManager.getSessionFile() : undefined;
 	await sessionManager?.close();
-	return ensureSessionHost(sessionFile, launch, { launchFlagsMustApply: true });
+	return ensureSessionHost(sessionFile, launch, { launchFlagsMustApply: true, restore: options.restore });
 }
 
 async function resolveSessionFile(name: string, launch: HostLaunch): Promise<string | undefined> {
