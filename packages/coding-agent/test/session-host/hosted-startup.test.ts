@@ -121,28 +121,93 @@ async function standInHost(hostId: string, sessionFile: string | undefined): Pro
 
 describe("hostLaunchArgs", () => {
 	it("keeps the configuration the host needs and drops what only this terminal consumes", () => {
-		const args = hostLaunchArgs([
-			"--model",
-			"claude-sonnet-4-5",
-			"--cwd",
-			"/elsewhere",
-			"--resume",
-			"abc123",
-			"fix the bug",
-			"@notes.md",
-			"--no-tools",
-			"-c",
-			"--tools=read",
-			"--omp-profile-boundary",
-			"another prompt",
-			"--cwd=/again",
-			"--hide-thinking",
-			"--no-title",
-			"--print-thoughts",
-			"--allow-home",
-			"--no-pty",
-		]);
+		const args = hostLaunchArgs(
+			[
+				"--model",
+				"claude-sonnet-4-5",
+				"--cwd",
+				"/elsewhere",
+				"--resume",
+				"abc123",
+				"fix the bug",
+				"@notes.md",
+				"--no-tools",
+				"-c",
+				"--tools=read",
+				"--omp-profile-boundary",
+				"another prompt",
+				"--cwd=/again",
+				"--hide-thinking",
+				"--no-title",
+				"--print-thoughts",
+				"--allow-home",
+				"--no-pty",
+			],
+			dir,
+		);
 		expect(args).toEqual(["--model", "claude-sonnet-4-5", "--no-tools", "--tools=read"]);
+	});
+
+	it("resolves relative path flags against the launch directory, since the host may run in another", () => {
+		const launchCwd = path.join(dir, "launch");
+		fs.mkdirSync(launchCwd);
+		fs.writeFileSync(path.join(launchCwd, "overlay.yml"), "{}\n");
+		fs.writeFileSync(path.join(launchCwd, "prompt.md"), "be brief\n");
+		const at = (name: string): string => path.join(launchCwd, name);
+
+		const args = hostLaunchArgs(
+			[
+				"--config",
+				"overlay.yml",
+				"--config=sub/../overlay.yml",
+				"--add-dir",
+				"src",
+				"--session-dir=sessions",
+				"-e",
+				"ext.ts",
+				"--extension",
+				"~/ext.ts",
+				"--hook",
+				"/abs/hook.ts",
+				"--plugin-dir",
+				"plugins",
+				"--system-prompt-template",
+				"tpl.md",
+				"--system-prompt",
+				"prompt.md",
+				"--append-system-prompt",
+				"be brief",
+				"--model",
+				"overlay.yml",
+			],
+			launchCwd,
+		);
+
+		expect(args).toEqual([
+			"--config",
+			at("overlay.yml"),
+			`--config=${at("overlay.yml")}`,
+			"--add-dir",
+			at("src"),
+			`--session-dir=${at("sessions")}`,
+			"-e",
+			at("ext.ts"),
+			"--extension",
+			"~/ext.ts",
+			"--hook",
+			"/abs/hook.ts",
+			"--plugin-dir",
+			at("plugins"),
+			"--system-prompt-template",
+			at("tpl.md"),
+			"--system-prompt",
+			at("prompt.md"),
+			"--append-system-prompt",
+			"be brief",
+			"--model",
+			"overlay.yml",
+		]);
+		expect(fs.existsSync(args[1])).toBe(true);
 	});
 });
 
@@ -219,14 +284,14 @@ describe("resolving what to attach to", () => {
 
 		const reused = await ensureHostForResolvedSession(
 			await SessionManager.open(file, sessionsDir),
-			launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-title"])),
+			launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-title"], dir)),
 		);
 		expect(reused.hostId).toBe(host.hostId);
 
 		await expect(
 			ensureHostForResolvedSession(
 				await SessionManager.open(file, sessionsDir),
-				launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-tools"])),
+				launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-tools"], dir)),
 			),
 		).rejects.toThrow(/already runs this session/);
 	});

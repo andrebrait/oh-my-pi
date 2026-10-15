@@ -7,10 +7,11 @@
  * There is no reconnect and no in-process fallback. A host that cannot be reached is reported and the process exits.
  */
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBaseConfigRoot, withFileLock } from "@oh-my-pi/pi-utils";
 import type { Args } from "../cli/args";
-import { PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
+import { flagConsumesValue, PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
 import { CliUsageError } from "../cli/usage-error";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -80,19 +81,60 @@ const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
 	"--no-pty": true,
 };
 
+/** Launch flags whose value is a path. `--trusted-extension` is absolute by validation; `--cwd` is dropped. */
+const PATH_FLAGS: Readonly<Record<string, true>> = {
+	"--config": true,
+	"--add-dir": true,
+	"--session-dir": true,
+	"--export": true,
+	"--extension": true,
+	"-e": true,
+	"--hook": true,
+	"--plugin-dir": true,
+	"--system-prompt-template": true,
+};
+
+/** Launch flags whose value is inline text or a file path (`resolvePromptInput`). */
+const TEXT_OR_PATH_FLAGS: Readonly<Record<string, true>> = {
+	"--system-prompt": true,
+	"--append-system-prompt": true,
+};
+
+/** `value` of `flag` made independent of the directory it is read in; `~` stays for the host to expand. */
+function launchPathValue(flag: string, value: string, launchCwd: string): string {
+	if (!value || value.startsWith("~")) return value;
+	if (Object.hasOwn(PATH_FLAGS, flag)) return path.resolve(launchCwd, value);
+	if (!Object.hasOwn(TEXT_OR_PATH_FLAGS, flag) || value.includes("\n")) return value;
+	const file = path.resolve(launchCwd, value);
+	return fs.statSync(file, { throwIfNoEntry: false })?.isFile() ? file : value;
+}
+
 /**
  * The launch flags a new host is started with: everything this process was launched with except what only this
  * terminal consumes. Session-source flags (`--resume`, `--restore`, `--continue`, `--fork`, imports), positional
  * prompts and `@file` arguments are dropped (the terminal resolves the session and sends the prompt), and so are
  * {@link TERMINAL_ONLY_FLAGS}. Taken from the argv as given, never from the lean options the local session is built
- * with, so a host keeps the tools, providers, and extensions that were asked for.
+ * with, so a host keeps the tools, providers, and extensions that were asked for. Relative paths are resolved
+ * against `launchCwd`, where this launch reads them: a host resuming a session runs in that session's directory.
  */
-export function hostLaunchArgs(rawArgs: readonly string[]): string[] {
-	return restartArgv(
+export function hostLaunchArgs(rawArgs: readonly string[], launchCwd: string): string[] {
+	const args = restartArgv(
 		rawArgs.filter(arg => arg !== PROFILE_BOOTSTRAP_BOUNDARY_ARG),
 		undefined,
 		TERMINAL_ONLY_FLAGS,
 	);
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		const eq = arg.startsWith("--") ? arg.indexOf("=") : -1;
+		if (eq !== -1) {
+			const flag = arg.slice(0, eq);
+			args[i] = `${flag}=${launchPathValue(flag, arg.slice(eq + 1), launchCwd)}`;
+		} else if (flagConsumesValue(arg, args[i + 1])) {
+			i++;
+			args[i] = launchPathValue(arg, args[i], launchCwd);
+		}
+	}
+	return args;
 }
 
 /**
