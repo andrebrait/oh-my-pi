@@ -97,6 +97,8 @@ export class GoalModeController {
 	#continuationScheduled = false;
 	/** Bumped by an abort or session change; a waiting continuation from before is void. */
 	#continuationGeneration = 0;
+	/** The `delayMs` wait of the scheduled continuation; cleared on dispose. */
+	#continuationTimer: NodeJS.Timeout | undefined;
 	/** Resolves once the outermost in-progress session change has reattached the goal; see {@link reattached}. */
 	#reattach: PromiseWithResolvers<void> | undefined;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
@@ -121,6 +123,11 @@ export class GoalModeController {
 	constructor(session: GoalModeSession, options: GoalModeOptions) {
 		this.#session = session;
 		this.#options = options;
+	}
+
+	/** The options its owner enabled it with. */
+	get options(): GoalModeOptions {
+		return this.#options;
 	}
 
 	/**
@@ -150,6 +157,14 @@ export class GoalModeController {
 	stopForAbort(): void {
 		this.#abortStopped = true;
 		this.#suppressContinuation = true;
+		this.#continuationScheduled = false;
+		this.#continuationGeneration++;
+	}
+
+	/** The session is being disposed: void a scheduled continuation and drop its timer. */
+	dispose(): void {
+		clearTimeout(this.#continuationTimer);
+		this.#continuationTimer = undefined;
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
 	}
@@ -490,6 +505,7 @@ export class GoalModeController {
 	/**
 	 * Feed session events. The session calls it before any other subscriber (an RPC settle
 	 * watcher included) so a continuation is decided before settlement is evaluated.
+	 * A completed goal is journaled afterwards, by {@link observeAfterListeners}.
 	 */
 	observe(event: AgentSessionEvent): void {
 		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
@@ -520,14 +536,21 @@ export class GoalModeController {
 			this.#suppressContinuation = false;
 			this.#previousContinuationActivity = undefined;
 		}
-		if (this.#session.getGoalModeState()?.mode === "exiting") {
-			// Journal now, while the transcript is certainly the one that completed the
-			// goal; only the tool-set restore is queued (a later reconcile also restores it).
-			this.#journalCompletion();
-			this.#queueExit(() => this.#exit());
-			return;
-		}
+		// Completed: journaled once subscribers have seen this agent_end (observeAfterListeners).
+		if (this.#session.getGoalModeState()?.mode === "exiting") return;
 		this.#scheduleContinuation();
+	}
+
+	/**
+	 * Called after every subscriber saw `event`, so a client gets the terminal `agent_end` before
+	 * the completion's journal entries. Journals now, while the transcript is certainly the one that
+	 * completed the goal; only the tool-set restore is queued (a later reconcile also restores it).
+	 */
+	observeAfterListeners(event: AgentSessionEvent): void {
+		if (event.type !== "agent_end" || event.isTerminal === false) return;
+		if (this.#session.getGoalModeState()?.mode !== "exiting") return;
+		this.#journalCompletion();
+		this.#queueExit(() => this.#exit());
 	}
 
 	/**
@@ -565,9 +588,10 @@ export class GoalModeController {
 		const generation = this.#continuationGeneration;
 		void (async () => {
 			const { promise, resolve } = Promise.withResolvers<void>();
-			if (this.#options.delayMs > 0) setTimeout(resolve, this.#options.delayMs);
+			if (this.#options.delayMs > 0) this.#continuationTimer = setTimeout(resolve, this.#options.delayMs);
 			else setImmediate(resolve);
 			await promise;
+			this.#continuationTimer = undefined;
 			await this.#session.waitForIdle();
 			if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
 				this.#options.onContinuationDropped?.();

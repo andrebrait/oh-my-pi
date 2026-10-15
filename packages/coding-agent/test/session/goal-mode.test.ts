@@ -22,6 +22,43 @@ function nextMacrotask(): Promise<void> {
 	return promise;
 }
 
+/** A real session with goal mode enabled for `--mode rpc` (continuation only when `continuation`). */
+async function withGoalSession(
+	continuation: boolean,
+	run: (session: AgentSession, goalMode: GoalModeController) => Promise<void>,
+): Promise<void> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-goal-ops-"));
+	const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
+	const session = await createTestSession(
+		dir,
+		{ handler: { content: ["ok"] } },
+		undefined,
+		continuation ? { settings: { "goal.continuationModes": ["rpc"] } } : {},
+	);
+	try {
+		await run(session, session.enableGoalMode({ mode: "rpc", delayMs: 0 }));
+	} finally {
+		await session.dispose();
+		restoreAgentDir();
+		await removeWithRetries(dir);
+	}
+}
+
+/** Resolves after `count` terminal `agent_end` events from now. */
+function terminalAgentEnds(session: AgentSession, count: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	let seen = 0;
+	const unsubscribe = session.subscribe(event => {
+		if (event.type !== "agent_end" || event.isTerminal === false || ++seen < count) return;
+		unsubscribe();
+		resolve();
+	});
+	return withTimeout(promise, 15_000, `${count} terminal agent_end never arrived`);
+}
+
+const continuations = (session: AgentSession): number =>
+	session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation").length;
+
 describe("session-owned goal mode", () => {
 	test("an in-process abort stops a scheduled continuation", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-goal-mode-"));
@@ -65,43 +102,112 @@ describe("session-owned goal mode", () => {
 			await removeWithRetries(dir);
 		}
 	});
-});
 
-describe("goal ops", () => {
-	/** A real session with goal mode enabled for `--mode rpc` (continuation only when `continuation`). */
-	async function withGoalSession(
-		continuation: boolean,
-		run: (session: AgentSession, goalMode: GoalModeController) => Promise<void>,
-	): Promise<void> {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-goal-ops-"));
+	test("enableGoalMode returns the running controller and refuses different options", async () => {
+		await withGoalSession(false, async (session, goalMode) => {
+			expect(session.enableGoalMode({ mode: "rpc", delayMs: 0 })).toBe(goalMode);
+			expect(() => session.enableGoalMode({ mode: "interactive", delayMs: 800 })).toThrow();
+			expect(() => session.enableGoalMode({ mode: "rpc", delayMs: 800 })).toThrow();
+		});
+	});
+
+	test("disposing the session voids a scheduled continuation", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-goal-mode-"));
 		const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
-		const session = await createTestSession(
-			dir,
-			{ handler: { content: ["ok"] } },
-			undefined,
-			continuation ? { settings: { "goal.continuationModes": ["rpc"] } } : {},
-		);
+		const session = await createTestSession(dir, { handler: { content: ["ok"] } });
+		vi.useFakeTimers();
 		try {
-			await run(session, session.enableGoalMode({ mode: "rpc", delayMs: 0 }));
+			const controller = session.enableGoalMode({ mode: "interactive", delayMs: 800 });
+			await controller.handle({ op: "create", objective: "keep going" });
+			expect(controller.continuationPending).toBe(true);
+			await session.dispose();
+			expect(controller.continuationPending).toBe(false);
 		} finally {
+			vi.useRealTimers();
 			await session.dispose();
 			restoreAgentDir();
 			await removeWithRetries(dir);
 		}
-	}
+	});
 
-	/** Resolves after `count` terminal `agent_end` events from now. */
-	function terminalAgentEnds(session: AgentSession, count: number): Promise<void> {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		let seen = 0;
-		const unsubscribe = session.subscribe(event => {
-			if (event.type !== "agent_end" || event.isTerminal === false || ++seen < count) return;
-			unsubscribe();
-			resolve();
+	test("a completed goal is journaled after its agent_end reached the subscribers", async () => {
+		await withGoalSession(false, async (session, goalMode) => {
+			await goalMode.handle({ op: "create", objective: "finish it" });
+			await session.goalRuntime.completeGoalFromTool();
+			const order: string[] = [];
+			session.subscribe(event => {
+				if (event.type === "agent_end" && event.isTerminal !== false) order.push("agent_end");
+			});
+			session.sessionManager.subscribeEntryAppended(entry => {
+				if (entry.type === "mode_change") order.push("mode_change");
+			});
+			const turn = terminalAgentEnds(session, 1);
+			await session.prompt("wrap up");
+			await turn;
+			await goalMode.settled();
+			expect(order).toEqual(["agent_end", "mode_change"]);
+			expect(session.getGoalModeState()).toBeUndefined();
 		});
-		return withTimeout(promise, 15_000, `${count} terminal agent_end never arrived`);
-	}
+	});
 
+	test("a direct newSession leaves the goal behind and starts no continuation", async () => {
+		await withGoalSession(true, async (session, goalMode) => {
+			await goalMode.handle({ op: "create", objective: "belongs to the first session" });
+			// Decided, not yet admitted: the change voids it.
+			expect(goalMode.continuationPending).toBe(true);
+			expect(await session.newSession()).toBe(true);
+			await nextMacrotask();
+			await session.waitForIdle();
+			expect(session.getGoalModeState()).toBeUndefined();
+			expect(goalMode.continuationPending).toBe(false);
+			expect(continuations(session)).toBe(0);
+		});
+	});
+
+	test("newSession runs its setup inside the goal hold, so the reattach sees what setup journaled", async () => {
+		await withGoalSession(false, async (session, goalMode) => {
+			await goalMode.handle({ op: "create", objective: "left behind" });
+			const goal = {
+				id: "set-up",
+				objective: "journaled by setup",
+				status: "paused",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			};
+			expect(
+				await session.newSession({
+					setup: async sessionManager => {
+						sessionManager.appendModeChange("goal_paused", { goal });
+					},
+				}),
+			).toBe(true);
+			expect(session.getGoalModeState()?.goal).toMatchObject({ objective: "journaled by setup", status: "paused" });
+		});
+	});
+
+	test("a same-session navigateTree holds a scheduled continuation and resumes it exactly once", async () => {
+		await withGoalSession(true, async (session, goalMode) => {
+			const first = terminalAgentEnds(session, 1);
+			await session.prompt("first");
+			await first;
+			const continued = terminalAgentEnds(session, 1);
+			await goalMode.handle({ op: "create", objective: "keep going" });
+			const leaf = session.sessionManager.getLeafId();
+			if (!leaf) throw new Error("no leaf to navigate to");
+			expect((await session.navigateTree(leaf)).cancelled).toBe(false);
+			await continued;
+			// That continuation made no progress, so nothing follows it.
+			await nextMacrotask();
+			await session.waitForIdle();
+			expect(continuations(session)).toBe(1);
+			expect(goalMode.continuationPending).toBe(false);
+		});
+	});
+});
+
+describe("goal ops", () => {
 	const userTexts = (session: AgentSession): string[] =>
 		session.messages.flatMap(message => (message.role === "user" ? [JSON.stringify(message.content)] : []));
 
@@ -500,6 +606,7 @@ describe("GoalModeController continuation gate", () => {
 		const current = session.getGoalModeState();
 		session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
 		controller.observe(agentEnd);
+		controller.observeAfterListeners(agentEnd);
 		// The switch commits before any queued exit work could run.
 		transcript.id = "t2";
 		await controller.settled();
@@ -590,6 +697,7 @@ describe("GoalModeController continuation gate", () => {
 		const current = f.session.getGoalModeState();
 		f.session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
 		f.controller.observe(agentEnd);
+		f.controller.observeAfterListeners(agentEnd);
 		await f.controller.settled();
 		expect(f.tools()).toEqual(["read"]);
 	});
