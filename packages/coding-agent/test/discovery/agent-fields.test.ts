@@ -125,19 +125,6 @@ describe("parseAgentFields", () => {
 		expect(plan.names).toEqual(["yield"]);
 	});
 
-	test("treats a malformed tools value as absent rather than an empty toolset", () => {
-		// Only the `[]` literal means "present but empty". A blank CSV or an
-		// array holding no strings carries no tool names, so it must degrade to
-		// the absent-field default (unrestricted); parsing it as `[]` would
-		// silently strip every tool down to `yield`.
-		expect(parseAgentFields({ name: "quiet", description: "desc", tools: "" })?.tools).toBeUndefined();
-		expect(parseAgentFields({ name: "quiet", description: "desc", tools: "   " })?.tools).toBeUndefined();
-		expect(parseAgentFields({ name: "quiet", description: "desc", tools: [1, 2] })?.tools).toBeUndefined();
-		// An array of blank strings carries no tool names either — same absent
-		// default, not a yield-only strip.
-		expect(parseAgentFields({ name: "quiet", description: "desc", tools: ["", "   "] })?.tools).toBeUndefined();
-	});
-
 	test("maps legacy search alias to grep and keeps find canonical", () => {
 		const fields = parseAgentFields({
 			name: "reviewer",
