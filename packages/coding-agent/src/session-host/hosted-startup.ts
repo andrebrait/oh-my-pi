@@ -150,18 +150,23 @@ export function hostLaunchArgs(rawArgs: readonly string[], launchCwd: string): s
 /**
  * How this terminal starts and finds hosts: new ones run in `cwd` with {@link hostLaunchArgs}, and its own session
  * directory is read from `launchCwd` as the host's `--session-dir` is, though a resume moved this process to `cwd`.
+ * `envSessionDir` (`PI_CODING_AGENT_SESSION_DIR`) reaches the host resolved the same way, as the host inherits it.
  */
 export function createHostLaunch(options: {
 	rawArgs: readonly string[];
 	cwd: string;
 	launchCwd: string;
 	sessionDir: string | undefined;
+	envSessionDir: string | undefined;
 }): HostLaunch {
-	const { rawArgs, cwd, launchCwd, sessionDir } = options;
+	const { rawArgs, cwd, launchCwd, sessionDir, envSessionDir } = options;
 	return {
 		cwd,
 		args: hostLaunchArgs(rawArgs, launchCwd),
 		sessionDir: sessionDir && launchPathValue("--session-dir", sessionDir, launchCwd),
+		env: envSessionDir
+			? { PI_CODING_AGENT_SESSION_DIR: launchPathValue("--session-dir", envSessionDir, launchCwd) }
+			: undefined,
 	};
 }
 
