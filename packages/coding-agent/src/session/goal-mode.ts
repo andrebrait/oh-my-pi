@@ -471,6 +471,20 @@ export class GoalModeController {
 		await run;
 	}
 
+	/**
+	 * For an owner's session-switch reconciler, which runs inside the change: leave the
+	 * previous session's goal and restore its tool set now, so the owner can restore the
+	 * target's other modes on top. The change's end then adopts the target's goal, even
+	 * if the transcript id did not change. Not queued behind a running reconcile, which
+	 * may itself be waiting on this change.
+	 */
+	async leavePreviousGoal(): Promise<void> {
+		if (this.#sessionChanges === 0) return await this.reconcile({ preserveActiveGoal: true });
+		this.#changeOverlappedReconcile = true;
+		await this.#exit();
+		this.#session.setGoalModeState(undefined);
+	}
+
 	async #reconcileOnce(options: { preserveActiveGoal?: boolean } | undefined): Promise<void> {
 		// Goal state and the goal tool belong to the session that set them; the
 		// session itself keeps both across a switch, so clear them here first.
@@ -615,15 +629,20 @@ export class GoalModeController {
 			// promptCustomMessage counts the submission as admitted synchronously, so every
 			// settle report sees it from here on. A continuation that is refused or bails
 			// before its run starts must neither stay counted nor withhold settlement.
-			session.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false }).then(
-				dispatched => {
-					if (!dispatched) unclaim();
-				},
-				error => {
-					unclaim();
-					reportControllerError(error);
-				},
-			);
+			session
+				.promptCustomMessage(
+					{ customType: "goal-continuation", content: prompt, display: false, attribution: "agent" },
+					{ streamingBehavior: "followUp" },
+				)
+				.then(
+					dispatched => {
+						if (!dispatched) unclaim();
+					},
+					error => {
+						unclaim();
+						reportControllerError(error);
+					},
+				);
 		})().catch(error => {
 			this.#continuationScheduled = false;
 			this.#options.onContinuationDropped?.();

@@ -586,7 +586,8 @@ contains `"rpc"`; this covers `--mode rpc` and `--mode rpc-ui`. A session host
 so default settings continue goals there whether or not a client is attached, once
 per idle whatever the number of clients, about 800 ms after the run yields. When
 enabled, `create`/`resume` and each terminal `agent_end` decide whether to start
-another goal turn, sent as a hidden `goal-continuation` message.
+another goal turn, sent as a hidden `goal-continuation` custom message attributed to
+the agent (`attribution: "agent"`).
 
 - The turn starts once the yielding run has fully unwound. At that moment the goal
   must still be active, the session idle with nothing queued, plan mode off, open

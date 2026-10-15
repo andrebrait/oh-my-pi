@@ -450,15 +450,7 @@ export async function submitInteractiveInput(
 				return mode.optimisticSkillMessagePending;
 			},
 		};
-		if (input.customType) {
-			const message = {
-				customType: input.customType,
-				content: input.text,
-				display: input.display ?? false,
-				attribution: "agent" as const,
-			};
-			await session.promptCustomMessage(message, { streamingBehavior });
-		} else if (input.synthetic) {
+		if (input.synthetic) {
 			// Synthetic continue shortcuts are hidden developer prompts. The streaming
 			// queue (#queueUserMessage) only carries user-attributed messages, so we do
 			// NOT pass streamingBehavior here: queueing would silently demote the

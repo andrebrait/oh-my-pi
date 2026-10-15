@@ -76,6 +76,7 @@ async function createHarness(options?: { goalEnabled?: boolean }): Promise<Guide
 	const goalTool = new GoalTool(goalToolSession);
 	toolRegistry.set("goal", goalTool as unknown as Tool);
 	const mode = new InteractiveMode(session, "test");
+	mode.enableGoalMode();
 	vi.spyOn(mode, "addMessageToChat").mockReturnValue([]);
 	vi.spyOn(mode, "ensureLoadingAnimation").mockImplementation(() => {});
 	mode.ui.requestRender = vi.fn();
@@ -160,7 +161,7 @@ describe("guided goal setup", () => {
 
 			expect(promptSpy).toHaveBeenCalledTimes(1);
 			const [text, promptOptions] = promptSpy.mock.calls[0]!;
-			expect(promptOptions).toEqual({ synthetic: true, images });
+			expect(promptOptions).toEqual(expect.objectContaining({ synthetic: true, images }));
 			// The rough objective rides inside the kickoff, and the kickoff tells the
 			// agent how to finish: `goal` tool, op create.
 			expect(text).toContain("automate flaky test triage");
@@ -241,28 +242,24 @@ describe("guided goal setup", () => {
 			const status = vi.spyOn(harness.mode, "showStatus");
 			const warning = vi.spyOn(harness.mode, "showWarning");
 
-			harness.mode.goalModeEnabled = true;
+			const now = Date.now();
+			const goal = {
+				id: "g1",
+				objective: "Ship it",
+				status: "active" as const,
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			};
+			harness.session.setGoalModeState({ enabled: true, mode: "active", goal });
 			await harness.mode.handleGuidedGoalCommand("ship it");
 			expect(promptSpy).not.toHaveBeenCalled();
 			expect(status).toHaveBeenCalledWith(
 				"Goal mode is already active. Use /goal to manage it, or /goal drop to start over.",
 			);
 
-			harness.mode.goalModeEnabled = false;
-			const now = Date.now();
-			harness.session.setGoalModeState({
-				enabled: false,
-				mode: "active",
-				goal: {
-					id: "g1",
-					objective: "Ship it",
-					status: "paused",
-					tokensUsed: 0,
-					timeUsedSeconds: 0,
-					createdAt: now,
-					updatedAt: now,
-				},
-			});
+			harness.session.setGoalModeState({ enabled: false, mode: "active", goal: { ...goal, status: "paused" } });
 			await harness.mode.handleGuidedGoalCommand("ship it");
 			expect(promptSpy).not.toHaveBeenCalled();
 			expect(warning).toHaveBeenCalledWith(

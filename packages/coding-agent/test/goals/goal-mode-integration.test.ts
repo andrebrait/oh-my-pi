@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -12,7 +12,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -97,6 +97,9 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
 	});
 	const mode = new InteractiveMode(session, "test");
+	mode.enableGoalMode();
+	// A goal's objective is submitted as its first turn; tests that run turns restore this.
+	vi.spyOn(session, "prompt").mockResolvedValue(true);
 	const toolSession = createToolSession(tempDir.path(), settings, {
 		getGoalModeState: () => session.getGoalModeState(),
 		getGoalRuntime: () => session.goalRuntime,
@@ -136,6 +139,73 @@ async function waitForMicrotasks(): Promise<void> {
 	await Promise.resolve();
 	await Promise.resolve();
 }
+
+function nextMacrotask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+
+/** Run the 800 ms continuation window (fake timers) and let a due continuation be admitted. */
+async function passContinuationWindow(): Promise<void> {
+	vi.advanceTimersByTime(800);
+	await nextMacrotask();
+}
+
+/** Record goal continuations the controller admits, without running their turns. */
+function recordContinuations(session: AgentSession): string[] {
+	const admitted: string[] = [];
+	vi.spyOn(session, "promptCustomMessage").mockImplementation(async message => {
+		admitted.push(message.customType);
+		return true;
+	});
+	return admitted;
+}
+
+function terminalAgentEnd(session: AgentSession): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const unsubscribe = session.subscribe(event => {
+		if (event.type !== "agent_end" || event.isTerminal === false) return;
+		unsubscribe();
+		resolve();
+	});
+	return promise;
+}
+
+/** Script the provider: each call answers with the next content, a tool call ending its turn with `toolUse`. */
+function scriptProvider(session: AgentSession, next: (call: number) => AssistantMessage["content"]): void {
+	let call = 0;
+	session.agent.streamFn = () => {
+		const content = next(call++);
+		const stopReason = content.some(block => block.type === "toolCall") ? "toolUse" : "stop";
+		const message: AssistantMessage = {
+			role: "assistant",
+			content,
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason,
+			timestamp: Date.now(),
+		};
+		const stream = new AssistantMessageEventStream();
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "done", reason: stopReason, message });
+		});
+		return stream;
+	};
+}
+
+const continuationCount = (session: AgentSession): number =>
+	session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation").length;
 
 async function armInputWaiter(mode: InteractiveMode): Promise<{
 	inputPromise: Promise<void>;
@@ -188,7 +258,7 @@ describe("InteractiveMode goal mode integration", () => {
 
 		await harness.mode.startGoalAtStartup(objective);
 
-		expect(prompt).toHaveBeenCalledWith(objective, { streamingBehavior: "steer" });
+		expect(prompt).toHaveBeenCalledWith(objective, expect.objectContaining({ streamingBehavior: "steer" }));
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
 	});
 
@@ -248,7 +318,10 @@ describe("InteractiveMode goal mode integration", () => {
 
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe(objective);
 		expect(sendGoalModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(
+			objective,
+			expect.objectContaining({ streamingBehavior: "steer", images }),
+		);
 	});
 
 	it("steers replacement goal objective attachments while streaming", async () => {
@@ -263,7 +336,10 @@ describe("InteractiveMode goal mode integration", () => {
 
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe(objective);
 		expect(sendGoalModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(
+			objective,
+			expect.objectContaining({ streamingBehavior: "steer", images }),
+		);
 	});
 	it("steers plan prompt attachments while streaming", async () => {
 		Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
@@ -299,19 +375,6 @@ describe("InteractiveMode goal mode integration", () => {
 		submit: (mode: InteractiveMode, input: Pick<SubmittedUserInput, "images" | "imageLinks">) => Promise<boolean>;
 	}> = [
 		{
-			name: "/goal",
-			text: "[Image #1, 10x10] fix this",
-			submit: (mode: InteractiveMode, input: Pick<SubmittedUserInput, "images" | "imageLinks">) =>
-				mode.handleGoalModeCommand("[Image #1, 10x10] fix this", input),
-		},
-		{
-			name: "/goal set",
-			text: "[Image #1, 10x10] replace this",
-			prepare: (mode: InteractiveMode) => mode.handleGoalModeCommand("Ship the release"),
-			submit: (mode: InteractiveMode, input: Pick<SubmittedUserInput, "images" | "imageLinks">) =>
-				mode.handleGoalModeCommand("set [Image #1, 10x10] replace this", input),
-		},
-		{
 			name: "/plan",
 			text: "[Image #1, 10x10] plan this",
 			submit: (mode: InteractiveMode, input: Pick<SubmittedUserInput, "images" | "imageLinks">) =>
@@ -344,6 +407,22 @@ describe("InteractiveMode goal mode integration", () => {
 			expect(input?.imageLinks).toBe(imageLinks);
 		});
 	}
+
+	it("submits /goal and /goal set objectives with their attachments as the goal's first turn", async () => {
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+		const images: ImageContent[] = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+		const imageLinks = ["file:///shot.png"];
+
+		expect(await harness.mode.handleGoalModeCommand("[Image #1, 10x10] fix this", { images, imageLinks })).toBe(true);
+		expect(prompt).toHaveBeenLastCalledWith("[Image #1, 10x10] fix this", expect.objectContaining({ images }));
+
+		expect(
+			await harness.mode.handleGoalModeCommand("set [Image #1, 10x10] replace this", { images, imageLinks }),
+		).toBe(true);
+		expect(prompt).toHaveBeenLastCalledWith("[Image #1, 10x10] replace this", expect.objectContaining({ images }));
+		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("[Image #1, 10x10] replace this");
+	});
 	it("restores the goal draft when setup fails", async () => {
 		const images: ImageContent[] = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
 		const imageLinks = ["file:///shot.png"];
@@ -497,32 +576,41 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(content).not.toContain("Run focused checks");
 	});
 
-	it("drops a goal continuation tick while the agent is streaming", async () => {
-		// Repro for the race the streaming guard on /goal set X exposed: the
-		// 800ms continuation timer armed by getUserInput() can outlive the idle
-		// window when streaming starts between schedule and fire (e.g. /goal set
-		// taking the streaming branch, or any extension that triggers a turn).
-		// Without the streaming-aware guard the timer fires onInputCallback
-		// with a `goal-continuation` and submitInteractiveInput resurfaces
-		// AgentBusyError via promptCustomMessage. Driven with fake timers so the
-		// 800ms window is exercised deterministically without a real wall-clock wait.
+	it("a draft holds a goal continuation back; emptying it lets the goal continue once", async () => {
+		vi.spyOn(vcs, "repo").mockReturnValue(null);
+		vi.spyOn(vcs, "git").mockReturnValue(null);
+		await harness.mode.init({ suppressWelcomeIntro: true });
 		await harness.mode.handleGoalModeCommand("Ship the release");
-
+		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
-		const waiter = await armInputWaiter(harness.mode);
 
-		let streaming = true;
-		Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => streaming });
+		harness.mode.editor.setText("half-typed reply");
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
 
-		// Fire the armed 800ms continuation timer while streaming is true.
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
+		harness.mode.editor.setText("");
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
+		expect(harness.session.promptCustomMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ customType: "goal-continuation", display: false, attribution: "agent" }),
+			{ streamingBehavior: "followUp" },
+		);
+	});
 
-		expect(waiter.getResolvedInput()).toBeUndefined();
+	it("a pending submission holds a goal continuation back until it settles", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		vi.useFakeTimers();
 
-		streaming = false;
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
-		await waiter.inputPromise;
+		const submission = harness.mode.startPendingSubmission({ text: "next step" });
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
+
+		harness.mode.finishPendingSubmission(submission);
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	it("waits for input rather than continuing an active goal with only blocked work", async () => {
@@ -536,47 +624,35 @@ describe("InteractiveMode goal mode integration", () => {
 				],
 			},
 		]);
-
+		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
-		const waiter = await armInputWaiter(harness.mode);
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
-		expect(waiter.getResolvedInput()).toBeUndefined();
 
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "Approved" }));
-		await waiter.inputPromise;
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
 	});
 
-	it("drops an armed continuation when work becomes blocked, then resumes after input", async () => {
+	it("drops a waiting continuation when work becomes blocked, then continues once it is unblocked", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
-		harness.session.setTodoPhases([
-			{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" }] },
-		]);
-
+		const pending = [{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" as const }] }];
+		harness.session.setTodoPhases(pending);
+		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
-		const waiter = await armInputWaiter(harness.mode);
+
+		harness.session.goalMode?.reschedule();
 		harness.session.setTodoPhases([
 			{
 				name: "Approval",
 				tasks: [{ content: "Apply the change", status: "blocked", blocker: "Awaiting user approval" }],
 			},
 		]);
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
-		expect(waiter.getResolvedInput()).toBeUndefined();
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
 
-		const approval = harness.mode.startPendingSubmission({ text: "Approved" });
-		harness.mode.onInputCallback?.(approval);
-		await waiter.inputPromise;
-		harness.mode.finishPendingSubmission(approval);
-		harness.session.setTodoPhases([
-			{ name: "Approval", tasks: [{ content: "Apply the change", status: "pending" }] },
-		]);
-		const resumed = await armInputWaiter(harness.mode);
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
-		expect(resumed.getResolvedInput()?.customType).toBe("goal-continuation");
-		await resumed.inputPromise;
+		harness.session.setTodoPhases(pending);
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	it("continues an active goal when actionable work remains alongside blocked work", async () => {
@@ -590,13 +666,26 @@ describe("InteractiveMode goal mode integration", () => {
 				],
 			},
 		]);
-
+		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
-		const waiter = await armInputWaiter(harness.mode);
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
-		expect(waiter.getResolvedInput()?.customType).toBe("goal-continuation");
-		await waiter.inputPromise;
+
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	it("Esc pauses the goal and voids a waiting continuation", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		vi.useFakeTimers();
+
+		harness.session.goalMode?.reschedule();
+		expect(harness.session.goalMode?.continuationPending).toBe(true);
+		await harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+		await passContinuationWindow();
+
+		expect(admitted).toEqual([]);
+		expect(harness.mode.goalModePaused).toBe(true);
 	});
 
 	it("stops repeated goal continuations when identical tool evidence adds no new signal", async () => {
@@ -604,64 +693,38 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.spyOn(vcs, "git").mockReturnValue(null);
 		await harness.mode.init({ suppressWelcomeIntro: true });
 		await harness.session.setActiveToolsByName(["todo"]);
-		await harness.mode.handleGoalModeCommand("Ship the release");
 		harness.session.setTodoPhases([
 			{
 				name: "Verification",
 				tasks: [{ content: "Run focused checks", status: "completed" }],
 			},
 		]);
-		let providerCall = 0;
-		harness.session.agent.streamFn = () => {
-			const index = providerCall++;
-			const toolTurn = index % 2 === 0;
-			const toolCallId = `call-${Math.floor(index / 2)}`;
-			const message = {
-				role: "assistant" as const,
-				content: toolTurn
-					? [{ type: "toolCall" as const, id: toolCallId, name: "todo", arguments: { op: "view" } }]
-					: [{ type: "text" as const, text: "Verification remains complete." }],
-				api: "anthropic-messages" as const,
-				provider: "anthropic" as const,
-				model: "claude-sonnet-4-5",
-				usage: {
-					input: 1,
-					output: 1,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 2,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: toolTurn ? ("toolUse" as const) : ("stop" as const),
-				timestamp: Date.now(),
-			};
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: message });
-				stream.push({ type: "done", reason: message.stopReason, message });
+		// Every turn views the todo list, then answers.
+		scriptProvider(harness.session, call =>
+			call % 2 === 0
+				? [{ type: "toolCall", id: `call-${call}`, name: "todo", arguments: { op: "view" } }]
+				: [{ type: "text", text: "Verification remains complete." }],
+		);
+		vi.spyOn(harness.session, "prompt").mockRestore();
+		vi.useFakeTimers();
+		// Real turns run between continuation windows: advance fake time until each turn ends.
+		const pumpUntil = async (signal: Promise<void>): Promise<void> => {
+			let done = false;
+			void signal.then(() => {
+				done = true;
 			});
-			return stream;
+			while (!done) {
+				vi.advanceTimersByTime(50);
+				await nextMacrotask();
+			}
 		};
 
+		const objectiveTurn = terminalAgentEnd(harness.session);
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		await pumpUntil(objectiveTurn);
 		const runContinuation = async (): Promise<void> => {
-			vi.useFakeTimers();
-			const waiter = await armInputWaiter(harness.mode);
-			vi.advanceTimersByTime(800);
-			await waitForMicrotasks();
-			vi.useRealTimers();
-			const input = waiter.getResolvedInput();
-			expect(input?.customType).toBe("goal-continuation");
-			if (!input?.customType) throw new Error("expected goal continuation");
-			expect(harness.mode.markPendingSubmissionStarted(input)).toBe(true);
-			await harness.session.promptCustomMessage({
-				customType: input.customType,
-				content: input.text,
-				display: false,
-				attribution: "agent",
-			});
-			harness.mode.finishPendingSubmission(input);
+			await pumpUntil(terminalAgentEnd(harness.session));
 		};
-
 		await runContinuation();
 		harness.session.setTodoPhases([
 			{
@@ -670,17 +733,12 @@ describe("InteractiveMode goal mode integration", () => {
 			},
 		]);
 		await runContinuation();
+		// Same evidence as the previous continuation: no new signal, so the goal waits for input.
 		await runContinuation();
+		expect(harness.session.goalMode?.continuationPending).toBe(false);
+		await passContinuationWindow();
 
-		vi.useFakeTimers();
-		const fourthWaiter = await armInputWaiter(harness.mode);
-		vi.advanceTimersByTime(800);
-		await waitForMicrotasks();
-
-		expect(fourthWaiter.getResolvedInput()).toBeUndefined();
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
-		vi.useRealTimers();
-		await fourthWaiter.inputPromise;
+		expect(continuationCount(harness.session)).toBe(3);
 	});
 
 	it("refuses /goal while plan mode is active", async () => {
@@ -773,52 +831,31 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
 	});
 
-	it("returns the completion report from the goal tool and exits goal mode before the next turn rebuild", async () => {
+	it("journals a goal the agent completes once its turn ends and leaves goal mode", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		await harness.mode.handleGoalModeCommand("budget 50");
 		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
-		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
-			tool => tool.name === "goal",
+		scriptProvider(harness.session, call =>
+			call === 0
+				? [{ type: "toolCall", id: "call-complete", name: "goal", arguments: { op: "complete" } }]
+				: [{ type: "text", text: "Shipped." }],
 		);
-		if (!goalTool) {
-			throw new Error("Expected goal tool to be active");
-		}
+		vi.spyOn(harness.session, "prompt").mockRestore();
 
-		const result = await goalTool.execute("call-1", { op: "complete" });
-		const completionText = JSON.stringify(result.content);
+		const turn = terminalAgentEnd(harness.session);
+		await harness.session.prompt("Finish the release");
+		await turn;
+		await harness.session.goalMode?.settled();
 
-		expect(result.details?.completionBudgetReport).toBe(
-			"Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.",
-		);
-		expect(completionText).toContain("Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.");
-		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
-		// Per fix #1: completeGoalFromTool clears state.enabled so subsequent createTools
-		// calls (e.g. mid-turn refreshes) no longer advertise the goal tool. The model's
-		// existing toolset for the in-flight turn is unaffected — what we care about here
-		// is that the next createTools observation reflects the deactivation.
-		expect(harness.session.getGoalModeState()?.enabled).toBe(false);
-		expect(await toolNamesFor(harness)).not.toContain("goal");
-
-		const nextTurn = harness.mode.getUserInput();
-		// getUserInput observes mode === "exiting" and awaits #exitGoalMode before
-		// arming onInputCallback. Drain microtasks until that side-effect lands.
-		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
-			await Bun.sleep(0);
-		}
+		const toolResult = harness.session.messages.find(message => message.role === "toolResult");
+		expect(JSON.stringify(toolResult)).toContain("Goal achieved. Report final budget usage to the user");
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
 		expect(harness.session.getGoalModeState()).toBeUndefined();
 		expect(await toolNamesFor(harness)).not.toContain("goal");
 		expect(appendCustomEntry).toHaveBeenCalledWith(
 			"goal-completed",
-			expect.objectContaining({
-				objective: "Ship the release",
-				tokenBudget: 50,
-				tokensUsed: 0,
-			}),
+			expect.objectContaining({ objective: "Ship the release", tokenBudget: 50 }),
 		);
-
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
-		await nextTurn;
 	});
 });

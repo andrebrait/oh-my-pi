@@ -30,6 +30,7 @@
 
 - `RpcClient.steer()`, `followUp()`, and `setThinkingLevel()` now reject with `RpcCommandError` when the server reports a failure instead of resolving silently ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Goal mode runs in the session: a session host continues an active goal with default settings (`goal.continuationModes` counts `--mode host` as `"interactive"`), with or without attached clients and once per idle however many are attached; `--mode rpc` stays opt-in with `"rpc"`
+- The terminal's goal mode uses the same session-owned controller: a goal continuation is no longer a pending submission that Esc can cancel before it starts. Typing a draft during the 800 ms wait still holds it back, and Esc once it has started still pauses the goal
 
 ### Fixed
 
