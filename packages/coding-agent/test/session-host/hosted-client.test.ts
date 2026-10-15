@@ -1709,6 +1709,47 @@ describe("HostedClientLink reconnect", () => {
 		}
 	});
 
+	itPosix(
+		"fails closed, without another attempt, when a reconnect's snapshot is over the transport limit",
+		async () => {
+			let ui: ExtensionUIContext | undefined;
+			const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			try {
+				const view = await openView();
+				await view.connect(proxy.entry);
+				// A dialog lost with the connection makes the next attempt ask for a snapshot instead of resuming.
+				void ui!.confirm("Proceed?", "Really?").catch(() => {});
+				await waitFor(() => view.dialogs.length === 1);
+
+				await loseConnection(view, proxy);
+				// One message past the reassembly limit: the attempt's reply can only arrive as `rpc_frame_error`.
+				host.session.sessionManager.appendMessage({
+					role: "user",
+					content: "x".repeat(MAX_RPC_REASSEMBLED_BYTES),
+					timestamp: Date.now(),
+				});
+				proxy.accept();
+				await waitFor(() => view.closed.length === 1, 30_000);
+
+				// A frame error is a view that cannot match the host, not a lost transport: no retry until the timeout.
+				expect(view.closed[0]).toEqual({
+					hostAlive: true,
+					message: `session view update failed: The session is too large to attach: the host's snapshot exceeds the 64 MiB RPC frame limit (host ${host.hostId} still running; omp attach ${host.hostId})`,
+				});
+				expect(view.hostLink.reconnecting).toBe(false);
+				expect(view.showStatus.mock.calls.map(call => call[0])).not.toContain(
+					`Reconnected to session host ${host.hostId}`,
+				);
+				await fixture.waitForClients(host, 0);
+				expect(host.exited).toBe(false);
+			} finally {
+				proxy.close();
+			}
+		},
+		60_000,
+	);
+
 	itPosix("rejects writes while reconnecting and sends nothing later", async () => {
 		const host = await fixture.startHost();
 		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
