@@ -1709,6 +1709,34 @@ describe("HostedClientLink reconnect", () => {
 		}
 	});
 
+	itPosix("takes a snapshot after a dialog answer the connection lost, and presents the dialog again", async () => {
+		let ui: ExtensionUIContext | undefined;
+		const host = await fixture.startHost({ setToolUIContext: ctx => void (ui = ctx) });
+		const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+		try {
+			const view = await openView();
+			await view.connect(proxy.entry);
+			const replica = view.local.sessionFile;
+			const confirmed = ui!.confirm("Proceed?", "Really?");
+			await waitFor(() => view.dialogs.length === 1);
+
+			// The answer leaves the client and never reaches the host, which still waits for it.
+			proxy.mute();
+			view.dialogs[0].answer(false);
+			await waitFor(() => proxy.muted().includes('"extension_ui_response"'));
+			proxy.drop();
+			await waitFor(() => view.dialogs.length === 2);
+
+			expect(view.local.sessionFile).not.toBe(replica);
+			expect(view.dialogs[1].title).toBe("Proceed?");
+			view.dialogs[1].answer(true);
+			expect(await confirmed).toBe(true);
+			expect(view.closed).toEqual([]);
+		} finally {
+			proxy.close();
+		}
+	});
+
 	itPosix(
 		"fails closed, without another attempt, when a reconnect's snapshot is over the transport limit",
 		async () => {
