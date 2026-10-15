@@ -2320,10 +2320,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTitleSpinnerStyle(cfgTuiTitleSpinner.get(this.settings));
 		initProgramStatus();
 		setProgramStatusEnabled(cfgTerminalProgramStatus.get(this.settings));
-		setTerminalSessionSource({
-			file: () => this.sessionManager.getSessionFile(),
-			cwd: () => this.sessionManager.getCwd(),
-		});
+		// A hosted terminal's local session is a disposable replica: its link reports the host's session instead.
+		if (!this.hostedClientMode) {
+			setTerminalSessionSource({
+				file: () => this.sessionManager.getSessionFile(),
+				cwd: () => this.sessionManager.getCwd(),
+			});
+		}
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		// Seeds the border, the status-line `vim` segment, and the cursor shape in one call.
 		// Deliberately here rather than beside #applyVimMode in the constructor: that runs before
@@ -8097,6 +8100,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * failures become a warning so startup continues.
 	 */
 	async maybeAutoCreateWorktree(): Promise<void> {
+		// A hosted terminal's session is the host's: a worktree here would only move the local replica.
+		if (this.hostedClientMode) return;
 		try {
 			const policy = cfgWorktreeOnStart.get(this.settings);
 			if (policy === "off" || !(await canAutoCreateWorktree(this.sessionManager.getCwd()))) return;
