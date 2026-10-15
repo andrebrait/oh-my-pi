@@ -437,7 +437,15 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	// Not awaited: the restored turn runs as long as any turn does, and clients see it as they would any other.
 	void restore?.().then(
 		outcome => logger.debug("Session host restored its session", { hostId, ...outcome }),
-		error => logger.warn("Session host restore failed", { hostId, error: String(error) }),
+		error => {
+			logger.warn("Session host restore failed", { hostId, error: String(error) });
+			// Only clients attached by now see it; the host's log keeps it for later ones.
+			session.emitNotice(
+				"warning",
+				`Could not restore the interrupted session: ${error instanceof Error ? error.message : String(error)}`,
+				"restore",
+			);
+		},
 	);
 	return lifetime.promise;
 }

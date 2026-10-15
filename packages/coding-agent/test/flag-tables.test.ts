@@ -312,6 +312,16 @@ describe("--restore", () => {
 		validateRestoreLaunch(parseArgs(["--restore", "a"]), true);
 		validateRestorePrompt(parseArgs(["--resume", "a", "keep going"]));
 	});
+
+	it("is accepted by a session host a hosted terminal starts, and refused in other protocol modes", () => {
+		validateRestoreLaunch(
+			parseArgs(["--mode", "host", "--host-id", "0123456789abcdef", "--restore", "/s/a.jsonl"]),
+			false,
+		);
+		expect(() => validateRestoreLaunch(parseArgs(["--mode", "rpc", "--restore", "/s/a.jsonl"]), false)).toThrow(
+			"--restore requires an interactive terminal",
+		);
+	});
 });
 
 describe("--system-prompt-template", () => {
