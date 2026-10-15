@@ -230,15 +230,30 @@ describe("createHostLaunch", () => {
 			cwd: sessionCwd,
 			launchCwd: dir,
 			sessionDir: "sessions",
+			envSessionDir: undefined,
 		});
-		expect(hosted).toEqual({
+		expect(hosted).toStrictEqual({
 			cwd: sessionCwd,
 			args: ["--session-dir", sessionsDir],
 			sessionDir: sessionsDir,
+			env: undefined,
 		});
-		expect(createHostLaunch({ rawArgs: [], cwd: sessionCwd, launchCwd: dir, sessionDir: undefined }).sessionDir).toBe(
-			undefined,
-		);
+		expect(
+			createHostLaunch({ rawArgs: [], cwd: sessionCwd, launchCwd: dir, sessionDir: undefined, envSessionDir: "" })
+				.sessionDir,
+		).toBe(undefined);
+	});
+
+	it("hands the host a relative PI_CODING_AGENT_SESSION_DIR resolved, since the host reads it from another directory", () => {
+		const hosted = createHostLaunch({
+			rawArgs: [],
+			cwd: path.join(dir, "resumed-project"),
+			launchCwd: dir,
+			sessionDir: "sessions",
+			envSessionDir: "sessions",
+		});
+		expect(hosted.sessionDir).toBe(sessionsDir);
+		expect(hosted.env).toEqual({ PI_CODING_AGENT_SESSION_DIR: sessionsDir });
 	});
 });
 
