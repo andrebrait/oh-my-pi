@@ -1401,6 +1401,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		return {
 			order,
 			compactedAtRequest,
+			/** Let the hook return without waiting for the pass to end. */
+			release: (): void => gate.resolve(),
 			/** Let the hook return and wait for the compaction pass to end. */
 			async finish(): Promise<void> {
 				gate.resolve();
@@ -1555,6 +1557,76 @@ describe("AgentSession auto-compaction queue resume", () => {
 				message => message.role === "custom" && message.customType === "extension-nudge",
 			);
 			expect([transcript.length, context.length]).toEqual([kept, kept]);
+		});
+	}
+
+	it("drops a turn-triggering custom message whose idle compaction ends while a new session is still aborting the old one", async () => {
+		const held = await holdIdleCompaction();
+		const persisted = vi.spyOn(sessionManager, "appendCustomMessageEntry");
+		const sent = session.sendCustomMessage(
+			{ customType: "extension-nudge", content: "act on the nudge", display: false },
+			{ triggerTurn: true },
+		);
+		await scheduler.yield();
+		// The pass ends inside /new's abort: the prompt generation has moved on, the transcript is not replaced yet.
+		const abortCompaction = SessionMaintenance.prototype.abortCompaction;
+		vi.spyOn(SessionMaintenance.prototype, "abortCompaction").mockImplementation(function (
+			this: SessionMaintenance,
+			reason?: unknown,
+		) {
+			held.release();
+			return abortCompaction.call(this, reason);
+		});
+		await session.newSession();
+		await held.finish();
+		expect(await sent).toBe(false);
+		await session.waitForIdle();
+		await flushEventLoop();
+		expect(held.order).not.toContain("agent_start");
+		expect(persisted.mock.calls.filter(([customType]) => customType === "extension-nudge")).toEqual([]);
+		expect(
+			session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "extension-nudge",
+			),
+		).toEqual([]);
+	});
+
+	const clearedStarters: Array<
+		[name: string, customType: string, start: (session: AgentSession) => Promise<unknown>]
+	> = [
+		[
+			"a turn-triggering custom message",
+			"extension-nudge",
+			session =>
+				session.sendCustomMessage(
+					{ customType: "extension-nudge", content: "act on the nudge", display: false },
+					{ triggerTurn: true },
+				),
+		],
+		[
+			"an IRC wake",
+			"irc:incoming",
+			session =>
+				session.deliverIrcMessage({ id: "m1", from: "peer", to: MAIN_AGENT_ID, body: "ping", ts: Date.now() }),
+		],
+	];
+	for (const [name, customType, start] of clearedStarters) {
+		it(`keeps ${name} held by idle compaction out of the context /clear started afresh`, async () => {
+			const held = await holdIdleCompaction();
+			void start(session).catch(() => {});
+			await scheduler.yield();
+			expect(await session.resetSessionContext()).toBeDefined();
+			await held.finish();
+			await flushEventLoop();
+			await session.waitForIdle();
+			// The next turn starts from the cleared context, and nothing held for the old one rides along.
+			expect(await session.prompt("after clear")).toBe(true);
+			await session.waitForIdle();
+			expect(
+				session.agent.state.messages.filter(
+					message => message.role === "custom" && message.customType === customType,
+				),
+			).toEqual([]);
 		});
 	}
 

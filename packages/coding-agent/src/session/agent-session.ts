@@ -1457,7 +1457,10 @@ export class AgentSession implements SettingsScope {
 			const sessionGeneration = this.#sessionGeneration;
 			void idleCompaction
 				.then(async () => {
-					// A session change cleared the old transcript's pending IRC; these records go with it.
+					// A transition (/new, /clear, a switch) aborts long before it replaces the transcript, so
+					// let it settle first: only then does the session generation say which transcript is live.
+					if (this.isSessionTransitioning) await this.waitForSessionTransition();
+					// The transcript these records were sent to was replaced (/new, /clear, a switch): drop them with it.
 					if (
 						this.#sessionGeneration !== sessionGeneration &&
 						(await this.#sessionGenerationChanged(sessionGeneration))
@@ -6207,6 +6210,9 @@ export class AgentSession implements SettingsScope {
 		// calls, and error state. agent.reset() keeps the model and system prompt.
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
+		// The cleared context is a new transcript: an aside or held message captured for the old one drops
+		// its record instead of landing here (mirrors newSession()).
+		this.#sessionGeneration++;
 		this.#pendingNextTurnMessages = [];
 		this.#experimentalContextNotesReminder = undefined;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -9191,6 +9197,9 @@ export class AgentSession implements SettingsScope {
 		if (idleCompaction) {
 			const promptGeneration = this.#promptGeneration;
 			await idleCompaction;
+			// A transition (/new, /clear, a switch) aborts long before it replaces the transcript, so let it
+			// settle first: only then does the session generation tell an abort from a session change.
+			if (this.isSessionTransitioning) await this.waitForSessionTransition();
 			// A session change or disposal during the wait drops the message with the transcript it was sent to.
 			if (
 				this.#isDisposed ||
