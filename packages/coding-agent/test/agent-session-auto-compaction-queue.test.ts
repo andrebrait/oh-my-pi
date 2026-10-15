@@ -1517,6 +1517,47 @@ describe("AgentSession auto-compaction queue resume", () => {
 		}
 	}
 
+	const keptAfterSupersession: Array<
+		[supersession: string, supersede: (session: AgentSession) => Promise<unknown>, kept: number]
+	> = [
+		// The session is still the one the message was sent to: only the turn is gone, as when an abort killed a started one.
+		["an abort", session => session.abort(), 1],
+		// The transcript it was sent to is gone, so it must not surface in the new one.
+		["a new session", session => session.newSession(), 0],
+	];
+	for (const [supersession, supersede, kept] of keptAfterSupersession) {
+		it(`keeps a turn-triggering custom message held by idle compaction ${kept ? "in" : "out of"} the transcript after ${supersession}, with no turn`, async () => {
+			const held = await holdIdleCompaction();
+			const sent = session.sendCustomMessage(
+				{ customType: "extension-nudge", content: "act on the nudge", display: false },
+				{ triggerTurn: true },
+			);
+			await scheduler.yield();
+			let superseded = false;
+			const superseding = supersede(session).then(() => {
+				superseded = true;
+			});
+			try {
+				await until(() => superseded, `${supersession} to settle while idle compaction holds`);
+			} finally {
+				await held.finish();
+				await superseding;
+			}
+			expect(await sent).toBe(false);
+			await session.waitForIdle();
+			await flushEventLoop();
+			expect(held.order).not.toContain("agent_start");
+			expect(held.compactedAtRequest).toEqual([]);
+			const transcript = session.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "extension-nudge");
+			const context = session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "extension-nudge",
+			);
+			expect([transcript.length, context.length]).toEqual([kept, kept]);
+		});
+	}
+
 	it("lets an abort settle while a launch completion waits out idle compaction, and delivers it afterwards", async () => {
 		const held = await holdIdleCompaction();
 		const delivered = queueLaunchCompletion(session);

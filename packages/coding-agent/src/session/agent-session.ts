@@ -9191,8 +9191,18 @@ export class AgentSession implements SettingsScope {
 		if (idleCompaction) {
 			const promptGeneration = this.#promptGeneration;
 			await idleCompaction;
-			// An abort, session change or disposal during the wait supersedes the turn this would start.
-			if (this.#isDisposed || this.#promptGeneration !== promptGeneration) return false;
+			// A session change or disposal during the wait drops the message with the transcript it was sent to.
+			if (
+				this.#isDisposed ||
+				(this.#sessionGeneration !== sessionGeneration && (await this.#sessionGenerationChanged(sessionGeneration)))
+			) {
+				return false;
+			}
+			// An abort supersedes only the turn. The message stays in this session's transcript, as it did when the
+			// aborted turn had already started, and is delivered like any message that triggers none.
+			if (this.#promptGeneration !== promptGeneration) {
+				options = { ...options, triggerTurn: false, deliverAs: undefined };
+			}
 		}
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
