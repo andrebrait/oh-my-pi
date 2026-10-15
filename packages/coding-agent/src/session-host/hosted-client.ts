@@ -54,7 +54,13 @@ import {
 	loadReplica,
 	resetReplicaEventState,
 } from "../session/replica-view";
-import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import {
+	reportTernSession,
+	setExtensionTerminalTitle,
+	setSessionTerminalTitle,
+	setTerminalSessionSource,
+	type TerminalSessionSource,
+} from "../utils/title-generator";
 import { connectSessionHost } from "./client";
 import type { SessionHostEntry } from "./registry";
 
@@ -160,6 +166,12 @@ export class HostedClientLink {
 	readonly #replicas = new Set<string>();
 	/** The origin this link published to `ctx.hostOrigin`: the only one it ever withdraws. */
 	#origin: RpcSessionOrigin | undefined;
+	/** The host's session file (none: an unsaved session), as Tern is told to restore it instead of the replica. */
+	#sessionFile: string | undefined;
+	readonly #terminalSession: TerminalSessionSource = {
+		file: () => this.#sessionFile,
+		cwd: () => this.#origin?.cwd ?? this.#ctx.sessionManager.getCwd(),
+	};
 	/** Frames apply strictly in arrival order through this chain. */
 	#chain: Promise<void> = Promise.resolve();
 	readonly #firstSnapshot = Promise.withResolvers<void>();
@@ -481,6 +493,7 @@ export class HostedClientLink {
 				// A relocation notice: the same session, now somewhere else. Links already on screen follow it.
 				if (frame.origin) {
 					this.#setOrigin(frame.origin);
+					await this.#readRelocatedSessionFile();
 					await ctx.refreshTranscriptLinks();
 					if (!this.#open) return;
 				}
@@ -556,6 +569,8 @@ export class HostedClientLink {
 		if (!activated || !this.#open) return;
 		// Before the repaint below: its links resolve against the host this snapshot came from, not the terminal's directory.
 		this.#setOrigin(origin);
+		this.#sessionFile = state.sessionFile;
+		setTerminalSessionSource(this.#terminalSession);
 		// The session switched off every earlier replica of this link after flushing it. One that cannot be removed
 		// now stays owned, for the cleanup when the link ends.
 		for (const superseded of this.#replicas) {
@@ -656,9 +671,32 @@ export class HostedClientLink {
 		clearAssistantMessageLinkTargets(this.#ctx);
 	}
 
-	/** Withdraw the origin this link published, unless something else has replaced it since. */
+	/**
+	 * Withdraw the origin this link published, and the host session it reports to the terminal with it, unless
+	 * something else has replaced them since.
+	 */
 	#retireOrigin(): void {
-		if (this.#origin !== undefined && this.#ctx.hostOrigin === this.#origin) this.#setOrigin(undefined);
+		if (this.#origin === undefined || this.#ctx.hostOrigin !== this.#origin) return;
+		this.#setOrigin(undefined);
+		setTerminalSessionSource(undefined);
+	}
+
+	/** A relocation moved the host's session file, and its notice names only the new directory: read the file back. */
+	async #readRelocatedSessionFile(): Promise<void> {
+		try {
+			const { sessionFile } = await this.#client.getState();
+			if (!this.#open) return;
+			this.#sessionFile = sessionFile;
+		} catch (error) {
+			// Leaving or losing the host fails the request too; those are reported by their own paths.
+			if (this.#open && !this.#lost) {
+				logger.warn("Hosted client could not read the relocated session file", {
+					hostId: this.hostId,
+					error: String(error),
+				});
+			}
+		}
+		if (this.#open) reportTernSession();
 	}
 
 	/**

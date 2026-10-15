@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ensurePrivateDir } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
@@ -22,9 +23,10 @@ import {
 	writeHostEntry,
 } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { attachCommand, resumeCommand } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
 import { type IpcConnection, IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
-import { postmortem } from "@oh-my-pi/pi-utils";
+import { postmortem, setTerminalHeadless, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
@@ -493,5 +495,115 @@ describe("a hosted terminal's shutdown", () => {
 		} finally {
 			await link.detach();
 		}
+	}, 20_000);
+});
+
+function git(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+	return result.stdout.toString().trim();
+}
+
+describe("a hosted terminal's startup automation", () => {
+	it("creates no worktree under worktree.onStart: the host's session stays where it is", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hosted = await HostedMode.open();
+		cfgWorktreeOnStart.set(hosted.local.settings, "create");
+		await hosted.attach(await fixture.entry(host));
+		// The terminal's directory is a primary git checkout with commits: the place `worktree.onStart` acts on.
+		const cwd = hosted.mode.sessionManager.getCwd();
+		const replica = hosted.mode.sessionManager.getSessionFile();
+		git(cwd, "init", "-q", "-b", "main");
+		await Bun.write(path.join(cwd, "tracked.txt"), "base\n");
+		git(cwd, "add", "tracked.txt");
+		git(cwd, "commit", "-q", "-m", "init");
+		const savedCwd = process.cwd();
+		const savedWorktreesDir = setWorktreesDir(path.join(fixture.dir, "worktrees"));
+		try {
+			await hosted.mode.maybeAutoCreateWorktree();
+
+			expect(git(cwd, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+			expect(git(cwd, "branch", "--list", "wt/*")).toBe("");
+			expect(hosted.mode.sessionManager.getCwd()).toBe(cwd);
+			expect(hosted.mode.sessionManager.getSessionFile()).toBe(replica);
+		} finally {
+			process.chdir(savedCwd);
+			setWorktreesDir(savedWorktreesDir);
+		}
+	}, 20_000);
+});
+
+// Tern relaunches `omp --resume <file>` from the session file a terminal advertises after its daemon restarts.
+describe("a hosted terminal in Tern", () => {
+	const SESSION_FILE_VAR = /\x1b\]1337;SetUserVar=omp_session_file(?:=([^\x07]*))?\x07/g;
+	let writes = "";
+	let prevHeadless = false;
+	let ttyDescriptor: PropertyDescriptor | undefined;
+	let prevTermProgram: string | undefined;
+
+	beforeEach(() => {
+		prevHeadless = setTerminalHeadless(true);
+		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		prevTermProgram = Bun.env.TERM_PROGRAM;
+		Bun.env.TERM_PROGRAM = "tern";
+		writes = "";
+		// Restored by the shared `vi.restoreAllMocks`, after the modes close: their teardown still writes.
+		vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			writes += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
+			return true;
+		});
+	});
+
+	afterEach(() => {
+		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+		else Reflect.deleteProperty(process.stdout, "isTTY");
+		if (prevTermProgram === undefined) delete Bun.env.TERM_PROGRAM;
+		else Bun.env.TERM_PROGRAM = prevTermProgram;
+		setTerminalHeadless(prevHeadless);
+	});
+
+	/** Every session file the terminal advertised, oldest first; `undefined`: withdrawn. */
+	function advertised(): (string | undefined)[] {
+		return [...writes.matchAll(SESSION_FILE_VAR)].map(match =>
+			match[1] === undefined ? undefined : Buffer.from(match[1], "base64").toString(),
+		);
+	}
+
+	it("advertises the host's session file, never its replica, through the host's moves and new sessions", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hostFile = host.session.sessionManager.getSessionFile();
+		if (!hostFile) throw new Error("the host has no session file");
+		const hosted = await HostedMode.open();
+		// Only after init: a terminal that is not headless at init owns stdin, and the runner's stdin ending reads as a hangup.
+		setTerminalHeadless(false);
+		await hosted.attach(await fixture.entry(host));
+
+		expect(advertised().at(-1)).toBe(path.resolve(hostFile));
+
+		// `/move` on the host: the session, now somewhere else, is what a relaunch must reopen.
+		const moved = path.join(fixture.dir, "moved-project");
+		await fs.mkdir(moved, { recursive: true });
+		await host.session.moveSession(moved);
+		const movedFile = host.session.sessionManager.getSessionFile();
+		if (!movedFile) throw new Error("the host has no session file after the move");
+		await waitFor(() => advertised().at(-1) === path.resolve(movedFile));
+		expect(writes).toContain(`\x1b]7;file://${os.hostname()}${moved}\x07`);
+
+		await host.session.newSession();
+		const nextFile = host.session.sessionManager.getSessionFile();
+		if (!nextFile || nextFile === hostFile) throw new Error("the host did not move to a new session file");
+		await waitFor(() => advertised().at(-1) === path.resolve(nextFile));
+
+		// Leaving withdraws it: nothing this terminal can resume is left behind.
+		await hosted.mode.hostedClient?.detach();
+		expect(advertised().at(-1)).toBeUndefined();
+		expect(advertised().filter(file => file?.startsWith(hostedReplicaDir()))).toEqual([]);
 	}, 20_000);
 });

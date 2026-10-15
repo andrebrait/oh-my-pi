@@ -262,7 +262,7 @@ omp config set tui.hosted true
 
 #### Working directory
 
-The terminal keeps the directory it was launched in and uses it only locally: it resolves `@file` arguments and appears in the footer with its git state. Tools, shell commands, and edits run in the host's directory, which `omp attach` lists. A host started by the launch runs in the resolved launch directory, and stays there unless `/move` or `/wt` moves the host's session to another directory. Attaching never moves the host to the terminal's directory or the terminal to the host's.
+The terminal keeps the directory it was launched in and uses it only locally: it resolves `@file` arguments and appears in the footer with its git state. Tools, shell commands, and edits run in the host's directory, which `omp attach` lists. A host started by the launch runs in the resolved launch directory, and stays there unless `/move` or `/wt` moves the host's session to another directory. Attaching never moves the host to the terminal's directory or the terminal to the host's, and `worktree.onStart` does not apply to a hosted terminal: no worktree is created or offered for it.
 
 Editor completion is local as well. `@` file suggestions list the terminal's directory, but an `@path` in a sent prompt is resolved by the host, in the host's directory, so the two differ when you attach from another directory. The slash-command menu offers the terminal's built-in commands only: it does not suggest the host's skills, prompt templates, or extension commands, which still work when typed.
 
@@ -281,6 +281,8 @@ Outside a hosted terminal, `/detach` and `/attach` only report that they need a 
 Unsent editor text is not saved when a hosted terminal detaches or exits, and attaching never restores a saved draft. In-process sessions still keep their Ctrl+D draft.
 
 Each terminal keeps its own copy of the host's transcript for rendering, in `<config root>/run/hosted-replicas/` (directory mode `0700`, files `0600`). Copies are not sessions: `/resume` never lists them, and the terminal deletes its own when it leaves. A terminal that dies without running its exit path (`SIGKILL`, an out-of-memory kill, power loss) leaves its copy behind, and nothing removes it: the copies include the transcript and any images, so delete leftover files in that directory by hand.
+
+In Tern, a hosted terminal reports the host's session file and directory, never its copy, and follows the host's session when it is replaced or moved. When Tern relaunches omp on that file after a restart, a launch with `tui.hosted` on attaches to the host that owns the session. Nothing is reported while the host's session is unsaved or after the terminal leaves the host.
 
 #### Connection loss
 
