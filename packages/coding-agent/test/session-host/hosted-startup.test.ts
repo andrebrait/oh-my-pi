@@ -209,6 +209,15 @@ describe("hostLaunchArgs", () => {
 		]);
 		expect(fs.existsSync(args[1])).toBe(true);
 	});
+
+	it("drops the selectors only the spawner sets, so the host publishes where the spawner polls", () => {
+		expect(
+			hostLaunchArgs(
+				["--host-id", "0123456789abcdef", "--host-registry-dir=/elsewhere", "--model", "claude-sonnet-4-5"],
+				dir,
+			),
+		).toEqual(["--model", "claude-sonnet-4-5"]);
+	});
 });
 
 describe("assertHostedLaunchSupported", () => {

@@ -447,6 +447,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 	if (result.systemPrompt !== undefined && result.systemPromptTemplate !== undefined) {
 		throw new CliUsageError("--system-prompt and --system-prompt-template cannot be combined");
 	}
+	// Internal to the hosts spawnSessionHost starts: a stray one would let a launch's argv rename such a host.
+	if (result.mode !== "host" && (result.hostId !== undefined || result.hostRegistryDir !== undefined)) {
+		throw new CliUsageError("--host-id and --host-registry-dir are internal to --mode host");
+	}
 	return result;
 }
 

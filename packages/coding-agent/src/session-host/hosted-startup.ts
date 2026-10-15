@@ -71,6 +71,8 @@ export interface HostedStartup {
  * - `--hide-thinking`: TUI display only.
  * - `--print-thoughts`: print-mode output only; neither a host nor a hosted terminal is print mode.
  * - `--no-title`, `--no-pty`: every `--mode host` process already runs without auto-titles and without a PTY.
+ * - `--host-id`, `--host-registry-dir`: refused outside `--mode host`; `spawnSessionHost` sets its own, and a later
+ *   copy would make the host publish where the spawner never looks.
  */
 const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
 	"--cwd": true,
@@ -79,6 +81,8 @@ const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
 	"--print-thoughts": true,
 	"--no-title": true,
 	"--no-pty": true,
+	"--host-id": true,
+	"--host-registry-dir": true,
 };
 
 /** Launch flags whose value is a path. `--trusted-extension` is absolute by validation; `--cwd` is dropped. */
