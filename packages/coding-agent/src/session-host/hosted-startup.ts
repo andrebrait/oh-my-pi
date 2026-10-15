@@ -10,7 +10,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { getBaseConfigRoot, withFileLock } from "@oh-my-pi/pi-utils";
 import type { Args } from "../cli/args";
-import { flagConsumesValue, PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
+import { PROFILE_BOOTSTRAP_BOUNDARY_ARG, restartArgv } from "../cli/flag-tables";
 import { CliUsageError } from "../cli/usage-error";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -64,29 +64,35 @@ export interface HostedStartup {
 }
 
 /**
+ * Launch flags that change nothing in a host, so a host that already runs the session is attached to despite them
+ * (they still apply to this terminal):
+ * - `--cwd`, `--allow-home`: this process's startup directory; the host is given the resolved one.
+ * - `--hide-thinking`: TUI display only.
+ * - `--print-thoughts`: print-mode output only; neither a host nor a hosted terminal is print mode.
+ * - `--no-title`, `--no-pty`: every `--mode host` process already runs without auto-titles and without a PTY.
+ */
+const TERMINAL_ONLY_FLAGS: Readonly<Record<string, true>> = {
+	"--cwd": true,
+	"--allow-home": true,
+	"--hide-thinking": true,
+	"--print-thoughts": true,
+	"--no-title": true,
+	"--no-pty": true,
+};
+
+/**
  * The launch flags a new host is started with: everything this process was launched with except what only this
- * terminal consumes. Session-source flags (`--resume`, `--continue`, `--fork`, imports), positional prompts and
- * `@file` arguments are dropped (the terminal resolves the session and sends the prompt), and so is `--cwd`, which
- * the host receives already resolved. Taken from the argv as given, never from the lean options the local session
- * is built with, so a host keeps the tools, providers, and extensions that were asked for.
+ * terminal consumes. Session-source flags (`--resume`, `--restore`, `--continue`, `--fork`, imports), positional
+ * prompts and `@file` arguments are dropped (the terminal resolves the session and sends the prompt), and so are
+ * {@link TERMINAL_ONLY_FLAGS}. Taken from the argv as given, never from the lean options the local session is built
+ * with, so a host keeps the tools, providers, and extensions that were asked for.
  */
 export function hostLaunchArgs(rawArgs: readonly string[]): string[] {
-	const configuration = restartArgv(
+	return restartArgv(
 		rawArgs.filter(arg => arg !== PROFILE_BOOTSTRAP_BOUNDARY_ARG),
 		undefined,
+		TERMINAL_ONLY_FLAGS,
 	);
-	const kept: string[] = [];
-	for (let i = 0; i < configuration.length; i++) {
-		const arg = configuration[i];
-		const consumesNext = flagConsumesValue(arg, configuration[i + 1]);
-		if ((arg.startsWith("--") ? arg.split("=", 1)[0] : arg) === "--cwd") {
-			if (consumesNext) i++;
-			continue;
-		}
-		kept.push(arg);
-		if (consumesNext) kept.push(configuration[++i]);
-	}
-	return kept;
 }
 
 /**
