@@ -2257,9 +2257,12 @@
 			"enum": [
 				"get",
 				"create",
+				"replace",
 				"resume",
 				"pause",
-				"drop"
+				"drop",
+				"budget",
+				"guided"
 			],
 			"type": "string"
 		},
@@ -6564,10 +6567,34 @@
 					"$ref": "#/$defs/GoalOp"
 				},
 				"objective": {
-					"type": "string"
+					"type": "string",
+					"description": "`create`/`replace`: the objective."
 				},
 				"token_budget": {
-					"type": "integer"
+					"anyOf": [
+						{
+							"type": "integer"
+						},
+						{
+							"type": "null"
+						}
+					],
+					"description": "`create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it."
+				},
+				"submitObjective": {
+					"type": "boolean",
+					"description": "`create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation."
+				},
+				"images": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "Images submitted with the objective (`submitObjective`) or the `guided` kickoff."
+				},
+				"rough": {
+					"type": "string",
+					"description": "`guided`: the rough idea the interview starts from."
 				}
 			},
 			"required": [

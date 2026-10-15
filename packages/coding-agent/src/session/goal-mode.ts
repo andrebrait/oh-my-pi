@@ -9,12 +9,16 @@
  * session change, and an opt-in continuation driver keyed to agent lifecycle events.
  * The session feeds it events, interrupting aborts and session changes.
  */
+import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
 import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../goals/state";
+import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import { nextActionableTask } from "../tools/todo";
 import type { AgentSession, AgentSessionEvent } from "./agent-session";
+import type { PromptOptions } from "./agent-session-types";
 
 /** The `goal.continuationModes` entry that lets an owner continue goals automatically. */
 export type GoalContinuationMode = "interactive" | "rpc";
@@ -29,12 +33,20 @@ export interface GoalModeOptions {
 	onContinuationDropped?: () => void;
 }
 
-export type RpcGoalOp = "get" | "create" | "resume" | "pause" | "drop";
+export type RpcGoalOp = "get" | "create" | "replace" | "resume" | "pause" | "drop" | "budget" | "guided";
 
 export interface RpcGoalCommand {
 	op: RpcGoalOp;
+	/** `create`/`replace`. */
 	objective?: string;
-	token_budget?: number;
+	/** `create`/`replace`: optional positive budget. `budget`: the new budget, `null` clears it. */
+	token_budget?: number | null;
+	/** `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation. */
+	submitObjective?: boolean;
+	/** Images submitted with the objective (`submitObjective`) or with the `guided` interview kickoff. */
+	images?: ImageContent[];
+	/** `guided`: the rough idea the interview starts from. */
+	rough?: string;
 }
 
 export interface RpcGoalResult {
@@ -55,6 +67,8 @@ export type GoalModeSession = Pick<
 	| "sendGoalModeContext"
 	| "getTodoPhases"
 	| "promptCustomMessage"
+	| "prompt"
+	| "followUp"
 	| "waitForIdle"
 	| "isStreaming"
 	| "isDisposed"
@@ -240,6 +254,8 @@ export class GoalModeController {
 				return this.#state;
 			case "create":
 				return await this.#create(command);
+			case "replace":
+				return await this.#replace(command);
 			case "resume":
 				return await this.#resume();
 			case "pause":
@@ -251,6 +267,10 @@ export class GoalModeController {
 				await this.#session.goalRuntime.dropGoal();
 				await this.#exitTask;
 				return this.#state;
+			case "budget":
+				return await this.#budget(command);
+			case "guided":
+				return await this.#guided(command);
 			default: {
 				const op: never = command.op;
 				throw new Error(`Unknown goal op: ${String(op)}`);
@@ -267,20 +287,38 @@ export class GoalModeController {
 		}
 	}
 
-	async #create(command: RpcGoalCommand): Promise<RpcGoalResult> {
-		this.#assertCanEnter();
-		const objective = command.objective?.trim();
-		if (!objective) throw new Error("objective is required when op=create");
-		const tokenBudget = command.token_budget;
-		if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
-			throw new Error("token_budget must be a positive integer when provided");
-		}
+	#assertNoGoal(): void {
 		const current = this.#session.getGoalModeState();
 		if (current?.enabled) throw new Error("A goal is already active. Drop it before creating another.");
 		if (current?.goal.status === "paused") {
 			throw new Error("Resume or drop the paused goal before creating another.");
 		}
-		await this.#enter(() => this.#session.goalRuntime.createGoal({ objective, tokenBudget }));
+	}
+
+	async #create(command: RpcGoalCommand): Promise<RpcGoalResult> {
+		this.#assertCanEnter();
+		const objective = command.objective?.trim();
+		if (!objective) throw new Error("objective is required when op=create");
+		const tokenBudget = optionalTokenBudget(command.token_budget);
+		this.#assertNoGoal();
+		await this.#enter(
+			() => this.#session.goalRuntime.createGoal({ objective, tokenBudget }),
+			command.submitObjective ? objective : undefined,
+			command.images,
+		);
+		return this.#state;
+	}
+
+	async #replace(command: RpcGoalCommand): Promise<RpcGoalResult> {
+		this.#assertCanEnter();
+		const objective = command.objective?.trim();
+		if (!objective) throw new Error("objective is required when op=replace");
+		const tokenBudget = optionalTokenBudget(command.token_budget);
+		if (!this.#session.getGoalModeState()?.enabled) throw new Error("No active goal to replace.");
+		const state = await this.#session.goalRuntime.replaceGoal({ objective, tokenBudget });
+		this.#session.setGoalModeState(state);
+		this.#resetContinuation();
+		await this.#startTurn(command.submitObjective ? objective : undefined, command.images);
 		return this.#state;
 	}
 
@@ -293,7 +331,49 @@ export class GoalModeController {
 		return this.#state;
 	}
 
-	async #enter(start: () => Promise<GoalModeState>): Promise<void> {
+	async #budget(command: RpcGoalCommand): Promise<RpcGoalResult> {
+		const budget = command.token_budget;
+		if (budget !== null && (budget === undefined || !Number.isInteger(budget) || budget <= 0)) {
+			throw new Error("token_budget must be a positive integer, or null to clear it");
+		}
+		const current = this.#session.getGoalModeState();
+		if (!current?.enabled) throw new Error("No active goal.");
+		if (current.goal.status === "complete") throw new Error("Goal is already complete.");
+		await this.#session.goalRuntime.onBudgetMutated(budget ?? undefined);
+		// A raised budget may let a budget-limited goal continue.
+		this.#resetContinuation();
+		this.#scheduleContinuation();
+		return this.#state;
+	}
+
+	/**
+	 * Start the guided-goal interview: expose the `goal` tool before any goal exists, so the
+	 * agent can finish with `goal create`, and send the interview kickoff as a hidden message,
+	 * queued behind a run in flight. The eventual goal's exit restores the pre-interview tools.
+	 */
+	async #guided(command: RpcGoalCommand): Promise<RpcGoalResult> {
+		this.#assertCanEnter();
+		this.#assertNoGoal();
+		const session = this.#session;
+		const enabledTools = session.getEnabledToolNames();
+		this.#previousTools ??= enabledTools;
+		if (!enabledTools.includes("goal")) await session.setActiveToolsByName([...enabledTools, "goal"]);
+		const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: command.rough?.trim() || undefined });
+		const images = command.images?.length ? command.images : undefined;
+		if (session.isStreaming) {
+			await session.followUp(kickoff, images, { synthetic: true });
+			return this.#state;
+		}
+		try {
+			await this.#submit(kickoff, { synthetic: true, images });
+		} catch (error) {
+			if (!(error instanceof AgentBusyError)) throw error;
+			await session.followUp(kickoff, images, { synthetic: true });
+		}
+		return this.#state;
+	}
+
+	async #enter(start: () => Promise<GoalModeState>, objective?: string, images?: ImageContent[]): Promise<void> {
 		// The pre-goal tool set is captured once, when this controller first adds `goal`
 		// (a reattached paused goal already holds it). A `goal` tool the host enabled
 		// before the goal stays enabled afterwards.
@@ -303,11 +383,34 @@ export class GoalModeController {
 		await this.#session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 		this.#session.setGoalModeState(state);
 		this.#resetContinuation();
-		if (this.#session.isStreaming) {
-			await this.#session.sendGoalModeContext({ deliverAs: "steer" });
-			return;
+		await this.#startTurn(objective, images);
+	}
+
+	/**
+	 * The goal's first turn: `objective` as a user prompt (steering a run in flight), or else a
+	 * continuation once idle. A run in flight is told about the goal either way.
+	 */
+	async #startTurn(objective: string | undefined, images: ImageContent[] | undefined): Promise<void> {
+		const streaming = this.#session.isStreaming;
+		if (streaming) await this.#session.sendGoalModeContext({ deliverAs: "steer" });
+		if (objective) {
+			await this.#submit(objective, { streamingBehavior: "steer", images: images?.length ? images : undefined });
+		} else if (!streaming) {
+			this.#scheduleContinuation();
 		}
-		this.#scheduleContinuation();
+	}
+
+	/** Submit a prompt and resolve once it is admitted, not when its turn ends. A failure before admission throws. */
+	async #submit(text: string, options: PromptOptions): Promise<void> {
+		const admitted = Promise.withResolvers<void>();
+		this.#session.prompt(text, { ...options, onPromptAdmitted: () => admitted.resolve() }).then(
+			() => admitted.resolve(),
+			(error: unknown) => {
+				admitted.reject(error);
+				reportControllerError(error);
+			},
+		);
+		await admitted.promise;
 	}
 
 	/** Restore the pre-goal tool set. Idempotent. */
@@ -506,6 +609,15 @@ export class GoalModeController {
 			reportControllerError(error);
 		});
 	}
+}
+
+/** A `create`/`replace` budget: absent, or a positive integer. */
+function optionalTokenBudget(value: number | null | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	if (value === null || !Number.isInteger(value) || value <= 0) {
+		throw new Error("token_budget must be a positive integer when provided");
+	}
+	return value;
 }
 
 function reportControllerError(error: unknown): void {

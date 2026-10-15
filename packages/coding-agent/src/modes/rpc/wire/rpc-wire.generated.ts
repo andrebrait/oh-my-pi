@@ -381,7 +381,7 @@ export type MessageUpdates = "full" | "delta";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
 
-export type GoalOp = "get" | "create" | "resume" | "pause" | "drop";
+export type GoalOp = "get" | "create" | "replace" | "resume" | "pause" | "drop" | "budget" | "guided";
 
 export type GoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
 
@@ -1683,8 +1683,16 @@ export interface SetSlowModeResult {
 
 export interface GoalParams {
 	op: GoalOp;
+	/** `create`/`replace`: the objective. */
 	objective?: string;
-	token_budget?: number;
+	/** `create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it. */
+	token_budget?: number | null;
+	/** `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation. */
+	submitObjective?: boolean;
+	/** Images submitted with the objective (`submitObjective`) or the `guided` kickoff. */
+	images?: ImageContent[];
+	/** `guided`: the rough idea the interview starts from. */
+	rough?: string;
 }
 
 export interface SetAskDialogParams {

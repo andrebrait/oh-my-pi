@@ -560,9 +560,23 @@ including those made by the agent's `goal` tool.
 - `create` needs `goal.enabled`, a non-empty `objective`, and no active or paused
   goal. It is refused in plan mode, and `token_budget` must be a positive integer.
   It adds the `goal` tool to the active tools.
+- `replace` swaps the objective (and optional `token_budget`) of the active goal,
+  as `/goal set` does over an active goal; a run in flight is told about it.
+- `create` and `replace` take `submitObjective: true` (and optional `images`): the
+  objective is then submitted as a user prompt, visible once, as the goal's first
+  turn instead of a hidden continuation. The command answers once the prompt is
+  admitted, not when its turn ends.
+- `budget` sets the active goal's `token_budget` (a positive integer); `null` clears
+  it. It is refused for a paused or completed goal. A raised budget lets a
+  budget-limited goal continue.
+- `guided` starts the `/guided-goal` interview: it adds the `goal` tool before any
+  goal exists, so the agent can finish with `goal create`, and sends the interview
+  as a hidden message (optional `rough` idea and `images`), queued behind a run in
+  flight. It is refused like `create` over an active or paused goal.
 - `resume` resumes a paused goal (refused in plan mode). `pause` and `drop` restore
   the active tools from before the goal started.
-- Failures are ordinary `success: false` responses.
+- Failures are ordinary `success: false` responses. On a session host the command
+  takes the usual `ifEpoch`/`ifLeaf` write preconditions.
 
 Goals do not continue on their own over RPC unless `goal.continuationModes`
 contains `"rpc"`; this covers `--mode rpc` and `--mode rpc-ui`. A session host

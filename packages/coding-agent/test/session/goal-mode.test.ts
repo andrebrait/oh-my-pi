@@ -10,10 +10,10 @@ import {
 	type RpcSettleSession,
 	watchedScheduledTurnProbe,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-settle";
-import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { GoalModeController, type GoalModeSession } from "@oh-my-pi/pi-coding-agent/session/goal-mode";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 import { createTestSession, isolateAgentDir } from "../helpers/rpc-server-harness";
 
 function nextMacrotask(): Promise<void> {
@@ -64,6 +64,117 @@ describe("session-owned goal mode", () => {
 			restoreAgentDir();
 			await removeWithRetries(dir);
 		}
+	});
+});
+
+describe("goal ops", () => {
+	/** A real session with goal mode enabled for `--mode rpc` (continuation only when `continuation`). */
+	async function withGoalSession(
+		continuation: boolean,
+		run: (session: AgentSession, goalMode: GoalModeController) => Promise<void>,
+	): Promise<void> {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-goal-ops-"));
+		const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
+		const session = await createTestSession(
+			dir,
+			{ handler: { content: ["ok"] } },
+			undefined,
+			continuation ? { settings: { "goal.continuationModes": ["rpc"] } } : {},
+		);
+		try {
+			await run(session, session.enableGoalMode({ mode: "rpc", delayMs: 0 }));
+		} finally {
+			await session.dispose();
+			restoreAgentDir();
+			await removeWithRetries(dir);
+		}
+	}
+
+	/** Resolves after `count` terminal `agent_end` events from now. */
+	function terminalAgentEnds(session: AgentSession, count: number): Promise<void> {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let seen = 0;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type !== "agent_end" || event.isTerminal === false || ++seen < count) return;
+			unsubscribe();
+			resolve();
+		});
+		return withTimeout(promise, 15_000, `${count} terminal agent_end never arrived`);
+	}
+
+	const userTexts = (session: AgentSession): string[] =>
+		session.messages.flatMap(message => (message.role === "user" ? [JSON.stringify(message.content)] : []));
+
+	test("create with submitObjective submits the objective as one user prompt before any continuation", async () => {
+		await withGoalSession(true, async (session, goalMode) => {
+			// The objective's own turn, then one continuation that makes no progress.
+			const turns = terminalAgentEnds(session, 2);
+			await goalMode.handle({ op: "create", objective: "ship the release", submitObjective: true });
+			await turns;
+			// User turns and hidden continuations, in order (each turn also carries a goal-mode context message).
+			const kinds = session.messages.flatMap(message =>
+				message.role === "user"
+					? ["user"]
+					: message.role === "custom" && message.customType === "goal-continuation"
+						? [message.customType]
+						: [],
+			);
+			expect(kinds).toEqual(["user", "goal-continuation"]);
+			expect(userTexts(session).filter(text => text.includes("ship the release"))).toHaveLength(1);
+		});
+	});
+
+	test("replace swaps an active goal's objective and submits it once; without an active goal it is refused", async () => {
+		await withGoalSession(false, async (session, goalMode) => {
+			await expect(goalMode.handle({ op: "replace", objective: "nothing to replace" })).rejects.toThrow(
+				"No active goal to replace.",
+			);
+			await goalMode.handle({ op: "create", objective: "first objective" });
+			const turn = terminalAgentEnds(session, 1);
+			const replaced = await goalMode.handle({
+				op: "replace",
+				objective: "second objective",
+				token_budget: 7000,
+				submitObjective: true,
+			});
+			await turn;
+			expect(replaced.goal).toMatchObject({ objective: "second objective", status: "active", tokenBudget: 7000 });
+			expect(userTexts(session).filter(text => text.includes("second objective"))).toHaveLength(1);
+			expect(userTexts(session).some(text => text.includes("first objective"))).toBe(false);
+		});
+	});
+
+	test("budget changes an active goal's budget and null clears it; a paused goal or a bad budget is refused", async () => {
+		await withGoalSession(false, async (_session, goalMode) => {
+			await goalMode.handle({ op: "create", objective: "budgeted", token_budget: 5000 });
+			expect((await goalMode.handle({ op: "budget", token_budget: 9000 })).goal?.tokenBudget).toBe(9000);
+			expect((await goalMode.handle({ op: "budget", token_budget: null })).goal?.tokenBudget).toBeUndefined();
+			await expect(goalMode.handle({ op: "budget", token_budget: 0 })).rejects.toThrow(
+				"token_budget must be a positive integer, or null to clear it",
+			);
+			await expect(goalMode.handle({ op: "budget" })).rejects.toThrow(
+				"token_budget must be a positive integer, or null to clear it",
+			);
+			await goalMode.handle({ op: "pause" });
+			await expect(goalMode.handle({ op: "budget", token_budget: 100 })).rejects.toThrow("No active goal.");
+		});
+	});
+
+	// This harness session registers no tools, so the `goal` tool's exposure is covered over RPC (test/rpc-goal.test.ts).
+	test("guided sends the interview kickoff as a hidden message", async () => {
+		await withGoalSession(false, async (session, goalMode) => {
+			const turn = terminalAgentEnds(session, 1);
+			const result = await goalMode.handle({ op: "guided", rough: "ship the release" });
+			await turn;
+			expect(result).toEqual({ goal: null, state: null });
+			// The kickoff is the guided-goal interview prompt around the rough idea, never a user message.
+			expect(userTexts(session)).toEqual([]);
+			expect(JSON.stringify(session.messages)).toContain("<rough-goal>");
+			expect(JSON.stringify(session.messages)).toContain("ship the release");
+			// An active or paused goal refuses it, like create.
+			await goalMode.handle({ op: "create", objective: "now a goal" });
+			await expect(goalMode.handle({ op: "guided" })).rejects.toThrow("A goal is already active.");
+		});
 	});
 });
 

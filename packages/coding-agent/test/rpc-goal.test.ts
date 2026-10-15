@@ -395,4 +395,38 @@ describe("RPC goal command", () => {
 		// own result must not claim the session settled.
 		expect([...results.values()]).toEqual([false]);
 	}, 30_000);
+
+	test("replace submits the new objective once, budget null clears it, guided is refused over an active goal", async () => {
+		const rpc = await start({ continuation: false, script: "idle" });
+		await rpc.goal("create", { objective: "first objective", tokenBudget: 5000 });
+		await untilSettled(rpc, "Replace", () =>
+			rpc.goal("replace", { objective: "second objective", submitObjective: true }),
+		);
+		const userTexts = (await rpc.getMessages()).flatMap(message =>
+			message.role === "user" ? [JSON.stringify(message.content)] : [],
+		);
+		expect(userTexts.filter(text => text.includes("second objective"))).toHaveLength(1);
+		expect((await rpc.getState()).goal?.goal).toMatchObject({ objective: "second objective", status: "active" });
+
+		expect((await rpc.goal("budget", { tokenBudget: 9000 })).goal?.tokenBudget).toBe(9000);
+		expect((await rpc.goal("budget", { tokenBudget: null })).goal?.tokenBudget).toBeUndefined();
+		expect(await rejectionOf(rpc.goal("guided", { rough: "another" }))).toMatchObject({ command: "goal" });
+		await rpc.goal("pause");
+		expect(await rejectionOf(rpc.goal("budget", { tokenBudget: 100 }))).toMatchObject({
+			command: "goal",
+			message: "No active goal.",
+		});
+	}, 30_000);
+
+	test("guided exposes the goal tool before any goal and sends the interview as a hidden message", async () => {
+		const rpc = await start({ continuation: false, script: "idle" });
+		expect((await rpc.getState()).dumpTools?.map(tool => tool.name)).not.toContain("goal");
+		await untilSettled(rpc, "Guided", () => rpc.goal("guided", { rough: "ship the release" }));
+		const state = await rpc.getState();
+		expect(state.goal).toBeNull();
+		expect(state.dumpTools?.map(tool => tool.name)).toContain("goal");
+		const messages = await rpc.getMessages();
+		expect(messages.filter(message => message.role === "user")).toEqual([]);
+		expect(JSON.stringify(messages)).toContain("<rough-goal>");
+	}, 30_000);
 });

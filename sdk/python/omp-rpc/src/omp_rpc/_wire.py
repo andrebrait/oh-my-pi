@@ -98,8 +98,8 @@ _TODO_STATUS_VALUES: Final[frozenset[str]] = frozenset({"pending", "in_progress"
 _decode_todo_status = cast("Decoder[TodoStatus]", literal(_TODO_STATUS_VALUES))
 
 
-GoalOp: TypeAlias = Literal["get", "create", "resume", "pause", "drop"]
-_GOAL_OP_VALUES: Final[frozenset[str]] = frozenset({"get", "create", "resume", "pause", "drop"})
+GoalOp: TypeAlias = Literal["get", "create", "replace", "resume", "pause", "drop", "budget", "guided"]
+_GOAL_OP_VALUES: Final[frozenset[str]] = frozenset({"get", "create", "replace", "resume", "pause", "drop", "budget", "guided"})
 _decode_goal_op = cast("Decoder[GoalOp]", literal(_GOAL_OP_VALUES))
 
 
@@ -3457,7 +3457,7 @@ class WireClient:
         params["enabled"] = enabled
         return required(expect_object(self._command("set_slow_mode", params), "set_slow_mode"), "enabled", decode_bool, "set_slow_mode")
 
-    def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None = None) -> GoalResult:
+    def goal(self, op: GoalOp, *, objective: str | None = None, token_budget: int | None | None = None, submit_objective: bool | None = None, images: Sequence[ImageContent] | None = None, rough: str | None = None) -> GoalResult:
         """Read or change goal mode with the lifecycle of the interactive `/goal` command."""
         params: dict[str, object] = {}
         params["op"] = op
@@ -3465,6 +3465,12 @@ class WireClient:
             params["objective"] = objective
         if token_budget is not None:
             params["token_budget"] = token_budget
+        if submit_objective is not None:
+            params["submitObjective"] = submit_objective
+        if images is not None:
+            params["images"] = list(images)
+        if rough is not None:
+            params["rough"] = rough
         return parse_goal_result(self._command("goal", params), "goal")
 
     def set_ask_dialog(self, enabled: bool) -> bool:

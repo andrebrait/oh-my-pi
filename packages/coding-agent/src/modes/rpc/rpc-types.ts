@@ -90,7 +90,10 @@ type RpcCommandBody =
 			type: "goal";
 			op: RpcGoalOp;
 			objective?: string;
-			token_budget?: number;
+			token_budget?: number | null;
+			submitObjective?: boolean;
+			images?: ImageContent[];
+			rough?: string;
 	  }
 	| { id?: string; type: "set_ask_dialog"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }

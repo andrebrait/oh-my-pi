@@ -1996,11 +1996,14 @@ func (v *TodoStatus) UnmarshalJSON(data []byte) error {
 type GoalOp string
 
 const (
-	GoalOpGet    GoalOp = "get"
-	GoalOpCreate GoalOp = "create"
-	GoalOpResume GoalOp = "resume"
-	GoalOpPause  GoalOp = "pause"
-	GoalOpDrop   GoalOp = "drop"
+	GoalOpGet     GoalOp = "get"
+	GoalOpCreate  GoalOp = "create"
+	GoalOpReplace GoalOp = "replace"
+	GoalOpResume  GoalOp = "resume"
+	GoalOpPause   GoalOp = "pause"
+	GoalOpDrop    GoalOp = "drop"
+	GoalOpBudget  GoalOp = "budget"
+	GoalOpGuided  GoalOp = "guided"
 )
 
 func (v *GoalOp) UnmarshalJSON(data []byte) error {
@@ -2009,7 +2012,7 @@ func (v *GoalOp) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := GoalOp(s); value {
-	case GoalOpGet, GoalOpCreate, GoalOpResume, GoalOpPause, GoalOpDrop:
+	case GoalOpGet, GoalOpCreate, GoalOpReplace, GoalOpResume, GoalOpPause, GoalOpDrop, GoalOpBudget, GoalOpGuided:
 		*v = value
 		return nil
 	}
@@ -7981,9 +7984,17 @@ func (c Commands) SetSlowMode(ctx context.Context, p SetSlowModeCommand) (bool, 
 
 // GoalCommand holds the parameters of "goal".
 type GoalCommand struct {
-	Op          GoalOp  `json:"op"`
-	Objective   *string `json:"objective,omitempty"`
-	TokenBudget *int64  `json:"token_budget,omitempty"`
+	Op GoalOp `json:"op"`
+	// `create`/`replace`: the objective.
+	Objective *string `json:"objective,omitempty"`
+	// `create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.
+	TokenBudget *int64 `json:"token_budget,omitempty"`
+	// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.
+	SubmitObjective *bool `json:"submitObjective,omitempty"`
+	// Images submitted with the objective (`submitObjective`) or the `guided` kickoff.
+	Images []ImageContent `json:"images,omitempty"`
+	// `guided`: the rough idea the interview starts from.
+	Rough *string `json:"rough,omitempty"`
 }
 
 // Goal sends "goal": Read or change goal mode with the lifecycle of the interactive `/goal` command.

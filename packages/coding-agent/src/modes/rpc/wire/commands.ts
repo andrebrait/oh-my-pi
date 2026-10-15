@@ -120,7 +120,23 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "goal",
 		doc: "Read or change goal mode with the lifecycle of the interactive `/goal` command.",
-		params: { op: "GoalOp", "objective?": "string", "token_budget?": "number.integer" },
+		params: {
+			op: "GoalOp",
+			"objective?": doc("string", "`create`/`replace`: the objective."),
+			"token_budget?": doc(
+				"number.integer | null",
+				"`create`/`replace`: optional positive budget. `budget`: the new budget; `null` clears it.",
+			),
+			"submitObjective?": doc(
+				"boolean",
+				"`create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.",
+			),
+			"images?": doc(
+				"ImageContent[]",
+				"Images submitted with the objective (`submitObjective`) or the `guided` kickoff.",
+			),
+			"rough?": doc("string", "`guided`: the rough idea the interview starts from."),
+		},
 		result: "GoalResult",
 	},
 	{
