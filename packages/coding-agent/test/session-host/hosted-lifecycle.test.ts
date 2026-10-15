@@ -930,12 +930,34 @@ describe("goal mode in a hosted terminal", () => {
 		// The agent completed it; the host journals it after that turn's end and sends no update.
 		await host.session.goalRuntime.completeGoalFromTool();
 		await waitFor(() => terminal.local.getGoalModeState()?.mode === "exiting");
+		const status = vi.spyOn(terminal.mode.statusLine, "setGoalModeStatus");
 
 		await seedTurn(host, "wrap up");
 
 		await waitFor(() => terminal.local.getGoalModeState() === undefined);
 		expect(host.session.getGoalModeState()).toBeUndefined();
+		// The status line was repainted once the goal was cleared.
+		expect(status).toHaveBeenCalled();
+		expect(status).toHaveBeenLastCalledWith(undefined);
 	}, 20_000);
+
+	it("a goal dropped from one terminal is gone from every terminal", async () => {
+		const host = await fixture.startHost();
+		const a = await attachedMode(host);
+		const b = await attachedMode(host);
+		await executeBuiltinSlashCommand("/goal ship the release", { ctx: a.mode });
+		await waitFor(() => b.mode.goalModeEnabled);
+		vi.spyOn(a.mode, "showHookConfirm").mockResolvedValue(true);
+
+		await executeBuiltinSlashCommand("/goal drop", { ctx: a.mode });
+
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		expect(a.local.getGoalModeState()).toBeUndefined();
+		await waitFor(() => b.local.getGoalModeState() === undefined);
+		const shown = vi.spyOn(b.mode, "showStatus");
+		await executeBuiltinSlashCommand("/goal show", { ctx: b.mode });
+		expect(shown).toHaveBeenCalledWith("No goal set.");
+	}, 30_000);
 
 	it("a goal op from a stale view is refused by the host", async () => {
 		const host = await fixture.startHost();

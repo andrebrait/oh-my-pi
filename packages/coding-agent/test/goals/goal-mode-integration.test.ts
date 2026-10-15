@@ -11,7 +11,7 @@ import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mod
 import { Text } from "@oh-my-pi/pi-tui";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -577,11 +577,14 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(content).not.toContain("Run focused checks");
 	});
 
-	/** The controller decides to continue (as at a goal turn's end) with fake timers on and the terminal waiting for input. */
+	/** A turn's terminal `agent_end`, as the session feeds it to its goal controller. */
+	const turnEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
+
+	/** A turn ends (the controller decides to continue) with fake timers on and the terminal waiting for input. */
 	async function decideContinuation(): Promise<void> {
 		vi.useFakeTimers();
 		await armInputWaiter(harness.mode);
-		harness.session.goalMode?.reschedule();
+		harness.session.goalMode?.observe(turnEnd);
 	}
 
 	it("admits a decided continuation after 800 ms, not before", async () => {
@@ -712,7 +715,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.goalMode?.continuationPending).toBe(false);
 
 		harness.session.setTodoPhases(pending);
-		harness.session.goalMode?.reschedule();
+		harness.session.goalMode?.observe(turnEnd);
 		await passContinuationWindow();
 		expect(admitted).toEqual(["goal-continuation"]);
 	});
@@ -746,31 +749,41 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModePaused).toBe(true);
 	});
 
+	it("a continuation held back when Esc pauses the goal never fires at its old time after a resume", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		harness.mode.editor.setText("half-typed reply");
+		await decideContinuation();
+		// Held by the draft at 800 ms: it waits again, next due at 1600 ms.
+		await passContinuationWindow();
+		vi.advanceTimersByTime(200);
+		await nextMacrotask();
+		await harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+		harness.mode.editor.setText("");
+		// The resumed goal's own continuation is due 800 ms from now (1800 ms).
+		vi.spyOn(harness.mode, "showStatus").mockImplementation(() => {});
+		await harness.mode.handleGoalModeCommand("resume");
+
+		vi.advanceTimersByTime(600);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		vi.advanceTimersByTime(200);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
 	it("waits until the terminal waits for input", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
 
-		harness.session.goalMode?.reschedule();
+		harness.session.goalMode?.observe(turnEnd);
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
 
 		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual(["goal-continuation"]);
-	});
-
-	it("a reschedule during a run waits for that run to end", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		const admitted = recordContinuations(harness.session);
-		vi.useFakeTimers();
-		await armInputWaiter(harness.mode);
-		Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
-
-		harness.session.goalMode?.reschedule();
-		expect(harness.session.goalMode?.continuationPending).toBe(false);
-		await passContinuationWindow();
-		expect(admitted).toEqual([]);
 	});
 
 	it("an active goal left by a switch to a plan-mode session keeps the plan-mode tools", async () => {

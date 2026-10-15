@@ -698,7 +698,10 @@ export class HostedClientLink {
 				break;
 			case "goal_updated":
 				// Mirror the host's goal into the replica, so goal flags, menus and the status line read it.
-				this.#ctx.session.setGoalModeState(event.state ?? undefined);
+				// A dropped goal is gone on the host (it journals no further state), so it is gone here too.
+				this.#ctx.session.setGoalModeState(
+					event.state?.goal.status === "dropped" ? undefined : (event.state ?? undefined),
+				);
 				this.#ctx.handleGoalSessionEvent(event);
 				break;
 			case "agent_end":

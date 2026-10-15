@@ -172,13 +172,6 @@ export class GoalModeController {
 		this.#continuationGeneration++;
 	}
 
-	/** Re-check continuation now, after something other than the session's own events may have allowed it. */
-	reschedule(): void {
-		// A run in flight decides at its own end, after the full wait.
-		if (this.#session.isStreaming) return;
-		this.#scheduleContinuation();
-	}
-
 	get #state(): RpcGoalResult {
 		const state = this.#session.getGoalModeState();
 		return { goal: state?.goal ?? null, state: state ?? null };
