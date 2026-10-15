@@ -821,3 +821,48 @@ describe("session host", () => {
 		await host.stop();
 	});
 });
+
+describe("session host goal mode", () => {
+	const continuations = (session: AgentSession): number =>
+		session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation")
+			.length;
+	/** The host decided nothing more: no goal turn waiting, none running. */
+	const quiet = (session: AgentSession): boolean =>
+		session.goalMode?.continuationPending === false && !session.isStreaming && !session.hasAdmittedSubmission;
+
+	it("a session host continues an active goal with default settings and no client attached", async () => {
+		const host = await startHost();
+		// Attaching waits for the host's startup reattach, which would otherwise clear a goal set before it.
+		await (await attachClient(host)).detach();
+		await waitFor(async () => (await onlyEntry()).clients === 0);
+		const goalMode = host.session.goalMode;
+		if (!goalMode) throw new Error("the host did not enable goal mode");
+		await goalMode.handle({ op: "create", objective: "keep going" });
+		await waitFor(() => continuations(host.session) === 1 && quiet(host.session));
+		// The continuation made no progress, so the loop stopped after it.
+		expect(continuations(host.session)).toBe(1);
+		expect(host.session.getGoalModeState()?.goal.status).toBe("active");
+		await host.stop();
+	});
+
+	it("two clients see one continuation per idle", async () => {
+		const host = await startHost();
+		const a = await attachClient(host);
+		const b = await attachClient(host);
+		await a.goal("create", { objective: "keep going" });
+		await waitFor(() => continuations(host.session) === 1 && quiet(host.session));
+		// Input from either client re-arms the goal; its idle continues once, not once per client.
+		await b.promptAndWait("go on");
+		await waitFor(() => continuations(host.session) === 2 && quiet(host.session));
+		expect(continuations(host.session)).toBe(2);
+		for (const client of [a, b]) {
+			const seen = (await client.getMessages()).filter(
+				message => message.role === "custom" && message.customType === "goal-continuation",
+			);
+			expect(seen).toHaveLength(2);
+		}
+		await a.detach();
+		await b.detach();
+		await host.stop();
+	});
+});

@@ -29,7 +29,7 @@ import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-sel
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
-import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
+import type { RpcGoalOp, RpcGoalResult } from "../../session/goal-mode";
 import type { BtwHistoryRecord } from "../../session/btw-history";
 
 // ============================================================================

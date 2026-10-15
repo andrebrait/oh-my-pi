@@ -565,9 +565,12 @@ including those made by the agent's `goal` tool.
 - Failures are ordinary `success: false` responses.
 
 Goals do not continue on their own over RPC unless `goal.continuationModes`
-contains `"rpc"`; this covers `--mode rpc`, `--mode rpc-ui` and `--mode host`. When enabled,
-`create`/`resume` and each terminal `agent_end` decide whether to start another goal
-turn, sent as a hidden `goal-continuation` message.
+contains `"rpc"`; this covers `--mode rpc` and `--mode rpc-ui`. A session host
+(`--mode host`) counts as `"interactive"`, like the in-process TUI it stands in for,
+so default settings continue goals there whether or not a client is attached, once
+per idle whatever the number of clients, about 800 ms after the run yields. When
+enabled, `create`/`resume` and each terminal `agent_end` decide whether to start
+another goal turn, sent as a hidden `goal-continuation` message.
 
 - The turn starts once the yielding run has fully unwound. At that moment the goal
   must still be active, the session idle with nothing queued, plan mode off, open
@@ -575,9 +578,10 @@ turn, sent as a hidden `goal-continuation` message.
 - While the turn is decided but not yet started, `get_state.isSettled`,
   `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
   `session_settled` follows if the continuation is abandoned.
-- `abort` stops continuation before the abort takes effect and pauses the
-  interrupted goal, so a later prompt does not restart it; only `goal resume` does
-  (or `drop` and a new `create`).
+- An interrupting abort (`abort`, `abort_and_prompt`, `abort_and_restore_queue`, or an
+  extension's `ctx.abort()`) stops continuation before the abort takes effect and
+  pauses the interrupted goal, so a later prompt does not restart it; only
+  `goal resume` does (or `drop` and a new `create`).
 - Continuation also stops after a goal turn with no new tool activity. The next
   turn that is not itself a goal continuation (a host prompt, steer or follow-up,
   for example) re-arms it.

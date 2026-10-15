@@ -1,22 +1,33 @@
 /**
- * Goal mode for RPC hosts (`--mode rpc` and `--mode rpc-ui`).
+ * Goal mode owned by the session: one controller per {@link AgentSession}, whichever
+ * owner (in-process TUI, `--mode rpc`, session host) opted it in, so a goal continues
+ * exactly once with zero or many clients.
  *
  * The durable lifecycle (create/resume/pause/drop, accounting, persistence) is
- * `GoalRuntime`, shared with the TUI and the `goal` tool. This controller adds
- * what `InteractiveMode` otherwise owns: the goal tool's place in the active
- * tool set, completion/drop exit, reattach after a session change, and an
- * opt-in continuation driver keyed to agent lifecycle events instead of an
- * editor idle window.
+ * `GoalRuntime`, shared with the TUI and the `goal` tool. This controller adds the
+ * goal tool's place in the active tool set, completion/drop exit, reattach after a
+ * session change, and an opt-in continuation driver keyed to agent lifecycle events.
+ * The session feeds it events, interrupting aborts and session changes.
  */
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import { logger } from "@oh-my-pi/pi-utils";
-import { cfgGoalContinuationModes, cfgGoalEnabled } from "../../goals/settings";
-import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../../goals/state";
-import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
-import { nextActionableTask } from "../../tools/todo";
+import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
+import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../goals/state";
+import { nextActionableTask } from "../tools/todo";
+import type { AgentSession, AgentSessionEvent } from "./agent-session";
 
-/** `goal.continuationModes` value that enables automatic continuation for RPC hosts. */
-export const RPC_GOAL_CONTINUATION_MODE = "rpc";
+/** The `goal.continuationModes` entry that lets an owner continue goals automatically. */
+export type GoalContinuationMode = "interactive" | "rpc";
+
+export interface GoalModeOptions {
+	mode: GoalContinuationMode;
+	/** Wait before a decided continuation is admitted (0: the next macrotask). */
+	delayMs: number;
+	/** Owner-side condition that holds continuation back (for example a draft being composed); see {@link GoalModeController.reschedule}. */
+	isBlocked?: () => boolean;
+	/** Called when a pending continuation is abandoned (a gate closed while it waited), so settle reporting can re-check. */
+	onContinuationDropped?: () => void;
+}
 
 export type RpcGoalOp = "get" | "create" | "resume" | "pause" | "drop";
 
@@ -31,7 +42,7 @@ export interface RpcGoalResult {
 	state: GoalModeState | null;
 }
 
-export type RpcGoalSession = Pick<
+export type GoalModeSession = Pick<
 	AgentSession,
 	| "settings"
 	| "sessionManager"
@@ -52,25 +63,28 @@ export type RpcGoalSession = Pick<
 	| "queuedMessageCount"
 >;
 
-export class RpcGoalController {
-	readonly #session: RpcGoalSession;
+export class GoalModeController {
+	readonly #session: GoalModeSession;
+	readonly #options: GoalModeOptions;
 	/** Active tool set before goal mode added `goal`; restored when the goal ends. */
 	#previousTools: string[] | undefined;
 	/** Continuation turns submitted whose terminal `agent_end` has not arrived. */
 	#pendingContinuationTurns = 0;
 	#previousContinuationActivity: string | undefined;
-	/** A continuation turn made no new progress; wait for the host before continuing. */
+	/** A continuation turn made no new progress; wait for input before continuing. */
 	#suppressContinuation = false;
 	/**
-	 * Set by a host abort; only host action (a prompt, or `goal create`/`resume`) clears it.
+	 * Set by an interrupting abort; only new input (a prompt, or `goal create`/`resume`) clears it.
 	 * Unlike {@link #suppressContinuation}, no turn's `agent_end` can re-arm it, so the
 	 * aborted turn's own end cannot schedule another goal turn whatever its activity.
 	 */
-	#hostStopped = false;
+	#abortStopped = false;
 	/** A continuation has been decided and is waiting for the session to go idle. */
 	#continuationScheduled = false;
-	/** Bumped by a host abort or session change; a waiting continuation from before is void. */
+	/** Bumped by an abort or session change; a waiting continuation from before is void. */
 	#continuationGeneration = 0;
+	/** Resolves once the outermost in-progress session change has reattached the goal; see {@link reattached}. */
+	#reattach: PromiseWithResolvers<void> | undefined;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
 	#exitTask: Promise<void> = Promise.resolve();
 	/** Session changes in progress; goal turns are held until they end. */
@@ -89,15 +103,10 @@ export class RpcGoalController {
 	 * reconcile again (after it) when the change ends, whatever the ids say.
 	 */
 	#changeOverlappedReconcile = false;
-	readonly #onContinuationDropped: (() => void) | undefined;
 
-	/**
-	 * @param onContinuationDropped called when a pending continuation is abandoned
-	 *   (a gate closed while it waited), so settle reporting can re-check.
-	 */
-	constructor(session: RpcGoalSession, onContinuationDropped?: () => void) {
+	constructor(session: GoalModeSession, options: GoalModeOptions) {
 		this.#session = session;
-		this.#onContinuationDropped = onContinuationDropped;
+		this.#options = options;
 	}
 
 	/**
@@ -110,16 +119,30 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * The host interrupted the session (`abort`). Stop automatic continuation until
-	 * the host acts again. Called before the abort starts, so the aborted run's own
-	 * `agent_end` cannot schedule another goal turn. The runtime separately pauses the
-	 * interrupted goal, so in practice only `goal resume`/`create` restarts it.
+	 * While a session change is in progress: resolves once it has reattached the goal of the
+	 * session it lands in (including a reattach queued behind a running one). A snapshot taken
+	 * after it carries that session's goal. `undefined` when no change is in progress.
 	 */
-	stopForHostAbort(): void {
-		this.#hostStopped = true;
+	get reattached(): Promise<void> | undefined {
+		return this.#reattach?.promise;
+	}
+
+	/**
+	 * The session was interrupted (`abort` with the user-interrupt reason, whoever called it).
+	 * Stop automatic continuation until new input. Runs before the abort unwinds, so the
+	 * aborted run's own `agent_end` cannot schedule another goal turn. The runtime separately
+	 * pauses the interrupted goal, so in practice only `goal resume`/`create` restarts it.
+	 */
+	stopForAbort(): void {
+		this.#abortStopped = true;
 		this.#suppressContinuation = true;
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
+	}
+
+	/** Re-check continuation after an owner's {@link GoalModeOptions.isBlocked} condition cleared. */
+	reschedule(): void {
+		this.#scheduleContinuation();
 	}
 
 	get #state(): RpcGoalResult {
@@ -141,10 +164,9 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * Call before any session change or tree navigation (RPC command or extension
-	 * action). Waits for a pending goal exit so it cannot land in the next session,
-	 * voids a waiting continuation, and holds new goal turns until
-	 * {@link endSessionChange}.
+	 * The session calls it before any session change or tree navigation, whoever started
+	 * it. Waits for a pending goal exit so it cannot land in the next session, voids a
+	 * waiting continuation, and holds new goal turns until {@link endSessionChange}.
 	 */
 	async beginSessionChange(): Promise<void> {
 		if (this.#sessionChanges++ === 0) {
@@ -152,6 +174,7 @@ export class RpcGoalController {
 			// (`--provider-session-id`) does not change when the transcript does.
 			this.#sessionBeforeChange = this.#session.sessionManager.getSessionId();
 			this.#heldDuringChange = this.#continuationScheduled || this.#continuationWanted();
+			this.#reattach = Promise.withResolvers<void>();
 		}
 		if (this.#reconcilesPending > 0) this.#changeOverlappedReconcile = true;
 		this.#continuationScheduled = false;
@@ -181,6 +204,8 @@ export class RpcGoalController {
 		this.#changeOverlappedReconcile = false;
 		this.#sessionBeforeChange = undefined;
 		this.#heldDuringChange = false;
+		const reattach = this.#reattach;
+		this.#reattach = undefined;
 		try {
 			if (switched && this.#reconcilesPending > 0) {
 				// A reconcile is running, possibly the one whose extension notification
@@ -189,7 +214,10 @@ export class RpcGoalController {
 				void this.reconcile({ preserveActiveGoal: true })
 					.then(() => this.#scheduleContinuation())
 					.catch(reportControllerError)
-					.finally(() => this.#onContinuationDropped?.());
+					.finally(() => {
+						reattach?.resolve();
+						this.#options.onContinuationDropped?.();
+					});
 				return;
 			}
 			if (switched) await this.reconcile({ preserveActiveGoal: true });
@@ -197,7 +225,8 @@ export class RpcGoalController {
 		} catch (error) {
 			reportControllerError(error);
 		}
-		this.#onContinuationDropped?.();
+		reattach?.resolve();
+		this.#options.onContinuationDropped?.();
 	}
 
 	#queueExit(exit: () => Promise<void>): void {
@@ -306,7 +335,7 @@ export class RpcGoalController {
 		this.#pendingContinuationTurns = 0;
 		this.#previousContinuationActivity = undefined;
 		this.#suppressContinuation = false;
-		this.#hostStopped = false;
+		this.#abortStopped = false;
 	}
 
 	/**
@@ -356,12 +385,12 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * Feed session events. Must run before the RPC settle watcher observes the same
-	 * event so a continuation is admitted before settlement is evaluated.
+	 * Feed session events. The session calls it before any other subscriber (an RPC settle
+	 * watcher included) so a continuation is decided before settlement is evaluated.
 	 */
 	observe(event: AgentSessionEvent): void {
 		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
-			// A host prompt re-arms continuation after a no-progress stop.
+			// New input re-arms continuation after a no-progress stop.
 			this.#resetContinuation();
 			return;
 		}
@@ -382,9 +411,9 @@ export class RpcGoalController {
 			this.#suppressContinuation = activity.length === 0 || activity === this.#previousContinuationActivity;
 			this.#previousContinuationActivity = activity;
 		} else {
-			// As in the TUI: a turn that was not a goal continuation (a host prompt, a delivery
+			// As in the TUI: a turn that was not a goal continuation (a prompt, a delivery
 			// or job wake, an extension-triggered turn) re-arms after a no-progress stop.
-			// A host abort stays in force (#hostStopped).
+			// An interrupting abort stays in force (#abortStopped).
 			this.#suppressContinuation = false;
 			this.#previousContinuationActivity = undefined;
 		}
@@ -404,8 +433,9 @@ export class RpcGoalController {
 	 */
 	#continuationWanted(): boolean {
 		const session = this.#session;
-		if (!cfgGoalContinuationModes.get(session.settings).includes(RPC_GOAL_CONTINUATION_MODE)) return false;
-		if (this.#hostStopped || this.#suppressContinuation || session.isDisposed) return false;
+		if (!cfgGoalContinuationModes.get(session.settings).includes(this.#options.mode)) return false;
+		if (this.#abortStopped || this.#suppressContinuation || session.isDisposed) return false;
+		if (this.#options.isBlocked?.()) return false;
 		if (session.getPlanModeState()?.enabled) return false;
 		const state = session.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") return false;
@@ -432,11 +462,12 @@ export class RpcGoalController {
 		const generation = this.#continuationGeneration;
 		void (async () => {
 			const { promise, resolve } = Promise.withResolvers<void>();
-			setImmediate(resolve);
+			if (this.#options.delayMs > 0) setTimeout(resolve, this.#options.delayMs);
+			else setImmediate(resolve);
 			await promise;
 			await this.#session.waitForIdle();
 			if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
-				this.#onContinuationDropped?.();
+				this.#options.onContinuationDropped?.();
 				return;
 			}
 			this.#continuationScheduled = false;
@@ -448,14 +479,14 @@ export class RpcGoalController {
 				!session.isSessionTransitioning;
 			const prompt = idle && this.#continuationWanted() ? session.goalRuntime.buildContinuationPrompt() : undefined;
 			if (!prompt) {
-				this.#onContinuationDropped?.();
+				this.#options.onContinuationDropped?.();
 				return;
 			}
 			this.#pendingContinuationTurns++;
 			const unclaim = () => {
 				this.#pendingContinuationTurns = Math.max(0, this.#pendingContinuationTurns - 1);
 				// No run follows, so nothing else will end this activity stretch.
-				this.#onContinuationDropped?.();
+				this.#options.onContinuationDropped?.();
 			};
 			// promptCustomMessage counts the submission as admitted synchronously, so every
 			// settle report sees it from here on. A continuation that is refused or bails
@@ -471,12 +502,12 @@ export class RpcGoalController {
 			);
 		})().catch(error => {
 			this.#continuationScheduled = false;
-			this.#onContinuationDropped?.();
+			this.#options.onContinuationDropped?.();
 			reportControllerError(error);
 		});
 	}
 }
 
 function reportControllerError(error: unknown): void {
-	logger.warn("RPC goal controller failed", { error: error instanceof Error ? error.message : String(error) });
+	logger.warn("Goal mode controller failed", { error: error instanceof Error ? error.message : String(error) });
 }

@@ -21,6 +21,7 @@ import { resolveLocalRoot } from "../../internal-urls";
 import { textPredictionBackend } from "../../predict/client";
 import { type AgentSession, SessionBusyError } from "../../session/agent-session";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
+import type { GoalContinuationMode, GoalModeController } from "../../session/goal-mode";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
@@ -32,7 +33,6 @@ import { initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
 import { selectRpcEntries } from "./rpc-compat";
 import { RpcConnection, type RpcConnectionOptions, type RpcConnectionTransport } from "./rpc-connection";
-import { RpcGoalController } from "./rpc-goal";
 import { RpcLiveBridge, type RpcLiveSessionFactory } from "./rpc-live";
 import { RpcBtwController } from "./rpc-btw";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -574,6 +574,11 @@ export interface RpcServerOptions {
 	hostId?: string;
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
+	/**
+	 * Which `goal.continuationModes` entry lets this server's session continue goals: `"rpc"` (default, `--mode rpc`/
+	 * `rpc-ui`, opt-in) or `"interactive"` (a session host, which continues after the TUI's 800 ms like the TUI).
+	 */
+	goalContinuationMode?: GoalContinuationMode;
 }
 
 export interface RpcDisconnectOptions {
@@ -598,10 +603,10 @@ export class RpcServer {
 	readonly #extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 	readonly #settleWatcher: RpcSessionSettleWatcher;
 	/**
-	 * Session-wide goal mode: the goal tool's place in the active tool set, completion exit, reattach after a
-	 * session change, and opt-in continuation. One controller serves every connection.
+	 * The session's goal mode, enabled by this server: the goal tool's place in the active tool set, completion exit,
+	 * reattach after a session change, and opt-in continuation. One controller serves every connection.
 	 */
-	readonly #goal: RpcGoalController;
+	readonly #goal: GoalModeController;
 	/** Session-wide side questions (`/btw`): one running question and history; frames reach every connection. */
 	readonly #btw: RpcBtwController;
 	/** A scheduled or held goal turn will start a turn: every settle report treats it as busy. */
@@ -647,11 +652,6 @@ export class RpcServer {
 	#pendingReason: RpcSessionReplacedFrame["reason"] | undefined;
 	/** The latest `session_replaced` broadcast; session-changing commands respond after it. */
 	#replacing: Promise<void> = Promise.resolve();
-	/**
-	 * Resolves once the goal controller has reattached the session change in progress (or none is). A
-	 * `session_replaced` snapshot waits for it, so it carries the new session's goal, not the previous one's.
-	 */
-	#goalReattached: Promise<void> | undefined;
 	readonly #unsubscribeEntries: () => void;
 	readonly #unsubscribeRelocated: () => void;
 	/** Targets a command arm already got the host's approval for, until its switch ends: the switch guard stands down. */
@@ -694,10 +694,15 @@ export class RpcServer {
 			this.onBeforeSwitch ? this.#switchGuarded(target, proceed) : proceed(),
 		);
 		session.registerSessionChangeCallback(() => {
-			this.#replacing = this.#replace(this.#pendingReason ?? "resume", this.#goalReattached);
+			this.#replacing = this.#replace(this.#pendingReason ?? "resume", this.#goal.reattached);
 		});
 		// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
-		this.#goal = new RpcGoalController(session, () => void this.#settleWatcher.check());
+		const goalContinuationMode = options.goalContinuationMode ?? "rpc";
+		this.#goal = session.enableGoalMode({
+			mode: goalContinuationMode,
+			delayMs: goalContinuationMode === "interactive" ? 800 : 0,
+			onContinuationDropped: () => void this.#settleWatcher.check(),
+		});
 		// Every "not settled" report for a pending goal turn is later closed by `session_settled`.
 		this.#goalTurnScheduled = watchedScheduledTurnProbe(
 			() => this.#goal.continuationPending,
@@ -987,19 +992,14 @@ export class RpcServer {
 		// Set up extensions with RPC-based UI context
 		await initializeExtensions(session, {
 			mode: "rpc",
-			// Extension-initiated session changes get the same goal quiesce/reattach as the commands. Not
-			// `settled()`: this may run inside the extension notification of a reconcile in progress.
+			// Not `settled()`: this may run inside the extension notification of a reconcile in progress. The
+			// session itself holds and reattaches goal mode around the change.
 			wrapSessionChange: async <T extends { cancelled: boolean }>(
 				change: () => Promise<T>,
 				{ detachesRun }: { detachesRun: boolean },
 			): Promise<T> => {
 				await this.#btw.close();
-				// A change that throws may already have detached the run: count it as detached.
-				const result = await this.#withGoalReattach(
-					change,
-					partial => detachesRun && partial?.cancelled !== true,
-					false,
-				);
+				const result = await change();
 				if (!result.cancelled) {
 					// As for the host's new/switch commands: a detached run never yields, so
 					// close the prompts it was answering. Branch and navigation leave a live
@@ -1043,9 +1043,8 @@ export class RpcServer {
 						: all,
 				),
 			);
-			// Before the prompt-result and settle reports: a goal continuation decided at this
-			// agent_end is scheduled (and reported as pending) before either reads settlement.
-			this.#goal.observe(event);
+			// The session fed the goal controller first: a continuation decided at this agent_end is
+			// scheduled (and reported as pending) before the prompt-result and settle reports read settlement.
 			for (const conn of this.#connections) conn.promptResults.observe(event);
 			this.#settleWatcher.observe(event);
 		});
@@ -1145,7 +1144,7 @@ export class RpcServer {
 
 	/**
 	 * The session changed identity: bump the epoch, then hand sequenced clients the new snapshot. Waits for
-	 * `goalReattached` (the goal bracket of the change that caused this) after the transition, so the snapshot's
+	 * `goalReattached` (the goal reattach of the change that caused this) after the transition, so the snapshot's
 	 * goal is the target session's.
 	 */
 	async #replace(reason: RpcSessionReplacedFrame["reason"], goalReattached?: Promise<void>): Promise<void> {
@@ -1165,58 +1164,16 @@ export class RpcServer {
 	}
 
 	/**
-	 * Run `change` between the goal controller's quiesce and reattach. Any `session_replaced` it causes is held
-	 * until the reattach has run. `detachedRun` is read after `change` settles (`undefined`: it threw).
-	 * `waitForReattach` also waits for queued reconciles: host commands only, never inside an extension
-	 * notification (see {@link RpcGoalController.settled}); `endSessionChange` itself queues instead of waiting
-	 * for a reconcile that may have started this change.
-	 */
-	async #withGoalReattach<T>(
-		change: () => Promise<T>,
-		detachedRun: (result: T | undefined) => boolean,
-		waitForReattach: boolean,
-	): Promise<T> {
-		await this.#goal.beginSessionChange();
-		const reattached = Promise.withResolvers<void>();
-		this.#goalReattached = reattached.promise;
-		let result: T | undefined;
-		try {
-			result = await change();
-			return result;
-		} finally {
-			try {
-				await this.#goal.endSessionChange({ detachedRun: detachedRun(result) });
-				if (waitForReattach) await this.#goal.settled();
-			} finally {
-				if (this.#goalReattached === reattached.promise) this.#goalReattached = undefined;
-				reattached.resolve();
-			}
-		}
-	}
-
-	/**
 	 * Run a session-changing command whose replacement reports `reason`; settles after its `session_replaced`,
-	 * which follows the goal reattach. `detachedRun`: whether the change stopped the running agent.
+	 * which follows the goal reattach, and after any reattach queued behind a running one.
 	 */
-	async #changeSession<T>(
-		reason: RpcSessionReplacedFrame["reason"],
-		change: () => Promise<T>,
-		detachedRun: (result: T | undefined) => boolean,
-	): Promise<T> {
+	async #changeSession<T>(reason: RpcSessionReplacedFrame["reason"], change: () => Promise<T>): Promise<T> {
+		this.#pendingReason = reason;
 		try {
-			return await this.#withGoalReattach(
-				async () => {
-					this.#pendingReason = reason;
-					try {
-						return await change();
-					} finally {
-						this.#pendingReason = undefined;
-					}
-				},
-				detachedRun,
-				true,
-			);
+			return await change();
 		} finally {
+			this.#pendingReason = undefined;
+			await this.#goal.settled();
 			await this.#replacing;
 		}
 	}
@@ -1591,7 +1548,6 @@ export class RpcServer {
 			}
 
 			case "abort": {
-				this.#goal.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return rpcSuccess(id, "abort");
 			}
@@ -1601,13 +1557,11 @@ export class RpcServer {
 				// dequeued but never recorded) before aborting, so neither the aborted turn nor
 				// abort()'s stranded-queue drain can run it.
 				const restored = session.clearQueue({ forInterrupt: true });
-				this.#goal.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return fitAbortAndRestoreQueueResponse(id, restored, conn.encoder.maxResponseBytes);
 			}
 
 			case "abort_and_prompt": {
-				this.#goal.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				// After the abort so the aborted run's terminal agent_end cannot settle this prompt.
 				const ticket = conn.promptResults.begin(id);
@@ -1646,11 +1600,8 @@ export class RpcServer {
 				await this.#btw.close();
 				let result: RpcSessionChangeResult | undefined;
 				try {
-					const change = this.#changeSession(
-						SESSION_CHANGE_REASONS[command.type],
-						() => handleRpcSessionChange(session, command, subagentRegistry, requestedModel),
-						// Branch and fork switch files in-process without detaching a run (fork requires idle).
-						partial => command.type !== "branch" && command.type !== "fork" && partial?.data.cancelled !== true,
+					const change = this.#changeSession(SESSION_CHANGE_REASONS[command.type], () =>
+						handleRpcSessionChange(session, command, subagentRegistry, requestedModel),
 					);
 					result = await (vetted !== undefined ? change.finally(() => this.#settleSwitch(vetted)) : change);
 				} catch (err) {
@@ -1679,25 +1630,18 @@ export class RpcServer {
 				await this.#btw.close();
 				const leafBefore = session.sessionManager.getLeafId();
 				// A goal continuation waiting to start is held until the navigation ends, then resumes (same session).
-				const result = await this.#withGoalReattach(
-					async () => {
-						const navigated = await session.navigateTree(command.entryId, {
-							summarize: command.summarize === true,
-							customInstructions:
-								typeof command.customInstructions === "string" ? command.customInstructions : undefined,
-							// Only to detect a re-answer, which moves nothing yet: refused below, since it needs a picker here.
-							allowAskReopen: true,
-						});
-						// The leaf moves without an entry frame, so clients follow the snapshot of a `tree` replacement.
-						if (!navigated.cancelled && session.sessionManager.getLeafId() !== leafBefore) {
-							this.#inputGate.commitSessionChange(command);
-							this.#replacing = this.#replace("tree", this.#goalReattached);
-						}
-						return navigated;
-					},
-					() => false,
-					true,
-				);
+				const result = await session.navigateTree(command.entryId, {
+					summarize: command.summarize === true,
+					customInstructions:
+						typeof command.customInstructions === "string" ? command.customInstructions : undefined,
+					// Only to detect a re-answer, which moves nothing yet: refused below, since it needs a picker here.
+					allowAskReopen: true,
+				});
+				// The leaf moves without an entry frame, so clients follow the snapshot of a `tree` replacement.
+				if (!result.cancelled && session.sessionManager.getLeafId() !== leafBefore) {
+					this.#inputGate.commitSessionChange(command);
+					this.#replacing = this.#replace("tree", this.#goal.settled());
+				}
 				await this.#replacing;
 				if (result.reopenAsk) {
 					return rpcError(
@@ -1741,10 +1685,8 @@ export class RpcServer {
 				// Validation first: a refused change must not cancel the running side question.
 				await this.#btw.close();
 				// Opening the session that is already open leaves a live run going (see below).
-				const change = this.#changeSession(
-					SESSION_CHANGE_REASONS.open_session,
-					() => openRpcSession(session, command.sessionDir, subagentRegistry, target, requestedModel),
-					() => session.sessionFile !== fileBeforeOpen,
+				const change = this.#changeSession(SESSION_CHANGE_REASONS.open_session, () =>
+					openRpcSession(session, command.sessionDir, subagentRegistry, target, requestedModel),
 				);
 				const result = await (vetted !== undefined ? change.finally(() => this.#settleSwitch(vetted)) : change);
 				if (!result.cancelled) {

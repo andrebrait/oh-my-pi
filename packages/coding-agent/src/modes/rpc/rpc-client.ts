@@ -15,9 +15,9 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { BtwHistoryRecord } from "../../session/btw-history";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
+import type { RpcGoalOp, RpcGoalResult } from "../../session/goal-mode";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
-import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -1048,7 +1048,8 @@ export class RpcClient {
 
 	/**
 	 * Read or change goal mode. `get` never mutates or starts a turn; `create`/`resume`
-	 * start a turn only when the server enables `goal.continuationModes: ["rpc"]`.
+	 * start a turn only when the server's mode is in `goal.continuationModes` (`"rpc"` for `--mode rpc`,
+	 * `"interactive"` (the default) for a session host).
 	 */
 	async goal(op: RpcGoalOp, options?: { objective?: string; tokenBudget?: number }): Promise<RpcGoalResult> {
 		const response = await this.#send({
