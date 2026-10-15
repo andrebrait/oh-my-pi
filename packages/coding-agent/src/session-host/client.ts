@@ -28,11 +28,15 @@ export interface ConnectSessionHostOptions {
 	ui: boolean;
 	/** From the `attached` frame (`hostId`) and the last `seq`/`epoch` seen; a mismatched host answers with a snapshot. */
 	resume?: { hostId: string; epoch: number; lastSeq: number };
+	/** Dial deadline; default 3 s. A Windows pipe whose instances are all busy is waited out until it passes. */
+	timeoutMs?: number;
 }
 
 /** Socket transport for RpcClient's `spawn` option, speaking protocol v2 from `attached` on. `kill()` closes the socket (a detach). */
 export async function connectSessionHost(options: ConnectSessionHostOptions): Promise<RpcAgentProcess> {
-	const socket = ipcDuplex(await IpcConnection.connect(options.entry.endpoint, { framing: "raw" }));
+	const socket = ipcDuplex(
+		await IpcConnection.connect(options.entry.endpoint, { framing: "raw", timeoutMs: options.timeoutMs }),
+	);
 	// A reset after connect surfaces as the stream's end; `close` always follows.
 	socket.on("error", () => {});
 	const exited = Promise.withResolvers<number>();
