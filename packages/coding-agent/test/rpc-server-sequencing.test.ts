@@ -127,6 +127,20 @@ describe("RpcServer sequencing", () => {
 		expect(resume(server.seq - ringLimit - 1)).toBe("attached");
 	});
 
+	it("evicts the oldest frames once the ring exceeds its byte budget, well under its frame count", async () => {
+		const ringBudget = 64 * 1024 * 1024; // RING_BUDGET_BYTES in rpc-server.ts
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		server.attach(a.conn);
+		const first = server.seq + 1;
+		const big = "x".repeat(512 * 1024);
+		for (let i = 0; i < ringBudget / big.length + 2; i++) ui.notify(big);
+		const resume = (lastSeq: number) =>
+			server.attach(new TestClient(server).conn, { epoch: server.epoch, lastSeq }).type;
+		expect(resume(first - 1)).toBe("attached");
+		expect(resume(server.seq - 100)).toBe("resumed");
+	});
+
 	it("replays an extension dialog opened while the client was away, so the resumer can answer it", async () => {
 		await startServer({ handler: { content: ["ok"] } });
 		const a = new TestClient(server);

@@ -96,13 +96,27 @@ const INVALID_TEXT_CURSOR_ERROR = "cursor must be an integer UTF-16 offset withi
 // ponytail: fixed cap, make it a setting if real clients hit it.
 const SOCKET_MAX_SPOOL_BYTES = 64 * 1024 * 1024;
 
-/** Broadcast frames kept for `attach` resumes. */
-// ponytail: count-bounded ring, byte-bound it if snapshots stay cheaper than replay
+/** Broadcast frames kept for `attach` resumes: the newest ones within both bounds. */
 const RING_LIMIT = 4096;
+/** Every streamed `message_update` holds a snapshot of the reply so far, so a long reply outgrows any frame count. */
+const RING_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Rough retained size of a ring frame: its string lengths plus 8 per other value. Not `JSON.stringify`, which
+ * would re-serialize the whole reply on every streamed token, even for delta clients that never encode it.
+ */
+function ringFrameBytes(value: unknown): number {
+	if (typeof value === "string") return value.length;
+	if (typeof value !== "object" || value === null) return 8;
+	let bytes = 8;
+	for (const item of Object.values(value)) bytes += ringFrameBytes(item);
+	return bytes;
+}
 
 /** One broadcast frame in the ring; `replay` delivers it, `seq` included, through a connection's audience and projection. */
 interface RpcRingSlot {
 	seq: number;
+	bytes: number;
 	replay: (conn: RpcConnection) => void;
 }
 
@@ -622,8 +636,10 @@ export class RpcServer {
 	/** Seeded from the clock, so a respawned host never accepts a resume minted against an earlier one. */
 	#epoch = Date.now();
 	#seq = 0;
-	/** Slot `seq % RING_LIMIT` holds broadcast frame `seq`. */
-	readonly #ring: Array<RpcRingSlot | undefined> = [];
+	/** Consecutive broadcast frames, oldest first. */
+	readonly #ring: RpcRingSlot[] = [];
+	/** Sum of the ring's {@link RpcRingSlot.bytes}. */
+	#ringBytes = 0;
 	/** Off until the first sequenced client: nothing earlier can be resumed from, so stdio-only servers keep no ring. */
 	#ringActive = false;
 	/** Reason the in-flight session-changing command reports; changes from elsewhere report `resume`. */
@@ -833,10 +849,11 @@ export class RpcServer {
 	attach(conn: RpcConnection, resume?: { epoch: number; lastSeq: number }): RpcAttachedFrame | RpcResumedFrame {
 		if (resume?.epoch === this.#epoch) {
 			const { lastSeq } = resume;
-			if (lastSeq === this.#seq || this.#ring[(lastSeq + 1) % RING_LIMIT]?.seq === lastSeq + 1) {
+			const index = lastSeq + 1 - (this.#ring[0]?.seq ?? this.#seq + 1);
+			if (lastSeq === this.#seq || this.#ring[index]?.seq === lastSeq + 1) {
 				const resumed: RpcResumedFrame = { type: "resumed", epoch: this.#epoch, replayed: this.#seq - lastSeq };
 				conn.send(resumed);
-				for (let seq = lastSeq + 1; seq <= this.#seq; seq++) this.#ring[seq % RING_LIMIT]?.replay(conn);
+				for (const slot of this.#ring.slice(index)) slot.replay(conn);
 				return resumed;
 			}
 		}
@@ -1114,7 +1131,11 @@ export class RpcServer {
 		if (this.#ringActive) {
 			const ringFrame: F = { ...frame, seq };
 			stamped = ringFrame;
-			this.#ring[seq % RING_LIMIT] = { seq, replay: conn => deliver(conn, ringFrame) };
+			const bytes = ringFrameBytes(ringFrame);
+			this.#ring.push({ seq, bytes, replay: conn => deliver(conn, ringFrame) });
+			this.#ringBytes += bytes;
+			while (this.#ring.length > RING_LIMIT || this.#ringBytes > RING_BUDGET_BYTES)
+				this.#ringBytes -= this.#ring.shift()!.bytes;
 		}
 		for (const conn of this.#connections) {
 			if (conn !== except) deliver(conn, conn.options.sequenced ? (stamped ??= { ...frame, seq }) : frame);
