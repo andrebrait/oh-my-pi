@@ -291,7 +291,7 @@ When the connection breaks unexpectedly, the terminal shows `Connection to sessi
 
 If the host process exited, the terminal asks whether to reopen the session in a new host. The new host starts with this terminal's launch flags (none when it was started with `omp attach`). Declining exits with status 1 and `host exited`. A session that was never saved to a file has nothing to reopen, so it exits the same way without asking.
 
-A command whose outcome is unknown after a loss is never sent again on its own. `/detach` and `/exit` never reconnect. `/detach` while reconnecting leaves quietly; `/exit` while reconnecting cannot stop the host, so it exits with status 1 and names the host that is still running.
+A command whose outcome is unknown after a loss is never sent again on its own. An extension dialog that was open when the connection broke, or that you answered just before, comes back after the reconnect if the host is still waiting for its answer. `/detach` and `/exit` never reconnect. `/detach` while reconnecting leaves quietly; `/exit` while reconnecting cannot stop the host, so it exits with status 1 and names the host that is still running.
 
 #### What works when attached
 

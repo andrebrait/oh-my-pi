@@ -199,8 +199,13 @@ export class HostedClientLink {
 	#reconnectLoop: Promise<void> | undefined;
 	/** The current reconnect attempt: resolved once the host's reply is applied, rejected when it cannot be. */
 	#reconnectAttempt: PromiseWithResolvers<void> | undefined;
-	/** A dialog was aborted by the loss: the ring would not resend it, so the next attempt asks for a snapshot. */
+	/**
+	 * A dialog was aborted by the loss, or its answer may have died with the transport: the ring would not resend
+	 * it, so the next attempt asks for a snapshot.
+	 */
 	#dialogLost = false;
+	/** A dialog answer went out on the current transport. The host confirms none, so a loss may have dropped it. */
+	#answerSent = false;
 	/** What the next connection's `hello` resumes from; undefined asks for a snapshot. */
 	#resumePoint: { hostId: string; epoch: number; lastSeq: number } | undefined;
 	/** A frame failed to apply, so the view no longer matches the host: nothing else is applied. */
@@ -432,9 +437,9 @@ export class HostedClientLink {
 		return !this.#left && this.#failure === undefined;
 	}
 
-	/** Whether a host dialog is on screen or received and not yet presented. */
-	get #hasDialogs(): boolean {
-		return this.#dialogs.size > 0 || this.#awaiting.size > 0;
+	/** Whether a host dialog is on screen, received and not yet presented, or answered on the current transport. */
+	get #dialogsAtRisk(): boolean {
+		return this.#dialogs.size > 0 || this.#awaiting.size > 0 || this.#answerSent;
 	}
 
 	/** Mark the leave before the request: nothing may report it as a lost connection, and no answer may follow it. */
@@ -952,6 +957,7 @@ export class HostedClientLink {
 			response => {
 				if (this.#dialogs.get(request.id) !== abort) return;
 				this.#dialogs.delete(request.id);
+				this.#answerSent = true;
 				try {
 					this.#client.sendExtensionUiResponse(response);
 				} catch (error) {
@@ -1059,13 +1065,13 @@ export class HostedClientLink {
 			const attempt = this.#reconnectAttempt;
 			this.#reconnectAttempt = undefined;
 			attempt?.reject(error);
-			this.#dialogLost ||= this.#hasDialogs;
+			this.#dialogLost ||= this.#dialogsAtRisk;
 			this.#abortDialogs();
 			return;
 		}
 		this.#reconnecting = true;
 		// A dialog aborted here gets no replay from the ring: resuming without `resume` makes the snapshot present it again.
-		this.#dialogLost = this.#hasDialogs;
+		this.#dialogLost = this.#dialogsAtRisk;
 		this.#abortDialogs();
 		this.#reconnectLoop = this.#reconnect(error);
 	}
@@ -1118,6 +1124,8 @@ export class HostedClientLink {
 					this.#dialogLost || lastSeq === undefined
 						? undefined
 						: { hostId: this.hostId, epoch: this.#epoch, lastSeq };
+				// Folded into `#dialogLost` already: from here on, answers go out on the new transport.
+				this.#answerSent = false;
 				// shortcut: `stop()` cannot interrupt `start()` before its transport exists (while it reaps or connects), so
 				// the bound covers the wait for the host's reply, not a hung connect; bound the connect if pipes need it.
 				await this.#client.start();
@@ -1135,7 +1143,7 @@ export class HostedClientLink {
 					error: String(attemptError),
 				});
 				// A transport that died inside `start()` reports no close: dialogs its snapshot presented end here.
-				this.#dialogLost ||= this.#hasDialogs;
+				this.#dialogLost ||= this.#dialogsAtRisk;
 				this.#abortDialogs();
 				await this.#client.stop();
 				continue;

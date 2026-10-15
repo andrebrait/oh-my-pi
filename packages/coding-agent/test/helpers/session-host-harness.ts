@@ -195,6 +195,10 @@ export interface HostProxy {
 	hold(): void;
 	/** Forward new client connections again (the default). */
 	accept(): void;
+	/** Stop passing what the connected clients send on to the host, as if it were lost on the way. */
+	mute(): void;
+	/** What {@link mute} kept from the host. */
+	muted(): string;
 	close(): void;
 }
 
@@ -209,8 +213,11 @@ export async function startProxy(
 ): Promise<HostProxy> {
 	const socketPath = path.join(dir, "proxy.sock");
 	const clients = new Set<net.Socket>();
+	/** The upstream connection of each client piped straight to the host. */
+	const upstreams = new Map<net.Socket, net.Socket>();
 	let mode: "accept" | "refuse" | "hold" = "accept";
 	let refused = 0;
+	let muted = "";
 	const server = net.createServer(client => {
 		if (mode === "refuse") {
 			refused++;
@@ -225,14 +232,17 @@ export async function startProxy(
 		}
 		const upstream = net.connect(entry.endpoint);
 		clients.add(client);
-		if (options.refuseExit === undefined) client.pipe(upstream);
-		else forwardRefusingExit(client, upstream, options.refuseExit);
+		if (options.refuseExit === undefined) {
+			client.pipe(upstream);
+			upstreams.set(client, upstream);
+		} else forwardRefusingExit(client, upstream, options.refuseExit);
 		upstream.pipe(client);
 		// A reset ends the pair; `close` always follows.
 		for (const socket of [client, upstream]) {
 			socket.on("error", () => {});
 			socket.on("close", () => {
 				clients.delete(client);
+				upstreams.delete(client);
 				client.destroy();
 				upstream.destroy();
 			});
@@ -259,6 +269,14 @@ export async function startProxy(
 		accept: (): void => {
 			mode = "accept";
 		},
+		mute: (): void => {
+			for (const [client, upstream] of upstreams) {
+				client.unpipe(upstream);
+				client.on("data", chunk => void (muted += String(chunk)));
+				client.resume();
+			}
+		},
+		muted: (): string => muted,
 		close: (): void => void server.close(),
 	};
 }
