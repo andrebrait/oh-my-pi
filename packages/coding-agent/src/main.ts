@@ -88,10 +88,9 @@ import {
 	assertHostedLaunchSupported,
 	attachHostedUi,
 	createHostedLocalSession,
+	createHostLaunch,
 	ensureHostForResolvedSession,
 	type HostedStartup,
-	type HostLaunch,
-	hostLaunchArgs,
 	resolveAttachTarget,
 } from "./session-host/hosted-startup";
 import type { SessionHostEntry } from "./session-host/registry";
@@ -1821,11 +1820,12 @@ async function runHostedInteractive(options: {
 }): Promise<void> {
 	const { parsedArgs, cwd, settings: activeSettings } = options;
 	// From the argv as given, before anything below makes the local session lean.
-	const launch: HostLaunch = {
+	const launch = createHostLaunch({
+		rawArgs: options.rawArgs,
 		cwd,
-		args: hostLaunchArgs(options.rawArgs, options.launchCwd),
+		launchCwd: options.launchCwd,
 		sessionDir: parsedArgs.sessionDir,
-	};
+	});
 	const processedFiles =
 		parsedArgs.fileArgs.length > 0
 			? await logger.time("processFileArguments", () =>

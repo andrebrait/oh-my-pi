@@ -13,6 +13,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
 import {
 	assertHostedLaunchSupported,
+	createHostLaunch,
 	ensureHostForResolvedSession,
 	ensureSessionHost,
 	type HostLaunch,
@@ -218,6 +219,26 @@ describe("hostLaunchArgs", () => {
 				dir,
 			),
 		).toEqual(["--model", "claude-sonnet-4-5"]);
+	});
+});
+
+describe("createHostLaunch", () => {
+	it("reads this terminal's session directory where the launch did, as the host it starts does", () => {
+		const sessionCwd = path.join(dir, "resumed-project");
+		const hosted = createHostLaunch({
+			rawArgs: ["--session-dir", "sessions"],
+			cwd: sessionCwd,
+			launchCwd: dir,
+			sessionDir: "sessions",
+		});
+		expect(hosted).toEqual({
+			cwd: sessionCwd,
+			args: ["--session-dir", sessionsDir],
+			sessionDir: sessionsDir,
+		});
+		expect(createHostLaunch({ rawArgs: [], cwd: sessionCwd, launchCwd: dir, sessionDir: undefined }).sessionDir).toBe(
+			undefined,
+		);
 	});
 });
 
