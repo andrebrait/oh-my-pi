@@ -7,6 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { INTERRUPTED_TURN_ERROR } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	assertHostedLaunchSupported,
@@ -25,7 +26,7 @@ import {
 import { IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { getProjectDir, removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 import { holdLeaseInAnotherProcess, killLeaseProcesses } from "../helpers/session-lease-process";
-import { type IsolatedConfigRoot, isolateConfigRoot } from "../helpers/session-host-harness";
+import { type IsolatedConfigRoot, isolateConfigRoot, waitFor } from "../helpers/session-host-harness";
 
 /** A host that boots without network: a dummy key makes the model available, and discovery hits a closed port. */
 const MODEL_ARGS = [
@@ -81,6 +82,17 @@ async function persistedSession(): Promise<{ file: string; id: string }> {
 	const id = manager.getSessionId();
 	await manager.close();
 	return { file, id };
+}
+
+/** A session its last process left mid-turn: a prompt the model never answered, and no exit record. */
+async function interruptedSession(): Promise<string> {
+	const manager = SessionManager.create(dir, sessionsDir);
+	manager.appendMessage({ role: "user", content: "keep going", timestamp: Date.now() });
+	await manager.ensureOnDisk();
+	const file = manager.getSessionFile();
+	if (!file) throw new Error("session was not given a file");
+	await manager.close();
+	return file;
 }
 
 /** A listening stand-in for a live host serving `sessionFile`; the registry probes it alive. */
@@ -182,6 +194,18 @@ describe("resolving what to attach to", () => {
 		expect((await listSessionHosts(registryDir)).map(entry => entry.hostId)).toEqual([host.hostId]);
 	});
 
+	it("attaches under --restore to the host already running the session: a live host's turn was never interrupted", async () => {
+		const { file } = await persistedSession();
+		const host = await standInHost("dddddddddddddddd", file);
+
+		const reused = await ensureHostForResolvedSession(await SessionManager.open(file, sessionsDir), launch(), {
+			restore: true,
+		});
+
+		expect(reused.hostId).toBe(host.hostId);
+		expect((await listSessionHosts(registryDir)).map(entry => entry.hostId)).toEqual([host.hostId]);
+	});
+
 	it("does not take a session another process leases for a registered host", async () => {
 		const { file, id } = await persistedSession();
 		await holdLeaseInAnotherProcess(file, id);
@@ -215,6 +239,22 @@ describe("starting hosts", () => {
 		expect((await listSessionHosts(registryDir)).map(entry => entry.hostId).sort()).toEqual(
 			[first.hostId, second.hostId].sort(),
 		);
+	}, 150_000);
+
+	it("has the host it starts under --restore go on with the interrupted turn, with no client attached", async () => {
+		const file = await interruptedSession();
+
+		const host = await ensureHostForResolvedSession(
+			await SessionManager.open(file, sessionsDir),
+			launch(MODEL_ARGS),
+			{
+				restore: true,
+			},
+		);
+		hostPids.push(host.pid);
+
+		// Restoring closes the cut-off turn with the interrupted-turn record before retrying it; a plain resume never does.
+		await waitFor(async () => (await Bun.file(file).text()).includes(INTERRUPTED_TURN_ERROR), 30_000);
 	}, 150_000);
 });
 

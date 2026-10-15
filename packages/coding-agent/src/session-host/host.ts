@@ -17,6 +17,7 @@ import { RpcServer, type RpcServerOptions } from "../modes/rpc/rpc-server";
 import { type AgentSession, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { readSessionHeaderId } from "../session/session-loader";
 import { FileSessionStorage } from "../session/session-storage";
+import type { RestoreOutcome } from "../task/restore";
 import {
 	findHostForSession,
 	removeHostEntry,
@@ -45,6 +46,8 @@ export interface SessionHostOptions extends Omit<RpcServerOptions, "onShutdown">
 	helloTimeoutMs?: number;
 	/** A leaving client's queued output that has not drained by then is discarded with the connection. Default 5 s. */
 	flushTimeoutMs?: number;
+	/** `--restore`: started once the host is reachable and its extensions are up, whether or not a client attached. */
+	restore?: () => Promise<RestoreOutcome>;
 }
 
 interface LeaseClaim {
@@ -110,6 +113,7 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		onExit,
 		helloTimeoutMs = HELLO_TIMEOUT_MS,
 		flushTimeoutMs = FLUSH_TIMEOUT_MS,
+		restore,
 		...serverOptions
 	} = options;
 	// Every use below must name the same directory, whatever the process's cwd is or becomes.
@@ -430,6 +434,11 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 		owned?.release();
 		throw error;
 	}
+	// Not awaited: the restored turn runs as long as any turn does, and clients see it as they would any other.
+	void restore?.().then(
+		outcome => logger.debug("Session host restored its session", { hostId, ...outcome }),
+		error => logger.warn("Session host restore failed", { hostId, error: String(error) }),
+	);
 	return lifetime.promise;
 }
 

@@ -1839,7 +1839,7 @@ async function runHostedInteractive(options: {
 		entry =
 			parsedArgs.attach !== undefined
 				? await resolveAttachTarget(parsedArgs.attach, launch)
-				: await ensureHostForResolvedSession(options.sessionManager, launch);
+				: await ensureHostForResolvedSession(options.sessionManager, launch, { restore: parsedArgs.restore });
 	} catch (error: unknown) {
 		process.stderr.write(`${chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`)}\n`);
 		process.exit(1);
@@ -2087,6 +2087,8 @@ export async function runRootCommand(
 			// No extension loads here to own a flag the bootstrap parse rejected, so a bad value is final.
 			if (reportInvalidFlagValues(parsedArgs)) process.exit(2);
 			assertHostedLaunchSupported(parsedArgs);
+			// The host goes on with the interrupted turn; a prompt would race it, as in process.
+			validateRestorePrompt(parsedArgs);
 		}
 
 		// The registry composes policy-dependent metadata synchronously, including
@@ -2813,6 +2815,7 @@ export async function runRootCommand(
 					headless: false,
 					subagentEventBus,
 					onExit: () => exitAfterHostDispose(session),
+					restore: parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
 				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);

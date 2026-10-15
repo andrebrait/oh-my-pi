@@ -60,6 +60,8 @@ export interface SpawnSessionHostOptions {
 	cwd: string;
 	/** Absolute session file to resume; omitted = new session. */
 	sessionFile?: string;
+	/** Open `sessionFile` with `--restore`: the host goes on with what its last process left unfinished. */
+	restore?: boolean;
 	/** Extra launch flags (model, profile, …) forwarded verbatim. */
 	args?: string[];
 	/**
@@ -81,7 +83,7 @@ export interface SpawnSessionHostOptions {
  * a host still running then is killed.
  */
 export async function spawnSessionHost(options: SpawnSessionHostOptions): Promise<SessionHostEntry> {
-	const { cwd, sessionFile, args = [], env, timeoutMs = SPAWN_TIMEOUT_MS } = options;
+	const { cwd, sessionFile, restore, args = [], env, timeoutMs = SPAWN_TIMEOUT_MS } = options;
 	// The host runs in `cwd`: a relative registry would name a different directory there.
 	const registryDir = path.resolve(options.registryDir ?? sessionHostsDir());
 	const hostId = newHostId();
@@ -101,7 +103,7 @@ export async function spawnSessionHost(options: SpawnSessionHostOptions): Promis
 				registryDir,
 				"--cwd",
 				cwd,
-				...(sessionFile ? ["--resume", sessionFile] : []),
+				...(sessionFile ? [restore ? "--restore" : "--resume", sessionFile] : []),
 				...args,
 			],
 			env: workerEnvFromParent(env),
