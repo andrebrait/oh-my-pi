@@ -58,7 +58,7 @@ export const mnemosyneOssBackend: MemoryBackend = {
 		state.attachSessionListeners();
 	},
 
-	async buildDeveloperInstructions(_agentDir, _settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, _cwd, _settings, session): Promise<string | undefined> {
 		const owner = getMnemosyneOssOwner(session);
 		if (!owner) return undefined;
 		return [INSTRUCTIONS, owner.lastRecallSnippet].filter(Boolean).join("\n\n");
