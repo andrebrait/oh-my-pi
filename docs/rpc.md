@@ -1699,7 +1699,7 @@ Commands may be pipelined behind `hello`.
 { "type": "resumed", "epoch": 1790000000000, "replayed": 7 }
 ```
 
-`replayed` is the number of sequence numbers covered (`current seq - lastSeq`); frames that the new connection does not receive anyway (extension UI frames without `capabilities.ui`) are skipped, so fewer frames can follow. The ring holds the last 4096 broadcast frames. If the `hostId` differs, the epoch is stale, or `lastSeq` is out of the ring, the host sends `attached` with a fresh snapshot instead; it never sends a partial replay. After `attached`, discard local state and rebuild it from the snapshot.
+`replayed` is the number of sequence numbers covered (`current seq - lastSeq`); frames that the new connection does not receive anyway (extension UI frames without `capabilities.ui`) are skipped, so fewer frames can follow. The ring holds the last 4096 broadcast frames, fewer when they total more than about 64 MiB (a long streamed reply's full `message_update` frames each carry the reply so far); the oldest frames go first. If the `hostId` differs, the epoch is stale, or `lastSeq` is out of the ring, the host sends `attached` with a fresh snapshot instead; it never sends a partial replay. After `attached`, discard local state and rebuild it from the snapshot.
 
 Per-connection settings do not survive a reconnect, whether it ends in `resumed` or `attached`: re-send `set_event_filter`, `set_subagent_subscription`, `set_ask_dialog`, `set_host_tools`, and `set_host_uri_schemes` on the new connection. Frames replayed after `resumed` arrive before any of them can take effect, so they use the default projection: every event type, with full `message_update` frames.
 
