@@ -1474,11 +1474,15 @@ export class AgentSession implements SettingsScope {
 		const generation = this.#promptGeneration;
 		const inFlightEpoch = this.#beginInFlight();
 		let turnError: unknown;
-		// A pooled-turn yield transition (item-set mutation + prompt rebuild) may be
+		// Idle compaction rewrites history without owning a turn, so the wake waits it out
+		// first. A pooled-turn yield transition (item-set mutation + prompt rebuild) may be
 		// in flight when the wake lands. Starting the turn on the stale prompt would
 		// advertise one yield schema while the runtime enforces the other, so join
 		// the transition before building the turn from a consistent contract.
-		void this.whenWorkPoolYieldSettled()
+		const idleCompaction = this.#maintenance.waitForIdleCompaction();
+		void (
+			idleCompaction ? idleCompaction.then(() => this.whenWorkPoolYieldSettled()) : this.whenWorkPoolYieldSettled()
+		)
 			.then(() => {
 				// Synchronous ownership check, atomic with the dispatch below:
 				// agent.prompt() claims streaming with no await in between, and the
@@ -2110,6 +2114,8 @@ export class AgentSession implements SettingsScope {
 					this.#schedulePostPromptTask(
 						async () => {
 							try {
+								// Idle compaction rewrites history without owning a turn; flush into the compacted context.
+								await this.#maintenance.waitForIdleCompaction();
 								await run();
 							} finally {
 								keepalive[Symbol.dispose]();
@@ -9136,8 +9142,10 @@ export class AgentSession implements SettingsScope {
 			| undefined,
 		outcome: PromptDispatchOutcome,
 	): Promise<boolean> {
-		// Captured before the normalization await below — see #sessionGeneration's doc comment.
+		// Captured before the awaits below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
+		// A message that may start a turn waits out idle compaction, as prompt() does; plain appends do not.
+		if (options?.triggerTurn || options?.deliverAs === "aside") await this.#maintenance.waitForIdleCompaction();
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
 		const details =

@@ -2023,6 +2023,20 @@ export class SessionMaintenance {
 	}
 
 	/**
+	 * Settles once no idle compaction is rewriting history. Paths that start a turn
+	 * from idle outside {@link waitForMaintenanceCleanup} (turn-triggering custom
+	 * messages, IRC wakes, yield-queue idle flushes) await it so the turn runs on
+	 * the compacted context. `undefined` when no idle compaction is running, so the
+	 * common path adds no await.
+	 */
+	waitForIdleCompaction(): Promise<void> | undefined {
+		if (!this.#idleCompactionCleanup) return undefined;
+		return (async () => {
+			while (this.#idleCompactionCleanup) await this.#idleCompactionCleanup;
+		})();
+	}
+
+	/**
 	 * Register a dispatch that may start a turn while an interrupted-turn resume
 	 * decision is open (a prompt parked by {@link waitForMaintenanceCleanup}
 	 * has not released yet). `undefined` when no decision is open.

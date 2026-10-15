@@ -211,7 +211,7 @@
 - Hosted launches reject invalid file attachments before starting a detached session host, avoiding orphaned background sessions ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - RPC mode: an extension dialog opened during `session_start` can be answered instead of hanging startup; other commands still wait for startup to finish ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Session hosts publish before extension startup, so an attached terminal can answer a startup dialog instead of the launch timing out, and hosted launches with several CLI messages run each as its own turn ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
-- Prompts submitted during idle compaction now wait for it to finish before starting a turn ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
+- Prompts, turn-triggering extension and advisor messages, IRC wakes and background launch completions that arrive during idle compaction now wait for it to finish before starting a turn ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.11.0] - 2026-10-14
 

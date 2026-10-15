@@ -18,6 +18,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as logger from "@oh-my-pi/pi-utils/logger";
+import { MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { activateTodoTool, createAssistantMessage } from "./helpers/agent-session-setup";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
@@ -1363,6 +1364,92 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(requests[0]).toEqual({ text: "after idle compaction", images: 1 });
 		expect(order).toEqual(["compaction ended", "prompt admitted", "model request"]);
 	});
+
+	// Paths that start a turn from idle without passing prompt()'s admission barrier.
+	const idleTurnStarters: Array<[name: string, start: (session: AgentSession) => Promise<unknown>]> = [
+		[
+			"a turn-triggering custom message",
+			session =>
+				session.sendCustomMessage(
+					{ customType: "extension-nudge", content: "act on the nudge", display: false },
+					{ triggerTurn: true },
+				),
+		],
+		[
+			"an IRC wake",
+			session =>
+				session.deliverIrcMessage({ id: "m1", from: "peer", to: MAIN_AGENT_ID, body: "ping", ts: Date.now() }),
+		],
+		[
+			"a launch completion",
+			session => {
+				const owner = session.sessionManager.getSessionId();
+				return session.queueLaunchCompletion({
+					event: "daemon-completed",
+					completionId: "idle-completion",
+					owner,
+					daemon: {
+						name: "worker",
+						id: "daemon-id",
+						state: "exited",
+						createdAt: 1,
+						startedAt: 1,
+						exitedAt: 2,
+						exitCode: 0,
+						restartCount: 0,
+						outputBytes: 0,
+						owner,
+						persist: false,
+						detached: false,
+					},
+				});
+			},
+		],
+	];
+
+	for (const [name, start] of idleTurnStarters) {
+		it(`holds ${name} until idle compaction finishes, then runs one turn on the compacted context`, async () => {
+			vi.useRealTimers();
+			// The idle flush's 1 ms delay resolves at once, so a wrongly admitted turn starts within one event-loop yield.
+			mockSchedulerWaitWithClock();
+			cfgCompactionKeepRecentTokens.set(session.settings, 1);
+			sessionManager.appendMessage(createAssistantMessage("previous answer"));
+			sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() });
+			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			const mock = createMockModel({ responses: [{ content: ["next answer"] }] });
+			const compactedAtRequest: boolean[] = [];
+			session.agent.streamFn = (model, context, options) => {
+				compactedAtRequest.push(session.agent.state.messages.some(message => message.role === "compactionSummary"));
+				return mock.stream(model, context, options);
+			};
+			session.agent.getApiKey = () => "test-key";
+
+			const gate = Promise.withResolvers<void>();
+			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+				gate.promise;
+			const entered = Promise.withResolvers<void>();
+			const order: string[] = [];
+			session.subscribe(event => {
+				if (event.type === "auto_compaction_start") entered.resolve();
+				if (event.type === "auto_compaction_end") order.push("compaction ended");
+				if (event.type === "agent_start") order.push("agent_start");
+			});
+			const compacted = session.runIdleCompaction();
+			await entered.promise;
+
+			const started = start(session);
+			try {
+				await scheduler.yield();
+				expect(order).toEqual([]);
+			} finally {
+				gate.resolve();
+				await Promise.all([compacted, started]);
+				await session.waitForIdle();
+			}
+			expect(order).toEqual(["compaction ended", "agent_start"]);
+			expect(compactedAtRequest).toEqual([true]);
+		});
+	}
 
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
 		// Give the branch something to summarize so auto-compaction reaches the
