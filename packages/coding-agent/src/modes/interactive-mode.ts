@@ -3490,10 +3490,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (submission.customType === "goal-continuation") {
-			this.#pendingGoalContinuationTurns = Math.max(0, this.#pendingGoalContinuationTurns - 1);
-			this.syncIdleMaintenanceView();
-		}
+		if (submission.customType === "goal-continuation") this.#releaseGoalContinuationTurn();
 		if (this.loadingAnimation) {
 			this.#stopLoadingAnimation(true);
 		}
@@ -3559,6 +3556,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	finishPendingSubmission(input: SubmittedUserInput): void {
+		// A started continuation the session refused or dropped gets no `agent_end` to release its reservation.
+		if (input.customType === "goal-continuation" && input.started && !input.dispatched) {
+			this.#releaseGoalContinuationTurn();
+		}
 		const wasPendingSubmission = this.#pendingSubmittedInput === input;
 		const pendingSubmissionDispose = this.#pendingSubmissionDispose;
 		if (wasPendingSubmission) {
@@ -3576,6 +3577,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#stopLoadingAnimation(true);
 			}
 		}
+	}
+
+	/** Drop one pending goal-continuation reservation, so idle maintenance stops waiting for its turn. */
+	#releaseGoalContinuationTurn(): void {
+		this.#pendingGoalContinuationTurns = Math.max(0, this.#pendingGoalContinuationTurns - 1);
+		this.syncIdleMaintenanceView();
 	}
 
 	#computeEditorMaxHeight(): number {

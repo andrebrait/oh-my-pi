@@ -90,6 +90,8 @@ export type SubmittedUserInput = {
 	 *  it). Normal user Enter carries "steer" to match the streaming-branch Enter;
 	 *  background/continuation submits omit it and default to "followUp". */
 	streamingBehavior?: "steer" | "followUp";
+	/** Set by `submitInteractiveInput` for a custom-message submission: the session took it (started a turn or queued it into one). */
+	dispatched?: boolean;
 	cancelled: boolean;
 	started: boolean;
 };

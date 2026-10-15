@@ -21,6 +21,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
@@ -1592,6 +1593,34 @@ describe("a hosted client's automation", () => {
 				expect(journal(session)).toEqual([RECAP]);
 				expect(shown(mode, RECAP)).toBe(1);
 			}, 30_000);
+
+			const refusals: Array<[outcome: string, dispatch: () => Promise<boolean>]> = [
+				["rejects", () => Promise.reject(new Error("No API key found for anthropic."))],
+				["drops", () => Promise.resolve(false)],
+			];
+			for (const [outcome, dispatch] of refusals) {
+				it(`recaps the stretch once the session ${outcome} a goal continuation, with no other turn to restart the clock`, async () => {
+					const { mode, session, models } = await openRecapMode(false);
+					await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
+					vi.useFakeTimers();
+					const input = mode.getUserInput();
+					await runTurn(session);
+					await elapse(800);
+					const continuation = await wait(input);
+					expect(continuation.customType).toBe("goal-continuation");
+
+					// The main loop submits it and the session refuses it before any turn starts: no `agent_end` follows.
+					vi.spyOn(session, "promptCustomMessage").mockImplementationOnce(dispatch);
+					await wait(submitInteractiveInput(mode, session, continuation));
+					await flush();
+					await elapse(RECAP_DELAY_MS);
+					await until(() => shown(mode, RECAP) > 0, "the recap on screen");
+					await elapse(3 * RECAP_DELAY_MS);
+					expect(models.main.calls).toHaveLength(1);
+					expect(models.side.calls).toHaveLength(1);
+					expect(journal(session)).toEqual([RECAP]);
+				}, 30_000);
+			}
 		});
 	});
 });
