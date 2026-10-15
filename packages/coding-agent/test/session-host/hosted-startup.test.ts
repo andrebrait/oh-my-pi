@@ -134,6 +134,11 @@ describe("hostLaunchArgs", () => {
 			"--omp-profile-boundary",
 			"another prompt",
 			"--cwd=/again",
+			"--hide-thinking",
+			"--no-title",
+			"--print-thoughts",
+			"--allow-home",
+			"--no-pty",
 		]);
 		expect(args).toEqual(["--model", "claude-sonnet-4-5", "--no-tools", "--tools=read"]);
 	});
@@ -204,6 +209,24 @@ describe("resolving what to attach to", () => {
 
 		expect(reused.hostId).toBe(host.hostId);
 		expect((await listSessionHosts(registryDir)).map(entry => entry.hostId)).toEqual([host.hostId]);
+	});
+
+	it("resumes into the host already running the session with flags that only shape this terminal", async () => {
+		const { file } = await persistedSession();
+		const host = await standInHost("eeeeeeeeeeeeeeee", file);
+
+		const reused = await ensureHostForResolvedSession(
+			await SessionManager.open(file, sessionsDir),
+			launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-title"])),
+		);
+		expect(reused.hostId).toBe(host.hostId);
+
+		await expect(
+			ensureHostForResolvedSession(
+				await SessionManager.open(file, sessionsDir),
+				launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-tools"])),
+			),
+		).rejects.toThrow(/already runs this session/);
 	});
 
 	it("does not take a session another process leases for a registered host", async () => {
