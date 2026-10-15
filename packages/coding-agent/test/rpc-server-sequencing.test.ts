@@ -348,9 +348,10 @@ describe("RpcServer sequencing", () => {
 		expect(replaced.reason).toBe("new");
 		expect(session.sessionId).not.toBe(oldSessionId);
 		// The new session's own bookkeeping entries (thinking level, service tier), never the old transcript.
+		// Compared as the wire carries them: a field left undefined in memory (a runtime-identity label) is not sent.
 		expect(replaced.snapshot).toMatchObject({
 			header: { id: session.sessionId },
-			entries: session.sessionManager.getEntries(),
+			entries: JSON.parse(JSON.stringify(session.sessionManager.getEntries())),
 		});
 		expect(replaced.sessionFile).toBe(session.sessionFile);
 		expect(epochChanges).toEqual([[before + 1, session.sessionFile]]);
