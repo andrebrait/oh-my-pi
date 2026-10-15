@@ -585,7 +585,7 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.useFakeTimers();
 
 		harness.mode.editor.setText("half-typed reply");
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
 
@@ -604,7 +604,7 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.useFakeTimers();
 
 		const submission = harness.mode.startPendingSubmission({ text: "next step" });
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
 
@@ -627,7 +627,7 @@ describe("InteractiveMode goal mode integration", () => {
 		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
 
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual([]);
 	});
@@ -639,7 +639,7 @@ describe("InteractiveMode goal mode integration", () => {
 		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
 
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		harness.session.setTodoPhases([
 			{
 				name: "Approval",
@@ -669,7 +669,7 @@ describe("InteractiveMode goal mode integration", () => {
 		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
 
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		await passContinuationWindow();
 		expect(admitted).toEqual(["goal-continuation"]);
 	});
@@ -679,13 +679,44 @@ describe("InteractiveMode goal mode integration", () => {
 		const admitted = recordContinuations(harness.session);
 		vi.useFakeTimers();
 
-		harness.session.goalMode?.reschedule();
+		await armInputWaiter(harness.mode);
 		expect(harness.session.goalMode?.continuationPending).toBe(true);
 		await harness.session.abort({ reason: USER_INTERRUPT_LABEL });
 		await passContinuationWindow();
 
 		expect(admitted).toEqual([]);
 		expect(harness.mode.goalModePaused).toBe(true);
+	});
+
+	it("an open dialog holds a goal continuation back; closing it lets the goal continue once", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		vi.useFakeTimers();
+		const dialog = new AbortController();
+		const choice = harness.mode.showHookSelector("Pick one", ["a", "b"], { signal: dialog.signal });
+
+		await armInputWaiter(harness.mode);
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
+
+		dialog.abort();
+		await choice;
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	it("waits until the terminal waits for input", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const admitted = recordContinuations(harness.session);
+		vi.useFakeTimers();
+
+		harness.session.goalMode?.reschedule();
+		await passContinuationWindow();
+		expect(admitted).toEqual([]);
+
+		await armInputWaiter(harness.mode);
+		await passContinuationWindow();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	it("stops repeated goal continuations when identical tool evidence adds no new signal", async () => {
@@ -706,6 +737,7 @@ describe("InteractiveMode goal mode integration", () => {
 				: [{ type: "text", text: "Verification remains complete." }],
 		);
 		vi.spyOn(harness.session, "prompt").mockRestore();
+		await armInputWaiter(harness.mode);
 		vi.useFakeTimers();
 		// Real turns run between continuation windows: advance fake time until each turn ends.
 		const pumpUntil = async (signal: Promise<void>): Promise<void> => {

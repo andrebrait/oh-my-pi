@@ -2857,14 +2857,18 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/**
 	 * Opt this session into session-owned goal mode as the in-process `"interactive"` owner
-	 * (`init` does; a hosted terminal never does). Continuation waits while the user is
-	 * composing or a submission is pending, and in loop mode or paused plan mode.
+	 * (`init` does; a hosted terminal never does). Continuation runs only while the terminal
+	 * waits for input with the editor in view, and waits while the user is composing, a
+	 * submission is pending, or loop mode or paused plan mode is on.
 	 */
 	enableGoalMode(): void {
 		this.session.enableGoalMode({
 			mode: "interactive",
 			delayMs: 800,
 			isBlocked: () =>
+				!this.onInputCallback ||
+				this.ui.hasOverlay() ||
+				!this.editorContainer.children.includes(this.editor) ||
 				this.editor.getText().trim().length > 0 ||
 				(this.editor.pendingImages?.length ?? 0) > 0 ||
 				this.#pendingSubmittedInput !== undefined ||
@@ -2880,6 +2884,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			resolve(input);
 		};
 		this.#scheduleLoopAutoSubmit();
+		this.session.goalMode?.reschedule();
 
 		using _ = new EventLoopKeepalive();
 		return await promise;
