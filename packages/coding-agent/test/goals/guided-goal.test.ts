@@ -359,9 +359,8 @@ describe("guided goal setup", () => {
 		const harness = await createHarness();
 		try {
 			vi.spyOn(harness.session, "prompt").mockRejectedValue(new Error("provider down"));
-			vi.spyOn(harness.mode, "showError").mockImplementation(() => {});
 
-			await harness.mode.handleGuidedGoalCommand("ship it");
+			await expect(harness.mode.handleGuidedGoalCommand("ship it")).rejects.toThrow("provider down");
 
 			expect(harness.mode.isGuidedGoalInterviewActive()).toBe(false);
 		} finally {

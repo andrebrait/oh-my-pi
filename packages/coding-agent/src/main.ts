@@ -804,12 +804,20 @@ async function runInteractiveMode(
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}
 		}
+		// `--goal` reaches here only for a host this launch started (ensureHostForResolvedSession).
+		if (startupGoal !== undefined && mode.hostedClient) {
+			try {
+				await mode.startGoalAtStartup(startupGoal);
+			} catch (error: unknown) {
+				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			}
+		}
 		// Input reaches the host straight from the editor, never through the loop below. The process ends in
 		// `shutdown()` (/exit, /detach, Ctrl+C, SIGHUP, or a lost connection), which exits the process.
 		await Promise.withResolvers<never>().promise;
 	}
 
-	// A hosted launch refuses `--goal` (assertHostedLaunchSupported), so a goal never reaches the branch above.
+	// A hosted launch ran a `--goal` objective on its new host above.
 	if (startupGoal !== undefined) {
 		try {
 			await mode.startGoalAtStartup(startupGoal);
@@ -1833,10 +1841,21 @@ async function runHostedInteractive(options: {
 	let entry: SessionHostEntry;
 	try {
 		validateSessionPersistenceArgs(parsedArgs);
+		if (parsedArgs.goal !== undefined) {
+			validateGoalStartup(
+				parsedArgs,
+				cfgGoalEnabled.get(activeSettings),
+				options.pipedInput,
+				cfgPlanDefaultOnStartup.get(activeSettings) && cfgPlanEnabled.get(activeSettings),
+			);
+		}
 		entry =
 			parsedArgs.attach !== undefined
 				? await resolveAttachTarget(parsedArgs.attach, launch)
-				: await ensureHostForResolvedSession(options.sessionManager, launch, { restore: parsedArgs.restore });
+				: await ensureHostForResolvedSession(options.sessionManager, launch, {
+						restore: parsedArgs.restore,
+						requireNewHost: parsedArgs.goal === undefined ? undefined : "--goal",
+					});
 	} catch (error: unknown) {
 		process.stderr.write(`${chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`)}\n`);
 		process.exit(1);
@@ -1889,7 +1908,7 @@ async function runHostedInteractive(options: {
 			undefined,
 			undefined,
 			startupLease,
-			undefined, // no startup goal: assertHostedLaunchSupported refuses `--goal`
+			parsedArgs.goal,
 			undefined,
 			{ entry, launch },
 		);

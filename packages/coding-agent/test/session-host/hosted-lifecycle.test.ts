@@ -847,6 +847,70 @@ describe("a hosted terminal in Tern", () => {
 	}, 20_000);
 });
 
+describe("goal mode in a hosted terminal", () => {
+	const continuations = (session: AgentSession): number =>
+		session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation")
+			.length;
+	/** The host decided nothing more: no goal turn waiting, none running. */
+	const quiet = (session: AgentSession): boolean =>
+		session.goalMode?.continuationPending === false && !session.isStreaming && !session.hasAdmittedSubmission;
+
+	async function attachedMode(host: TestSessionHost): Promise<HostedMode> {
+		const hosted = await HostedMode.open();
+		await hosted.attach(await fixture.entry(host));
+		return hosted;
+	}
+
+	it("/goal from one terminal sets the host's goal, sends the objective once, and every terminal shows it", async () => {
+		const host = await fixture.startHost();
+		const a = await attachedMode(host);
+		const b = await attachedMode(host);
+		const status = vi.spyOn(b.mode.statusLine, "setGoalModeStatus");
+
+		await executeBuiltinSlashCommand("/goal ship the release", { ctx: a.mode });
+
+		expect(host.session.getGoalModeState()?.goal).toMatchObject({ objective: "ship the release", status: "active" });
+		expect(a.mode.goalModeEnabled).toBe(true);
+		await waitFor(() => b.mode.goalModeEnabled);
+		expect(status).toHaveBeenLastCalledWith({ enabled: true, paused: false });
+		await waitFor(() => quiet(host.session) && continuations(host.session) === 1);
+		expect(userTexts(host.session).filter(text => text === "ship the release")).toHaveLength(1);
+
+		await executeBuiltinSlashCommand("/goal pause", { ctx: b.mode });
+
+		expect(host.session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(b.mode.goalModePaused).toBe(true);
+		await waitFor(() => a.mode.goalModePaused);
+	}, 30_000);
+
+	it("the host continues the goal with every terminal detached", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+		await terminal.mode.startGoalAtStartup("keep going");
+		await terminal.mode.hostedClient?.detach();
+		await fixture.waitForClients(host, 0);
+
+		await waitFor(() => quiet(host.session) && continuations(host.session) === 1);
+		expect(host.session.getGoalModeState()?.goal).toMatchObject({ objective: "keep going", status: "active" });
+		expect(userTexts(host.session)).toEqual(["keep going"]);
+	}, 30_000);
+
+	it("a /goal the host refuses stays in the editor", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+		const showError = vi.spyOn(terminal.mode, "showError");
+		// Plan mode on the host; this terminal does not know it.
+		host.session.setPlanModeState({ enabled: true, planFilePath: "plan.md" });
+
+		await executeBuiltinSlashCommand("/goal ship it", { ctx: terminal.mode });
+
+		expect(showError).toHaveBeenCalledWith("Exit plan mode before starting a goal.");
+		expect(terminal.mode.editor.getText()).toBe("/goal ship it");
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		expect(terminal.mode.goalModeEnabled).toBe(false);
+	}, 20_000);
+});
+
 /** A host that boots without network: a dummy key makes the model available, and discovery hits a closed port. */
 const MODEL_ARGS = [
 	"--no-extensions",

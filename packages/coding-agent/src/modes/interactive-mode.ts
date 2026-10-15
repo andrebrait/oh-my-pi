@@ -4599,7 +4599,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#vibeScopeSuspendedForSwitch = true;
 	}
 
-	#updateGoalModeStatus(): void {
+	updateGoalModeStatus(): void {
 		// A completed goal is journaled and cleared after this agent_end's listeners; show it gone already.
 		const status =
 			this.session.getGoalModeState()?.mode !== "exiting" && (this.goalModeEnabled || this.goalModePaused)
@@ -4628,17 +4628,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else {
 			return;
 		}
-		this.#updateGoalModeStatus();
+		this.updateGoalModeStatus();
 	}
 
-	/** Run a goal op on the session's controller (only a hosted terminal has none). */
+	/** Run a goal op on the session's controller, or on the host a hosted terminal is attached to. */
 	async #goalOp(command: RpcGoalCommand): Promise<void> {
+		if (this.hostedClientMode) {
+			const link = this.hostedClient;
+			if (!link) throw new Error("Not connected to the session host yet");
+			await link.goal(command);
+			return;
+		}
 		const goalMode = this.session.goalMode;
 		if (!goalMode) throw new Error("Goal mode is unavailable in this session.");
 		try {
 			await goalMode.handle(command);
 		} finally {
-			this.#updateGoalModeStatus();
+			this.updateGoalModeStatus();
 		}
 	}
 
@@ -4828,7 +4834,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// the session adopts the target's goal when the change ends.
 		if (options?.preserveActiveGoal) await goalMode?.leavePreviousGoal();
 		else await goalMode?.reconcile();
-		this.#updateGoalModeStatus();
+		this.updateGoalModeStatus();
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") return;
 		if (sessionContext.mode === "vibe") {
 			if (!preserveVibe) {
@@ -6091,40 +6097,40 @@ export class InteractiveMode implements InteractiveModeContext {
 		rest?: string,
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
-		try {
-			if (this.planModeEnabled || this.planModePaused) {
-				this.#warnPlanModeBlocks();
-				return false;
-			}
-			if (this.vibeModeEnabled) {
-				this.showWarning("Exit vibe mode first.");
-				return false;
-			}
-			if (!cfgGoalEnabled.get(this.session.settings)) {
-				this.showWarning("Goal mode is disabled. Enable it in settings (goal.enabled).");
-				return false;
-			}
-			if (this.goalModeEnabled) {
-				this.showStatus("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
-				return false;
-			}
-			if (this.#getPausedGoalState()) {
-				this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
-				return false;
-			}
-
-			this.#guidedGoalInterviewActive = true;
-			// The interview is a normal conversation: the controller exposes the goal tool, so the
-			// agent can finish with `goal create`, and sends the kickoff as a hidden message,
-			// queued behind an in-flight run; the user answers in the ordinary editor.
-			const images = input?.images?.length ? input.images : undefined;
-			await this.#goalOp({ op: "guided", rough: rest, images });
-			return true;
-		} catch (error) {
-			this.#guidedGoalInterviewActive = false;
-			this.showError(error instanceof Error ? error.message : String(error));
+		if (this.planModeEnabled || this.planModePaused) {
+			this.#warnPlanModeBlocks();
 			return false;
 		}
+		if (this.vibeModeEnabled) {
+			this.showWarning("Exit vibe mode first.");
+			return false;
+		}
+		if (!cfgGoalEnabled.get(this.session.settings)) {
+			this.showWarning("Goal mode is disabled. Enable it in settings (goal.enabled).");
+			return false;
+		}
+		if (this.goalModeEnabled) {
+			this.showStatus("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
+			return false;
+		}
+		if (this.#getPausedGoalState()) {
+			this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
+			return false;
+		}
+
+		this.#guidedGoalInterviewActive = true;
+		// The interview is a normal conversation: the controller exposes the goal tool, so the
+		// agent can finish with `goal create`, and sends the kickoff as a hidden message,
+		// queued behind an in-flight run; the user answers in the ordinary editor.
+		const images = input?.images?.length ? input.images : undefined;
+		try {
+			await this.#goalOp({ op: "guided", rough: rest, images });
+		} catch (error) {
+			// The command reports the failure and keeps the typed command.
+			this.#guidedGoalInterviewActive = false;
+			throw error;
+		}
+		return true;
 	}
 
 	async #dispatchGoalSubcommand(

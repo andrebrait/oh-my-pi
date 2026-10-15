@@ -368,7 +368,9 @@ describe("assertHostedLaunchSupported", () => {
 		expect(() => assertHostedLaunchSupported(parseArgs(["--fork", "abc"]))).toThrow(/--fork/);
 		expect(() => assertHostedLaunchSupported(parseArgs(["--from-claude"]))).toThrow(/--from-claude/);
 		expect(() => assertHostedLaunchSupported(parseArgs(["--from-codex"]))).toThrow(/--from-codex/);
-		expect(() => assertHostedLaunchSupported(parseArgs(["--goal", "ship it"]))).toThrow(/--goal/);
+		expect(() => assertHostedLaunchSupported({ ...parseArgs(["--goal", "ship it"]), attach: "abc" })).toThrow(
+			/--goal/,
+		);
 		expect(() => assertHostedLaunchSupported(parseArgs(["--registered-by-an-extension"]))).toThrow(
 			/--registered-by-an-extension/,
 		);
@@ -378,6 +380,8 @@ describe("assertHostedLaunchSupported", () => {
 		expect(() =>
 			assertHostedLaunchSupported(parseArgs(["--model", "claude-sonnet-4-5", "--no-tools", "-c", "hello"])),
 		).not.toThrow();
+		// A launch that starts a new host takes its goal there.
+		expect(() => assertHostedLaunchSupported(parseArgs(["--goal", "ship it"]))).not.toThrow();
 	});
 });
 
@@ -446,6 +450,17 @@ describe("resolving what to attach to", () => {
 				launch(hostLaunchArgs(["--resume", file, "--hide-thinking", "--no-tools"], dir)),
 			),
 		).rejects.toThrow(/already runs this session/);
+	});
+
+	it("refuses --goal for a session a host already runs", async () => {
+		const { file } = await persistedSession();
+		const host = await standInHost("dddddddddddddddd", file);
+		await expect(
+			ensureHostForResolvedSession(await SessionManager.open(file, sessionsDir), launch(), {
+				requireNewHost: "--goal",
+			}),
+		).rejects.toThrow(/already runs this session, and --goal needs a new one/);
+		expect((await listSessionHosts(registryDir)).map(entry => entry.hostId)).toEqual([host.hostId]);
 	});
 
 	it("does not take a session another process leases for a registered host", async () => {
