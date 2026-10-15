@@ -199,6 +199,8 @@ export class HostedClientLink {
 	#reconnectLoop: Promise<void> | undefined;
 	/** The current reconnect attempt: resolved once the host's reply is applied, rejected when it cannot be. */
 	#reconnectAttempt: PromiseWithResolvers<void> | undefined;
+	/** When the running reconnect gives up (epoch ms). */
+	#reconnectDeadline = 0;
 	/**
 	 * A dialog was aborted by the loss, or its answer may have died with the transport: the ring would not resend
 	 * it, so the next attempt asks for a snapshot.
@@ -257,6 +259,8 @@ export class HostedClientLink {
 							client: { kind: "tui" },
 							ui: true,
 							resume: this.#resumePoint,
+							// `stop()` cannot interrupt a dial: a reconnect's own is bounded by what is left of it.
+							timeoutMs: this.#reconnecting ? Math.max(0, this.#reconnectDeadline - Date.now()) : undefined,
 						})
 					: Promise.reject(new Error("Left the session host")),
 		});
@@ -1086,7 +1090,7 @@ export class HostedClientLink {
 	 * gone or the timeout passes. Commands in flight at the loss already failed with it and are never resent.
 	 */
 	async #reconnect(error: Error): Promise<void> {
-		const lostAt = Date.now();
+		this.#reconnectDeadline = Date.now() + this.#reconnectTimeoutMs;
 		// Frames that arrived before the close still render before anything else happens.
 		await this.#chain;
 		if (!this.#open) return;
@@ -1101,7 +1105,7 @@ export class HostedClientLink {
 			this.#reconnectAttempt = outcome;
 			try {
 				const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
-				const left = (): number => this.#reconnectTimeoutMs - (Date.now() - lostAt);
+				const left = (): number => this.#reconnectDeadline - Date.now();
 				await Promise.race([Bun.sleep(Math.min(delay, Math.max(0, left()))), outcome.promise]);
 				// A failed attempt may have applied frames: the resume point never passes what the view shows.
 				await this.#chain;
@@ -1113,7 +1117,8 @@ export class HostedClientLink {
 					return;
 				}
 				// A host that accepts and never answers would hold `start()` for its own ready timeout: the attempt
-				// gets only what is left of the reconnect timeout. `stop()` reports no close, so the attempt is failed here.
+				// gets only what is left of the reconnect timeout, as does its dial. `stop()` reports no close, so the
+				// attempt is failed here.
 				attemptTimer = setTimeout(() => {
 					outcome.reject(new Error("Session host did not answer before the reconnect timeout"));
 					void this.#client.stop();
@@ -1126,8 +1131,6 @@ export class HostedClientLink {
 						: { hostId: this.hostId, epoch: this.#epoch, lastSeq };
 				// Folded into `#dialogLost` already: from here on, answers go out on the new transport.
 				this.#answerSent = false;
-				// shortcut: `stop()` cannot interrupt `start()` before its transport exists (while it reaps or connects), so
-				// the bound covers the wait for the host's reply, not a hung connect; bound the connect if pipes need it.
 				await this.#client.start();
 				if (stopped()) throw new Error("Left the session host");
 				await outcome.promise;
