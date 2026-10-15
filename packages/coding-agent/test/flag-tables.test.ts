@@ -324,6 +324,16 @@ describe("--restore", () => {
 	});
 });
 
+describe("session host selectors", () => {
+	it("are refused outside --mode host, where only spawnSessionHost sets them", () => {
+		expect(() => parseArgs(["--host-id", "0123456789abcdef"])).toThrow(CliUsageError);
+		expect(() => parseArgs(["--host-registry-dir", "/tmp/hosts"])).toThrow(/--host-registry-dir/);
+		expect(() => parseArgs(["--mode", "rpc", "--host-id", "0123456789abcdef"])).toThrow(/--host-id/);
+		const host = parseArgs(["--mode", "host", "--host-id", "0123456789abcdef", "--host-registry-dir=/tmp/hosts"]);
+		expect(host.hostRegistryDir).toBe("/tmp/hosts");
+	});
+});
+
 describe("--system-prompt-template", () => {
 	it("parses a template path without leaking it into the prompt", () => {
 		const result = parseArgs(["--system-prompt-template", "/tmp/SYSTEM_TEMPLATE.md", "hello"]);
