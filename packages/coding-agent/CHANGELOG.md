@@ -14,6 +14,7 @@
 - Fixed leaving a subagent view before its transcript finished replaying leaving rows of both sessions on screen, dropping the start of one, and clearing native scrollback twice; transcript rebuilds now run one at a time and a superseded rebuild is discarded without painting ([#16066](https://github.com/can1357/oh-my-pi/pull/16066) by [@cagedbird043](https://github.com/cagedbird043))
 - Fixed Cursor task subagents losing their final report when it follows tool calls in the same turn ([#16059](https://github.com/can1357/oh-my-pi/issues/16059)).
 - Mnemopi recall now fuses its vector, graph, fact and temporal voices by default (`mnemopi.polyphonicRecall`), finding noticeably more relevant memories; set it to `false` to restore the previous ranking ([#15896](https://github.com/can1357/oh-my-pi/pull/15896) by [@andrebrait](https://github.com/andrebrait))
+- Mnemopi recall now fuses its vector, graph, fact and temporal voices by default (`mnemopi.polyphonicRecall`), finding noticeably more relevant memories; set it to `false` or `MNEMOPI_POLYPHONIC_RECALL=0` to restore the previous ranking. Retained memories' extracted facts are now also consolidated, and the first recall on an existing bank backfills them once ([#15896](https://github.com/can1357/oh-my-pi/pull/15896) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.11.3] - 2026-10-16
 
