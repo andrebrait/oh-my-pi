@@ -56,6 +56,9 @@
 ### Changed
 
 - `RpcClient.steer()`, `followUp()`, and `setThinkingLevel()` now reject with `RpcCommandError` when the server reports a failure instead of resolving silently ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+### Added
+
+- Added `memory.backend: mnemosyne-oss`, which runs your own Mnemosyne 4.x Python SDK so recall, retain, and `memory://<id>` reads use the same local SQLite banks as other Mnemosyne clients ([#15687](https://github.com/can1357/oh-my-pi/pull/15687), based on [#9211](https://github.com/can1357/oh-my-pi/pull/9211) by [@wannfq](https://github.com/wannfq))
 
 ### Fixed
 
