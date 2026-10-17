@@ -276,6 +276,7 @@ export function createPersistedSubagentReviverFactory(
 												: undefined,
 										},
 										ctx.modelRegistry,
+										"dispatch",
 									),
 							}
 						: {}),
