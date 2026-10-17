@@ -1,5 +1,18 @@
 import { popLoopPhase, pushLoopPhase, withLoopPhase } from "@oh-my-pi/pi-utils";
-import { normalizedRecallWeights, polyphonicRecallEnabled, temporalHalflifeHours } from "../../config";
+import {
+	DENSE_CANDIDATE_LIMIT,
+	importedWeight,
+	inferredWeight,
+	normalizedRecallWeights,
+	polyphonicRecallEnabled,
+	statedWeight,
+	temporalHalflifeHours,
+	tier1Weight,
+	tier2Weight,
+	tier3Weight,
+	toolWeight,
+	unknownWeight,
+} from "../../config";
 import { hasCjk, matchesWordForm } from "../../util/regex";
 import { embedQuery } from "../embeddings";
 import { mmrRerank } from "../mmr";
@@ -10,6 +23,7 @@ import { adjustWeights, classifyIntent } from "../query-intent";
 import { getSynonyms, STOP_WORDS as QUERY_STOP_WORDS } from "../synonyms";
 import { extractTemporal } from "../temporal-parser";
 import { cosineSimilarity } from "../vector-math";
+import { cachedEmbeddings } from "./embedding-cache";
 import type { BeamMemoryState, RecallEnhancedOptions, RecallOptions, RecallResult } from "./types";
 
 type DbValue = string | number | null | Uint8Array;
@@ -63,16 +77,33 @@ type RecallMmrItem = {
 	readonly [key: string]: unknown;
 };
 
-const VERACITY_WEIGHTS: Record<string, number> = {
-	stated: 1.0,
-	true: 1.0,
-	likely_true: 1.0,
-	unknown: 0.8,
-	inferred: 0.7,
-	imported: 0.6,
-	tool: 0.5,
-	false: 0,
-};
+/**
+ * Score multipliers for a candidate's stored `veracity` label and, for episodic
+ * rows, its degradation tier. Resolved once per {@link recall} from the
+ * `MNEMOPI_<LABEL>_WEIGHT` and `MNEMOPI_TIER<N>_WEIGHT` readers in `config.ts`,
+ * clamped at 0 like the hybrid weights so a negative value cannot rank a row
+ * below one labelled `false`; `true`, `likely_true` and `false` have no override.
+ */
+interface TrustWeights {
+	readonly veracity: Readonly<Record<string, number>> & { readonly unknown: number };
+	readonly tiers: readonly [tier1: number, tier2: number, tier3: number];
+}
+
+function resolveTrustWeights(): TrustWeights {
+	return {
+		veracity: {
+			stated: Math.max(0, statedWeight()),
+			true: 1.0,
+			likely_true: 1.0,
+			unknown: Math.max(0, unknownWeight()),
+			inferred: Math.max(0, inferredWeight()),
+			imported: Math.max(0, importedWeight()),
+			tool: Math.max(0, toolWeight()),
+			false: 0,
+		},
+		tiers: [Math.max(0, tier1Weight()), Math.max(0, tier2Weight()), Math.max(0, tier3Weight())],
+	};
+}
 
 /**
  * Default per-result content preview cap enforced by {@link recall}. Content
@@ -543,24 +574,6 @@ function normalizeRanks(rows: readonly Row[], key: string): Map<string | number,
 	return out;
 }
 
-function parseEmbedding(raw: unknown): number[] | null {
-	if (typeof raw !== "string") return null;
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (!Array.isArray(parsed)) return null;
-		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
-		const vector = new Array<number>(parsed.length);
-		for (let i = 0; i < parsed.length; i += 1) {
-			const value = Number(parsed[i]);
-			if (!Number.isFinite(value)) return null;
-			vector[i] = value;
-		}
-		return vector;
-	} catch {
-		return null;
-	}
-}
-
 function vectorSimilarities(
 	beam: BeamMemoryState,
 	memoryIds: readonly string[],
@@ -575,18 +588,8 @@ function vectorSimilarities(
 	) {
 		return out;
 	}
-	for (let offset = 0; offset < memoryIds.length; offset += 500) {
-		const chunk = memoryIds.slice(offset, offset + 500);
-		const rows = queryAll(
-			beam,
-			`SELECT memory_id, embedding_json FROM memory_embeddings WHERE memory_id IN (${placeholders(chunk.length)})`,
-			chunk,
-		);
-		for (const row of rows) {
-			const vector = parseEmbedding(row.embedding_json);
-			const id = asString(row.memory_id);
-			if (vector !== null && id.length > 0) out.set(id, Math.max(0, cosineSimilarity(queryEmbedding, vector)));
-		}
+	for (const [id, vector] of cachedEmbeddings(beam.db, memoryIds)) {
+		out.set(id, Math.max(0, cosineSimilarity(queryEmbedding, vector)));
 	}
 	return out;
 }
@@ -599,7 +602,7 @@ function allVisibleIds(
 	const { where, params } = buildWhere(beam, "", options);
 	const rows = queryAll(beam, `SELECT id FROM ${table} WHERE ${where} ORDER BY timestamp DESC LIMIT ?`, [
 		...params,
-		DEFAULT_LIMIT,
+		DENSE_CANDIDATE_LIMIT,
 	]);
 	return rows.map(row => asString(row.id)).filter(Boolean);
 }
@@ -671,6 +674,7 @@ function scoreCandidate(
 	queryTokens: readonly string[],
 	queryGroups: readonly (readonly string[])[],
 	weights: readonly [number, number, number],
+	trust: TrustWeights,
 	options: RecallOptionsInternal,
 ): RecallResult | null {
 	const content = asString(candidate.row.content);
@@ -685,6 +689,8 @@ function scoreCandidate(
 			? recencyDecay(candidate.row.timestamp, 72)
 			: temporalBoost(candidate.row.timestamp, parseQueryTime(options.queryTime), 72);
 	const keyword = Math.max(lexical, candidate.signals.fts * 0.6);
+	// Similarities were scored (see `vectorSimilarities`), so `dense` is meaningful even when it is 0.
+	const queryEmbedded = (options.queryEmbedding?.length ?? 0) > 0;
 	let baseScore: number;
 	if (candidate.tierLabel === "episodic") {
 		baseScore = Math.max(
@@ -694,7 +700,10 @@ function scoreCandidate(
 	} else {
 		const kwShare = (1 - importanceWeight) * 0.6;
 		baseScore = keyword * kwShare + importance * importanceWeight + keyword * keyword * 0.08;
-		if (candidate.signals.dense > 0) baseScore = baseScore * 0.8 + candidate.signals.dense * 0.2;
+		// An equal share: at 0.2, rows that only repeat the query's words outranked rows that answer it by meaning.
+		// Once the query is embedded every row is blended: a row without a stored vector counts as similarity 0, or
+		// it would keep twice the keyword weight of an embedded one.
+		if (queryEmbedded) baseScore = baseScore * 0.5 + candidate.signals.dense * 0.5;
 	}
 	let score = baseScore * (0.7 + 0.3 * decay);
 	const temporalWeight = options.temporalWeight ?? 0;
@@ -714,11 +723,11 @@ function scoreCandidate(
 		score *= 1 + temporalWeight * temporalScore;
 	}
 	const veracity = asString(candidate.row.veracity) || "unknown";
-	const veracityWeight = VERACITY_WEIGHTS[veracity] ?? VERACITY_WEIGHTS.unknown ?? 0.8;
+	const veracityWeight = trust.veracity[veracity] ?? trust.veracity.unknown;
 	const degradationTier = candidate.tierLabel === "episodic" ? asNumber(candidate.row.tier, 1) : undefined;
 	if (candidate.tierLabel === "episodic") {
-		const tierWeight = degradationTier === 1 ? 1 : degradationTier === 2 ? 0.85 : 0.7;
-		score *= tierWeight;
+		const [tier1, tier2, tier3] = trust.tiers;
+		score *= degradationTier === 1 ? tier1 : degradationTier === 2 ? tier2 : tier3;
 	}
 	score *= veracityWeight * currentContentAdjustment(searchableContent, options.currentSensitive === true);
 	const preview = clipRecallContent(content, options.contentPreviewChars ?? RECALL_CONTENT_PREVIEW_CHARS);
@@ -742,7 +751,7 @@ function scoreCandidate(
 		temporal_score: round4(temporalScore),
 		recall_count: asNumber(candidate.row.recall_count, 0),
 		last_recalled: asNullableString(candidate.row.last_recalled),
-		explanation: explain(candidate.tierLabel, candidate.signals, lexical, temporalScore),
+		explanation: explain(candidate.tierLabel, candidate.signals, lexical, temporalScore, queryEmbedded),
 		voice_scores: {
 			vec: round4(candidate.signals.dense),
 			fts: round4(candidate.signals.fts),
@@ -757,10 +766,16 @@ function scoreCandidate(
 	return result;
 }
 
-function explain(tierLabel: TierLabel, signals: CandidateSignals, lexical: number, temporalScore: number): string {
+function explain(
+	tierLabel: TierLabel,
+	signals: CandidateSignals,
+	lexical: number,
+	temporalScore: number,
+	queryEmbedded: boolean,
+): string {
 	const parts: string[] = [tierLabel, signals.candidateSource];
 	if (lexical > 0) parts.push(`keyword=${round4(lexical)}`);
-	if (signals.dense > 0) parts.push(`dense=${round4(signals.dense)}`);
+	if (queryEmbedded) parts.push(`dense=${round4(signals.dense)}`);
 	if (temporalScore > 0) parts.push(`temporal=${round4(temporalScore)}`);
 	return parts.join(" ");
 }
@@ -879,6 +894,8 @@ function collectMemoryCandidates(
 					.map(([id]) => id),
 			]),
 		];
+		// Keyword hits older than the scored window are candidates too: score their vectors so they blend like the rest.
+		for (const [id, similarity] of vectorSimilarities(beam, wmIds, queryEmbedding)) wmVec.set(id, similarity);
 		const emIds = [...emVec.entries()]
 			.sort((a, b) => b[1] - a[1])
 			.slice(0, limit)
@@ -938,9 +955,10 @@ export async function recall(
 		const tokens = expandedTokens(query, useSynonyms);
 		const tokenGroups = expandedTokenGroups(query, useSynonyms);
 		const candidates = collectMemoryCandidates(beam, query, topK, temporalOptions);
+		const trust = resolveTrustWeights();
 		const scored: RecallResult[] = [];
 		for (const candidate of candidates) {
-			const result = scoreCandidate(candidate, tokens, tokenGroups, weights, temporalOptions);
+			const result = scoreCandidate(candidate, tokens, tokenGroups, weights, trust, temporalOptions);
 			if (result !== null) scored.push(result);
 		}
 		scored.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
