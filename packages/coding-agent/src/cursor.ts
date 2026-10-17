@@ -10,6 +10,7 @@ import {
 	joinAdditionalContext,
 	TOOL_RESULT_ADDITIONAL_CONTEXT,
 	type ToolResultWithAdditionalContext,
+	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	CursorMcpCall,
@@ -30,7 +31,7 @@ import {
 	piLsPath,
 	piReadPath,
 	piTimeout,
-	shellTimeoutSeconds,
+	shellDeadlineSeconds,
 } from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./cursor-bridge-tools";
@@ -240,6 +241,11 @@ function createToolResultMessage(
  * The agent loop never sees these calls, so the bridge installs its own
  * `addAdditionalContext` sink and attaches what the call reported to the
  * result message; `Agent` injects it after the buffered Cursor results.
+ *
+ * Also sets `rawImages`: both read frames compose `:raw` for gutter-free text,
+ * and `read` must still answer an image file with the image. The flag rides on
+ * the caller's context only, because a missing context is what lets the
+ * extension wrapper fall back to the session's approval settings.
  */
 function createBridgeToolContext(options: CursorExecBridgeOptions): {
 	context: AgentToolContext | undefined;
@@ -250,6 +256,7 @@ function createBridgeToolContext(options: CursorExecBridgeOptions): {
 	return {
 		context: base && {
 			...base,
+			rawImages: true,
 			addAdditionalContext: (value: string) => {
 				reported.push(value);
 			},
@@ -311,13 +318,13 @@ async function executeTool(
 
 	const bridgeContext = createBridgeToolContext(options);
 	try {
-		result = await tool.execute(
-			toolCallId,
-			toolArgs as Record<string, unknown>,
-			undefined,
-			onUpdate,
-			bridgeContext.context,
-		);
+		const validatedArgs = validateAgentToolArguments(tool, {
+			type: "toolCall",
+			id: toolCallId,
+			name: toolName,
+			arguments: toolArgs,
+		});
+		result = await tool.execute(toolCallId, validatedArgs, undefined, onUpdate, bridgeContext.context);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		result = buildToolErrorResult(message);
@@ -590,7 +597,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 	async shell(args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0]) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
-		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
+		const timeoutSeconds = shellDeadlineSeconds(args);
 		const toolResultMessage = await executeTool(this.options, "bash", toolCallId, {
 			command: args.command,
 			cwd: args.workingDirectory || undefined,
@@ -611,7 +618,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			return createToolResultMessage(toolCallId, toolName, result, true);
 		}
 
-		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
+		const timeoutSeconds = shellDeadlineSeconds(args);
 		const toolArgs = omitUndefinedArgs({
 			command: args.command,
 			cwd: args.workingDirectory || undefined,
@@ -664,7 +671,13 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 		const bridgeContext = createBridgeToolContext(this.options);
 		try {
-			result = await tool.execute(toolCallId, toolArgs, undefined, onUpdate, bridgeContext.context);
+			const validatedArgs = validateAgentToolArguments(tool, {
+				type: "toolCall",
+				id: toolCallId,
+				name: toolName,
+				arguments: toolArgs,
+			});
+			result = await tool.execute(toolCallId, validatedArgs, undefined, onUpdate, bridgeContext.context);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);
