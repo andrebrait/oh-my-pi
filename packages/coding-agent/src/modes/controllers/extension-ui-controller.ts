@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
@@ -6,6 +7,7 @@ import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-
 import type {
 	CompactOptions,
 	ExtensionActions,
+	ExtensionApprovalAnswer,
 	ExtensionApprovalPrompt,
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
@@ -116,11 +118,13 @@ export class ExtensionUiController {
 	#dialogActive = false;
 	#dialogQueue: Array<() => void> = [];
 	/**
-	 * The queued steering (chip texts) when a steer last denied an approval. Steering waits for
-	 * the tool batch to end, so while the queue still starts with it, later approvals of that
-	 * batch (an exclusive call asks only after the denied one settles) are denied by it as well.
+	 * The steering messages that last denied an approval. Steering waits for the tool batch to
+	 * end, so while any of them is still pending, later approvals of that batch (an exclusive call
+	 * asks only after the denied one settles) are denied by it as well. Tracked by identity: once
+	 * they are delivered, an equal-looking newer steer (another `[Image]` chip) predates its prompt
+	 * and does not answer it.
 	 */
-	#denyingSteering: readonly string[] | undefined;
+	#denyingSteering: readonly AgentMessage[] | undefined;
 	/**
 	 * Built once in `initHooksAndCustomTools()`. Reused directly by `/tree`
 	 * `ask` re-answer (issue #5642) to drive a standalone `AskTool.execute()`
@@ -213,6 +217,10 @@ export class ExtensionUiController {
 		if (!extensionRunner) {
 			return; // No hooks loaded
 		}
+		// The extensions of a hosted session run on its host. Initializing this replica's runner would hand their
+		// handlers the replica's actions (send a message, set the model, append entries, start or switch sessions) and
+		// fire `session_start` into it, so a hosted client leaves the runner as it is: nothing in it ever runs here.
+		if (this.ctx.hostedClientMode) return;
 
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
@@ -444,6 +452,9 @@ export class ExtensionUiController {
 		if (!extensionRunner) {
 			return;
 		}
+		// Same reason as in `initHooksAndCustomTools`: this entry is public (`InteractiveMode.initializeHookRunner`), so
+		// a caller re-initializing the runner must not hand a hosted client's replica to extension code either.
+		if (this.ctx.hostedClientMode) return;
 
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
@@ -659,37 +670,48 @@ export class ExtensionUiController {
 	}
 
 	/**
-	 * The tool-approval prompt in the composer's place; a collab guest answers it as an Approve/Deny
-	 * select over the full prompt. Locally it shows the compact prompt (the details summarized to a
-	 * row, so the composer beneath keeps its room), and the expand key swaps in the full one,
-	 * wrapped — even when the two match, since a row the summary kept whole can still clip.
-	 * The composer stays mounted beneath it and takes the typing: a user message queued as steering
-	 * while the call waits (sent here, from Tern, or by a collab guest) denies the call, so the
-	 * message tells the agent why instead of a bare denial. The watch starts with the request, so
-	 * approvals still queued behind another dialog are denied by the same message.
+	 * The tool-approval prompt in the composer's place; a collab guest answers it as a select over
+	 * the full prompt with the same choices: Approve, the prompt's "for this session" choice when it
+	 * offers one, and Deny. Locally it shows the compact prompt (the details summarized to a
+	 * row, so the composer beneath keeps its room) over that list, and the expand key
+	 * swaps in the full one, wrapped — even when the two match, since a row the summary kept whole
+	 * can still clip. The composer stays mounted beneath it and takes the typing: a user message
+	 * queued as steering while the call waits (sent here, from Tern, or by a collab guest) denies
+	 * the call, so the message tells the agent why instead of a bare denial. The watch starts with
+	 * the request, so approvals still queued behind another dialog are denied by the same message.
 	 */
 	async showCollabAwareApproval(
 		prompt: ExtensionApprovalPrompt,
 		dialogOptions?: ExtensionUIDialogOptions,
-	): Promise<boolean> {
+	): Promise<ExtensionApprovalAnswer> {
+		const sessionLabel = prompt.session;
 		const request: CollabUiRequestDraft = {
 			kind: "select",
 			title: prompt.full,
-			options: [APPROVE_OPTION, DENY_OPTION],
+			options: sessionLabel ? [APPROVE_OPTION, sessionLabel, DENY_OPTION] : [APPROVE_OPTION, DENY_OPTION],
 		};
 		const session = this.ctx.session;
-		const queued = session.getQueuedMessages().steering;
-		const denying = this.#denyingSteering;
-		if (denying && denying.length <= queued.length && denying.every((text, i) => text === queued[i])) return false;
+		const agent = session.agent;
+		const pendingSteering = agent.peekSteeringQueue();
+		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return "deny";
 		this.#denyingSteering = undefined;
 		const steered = new AbortController();
-		let steeringBaseline = queued.length;
+		let steeringBaseline = session.getQueuedMessages().steering.length;
+		let knownSteering = new Set(pendingSteering);
 		const unsubscribe = session.subscribe(event => {
-			if (event.type !== "queue_update") return;
+			if (event.type !== "queue_update" || steered.signal.aborted) return;
+			const current = agent.peekSteeringQueue();
 			if (event.steering.length > steeringBaseline) {
-				this.#denyingSteering = event.steering;
+				const added = current.filter(message => !knownSteering.has(message));
+				this.#denyingSteering = added;
+				// One-at-a-time delivery takes the oldest steer at the batch boundary; the
+				// message that denied this call must be the one that lands after the denial.
+				agent.prioritizeSteering(added);
 				steered.abort();
-			} else steeringBaseline = event.steering.length;
+			} else {
+				steeringBaseline = event.steering.length;
+				knownSteering = new Set(current);
+			}
 		});
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
 		try {
@@ -706,6 +728,9 @@ export class ExtensionUiController {
 							onTimeout: dialogOptions?.onTimeout,
 							onTimeoutStart: dialogOptions?.onTimeoutStart,
 							onTimeoutReset: dialogOptions?.onTimeoutReset,
+							...(sessionLabel
+								? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
+								: {}),
 							draft: {
 								hasDraft: () =>
 									editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
@@ -719,8 +744,11 @@ export class ExtensionUiController {
 					this.ctx.ui.setFocus(dialog);
 					// The dialog owns focus but forwards typing: keep the composer's cursor visible.
 					editor.focused = true;
+					// Its submissions steer this (main) session, even from a focused agent's view.
+					this.ctx.approvalOwnsComposer = true;
 					this.ctx.ui.requestRender();
 					return () => {
+						this.ctx.approvalOwnsComposer = false;
 						dialog.dispose();
 						this.ctx.editorContainer.clear();
 						this.ctx.editorContainer.addChild(editor);
@@ -729,7 +757,8 @@ export class ExtensionUiController {
 					};
 				}),
 			);
-			return choice === APPROVE_OPTION;
+			if (choice === APPROVE_OPTION) return "once";
+			return sessionLabel !== undefined && choice === sessionLabel ? "session" : "deny";
 		} finally {
 			unsubscribe();
 		}
@@ -1335,9 +1364,11 @@ export class ExtensionUiController {
 	}
 
 	/**
-	 * Show an extension error in the UI.
+	 * Install an extension's raw terminal-input handler. Extension code does not run in a hosted client, so it is
+	 * refused there rather than given the keystrokes.
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
+		if (this.ctx.hostedClientMode) throw new Error("Extension terminal input is unavailable when attached.");
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
 		this.#extensionTerminalInputUnsubscribers.add(unsubscribe);
 		return () => {

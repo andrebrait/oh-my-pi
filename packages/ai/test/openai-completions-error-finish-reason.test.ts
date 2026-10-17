@@ -311,11 +311,15 @@ describe("finish_reason: network_error and unknown", () => {
 		}).result();
 	}
 
-	it.each(["network_error", "network-error", "NETWORK_ERROR"])("retries finish_reason %s", async reason => {
-		const result = await finishWith(reason);
-		expect(result.stopReason).toBe("error");
-		expect(AIError.retriable(AIError.classifyMessage(result))).toBe(true);
-	}, 10_000);
+	it.each(["network_error", "network-error", "NETWORK_ERROR"])(
+		"retries finish_reason %s",
+		async reason => {
+			const result = await finishWith(reason);
+			expect(result.stopReason).toBe("error");
+			expect(AIError.retriable(AIError.classifyMessage(result))).toBe(true);
+		},
+		10_000,
+	);
 
 	it.each(["unknown", "other", "unspecified", "FINISH_REASON_UNSPECIFIED"])(
 		"retries unknown finish_reason %s instead of pinning it",

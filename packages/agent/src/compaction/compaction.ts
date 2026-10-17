@@ -376,9 +376,11 @@ export function compactionContextTokens(providerContextTokens: number, storedCon
 /**
  * The prompt budget below `contextWindow`: the window less
  * {@link resolveBudgetReserveTokens}, capped at `contextWindow - 1` so it never
- * reaches the whole window even when the reserve resolves to 0.
+ * reaches the whole window even when the reserve resolves to 0. Independent of
+ * any configured trigger; the default {@link resolveThresholdTokens} and
+ * length-stop recovery's "did the window run out" check both use it.
  */
-function promptBudgetTokens(contextWindow: number, settings: CompactionSettings): number {
+export function promptBudgetTokens(contextWindow: number, settings: CompactionSettings): number {
 	return Math.max(0, Math.min(contextWindow - 1, contextWindow - resolveBudgetReserveTokens(contextWindow, settings)));
 }
 

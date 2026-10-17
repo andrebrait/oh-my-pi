@@ -756,8 +756,8 @@ interface FilesystemReadOptions {
 	onBufferedFile?: (bytes: Buffer) => void;
 	onConflictMarkers?: () => void;
 	lexicalAbsolutePath?: string;
-	/** Keep image routing under `:raw` (see `AgentToolContext.rawImages`). */
-	rawImages?: boolean;
+	/** The read's tool context: `rawImages` keeps image routing under `:raw`, and split reads pass it on. */
+	toolContext?: AgentToolContext;
 }
 
 /**
@@ -1162,14 +1162,20 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 	async #tryReadDelimitedPaths(
 		readPath: string,
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		toolContext: AgentToolContext | undefined,
 		routedUrlPredicate?: (entry: string) => boolean,
 	): Promise<AgentToolResult<ReadToolDetails> | null> {
 		const parts = await splitDelimitedPathEntry(readPath, this.session.cwd, { routedUrlPredicate });
-		return parts ? this.#readDelimitedParts(parts, signal) : null;
+		return parts ? this.#readDelimitedParts(parts, signal, toolContext) : null;
 	}
 
-	async #readDelimitedParts(parts: string[], signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
+	/** Read each part as its own call; `toolContext` carries flags such as `rawImages` into every part. */
+	async #readDelimitedParts(
+		parts: string[],
+		signal: AbortSignal | undefined,
+		toolContext: AgentToolContext | undefined,
+	): Promise<AgentToolResult<ReadToolDetails>> {
 		const notice = `Note: interpreted as ${parts.length} paths: ${parts.join(", ")}`;
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
@@ -1187,7 +1193,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		for (const part of parts) {
 			try {
-				const result = await this.execute("read-delimited-part", { path: part }, signal);
+				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;
@@ -1697,7 +1703,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			this.session.cwd,
 			part => parseReadUrlTarget(part) !== null || InternalUrlRouter.instance().canResolve(part),
 		);
-		if (mixedParts) return this.#readDelimitedParts(mixedParts, signal);
+		if (mixedParts) return this.#readDelimitedParts(mixedParts, signal, toolContext);
 		const imageQuestion = splitImageQuestionTarget(readPath);
 		readPath = imageQuestion.path;
 		const question = imageQuestion.question;
@@ -1726,7 +1732,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// Handle native OMP URLs and custom-scheme resources advertised by MCP servers.
 		const internalRouter = InternalUrlRouter.instance();
 		const delimitedInternalResult = internalRouter.canResolve(readPath)
-			? await this.#tryReadDelimitedPaths(readPath, signal, entry => internalRouter.canResolve(entry))
+			? await this.#tryReadDelimitedPaths(readPath, signal, toolContext, entry => internalRouter.canResolve(entry))
 			: null;
 		if (delimitedInternalResult) return delimitedInternalResult;
 
@@ -1748,7 +1754,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				located = { url, path: target.path, sel: target.sel, spec: target.spec };
 			}
 		}
-		const rawImages = toolContext?.rawImages === true;
 		if (!located) {
 			return this.#readFilesystemPath(readPath, {
 				question,
@@ -1756,7 +1761,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				onBufferedFile,
 				onConflictMarkers,
 				lexicalAbsolutePath,
-				rawImages,
+				toolContext,
 			});
 		}
 		// A located URL reads its backing file through the filesystem pipeline (images, `:img`,
@@ -1766,7 +1771,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			question,
 			questionPath: readPath,
 			signal,
-			rawImages,
+			toolContext,
 		});
 		const details: ReadToolDetails = result.details ?? {};
 		details.resolvedPath ??= located.path;
@@ -1815,8 +1820,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			onBufferedFile,
 			onConflictMarkers,
 			lexicalAbsolutePath,
-			rawImages,
+			toolContext,
 		} = options;
+		const rawImages = toolContext?.rawImages === true;
 		const immutable = located?.spec.immutable === true;
 		const displayMode = resolveFileDisplayMode(this.session, { immutable });
 		// In-body continuation hints name the URL for located reads, so paging stays on the URL.
@@ -1923,7 +1929,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// workspace scan, but only after literal/archive/sqlite resolution so
 				// real resources containing semicolons retain precedence.
 				if (readPath.includes(";")) {
-					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
+					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
 					if (delimitedResult) return delimitedResult;
 				}
 				// Attempt unique suffix resolution before falling back to the approved-plan
@@ -1964,7 +1970,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 
 				if (!recoveredApprovedPlan && !suffixResolution) {
-					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
+					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
 					if (delimitedResult) return delimitedResult;
 					throw new ToolError(`Path '${localReadPath}' not found`);
 				}
