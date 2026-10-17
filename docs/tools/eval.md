@@ -8,7 +8,6 @@
 - Entry and dynamic schema: `packages/coding-agent/src/tools/eval.ts`
 - Backend enablement: `packages/coding-agent/src/tools/eval-backends.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/eval.md`
-- Code Mode transport (enabled Codex Code Mode sessions demote non-essential tools into an eval bridge): `packages/tui/src/tools/eval-format/code-mode-declarations.ts`, prompt `packages/coding-agent/src/prompts/tools/eval-code-mode.md`
 - Shared contracts: `packages/coding-agent/src/eval/backend.ts`, `types.ts`, `executor-base.ts`, `kernel-base.ts`
 - Host bridges: `packages/coding-agent/src/eval/agent-bridge.ts`, `completion-bridge.ts`, `handle-bridge.ts`, `workpool-bridge.ts`, `judgment-bridge.ts`, `judgment-batch-bridge.ts`, `budget-bridge.ts`
 - File/percent-command preparation: `packages/coding-agent/src/eval/input.ts`; extension preludes: `packages/coding-agent/src/eval/preludes.ts`
@@ -151,7 +150,7 @@ All enabled runtimes expose equivalent helpers where the language permits:
 - `agent(...)`, `workpool(...)` when spawning is allowed
 - `log(message)`, `phase(title)`, `budget`
 
-JS helpers are asynchronous; Python file helpers are synchronous while `tool.<name>()` is a coroutine. `read()` delegates non-`local://` schemes to the registered read tool, resolves `local://` through injected roots, and reads regular paths relative to cwd. `write()` accepts regular and `local://` paths but rejects other protocol URLs.
+JS helpers are asynchronous; Python file helpers are synchronous while `tool.<name>()` is a coroutine. `read()` delegates non-`local://` schemes to the registered read tool, resolves `local://` through injected roots, and reads regular paths relative to cwd. A bare `read("artifact://<id>")` returns the artifact file's full text, with `offset`/`limit` selecting lines, whichever session's artifacts dir holds it; selector forms such as `artifact://<id>:raw:5-9` go to the read tool. `write()` accepts regular and `local://` paths but rejects other protocol URLs.
 
 `display()` captures JSON-compatible structures, images, markdown, or text according to the backend.
 
@@ -198,6 +197,8 @@ A stateless, tool-free one-shot model call that returns a `CompletionHandle` imm
 
 - JS: `completion(prompt, { model?, system?, schema? })`; Python: keyword form with `model`, `system`, and `schema`.
 - `model`: `"smol"`, `"default"`, or `"slow"` tier; default is the active/default tier.
+- For the `"slow"` tier, configured role selectors honor explicit concrete effort suffixes including `:max` and `:off`; `:max` is clamped to the target model's supported levels. Bare, `:auto`, and `:inherit` primary selectors retain tier-default behavior, including recomputing the default for root fallback models. With an explicit concrete or `:off` primary effort, bare and `:auto` root fallbacks inherit that effective setting and clamp it for their model. Nested fallbacks inherit their immediate parent candidate's effective setting. An explicit concrete effort or `:off` fallback suffix overrides inheritance. `"smol"` and `"default"` retain their existing provider-option behavior.
+- Effort extraction follows the shared selector grammar: strict suffixes such as `:low` and `:off` take precedence even when model matching retains that suffix in an exact model ID. Literal-ID protection applies to the ambiguous `:max` and `:auto` suffixes, with case-insensitive provider and model ID matching.
 - `schema`: JSON Schema for a synthetic `respond` tool; `.wait()` then returns parsed data.
 - Unresolved tier and invalid arguments fail handle allocation; JS's immediate pending-handle wrapper exposes that rejection when awaited/used. Missing credentials, error/abort stops, empty output, and invalid structured output surface from `.wait()`.
 - Handles are process-local, owned by the calling agent, and evicted 30 minutes after settling (or when the owner session ends).
@@ -206,31 +207,13 @@ A stateless, tool-free one-shot model call that returns a `CompletionHandle` imm
 
 Registers one background subagent job and returns an `AgentHandle` immediately:
 
-- JS: `await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated?, apply?, merge?, tools?, model? })`; Python uses keyword arguments (`schema_mode`).
+- JS: `await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated?, apply?, merge?, tools? })`; Python uses keyword arguments (`schema_mode`).
 - Preflight (spawn policy, unknown agent, `task.maxRecursionDepth`, hard turn budget, plan-mode isolation controls, unknown `tools` names) fails handle allocation; Python raises directly, JS's pending handle rejects when awaited/used. Execution failures surface from `.wait()`.
-- `agent` defaults from the current spawn policy. `model` overrides the selected agent's model for this call only (`provider/model[:level]` or a role alias); it outranks `task.agentModelOverrides` and the agent frontmatter, rejects the ambiguous literals `default`/`inherit` (use `@default`), and fails the call when it matches no available model. `schema` overrides agent/session schemas; `schemaMode`/`schema_mode` chooses `permissive` or `strict`.
+- `agent` defaults from the current spawn policy; the selected agent's frontmatter model and settings always apply (no per-call `model`). `schema` overrides agent/session schemas; `schemaMode`/`schema_mode` chooses `permissive` or `strict`.
 - `isolated` requests isolation. `apply` controls whether captured changes are integrated; `merge=false` selects patch mode while the normal setting controls branch mode.
 - `tools`: names of kernel-defined tools (see below) the child may call; each call executes inside the caller's kernel.
 - Handle surface: `.id`, `.agent`, `.handle` (`agent://<id>`), `.status`, `.done()`, `.wait(timeout?)`, `.send(message)`, `.cancel()`, `.output()`. Python handles are awaitable; JavaScript uses `await handle.wait()`.
 - The job is a regular async job owned by the calling agent: an unwaited result auto-delivers like a backgrounded `task`, and handle `.wait()` consumes the delivery so it is not replayed. Eval subagents are kept alive (message with `write agent://<id>`, read transcripts at `history://<id>`) and get their own eval executors, like every subagent.
-
-#### Per-call model selection
-
-Both `agent()` and `workpool()` accept a model selector or an ordered, non-empty array. Examples:
-
-```js
-const review = await agent("Review the change", { model: ["@slow", "@default"] });
-const pool = await workpool("scout", { name: "research", model: ["@smol", "@default"] });
-```
-
-```python
-review = agent("Review the change", model=["@slow", "@default"])
-pool = workpool("scout", name="research", model=["@smol", "@default"])
-```
-
-The shared resolver retains role identity and tries the requested candidates in order for working credentials. If none has them, the call fails instead of running on the parent's model, unless the selection includes `@default`. Empty arrays, blank elements, comma-only selectors and invalid thinking suffixes fail preflight. Literal model IDs with colon suffixes retain their identity. These selectors are ordered preferences, not a closed model allowlist: configured runtime fallbacks still apply.
-
-A workpool applies its raw selector to each worker's **first turn**. Follow-up turns reuse that worker's existing session and do not receive a new selector. With `eval.workpool.freshAgents=true`, every new worker receives the pool selector. Different pools keep independent selections.
 
 ### `wait()`
 
@@ -238,7 +221,7 @@ A workpool applies its raw selector to each worker's **first turn**. Follow-up t
 
 ### `workpool()`
 
-`workpool(agent=None, name=None, context=None, tools=None, model=None)` creates a pool of keep-alive subagents bounded by the live `task.maxConcurrency`:
+`workpool(agent=None, name=None, context=None, tools=None)` creates a pool of keep-alive subagents bounded by the live `task.maxConcurrency`:
 
 - `.push(*items)` returns item ids (`<pool>#<seq>`). An item goes to the idle worker with the lowest context usage, spawns a new worker while the pool has room, or is queued round-robin onto a busy worker and handed over as one batch when that worker's turn ends. `eval.workpool.freshAgents=true` instead queues for a fresh agent whenever capacity frees, so every item gets a new context and no follow-up batching occurs.
 - A worker submits each batch item separately through `yield({ key: <1-based number>, data: {...} })` or `yield({ key, error })`; each response names the remaining keys, and the final key ends the turn automatically.
@@ -270,7 +253,7 @@ With `eval.tools.enabled` (default on), a cell can turn a function into a tool o
 - Output sink default window: 50 KiB (`DEFAULT_MAX_BYTES`); live tail: 100 KiB; truncation helpers cap at 3000 lines.
 - Each model-visible JSON display preview is capped at 8000 UTF-8 bytes. Larger values spill in full to the output artifact and retain bounded preview metadata in `jsonOutputs`; if persistence is unavailable or fails, `jsonOutputs` retains the full value.
 - Transcript preview defaults to 10 lines.
-- Eval subagent spawning obeys `task.maxRecursionDepth` (default `2`; negative values allow unlimited depth). Subagent/workpool fan-out uses `task.maxConcurrency` (default 32, `0` unbounded); completion/judgment requests have their separate fixed 32-request cap.
+- Eval subagent spawning obeys `task.maxRecursionDepth` (default `2`; negative values allow unlimited depth). Each `workpool()` caps its own live workers at `task.maxConcurrency` (default 32, `0` unbounded). `agent()` takes no `task.maxConcurrency` slot: every handle is a running background job counted against the session-wide `async.maxJobs` cap (default and maximum 100), which it shares with every other background job in the session, including async `bash`, async `task` spawns, `workpool()` pools and nested subagents' jobs. `agent()` fails with `Background job limit reached` once that cap is full. Completion/judgment requests have their own fixed 32-request cap.
 - Malformed params are schema errors; unavailable/disabled backends and missing session are `ToolError`s.
 - Runtime exceptions become backend output with nonzero exit. Interactive stdin is an error. Output truncation does not fail the call.
 - A dead retained managed kernel may be replaced and the invocation retried once by its executor.

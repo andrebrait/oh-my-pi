@@ -9,8 +9,13 @@ import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes
 import computerUsePrompt from "../prompts/system/computer-use.md" with { type: "text" };
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type ComputerCallStep, isReadOnlyComputerCall, renderComputerCall } from "./computer/call";
-import type { ComputerScreenshot, ComputerSessionSnapshot } from "./computer/protocol";
-import { type ComputerController, ComputerSupervisor, registerComputerController } from "./computer/supervisor";
+import { type ComputerScreenshot, type ComputerSessionSnapshot, screenStateNotice } from "./computer/protocol";
+import {
+	type ComputerController,
+	ComputerSupervisor,
+	computerTurnInFlight,
+	registerComputerController,
+} from "./computer/supervisor";
 import type { ToolSession } from "./index";
 import { renderCallChain, renderFunctionRun } from "./run-code";
 import { throwIfAborted } from "./tool-errors";
@@ -149,7 +154,6 @@ export function createComputerPrelude(
 		javascript: computerPreludeAssets.javascript,
 		python: computerPreludeAssets.python,
 		exports: ["computer"],
-		codeModeDeclarations: computerPreludeAssets.codeModeDeclarations,
 		guidance: computerUsePrompt,
 		approval: computerApproval,
 		enabled: () => cfgComputerEnabled.get(session.settings) === true,
@@ -254,6 +258,7 @@ function buildComputerSnapshot(session: ToolSession, readOnly: boolean): Compute
 			: configuredMaxHeight,
 		display: cfgComputerDisplay.get(session.settings),
 		readOnly,
+		displayTurn: computerTurnInFlight(session.getEvalKernelOwnerId?.() ?? undefined),
 	};
 }
 
@@ -288,6 +293,8 @@ async function runComputer(
 		saveArtifact: full => saveComputerOutputArtifact(session, full),
 	});
 	const content: AgentToolResult<ComputerPreludeDetails>["content"] = [];
+	const notice = screenStateNotice(run.capabilities);
+	if (notice) content.push({ type: "text", text: notice });
 	if (cappedText) content.push({ type: "text", text: cappedText });
 	for (const image of run.displays) {
 		if (image.type === "image") content.push({ ...image, detail: "original" });

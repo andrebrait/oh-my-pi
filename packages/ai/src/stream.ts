@@ -12,13 +12,14 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 	resolveWireModelId,
+	withoutUnverifiedThinking,
 } from "@oh-my-pi/pi-catalog/model-thinking";
-import { providerEntries } from "@oh-my-pi/pi-catalog/compat/providers";
-import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, $pickenv, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
+import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
+import { $env, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolvedApiKeyBearer, resolveNextAuthRetryKey } from "./auth-retry";
 import type { OAuthRequestIdentity } from "./auth/types";
+import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
@@ -54,7 +55,7 @@ import {
 	streamOpenAICompletions,
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
-import { getProviderDefinition, PROVIDER_REGISTRY } from "./registry";
+import { getProviderDefinition } from "./registry";
 import type {
 	Api,
 	AssistantMessage,
@@ -127,23 +128,6 @@ function isOfficialOpenAIApiUrl(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return true;
 	try {
 		return new URL(baseUrl).hostname === "api.openai.com";
-	} catch {
-		return false;
-	}
-}
-
-const OFFICIAL_CODEX_URL = new URL(CODEX_BASE_URL);
-
-/** Strict official-Codex endpoint check; exact origin or a path boundary after {@link CODEX_BASE_URL}. */
-export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
-	if (!baseUrl) return true;
-	try {
-		const candidate = new URL(baseUrl);
-		const candidatePath = candidate.pathname.replace(/\/+$/, "");
-		return (
-			candidate.origin === OFFICIAL_CODEX_URL.origin &&
-			(candidatePath === OFFICIAL_CODEX_URL.pathname || candidatePath.startsWith(`${OFFICIAL_CODEX_URL.pathname}/`))
-		);
 	} catch {
 		return false;
 	}
@@ -865,75 +849,6 @@ function resolveVertexRequest(input: string | URL | Request): string | URL | Req
 	return rewriteUrl(input);
 }
 
-type KeyResolver = string | (() => string | undefined);
-
-const LEGACY_ENV_KEYS: Record<string, KeyResolver> = {
-	// Non-provider / search-tool keys and API-name keys not modeled as registry provider defs.
-	"azure-openai-responses": "AZURE_OPENAI_API_KEY",
-	jina: "JINA_API_KEY",
-	brave: "BRAVE_API_KEY",
-	tinyfish: "TINYFISH_API_KEY",
-	firecrawl: "FIRECRAWL_API_KEY",
-};
-
-/**
- * Env fallbacks derived from the catalog provider entries (`env` in
- * `providers/<id>.kdl`) — the single source for plain provider env-var names.
- * Registry defs override with computed resolvers (Foundry/ADC/Bedrock
- * probes); legacy non-provider keys merge last.
- */
-const CATALOG_ENTRY_ENV_KEYS = Object.values(providerEntries()).flatMap(provider => {
-	const envVars = provider.envVars;
-	if (!envVars || envVars.length === 0) return [];
-	const resolver: KeyResolver = envVars.length === 1 ? envVars[0] : () => $pickenv(...envVars);
-	return [[provider.id, resolver] as [string, KeyResolver]];
-});
-
-const serviceProviderMap: Record<string, KeyResolver> = {
-	...Object.fromEntries(CATALOG_ENTRY_ENV_KEYS),
-	...Object.fromEntries(
-		PROVIDER_REGISTRY.flatMap(provider =>
-			provider.envKeys != null ? [[provider.id, provider.envKeys] as [string, KeyResolver]] : [],
-		),
-	),
-	...LEGACY_ENV_KEYS,
-};
-
-/**
- * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
- *
- * Will not return API keys for providers that require OAuth tokens.
- * Checks Bun.env, then cwd/.env, then ~/.env.
- */
-export function getEnvApiKey(provider: string): string | undefined {
-	const resolver = serviceProviderMap[provider];
-	if (typeof resolver === "string") {
-		return $env[resolver];
-	}
-	return resolver?.();
-}
-
-/**
- * Name of the environment variable that backs `getEnvApiKey` for a provider,
- * when that provider maps to a single named variable (e.g. `github-copilot` →
- * `COPILOT_GITHUB_TOKEN`). Returns undefined for providers whose env fallback
- * is computed (multi-var pickers, Vertex ADC / Bedrock probes, …) since no
- * single variable name describes the source.
- */
-export function getEnvApiKeyName(provider: string): string | undefined {
-	const resolver = serviceProviderMap[provider];
-	return typeof resolver === "string" ? resolver : undefined;
-}
-
-/**
- * Enumerate every provider that has an env-var fallback for `getEnvApiKey`.
- * Used by `omp auth-broker migrate --include-env` to discover env-sourced keys
- * that should be uploaded to the broker.
- */
-export function listProvidersWithEnvKey(): string[] {
-	return Object.keys(serviceProviderMap);
-}
-
 function withResolvedModelHeaders<TApi extends Api>(
 	model: Model<TApi>,
 	signal: AbortSignal | undefined,
@@ -1306,6 +1221,11 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const sessionOptions = withInferenceSessionId(options);
+	// Unverified thinking is opt-in: without a requested effort the request is
+	// byte-identical to a non-reasoning model's.
+	const effortRequested =
+		sessionOptions.reasoning !== undefined && !sessionOptions.disableReasoning && !sessionOptions.forceReasoningOff;
+	if (!effortRequested) model = withoutUnverifiedThinking(model);
 	if (!model.requiresGlyphTokenization) {
 		return streamSimpleRequest(model, context, sessionOptions);
 	}
@@ -1896,6 +1816,7 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 		signal: options?.signal,
+		maxHttpAttempts: options?.maxHttpAttempts,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
 		oauthIdentity: options?.oauthIdentity,
@@ -1911,9 +1832,10 @@ function mapOptionsForApi<TApi extends Api>(
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		codexSseMaxAttempts: options?.codexSseMaxAttempts,
 		providerSessionState: options?.providerSessionState,
+		parentSessionId: options?.parentSessionId,
+		minimizeEffort: options?.minimizeEffort,
 		liveSteering: options?.liveSteering,
 		maxInFlightRequests: options?.maxInFlightRequests,
-		toolNamespacesInfo: options?.toolNamespacesInfo,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
@@ -2189,6 +2111,7 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
+				disableReasoning: options?.disableReasoning,
 				forceReasoningOff: options?.forceReasoningOff,
 			});
 

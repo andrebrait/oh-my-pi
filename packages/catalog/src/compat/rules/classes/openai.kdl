@@ -49,11 +49,52 @@ class "openai" {
 		delegation-bias "restrained"
 		supports-steering #true
 	}
-	// GPT-6 Astra changes reasoning effort mid-conversation through a
+	// The GPT-6 family changes reasoning effort mid-conversation through a
 	// `configuration_update` input item so the request-level effort (and the
-	// cached prompt prefix) stays put; every other SKU 400s on the item type.
-	models "gpt-6-astra" {
+	// cached prompt prefix) stays put. OpenAI's reasoning guide ("Change
+	// reasoning mid-conversation") documents it for the family, and Codex's
+	// `/models` reports `supports_reasoning_effort_updates` on every GPT-6 SKU.
+	revision ">=6 <7" {
 		supports-configuration-update #true
+	}
+	// Vendor default effort: what `reasoning.effort` resolves to when omitted,
+	// per each model's docs page (https://developers.openai.com/api/docs/models/<id>)
+	// and the reasoning guide (GPT-5.6 "defaults to medium in both modes").
+	// Pinned per revision so a new generation is re-checked first. Revisions
+	// whose default is `none` (5.1, 5.2, 5.4) or undocumented (gpt-5,
+	// gpt-6-astra, codex SKUs) stay unset: auto never resolves thinking off.
+	// Each id glob also takes its `:`-suffixed routes (`gpt-5.5-pro:batch`)
+	// and dated snapshots (`gpt-5.5-pro-2026-04-23`).
+	family "gpt" {
+		revision "=5" {
+			models "*gpt-5-pro" "*gpt-5-pro:*" "*gpt-5-pro-*" {
+				vendor-default-effort "high"
+			}
+		}
+		revision "=5.4" {
+			models "*-pro" "*-pro:*" "*-pro-*" {
+				vendor-default-effort "medium"
+			}
+		}
+		revision "=5.5" {
+			vendor-default-effort "medium"
+			models "*-pro" "*-pro:*" "*-pro-*" {
+				vendor-default-effort "high"
+			}
+		}
+		revision "=5.6" {
+			vendor-default-effort "medium"
+		}
+		revision "=6" {
+			models "*gpt-6-sol" "*gpt-6-sol:*" "*gpt-6-luna" "*gpt-6-luna:*" {
+				vendor-default-effort "medium"
+			}
+		}
+		revision "=6.1" {
+			models "*gpt-6.1-sol" "*gpt-6.1-sol:*" {
+				vendor-default-effort "medium"
+			}
+		}
 	}
 	// Codex SKUs: the advertised 400K figure includes the output budget; the
 	// true prompt window is 272K. Spark budgets are its own family's.
@@ -93,9 +134,28 @@ class "openai" {
 // Older lines carry no lineage rule and bill at their wire API's fallback
 // (providers/image-tokenization.kdl).
 class "openai" {
-	// gpt-5.6 sizing, shared by later lines. `<10` keeps separator-collapsed
-	// revisions (`openai-gpt-52-codex` parses as 52) off the 5.6+ sizing.
-	revision ">=5.6 <10" {
+	// gpt-5.6 sizing. verified: billing matched this formula on gpt-5.6 through 6.1.
+	revision ">=5.6 <6.2" {
+		image-tokenization {
+			regime "openai-patch"
+			verified #true
+			multiplier 1.2
+			auto "original"
+			low {
+				max-edge 512
+			}
+			high {
+				max-edge 2048
+				patch-budget 2500
+			}
+			original {
+				max-edge 65535
+			}
+		}
+	}
+	// Later lines size like gpt-5.6, unverified until measured. `<10` keeps
+	// separator-collapsed revisions (`openai-gpt-52-codex` parses as 52) off it.
+	revision ">=6.2 <10" {
 		image-tokenization {
 			regime "openai-patch"
 			multiplier 1.2
@@ -112,9 +172,11 @@ class "openai" {
 			}
 		}
 	}
+	// verified: billing matched this formula on gpt-5.5.
 	revision "=5.5" {
 		image-tokenization {
 			regime "openai-patch"
+			verified #true
 			multiplier 1.2
 			auto "original"
 			low {
@@ -171,9 +233,11 @@ class "openai" {
 		}
 	}
 	// residue: astra's limits differ from the rest of its revision.
+	// verified: billing matched this formula on gpt-6-astra.
 	models "*gpt-6-astra*" {
 		image-tokenization {
 			regime "openai-patch"
+			verified #true
 			multiplier 1.2
 			auto "original"
 			low {

@@ -13,19 +13,17 @@
  * the caller falls back to a concrete level and continues the turn.
  */
 import type { AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { type ChoiceQuestion, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type ChoiceQuestion, Effort, judgeQuestions, type Model, renderQuestion } from "@oh-my-pi/pi-ai";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { ModelRegistry } from "../config/model-registry";
-import bucketQuestionInstructions from "../prompts/system/auto-thinking-bucket-question.md" with { type: "text" };
-import levelQuestionTemplate from "../prompts/system/auto-thinking-level-question.md" with { type: "text" };
-import solutionSpaceQuestionTemplate from "../prompts/system/auto-thinking-solution-space-question.md" with { type: "text" };
 import type { Settings } from "../config/settings";
 import { type JudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import questionFile from "../prompts/judge/auto-thinking.json" with { type: "json" };
 import { clampAutoThinkingEffort } from "@oh-my-pi/pi-tui/thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
-import { prompt } from "@oh-my-pi/pi-utils";
 
-import { cfgProvidersAutoThinkingMaxEffort } from "../session/settings";
+import { cfgProvidersAutoThinkingMaxEffort, cfgProvidersAutoThinkingSource } from "../session/settings";
 
 type Level = "low" | "medium" | "high" | "xhigh" | "max";
 type Bucket = "trivial" | "moderate" | "hard";
@@ -44,23 +42,12 @@ const BUCKET_EFFORT: Record<Bucket, Effort> = {
 	hard: Effort.XHigh,
 };
 
-/** Levels by how open-ended the problem is; shared by request and solution-space questions. */
-const LEVEL_CRITERIA: Record<Exclude<Level, "max">, string> = {
-	low: "One obvious solution, mechanically applied: target, mapping, or fix given.",
-	medium: "A few candidates in a localized area, or one small trap: which line breaks a test, one boundary case.",
-	high: "Several viable designs or candidate causes: API shape, policy choice, a known cause whose fix needs a design choice.",
-	xhigh: "Open cause of flaky, concurrent, or stale behavior; solutions that are easy to get subtly wrong (races, invariants, cross-version compatibility).",
-};
-
-/** {@link LEVEL_CRITERIA} coarsened to the on-device buckets. */
-const BUCKET_CRITERIA: Record<Bucket, string> = {
-	trivial: LEVEL_CRITERIA.low,
-	moderate: "A few candidate causes or several viable designs: which line breaks a test, API shape, policy choice.",
-	hard: LEVEL_CRITERIA.xhigh,
-};
-
-const MAX_CRITERION =
-	"Meets xhigh and at least one of: no reproduction to work from, irreversible or data-loss operation, or a live cutover that must stay correct while running. xhigh is required; difficulty alone is insufficient.";
+/**
+ * The on-device bucket question, the effort ladder (levels by how open-ended
+ * the problem is, `max` last), and the solution-space instructions, which
+ * reuse the ladder's levels.
+ */
+const QUESTIONS = judgeQuestions(questionFile);
 
 /** Questions for one classification input kind: on-device bucket, full ladder, full ladder with `max`. */
 interface QuestionSet {
@@ -72,24 +59,22 @@ interface QuestionSet {
 
 /**
  * Build the question set for one input kind. Only the instructions differ
- * between kinds; every kind shares {@link LEVEL_CRITERIA} and {@link BUCKET_CRITERIA}.
+ * between kinds; every kind shares the ladder's levels and the bucket criteria.
  */
-function buildQuestionSet(levelTemplate: string, bucketInstructions: string): QuestionSet {
+function buildQuestionSet(instructions: string, bucketInstructions: string): QuestionSet {
+	const ladder: ChoiceQuestion<Level> = { ...QUESTIONS.level, instructions };
+	const { max: _max, ...levels } = ladder.criteria;
 	return {
-		bucket: { type: "choice", instructions: bucketInstructions, criteria: BUCKET_CRITERIA },
-		level: { type: "choice", instructions: prompt.render(levelTemplate), criteria: LEVEL_CRITERIA },
-		levelWithMax: {
-			type: "choice",
-			instructions: prompt.render(levelTemplate, { withMax: true }),
-			criteria: { ...LEVEL_CRITERIA, max: MAX_CRITERION },
-		},
+		bucket: { ...QUESTIONS.bucket, instructions: bucketInstructions },
+		level: { ...renderQuestion(ladder, {}), criteria: levels },
+		levelWithMax: renderQuestion(ladder, { withMax: true }),
 	};
 }
 
-const REQUEST_QUESTIONS = buildQuestionSet(levelQuestionTemplate, bucketQuestionInstructions);
+const REQUEST_QUESTIONS = buildQuestionSet(QUESTIONS.level.instructions, QUESTIONS.bucket.instructions);
 const SOLUTION_SPACE_QUESTIONS = buildQuestionSet(
-	solutionSpaceQuestionTemplate,
-	prompt.render(solutionSpaceQuestionTemplate),
+	QUESTIONS.solutionSpace.instructions,
+	renderQuestion(QUESTIONS.solutionSpace, {}).instructions,
 );
 
 /** The turn to classify. */
@@ -126,15 +111,41 @@ function autoEffortCeiling(deps: ClassifyDifficultyDeps): Effort {
 }
 
 /**
- * Classify `input` and return a concrete effort clamped to `deps.model`,
- * or `undefined` when the model has no controllable effort surface (auto has
- * nothing to pick — the caller leaves the prior reasoning level in place).
- * @throws when the backend cannot produce a usable classification.
+ * Prefer the publisher's concrete default, then omp's per-model default, and
+ * snap it onto the model's ladder at or below the auto ceiling (highest tier
+ * not above the default, else the lowest tier). Unlike classification there
+ * is no Low floor. Returns `undefined` when no tier sits below the ceiling.
+ * A reported `none` is preserved in metadata but is not a concrete Auto effort.
+ * @throws when neither default is concrete, so the caller uses normal Auto fallback.
+ */
+function resolveVendorDefaultEffort(deps: ClassifyDifficultyDeps): Effort | undefined {
+	const { model } = deps;
+	const vendorDefault =
+		model.vendorDefaultEffort === "none"
+			? model.thinking?.defaultLevel
+			: (model.vendorDefaultEffort ?? model.thinking?.defaultLevel);
+	if (vendorDefault === undefined) {
+		throw new Error(`No concrete default effort for ${model.provider}/${model.id}`);
+	}
+	const ceilingIndex = THINKING_EFFORTS.indexOf(autoEffortCeiling(deps));
+	const pool = getSupportedEfforts(model).filter(effort => THINKING_EFFORTS.indexOf(effort) <= ceilingIndex);
+	const defaultIndex = THINKING_EFFORTS.indexOf(vendorDefault);
+	return pool.findLast(effort => THINKING_EFFORTS.indexOf(effort) <= defaultIndex) ?? pool[0];
+}
+
+/**
+ * Resolve the effort for `input`: the vendor default when
+ * `providers.autoThinkingSource` is `vendor`, else a classification. Returns a
+ * concrete effort clamped to `deps.model`, or `undefined` when the model has
+ * no controllable effort surface (auto has nothing to pick — the caller
+ * leaves the prior reasoning level in place).
+ * @throws when the source cannot produce a usable level.
  */
 export async function classifyDifficulty(
 	input: DifficultyInput,
 	deps: ClassifyDifficultyDeps,
 ): Promise<Effort | undefined> {
+	if (cfgProvidersAutoThinkingSource.get(deps.settings) === "vendor") return resolveVendorDefaultEffort(deps);
 	const judge = resolveJudge({
 		settings: deps.settings,
 		registry: deps.registry,

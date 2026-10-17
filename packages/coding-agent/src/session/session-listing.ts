@@ -611,10 +611,11 @@ async function scanSessionDir(
 	sessionDir: string,
 	storage: SessionStorage,
 	withStatus: boolean,
+	siblingDirs: readonly string[] = [],
 ): Promise<SessionInfo[]> {
 	try {
 		await recoverOrphanedBackups(sessionDir, storage);
-		const files = storage.listFilesSync(sessionDir, "*.jsonl");
+		const files = [sessionDir, ...siblingDirs].flatMap(dir => storage.listFilesSync(dir, "*.jsonl"));
 		return await collectSessionsFromFiles(files, storage, withStatus);
 	} catch {
 		return [];
@@ -636,10 +637,16 @@ async function scanSessionDirReadOnly(
 
 /**
  * List sessions in a resolved session directory (newest first), reading each
- * file's lifecycle {@link SessionStatus}.
+ * file's lifecycle {@link SessionStatus}. `siblingDirs` merge into the same
+ * list; they belong to other working directories (see `worktreeSessionDirs`),
+ * so orphaned-backup recovery runs on `sessionDir` only.
  */
-export function listSessions(sessionDir: string, storage: SessionStorage): Promise<SessionInfo[]> {
-	return scanSessionDir(sessionDir, storage, true);
+export function listSessions(
+	sessionDir: string,
+	storage: SessionStorage,
+	siblingDirs: readonly string[] = [],
+): Promise<SessionInfo[]> {
+	return scanSessionDir(sessionDir, storage, true, siblingDirs);
 }
 
 /**
@@ -655,8 +662,9 @@ export async function listAllSessions(
 	sessionsRoot: string = getSessionsDir(),
 ): Promise<SessionInfo[]> {
 	try {
-		const files = await Array.fromAsync(new Bun.Glob("*/*.jsonl").scan(sessionsRoot), name =>
-			path.join(sessionsRoot, name),
+		const files = await Array.fromAsync(
+			new Bun.Glob("*/*.jsonl").scan({ cwd: sessionsRoot, followSymlinks: true }),
+			name => path.join(sessionsRoot, name),
 		);
 		return await collectSessionsFromFiles(files, storage, true);
 	} catch {
@@ -738,7 +746,9 @@ async function newestSessionFiles(
 	try {
 		files =
 			storage instanceof FileSessionStorage
-				? await Array.fromAsync(new Bun.Glob(pattern).scan(root), name => path.join(root, name))
+				? await Array.fromAsync(new Bun.Glob(pattern).scan({ cwd: root, followSymlinks: true }), name =>
+						path.join(root, name),
+					)
 				: storage.listFilesSync(root, pattern);
 	} catch {
 		return [];
@@ -858,8 +868,9 @@ export async function listRecentProjects(
 export async function findSessionFiles(idPrefix: string, sessionsRoot: string = getSessionsDir()): Promise<string[]> {
 	if (!/^[\w-]+$/.test(idPrefix)) return [];
 	try {
-		const files = await Array.fromAsync(new Bun.Glob(`*/*_${idPrefix}*.jsonl`).scan(sessionsRoot), name =>
-			path.join(sessionsRoot, name),
+		const files = await Array.fromAsync(
+			new Bun.Glob(`*/*_${idPrefix}*.jsonl`).scan({ cwd: sessionsRoot, followSymlinks: true }),
+			name => path.join(sessionsRoot, name),
 		);
 		// `*_` can also match an underscore inside an id; keep true id-prefix matches only.
 		return files.filter(file => sessionIdFromSessionPath(file)?.startsWith(idPrefix));

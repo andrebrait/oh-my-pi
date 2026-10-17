@@ -8,6 +8,7 @@
  */
 import type { AgentTool, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 import type { Settings } from "../config/settings";
+import type { ExtensionApprovalAnswer, ExtensionUIContext } from "../extensibility/extensions/types";
 
 import { cfgToolsApproval, cfgToolsApprovalMode } from "./settings";
 
@@ -88,7 +89,10 @@ export interface ResolvedApproval {
 	reason?: string;
 	override: boolean;
 	source?: "tool" | "user" | "mode";
-	/** User-policy key that produced `source: "user"` (defaults to the tool name). */
+	/**
+	 * User-policy key that produced `source: "user"` (defaults to the tool name), or the keyed
+	 * sub-tool (an `xd://` device) a tool-owned or mode decision is about.
+	 */
 	policyKey?: string;
 }
 
@@ -313,6 +317,7 @@ export function resolveApproval(
 		tier: decision.tier,
 		override: false,
 		source: "mode",
+		...(decision.policyKey ? { policyKey: decision.policyKey } : {}),
 		...(decision.reason ? { reason: decision.reason } : {}),
 	};
 }
@@ -360,10 +365,8 @@ export function truncateForPrompt(value: string, maxChars = DEFAULT_PROMPT_TRUNC
 	return `${value.slice(0, maxChars)}[…${omitted}ch elided…]`;
 }
 
-/**
- * Format the approval prompt body shown to the user.
- */
-export function formatApprovalPrompt(tool: ApprovalSubject, args: unknown, reason?: string): string {
+/** The prompt's header rows: tool name, MCP origin, and the reason it asks. */
+function approvalHeader(tool: ApprovalSubject, reason?: string): string[] {
 	const lines = [`Allow tool: ${tool.name}`];
 
 	if (tool.name.startsWith("mcp__") && tool.approval === undefined) {
@@ -373,15 +376,79 @@ export function formatApprovalPrompt(tool: ApprovalSubject, args: unknown, reaso
 	if (reason) {
 		lines.push(`Reason: ${reason}`);
 	}
+	return lines;
+}
 
+/** The tool's own detail rows for `args` (command, path, content), blanks dropped. */
+function approvalDetails(tool: ApprovalSubject, args: unknown): string[] {
 	const details = tool.formatApprovalDetails?.(args);
-	if (typeof details === "string") {
-		if (details.length > 0) lines.push(details);
-	} else if (Array.isArray(details)) {
-		for (const detail of details) {
-			if (detail.length > 0) lines.push(detail);
-		}
-	}
+	return (typeof details === "string" ? [details] : (details ?? [])).filter(detail => detail.length > 0);
+}
 
-	return lines.join("\n");
+/** Format the approval prompt body shown to the user: the header, then the tool's own details. */
+export function formatApprovalPrompt(tool: ApprovalSubject, args: unknown, reason?: string): string {
+	return [...approvalHeader(tool, reason), ...approvalDetails(tool, args)].join("\n");
+}
+
+/**
+ * The details as one row for a prompt that must stay small: each detail's first line, joined
+ * by ` · `, ending in `…` when any detail has more lines. A label alone (`Code:`, its body on
+ * the following lines) takes the body's first line after it.
+ */
+function approvalSummary(details: readonly string[]): string | undefined {
+	if (details.length === 0) return undefined;
+	let omitted = false;
+	const heads = details.map(detail => {
+		const lines = detail.split("\n", 3);
+		const head = lines[0]!.trimEnd();
+		const labelOnly = head.endsWith(":") && lines.length > 1;
+		if (lines.length > (labelOnly ? 2 : 1)) omitted = true;
+		return labelOnly ? `${head} ${lines[1]!.trim()}` : head;
+	});
+	const row = heads.join(" · ");
+	return omitted ? `${row} …` : row;
+}
+
+/**
+ * What an "approve for this session" answer may cover for a `resolved` prompt: the subject the
+ * prompt names (the tool, or its `xd://` device) and a grant key that also pins the tier, so
+ * approving a write never covers an exec call of the same tool. Undefined when the prompt must
+ * stay per-call: only a prompt the approval mode raised is grantable, never a critical override
+ * or an explicit `prompt` policy (the user's or the tool's own).
+ */
+export function sessionApprovalScope(
+	resolved: ResolvedApproval,
+	toolName: string,
+): { subject: string; key: string } | undefined {
+	if (resolved.policy !== "prompt" || resolved.source !== "mode") return undefined;
+	const subject = resolved.policyKey ?? toolName;
+	return { subject, key: `${subject}\0${resolved.tier}` };
+}
+
+/**
+ * Ask the user to approve a call: the host's approval dialog when it has one (it gets the full
+ * prompt and a compact one with the details summarized to a row, so the composer beneath it
+ * keeps its room), else a select with the full prompt (RPC, ACP, extension hosts). `appendix`
+ * lines follow the prompt on both. With a `sessionSubject`, both also offer to approve that
+ * subject for the rest of the session. Anything but an explicit approval is `deny`.
+ */
+export async function requestApproval(
+	ui: Pick<ExtensionUIContext, "select" | "approve">,
+	tool: ApprovalSubject,
+	args: unknown,
+	options: { reason?: string; appendix?: readonly string[]; sessionSubject?: string } = {},
+): Promise<ExtensionApprovalAnswer> {
+	const { reason, appendix = [], sessionSubject } = options;
+	const header = approvalHeader(tool, reason);
+	const details = approvalDetails(tool, args);
+	const full = [...header, ...details, ...appendix].join("\n");
+	const session = sessionSubject === undefined ? undefined : `Approve ${sessionSubject} for this session`;
+	if (ui.approve) {
+		const summary = approvalSummary(details);
+		const compact = [...header, ...(summary === undefined ? [] : [summary]), ...appendix].join("\n");
+		const answer = await ui.approve({ full, compact, ...(session ? { session } : {}) });
+		return answer === "once" || (answer === "session" && session) ? answer : "deny";
+	}
+	const choice = await ui.select(full, session ? ["Approve", session, "Deny"] : ["Approve", "Deny"]);
+	return choice === "Approve" ? "once" : session && choice === session ? "session" : "deny";
 }
