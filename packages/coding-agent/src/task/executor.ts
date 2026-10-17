@@ -4654,7 +4654,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
 				const target = resolvedPrewalk.model;
-				if (target && perCallModelGrants && !isPerCallModelApproved(target, perCallModelGrants, modelRegistry)) {
+				if (
+					target &&
+					perCallModelGrants &&
+					!isPerCallModelApproved(target, perCallModelGrants, modelRegistry, "dispatch")
+				) {
 					// A per-call model must not be swapped mid-run for one the operator never approved.
 					logger.debug("Subagent prewalk target is not approved for the per-call model; skipping prewalk", {
 						agent: agent.name,
@@ -4743,7 +4747,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					...(perCallModelGrants
 						? {
 								assertDispatchModel: (dispatchModel: Model) =>
-									assertPerCallModelApproved(dispatchModel, perCallModelGrants, modelRegistry),
+									assertPerCallModelApproved(dispatchModel, perCallModelGrants, modelRegistry, "dispatch"),
 							}
 						: {}),
 					thinkingLevelCeiling: spawnEffortCeiling,
