@@ -538,6 +538,7 @@ export async function resolveEffectiveSubagentPolicy(
 				};
 	const modelResolution = {
 		requestModel: preparedSeance?.modelPatterns ?? perCallModel ?? request.hostModel,
+		perCallRequest: perCallModel !== undefined,
 		settingsOverride: hasPreparedSeance ? undefined : configuredOverride,
 		agentModel: hasPreparedSeance ? undefined : effectiveAgent.model,
 		settings: request.session.settings,
