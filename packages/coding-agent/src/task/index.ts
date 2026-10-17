@@ -65,6 +65,7 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
+	invalidModelSelectorReason,
 	renderSubagentUserPrompt,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
@@ -89,6 +90,7 @@ import {
 	cfgTaskMaxConcurrency,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskMaxRuntimeMs,
+	cfgTaskPerCallModel,
 	cfgTaskSpeculativeLaunch,
 	cfgTaskStructured,
 } from "./settings";
@@ -156,6 +158,7 @@ interface TaskDescriptionOptions {
 	disabledAgents: string[];
 	batchEnabled: boolean;
 	effortEnabled: boolean;
+	perCallModel: "off" | "unpinned" | "on";
 	evalToolsEnabled: boolean;
 	structured: boolean;
 	file: boolean;
@@ -207,6 +210,8 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		applyIsolatedChanges: options.applyIsolatedChanges,
 		batchEnabled: options.batchEnabled,
 		effortEnabled: options.effortEnabled,
+		perCallModelEnabled: options.perCallModel !== "off",
+		perCallModelUnpinnedOnly: options.perCallModel === "unpinned",
 		evalToolsEnabled: options.evalToolsEnabled,
 		structured: options.structured,
 		file: options.file,
@@ -233,6 +238,10 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
  * `schema` remains an eval-only alias and is rejected.
  */
 function validateShapeParams(batchEnabled: boolean, params: TaskParams): string | undefined {
+	if (params.tasks !== undefined && Object.hasOwn(params, "model")) {
+		return "Put each model selector on its tasks[] item, not on the batch container.";
+	}
+
 	if (Object.hasOwn(params, "schema")) {
 		return "The task tool uses `outputSchema`; rename the stale `schema` field.";
 	}
@@ -308,14 +317,13 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 		}
 		for (let i = 0; i < tasks.length; i++) {
 			const item = tasks[i];
-			const inputError = validateTaskInput(
-				item,
-				`Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`,
-				fileEnabled,
-			);
+			const label = `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`;
+			const inputError = validateTaskInput(item, label, fileEnabled);
 			if (inputError) return inputError;
-			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			const effortError = validateEffort(item.effort, label);
 			if (effortError) return effortError;
+			const modelError = invalidModelSelectorReason(item.model, label);
+			if (modelError) return modelError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -336,7 +344,11 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 	if (batchEnabled && params.task === undefined && params.taskFile === undefined) {
 		return "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`.";
 	}
-	return validateTaskInput(params, "The call", fileEnabled) ?? validateEffort(params.effort, "The call");
+	return (
+		validateTaskInput(params, "The call", fileEnabled) ??
+		validateEffort(params.effort, "The call") ??
+		invalidModelSelectorReason(params.model, "The call")
+	);
 }
 
 /**
@@ -825,6 +837,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			file: cfgTaskFile.get(this.session.settings),
 			defaultAgent: this.#defaultAgent(),
 			seanceFields: this.#seanceSchemaFields(),
+			perCallModel: cfgTaskPerCallModel.get(this.session.settings) !== "off",
 		});
 	}
 
@@ -858,6 +871,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
+			perCallModel: cfgTaskPerCallModel.get(this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			structured: this.#isStructured(),
 			file: cfgTaskFile.get(this.session.settings),
@@ -1875,6 +1889,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...this.#resultParams(params),
 				...this.#effortParams(params),
 				solutionSpace: params.solutionSpace,
+				...(params.model !== undefined ? { model: params.model } : {}),
 				...(params.tools?.length
 					? {
 							customTools: createEvalCustomTools(
