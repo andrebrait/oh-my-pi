@@ -4538,6 +4538,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					id,
+					{ perCallModel: options.perCallModelGrants !== undefined },
 				),
 			);
 			if (modelResolutionWarning) {
