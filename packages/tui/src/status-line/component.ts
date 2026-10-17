@@ -27,7 +27,7 @@ import type {
 } from "./host";
 import type { Editor } from "../components/editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../theme/session-color";
-import { sanitizeStatusText } from "../chrome/shared";
+import { sanitizeHookStatusText, sanitizeStatusText } from "../chrome/shared";
 import { getThemeEpoch, theme } from "../theme";
 import { type CompactionBoundaries, EMPTY_STRING_PARTS, getToolSchemaMetadataRevision } from "./context-usage";
 import {
@@ -56,6 +56,7 @@ import type {
 	StatusLineSegmentOptions,
 	StatusLineSeparatorStyle,
 	StatusLineSettings,
+	StatusResetExpiry,
 } from "./types";
 
 /** What a click on a native status segment asks omp to open. */
@@ -83,9 +84,9 @@ const PINNED_NATIVE_PRIORITY = 1000;
 /**
  * Segments a TSP terminal shows outside the composer's facts: the model chip,
  * the context hairline and usage text (context, cost), Tern's pane header
- * (path, git), the tab title (session name, PR), the HUD pills (subagents),
- * the editor (vim) and the brand (`pi`; while focus-proxied, the viewed agent
- * is the composer's viewing header).
+ * (path), the tab title (session name, PR), the HUD pills (subagents), the
+ * editor (vim) and the brand (`pi`; while focus-proxied, the viewed agent is
+ * the composer's viewing header).
  */
 const COMPOSER_HOMED_SEGMENTS: Partial<Record<StatusLineSegmentId, true>> = {
 	pi: true,
@@ -94,7 +95,6 @@ const COMPOSER_HOMED_SEGMENTS: Partial<Record<StatusLineSegmentId, true>> = {
 	context_total: true,
 	cost: true,
 	path: true,
-	git: true,
 	pr: true,
 	session_name: true,
 	subagents: true,
@@ -372,6 +372,7 @@ interface ContextUsageMemo {
 	length: number;
 	lastFingerprint: string | undefined;
 	modelContextWindow: number;
+	toolSchemasInContext: boolean;
 	contextUsageRevision: number;
 	toolSchemaMetadataRevision: number;
 	settingsRevision: number;
@@ -766,9 +767,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	// than poison the fresh cache or advance its throttle.
 	#jjCacheGeneration = 0;
 
-	// PR lookup caching (invalidated on branch/repo context changes)
+	// PR lookup cache. `#cachedPrContext` is the branch/repo `#cachedPr` was
+	// resolved for; it is never shown for any other branch. Expiry forces a
+	// refetch while keeping that branch's PR visible until the lookup lands.
 	#cachedPr: { number: number; url: string } | null | undefined = undefined;
 	#cachedPrContext: PrCacheContext | undefined = undefined;
+	#cachedPrExpired = false;
 	#prLookupInFlight = false;
 	#defaultBranch?: string;
 	#defaultBranchCwd: string | undefined = undefined;
@@ -788,6 +792,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			expiryHours?: number;
 			expired?: boolean;
 			unavailableReason?: string;
+			expiring?: StatusResetExpiry;
 		};
 	} | null = null;
 	#cachedUsageContextKey: string | null = null;
@@ -800,6 +805,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#latestAppliedUsageRefreshSequence = 0;
 	#codexResetSnapshots = new Map<string, CodexResetUsageSnapshot>();
 	#onCodexResetFireworks: ((event: CodexResetFireworksEvent) => void) | undefined;
+	#onResetExpiryNotice: ((notice: string) => void) | undefined;
+	/** Conversations already warned about expiring saved resets: later refreshes stay quiet. */
+	#resetExpiryNoticedSessions = new Set<string>();
 	// Context-usage memo. The status line redraws on every agent event, so the
 	// hot path must not recompute context tokens unless an input changed.
 	// `getContextUsage()` anchors on the last assistant's real prompt-token
@@ -1203,6 +1211,11 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.#onCodexResetFireworks = handler;
 	}
 
+	/** Set the callback that presents the first pool-wide saved-reset expiry warning, or clear it with `undefined`. */
+	setResetExpiryNoticeHandler(handler: ((notice: string) => void) | undefined): void {
+		this.#onResetExpiryNotice = handler;
+	}
+
 	setHookStatus(key: string, text: string | undefined): void {
 		if (text === undefined) {
 			if (!this.#hookStatuses.delete(key)) return;
@@ -1272,6 +1285,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.#stopPricingTimer();
 		this.#clearUsageStartTimer();
 		this.#onCodexResetFireworks = undefined;
+		this.#onResetExpiryNotice = undefined;
 		this.#codexResetSnapshots.clear();
 		this.#retireGitWatcher();
 	}
@@ -1435,8 +1449,8 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		// was designed to avoid. Explicit Git/repository invalidation (watcher
 		// HEAD-move, cwd/repo switch) goes through {@link invalidateGitCaches}.
 		// A tool may open, close, or merge a PR without moving HEAD. Expire the
-		// settled PR context on ordinary activity while leaving HEAD work intact.
-		this.#cachedPrContext = undefined;
+		// settled PR on ordinary activity while leaving HEAD work intact.
+		this.#cachedPrExpired = true;
 	}
 	#invalidateSessionCaches(): void {
 		this.#clearUsageStartTimer();
@@ -1467,7 +1481,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		this.#branchResolveActive = undefined;
 		this.#branchLastFetch = undefined;
 		this.#branchCacheGeneration++;
-		this.#cachedPrContext = undefined;
+		this.#cachedPrExpired = true;
 		// A HEAD move (commit, checkout, reset) changes the dirty counts; keep the
 		// stale counts on screen but refetch on the next render. The generation
 		// bump stops an in-flight pre-move result from re-stamping freshness.
@@ -1788,11 +1802,16 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const branch = this.#getBranchLabel(activeRepoCache, this.#resolveRepository(activeRepoCache));
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
-		if (canReuseCachedPr(this.#cachedPr, this.#cachedPrContext, currentContext)) {
+		if (!this.#cachedPrExpired && canReuseCachedPr(this.#cachedPr, this.#cachedPrContext, currentContext)) {
 			return this.#cachedPr ?? null;
 		}
 
-		const stalePr = this.#cachedPr;
+		// Keep an expired PR visible during the refetch only on the branch it
+		// was resolved for; after a checkout the old PR must not linger.
+		const stalePr =
+			currentContext && isSamePrCacheContext(this.#cachedPrContext, currentContext)
+				? (this.#cachedPr ?? null)
+				: null;
 
 		if (!branch) {
 			this.#cachedPr = null;
@@ -1800,10 +1819,9 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return null;
 		}
 
-		// Don't look up if detached, default branch, or already in flight.
-		if (branch === "detached" || this.#isDefaultBranch(branch, gitCwd) || this.#prLookupInFlight) {
-			return stalePr ?? null;
-		}
+		// Detached HEAD and the default branch never carry a PR; no lookup.
+		if (branch === "detached" || this.#isDefaultBranch(branch, gitCwd)) return null;
+		if (this.#prLookupInFlight) return stalePr;
 
 		this.#prLookupInFlight = true;
 		const lookupContext = currentContext;
@@ -1825,6 +1843,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				if (lookupContext && isSamePrCacheContext(latestContext, lookupContext)) {
 					this.#cachedPr = value;
 					this.#cachedPrContext = lookupContext;
+					this.#cachedPrExpired = false;
 				}
 			};
 			try {
@@ -2026,6 +2045,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			this.#invalidateStatusLineRenderCache();
 			this.#onBranchChange?.();
 		}
+		this.#noticeResetExpiry(session, reports);
 		if (!resetSnapshot) return;
 		const contextKey = this.#formatUsageContextKey(activeProvider, activeIdentity);
 		const previous = this.#codexResetSnapshots.get(contextKey);
@@ -2033,6 +2053,33 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		if (!previous || !this.host.codexResetFireworksEnabled()) return;
 		const event = detectCodexResetFireworks(previous, resetSnapshot);
 		if (event) this.#onCodexResetFireworks?.(event);
+	}
+
+	#noticeResetExpiry(session: TSession, reports: unknown): void {
+		// A focused subagent's view is not a conversation the user started; warn in their own.
+		if (
+			this.#focusedAgentId !== undefined ||
+			!this.#onResetExpiryNotice ||
+			!this.host.resetExpiryNotice ||
+			!Array.isArray(reports)
+		) {
+			return;
+		}
+		const sessionId = session.sessionManager.getSessionId();
+		if (this.#resetExpiryNoticedSessions.has(sessionId)) return;
+		// fetchUsageReports supplies normalized rows; keep only entries shaped like reports.
+		const usageReports = reports.filter(
+			(report): report is UsageReport =>
+				!!report &&
+				typeof report === "object" &&
+				"provider" in report &&
+				"limits" in report &&
+				Array.isArray(report.limits),
+		);
+		const notice = this.host.resetExpiryNotice(usageReports, Date.now());
+		if (!notice) return;
+		this.#resetExpiryNoticedSessions.add(sessionId);
+		this.#onResetExpiryNotice(notice);
 	}
 
 	#observeLateUsageRefresh(session: TSession, reportsPromise: Promise<unknown>, sequence: number): void {
@@ -2141,6 +2188,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			expiryHours?: number;
 			expired?: boolean;
 			unavailableReason?: string;
+			expiring?: StatusResetExpiry;
 		};
 	} | null {
 		if (!Array.isArray(reports)) return null;
@@ -2258,7 +2306,16 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					? resetReports.find(report => reportMatchesExactIdentity(report, context.identity))
 					: undefined;
 		const resetSummary = summarizeUsageResetCredits(resetReport?.resetCredits, now);
-		const resetExpiryMs = resetSummary?.soonestExpiry ? Date.parse(resetSummary.soonestExpiry) - now : undefined;
+		const expiring =
+			resetSummary && resetSummary.bankedCount > 0 && resetReport
+				? this.host.classifyResetExpiry?.(resetReport, now)
+				: undefined;
+		// The highlighted countdown is the warned reset's, not an earlier one that is not worth warning about.
+		const resetExpiryMs = expiring
+			? expiring.expiresAtMs - now
+			: resetSummary?.soonestExpiry
+				? Date.parse(resetSummary.soonestExpiry) - now
+				: undefined;
 		const resetCredits =
 			resetSummary && resetSummary.bankedCount > 0
 				? {
@@ -2270,6 +2327,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 								: undefined,
 						expired: resetExpiryMs !== undefined && resetExpiryMs <= 0,
 						unavailableReason: resetSummary.unavailableReason,
+						expiring,
 					}
 				: undefined;
 		if (!selectedGroup) return resetCredits ? { resetCredits } : null;
@@ -2346,6 +2404,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	getCachedContextBreakdown(): { usedTokens: number; contextWindow: number } {
 		const messages = this.session.messages ?? EMPTY_MESSAGES;
 		const modelContextWindow = this.session.model?.contextWindow ?? 0;
+		const toolSchemasInContext = this.session.model?.toolSchemasInContext !== false;
 		const length = messages.length;
 		const lastFingerprint = length > 0 ? messageFingerprint(messages[length - 1]!) : undefined;
 		// Bumps when the in-flight pending snapshot is set/cleared. Without it a
@@ -2367,6 +2426,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			cache.length === length &&
 			cache.lastFingerprint === lastFingerprint &&
 			cache.modelContextWindow === modelContextWindow &&
+			cache.toolSchemasInContext === toolSchemasInContext &&
 			cache.contextUsageRevision === contextUsageRevision &&
 			cache.systemPromptRef === systemPrompt &&
 			cache.toolsRef === tools &&
@@ -2387,6 +2447,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			length,
 			lastFingerprint,
 			modelContextWindow,
+			toolSchemasInContext,
 			contextUsageRevision,
 			toolSchemaMetadataRevision,
 			settingsRevision,
@@ -3519,13 +3580,14 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	#buildComposerFacts(effectiveSettings: EffectiveStatusLineSettings, nowMs: number): ComposerFacts {
 		const { leftSegments, rightSegments } = effectiveSettings;
 		const segments = [...leftSegments, ...rightSegments];
-		// Tern's pane header shows the path and branch from the pane's cwd; only the PR is looked up here.
+		// Tern's pane header shows the path from the pane's cwd; the branch sits by the model chip.
+		const gitEnabled = this.#gitEnabled();
 		const ctx = this.#buildSegmentContext(
 			0,
 			effectiveSettings.segmentOptions,
 			false,
-			false,
-			this.#gitEnabled() && hasPrSegment(segments),
+			gitEnabled && hasGitSegment(segments),
+			gitEnabled && hasPrSegment(segments),
 			nowMs,
 		);
 		const pr = ctx.git.pr ?? undefined;
@@ -3543,8 +3605,12 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 				if (!view) return;
 				const props: TspProps<"seg"> = {
 					role: "omp.composer.fact",
-					priority: statusSegmentPriority(side, index, ids.length),
+					priority:
+						(PINNED_NATIVE_SEGMENTS[id] === true ? PINNED_NATIVE_PRIORITY : 0) +
+						statusSegmentPriority(side, index, ids.length),
 				};
+				const action = NATIVE_SEGMENT_ACTIONS[id];
+				if (action) props.actions = { click: action };
 				facts.push(describeSeg(id, props, view, dim));
 			});
 		};
@@ -3752,7 +3818,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		}
 		const showHooks = this.#settings.showHookStatus ?? true;
 		if (showHooks && this.#sortedHookStatuses.length > 0) {
-			lines.push(...this.#sortedHookStatuses.map(text => truncateToWidth(sanitizeStatusText(text), width)));
+			lines.push(...this.#sortedHookStatuses.map(text => truncateToWidth(sanitizeHookStatusText(text), width)));
 		}
 		return lines;
 	}

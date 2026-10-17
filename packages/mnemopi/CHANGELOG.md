@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [18.11.2] - 2026-10-16
+
+### Fixed
+
+- Fixed `MNEMOPI_<LABEL>_WEIGHT` and `MNEMOPI_TIER<N>_WEIGHT` having no effect on recall ranking ([#13824](https://github.com/can1357/oh-my-pi/pull/13824) by [@sjawhar](https://github.com/sjawhar))
+
+## [18.11.1] - 2026-10-15
+
+### Fixed
+
+- Fixed a failing `mnemopi` CLI command or MCP memory call dropping the embeddings of memories it had just stored ([#15804](https://github.com/can1357/oh-my-pi/pull/15804) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
+## [18.11.0] - 2026-10-14
+
+### Fixed
+
+- Fixed polyphonic recall ranking unrelated memories above relevant ones when the query shared only a common word such as "that" with an extracted fact subject ([#15512](https://github.com/can1357/oh-my-pi/issues/15512)).
+
+## [18.9.0] - 2026-10-11
+
+### Added
+
+- Exported `clipRecallContent` for applications that need to format content consistently with Mnemopi recall previews.
+
+### Fixed
+
+- Fixed memory-save performance degradation and excessive memory-database growth when date-related terms such as “today” appeared in otherwise unrelated memories.
+
+## [18.8.8] - 2026-10-10
+
+### Fixed
+
+- Fixed long retained transcripts exhausting local memory extraction models by limiting each extraction input to 8192 characters while keeping the opening context and newest turns ([#14956](https://github.com/can1357/oh-my-pi/issues/14956)).
+
 ## [18.8.7] - 2026-10-09
 
 ### Fixed
@@ -12,7 +46,6 @@
 
 ### Fixed
 
-- Fixed long retained transcripts exhausting local memory extraction models by limiting each extraction input to 8192 characters while keeping the opening context and newest turns ([#14956](https://github.com/can1357/oh-my-pi/issues/14956)).
 - Fixed new memories gaining graph links (`related_to`, `references`, `ctx`) to memories that were already invalidated, superseded, or expired; proactive linking and consolidation now link only to memories recall can still return, so the graph stops growing toward retired memories ([#14427](https://github.com/can1357/oh-my-pi/pull/14427) by [@tickernelz](https://github.com/tickernelz)).
 
 ## [18.5.1] - 2026-10-03

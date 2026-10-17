@@ -64,6 +64,7 @@ export function openaiCodexModelManagerOptions(
 		providerId: "openai-codex",
 		cacheProviderId: resolveModelCacheProviderId("openai-codex", { baseUrl }),
 		dynamicModelsAuthoritative: providerEntry("openai-codex")?.dynamicModelsAuthoritative === true,
+		keepStaticNames: providerEntry("openai-codex")?.keepBundledNames === true,
 		...(resolveAccounts
 			? {
 					fetchDynamicModels: async () => {
@@ -402,6 +403,15 @@ export function webModelManagerOptions(): ModelManagerOptions<"web-search"> {
 		providerId: "web",
 		cacheProviderId: resolveModelCacheProviderId("web"),
 		staticModels: seedModels<"web-search">("web"),
+	};
+}
+
+/** Cloudflare Workers AI judges: the authored Clef rows; the account id resolves per request. */
+export function cloudflareWorkersAiModelManagerOptions(): ModelManagerOptions<"workers-ai-systemone"> {
+	return {
+		providerId: "cloudflare-workers-ai",
+		cacheProviderId: resolveModelCacheProviderId("cloudflare-workers-ai"),
+		staticModels: seedModels<"workers-ai-systemone">("cloudflare-workers-ai"),
 	};
 }
 

@@ -625,6 +625,8 @@ export interface CompiledSeedModel {
 	baseUrl: string;
 	reasoning: boolean;
 	input: ("text" | "image")[];
+	/** Wire model id sent upstream when it differs from the row id (`request-model-id`). */
+	requestModelId?: string;
 	supportsTools?: boolean;
 	cost: TokenCost;
 	contextWindow: number | null;
@@ -666,6 +668,8 @@ export interface CompiledProvider {
 	dynamicModelsAuthoritative?: boolean;
 	/** Generator backfills never copy reasoning/input/limits from same-id rows on other hosts. */
 	skipCrossProviderReferenceFills?: boolean;
+	/** Runtime discovery keeps a bundled row's display name instead of the live one. */
+	keepBundledNames?: boolean;
 	/** Present only for providers enrolled in `generate-models.ts` discovery. */
 	discovery?: CompiledProviderDiscovery;
 	/** Non-chat model kinds mapped to their runtime transport APIs. */

@@ -7,16 +7,19 @@ import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-age
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { computerApproval, createComputerPrelude } from "@oh-my-pi/pi-coding-agent/tools/computer";
 import { isReadOnlyComputerCall, renderComputerCall } from "@oh-my-pi/pi-coding-agent/tools/computer/call";
-import type {
-	ComputerSessionSnapshot,
-	ComputerWorkerInbound,
-	ComputerWorkerOutbound,
-	ComputerWorkerTransport,
+import {
+	type ComputerSessionSnapshot,
+	type ComputerWorkerInbound,
+	type ComputerWorkerOutbound,
+	type ComputerWorkerTransport,
+	SCREEN_LOCKED_CAPTURE_NOTE,
 } from "@oh-my-pi/pi-coding-agent/tools/computer/protocol";
 import {
+	beginComputerTurnForOwner,
 	type ComputerController,
 	ComputerSupervisor,
 	type ComputerWorkerHandle,
+	endComputerTurnForOwner,
 } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-coding-agent/tools/computer/worker";
 import type {
@@ -28,6 +31,7 @@ import type {
 	DesktopCapture,
 	DesktopDisplay,
 	DesktopPoint,
+	DesktopScreenState,
 	DesktopWindow,
 	PointerOptions,
 } from "@oh-my-pi/pi-natives";
@@ -59,6 +63,8 @@ const capabilities: DesktopCapabilities = {
 	menus: true,
 	heldInput: true,
 	spaces: true,
+	screenLocked: false,
+	displayAsleep: false,
 };
 
 const display: DesktopDisplay = {
@@ -103,7 +109,15 @@ const axNode: AxNode = {
 };
 
 class FakeNativeSession implements NativeDesktopSession {
-	readonly capabilities = capabilities;
+	/** Lock and sleep state reported by captures, capabilities and screenState, as the native session reads it live. */
+	screenLocked = false;
+	displayAsleep = false;
+	get capabilities(): DesktopCapabilities {
+		return { ...capabilities, screenLocked: this.screenLocked, displayAsleep: this.displayAsleep };
+	}
+	get screenState(): DesktopScreenState {
+		return { screenLocked: this.screenLocked, displayAsleep: this.displayAsleep };
+	}
 	clickCount = 0;
 	closeCount = 0;
 	cancelCount = 0;
@@ -133,6 +147,7 @@ class FakeNativeSession implements NativeDesktopSession {
 			target,
 			displays: [display],
 			backend: "fake",
+			screenLocked: this.screenLocked,
 		};
 	}
 	async captureRegion(_target: string, _region: CaptureRegion): Promise<DesktopCapture> {
@@ -144,6 +159,14 @@ class FakeNativeSession implements NativeDesktopSession {
 	}
 	retire(): void {
 		this.retireCount += 1;
+	}
+	/** Display-hold calls in order: `turn` for holdDisplayUntilReleased, `release` for releaseDisplayAwake. */
+	readonly displayHolds: string[] = [];
+	holdDisplayUntilReleased(): void {
+		this.displayHolds.push("turn");
+	}
+	releaseDisplayAwake(): void {
+		this.displayHolds.push("release");
 	}
 	async listApplications() {
 		return [{ id: "test.editor", name: "Editor", path: "/Applications/Editor.app", running: true, pid: 123 }];
@@ -307,13 +330,14 @@ class MemoryTransport implements ComputerWorkerTransport {
 	}
 }
 
-const snapshot = (readOnly = false): ComputerSessionSnapshot => ({
+const snapshot = (readOnly = false, displayTurn?: number): ComputerSessionSnapshot => ({
 	cwd: import.meta.dir,
 	sessionId: crypto.randomUUID(),
 	captureMaxWidth: 1280,
 	captureMaxHeight: 896,
 	display: "active",
 	readOnly,
+	displayTurn,
 });
 
 async function runWorker(
@@ -958,6 +982,217 @@ describe("computer prelude", () => {
 		}
 	});
 
+	class RefCallSession extends FakeNativeSession {
+		readonly axCalls: unknown[] = [];
+		override async axNode(ref: string): Promise<AxNode> {
+			this.axCalls.push(["axNode", ref]);
+			return axNode;
+		}
+		override async axPerform(ref: string, action: string): Promise<void> {
+			this.axCalls.push(["axPerform", ref, action]);
+		}
+		override async axClick(ref: string, opts?: PointerOptions | null): Promise<void> {
+			this.axCalls.push(["axClick", ref, opts]);
+		}
+	}
+
+	it("chains element calls on JavaScript ref() handles, direct and in runs, and double-clicks", async () => {
+		const session = toolSession();
+		const native = new RefCallSession();
+		const prelude = workerPrelude(session, native);
+		const context = { session, toolCallId: "ref-chain-js" };
+		const realm = createContext({
+			__omp_display__: () => {},
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				const result = await prelude.invoke(parameters, context);
+				return { text: "", details: result.details };
+			},
+		});
+		runInContext(prelude.javascript, realm);
+		try {
+			const role = await runInContext(
+				`(async () => {
+					const win = await computer.window(42);
+					await win.ref("e1").click({ count: 2 });
+					await computer.ref("e1").press();
+					const el = await win.ref("e1");
+					await el.click({ count: 2, button: "right" });
+					await computer.run(async ({ desktop }) => {
+						const win = await desktop.window(42);
+						await win.ref("e1").click({ count: 2 });
+						await desktop.ref("e1").press();
+					});
+					return el.role;
+				})()`,
+				realm,
+			);
+			expect(role).toBe("button");
+			expect(native.axCalls).toEqual([
+				["axNode", "e1"],
+				["axClick", "e1", { count: 2 }],
+				["axNode", "e1"],
+				["axPerform", "e1", "press"],
+				["axNode", "e1"],
+				["axNode", "e1"],
+				["axClick", "e1", { button: "right", count: 2 }],
+				["axNode", "e1"],
+				["axClick", "e1", { count: 2 }],
+				["axNode", "e1"],
+				["axPerform", "e1", "press"],
+			]);
+		} finally {
+			await prelude.invoke({ action: "close" }, context);
+		}
+	});
+
+	it("chains element calls on Python ref() handles and still awaits them to elements", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const native = new RefCallSession();
+		const prelude = workerPrelude(session, native);
+		definitions = [prelude];
+		try {
+			const result = await executePython(
+				[
+					"win = await computer.window(42)",
+					'await win.ref("e1").click(count=2)',
+					'await computer.ref("e1").press()',
+					'el = await win.ref("e1")',
+					"print(repr(el))",
+				].join("\n"),
+				{
+					cwd: process.cwd(),
+					sessionId: `computer-ref-chain-py-${crypto.randomUUID()}`,
+					toolSession: session,
+					kernelMode: "per-call",
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.output.trim()).toBe("<computer.Element ref='e1' role='button'>");
+			expect(native.axCalls).toEqual([
+				["axNode", "e1"],
+				["axClick", "e1", { count: 2 }],
+				["axNode", "e1"],
+				["axPerform", "e1", "press"],
+				["axNode", "e1"],
+			]);
+		} finally {
+			await prelude.invoke({ action: "close" }, { session, toolCallId: "ref-chain-py-close" });
+		}
+	});
+
+	it("double-clicks JavaScript elements and names the element call made on find()'s array", async () => {
+		const session = toolSession();
+		const native = new RefCallSession();
+		const prelude = workerPrelude(session, native);
+		const context = { session, toolCallId: "element-shape-js" };
+		const realm = createContext({
+			__omp_display__: () => {},
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				const result = await prelude.invoke(parameters, context);
+				return { text: "", details: result.details };
+			},
+		});
+		runInContext(prelude.javascript, realm);
+		try {
+			const shape = await runInContext(
+				`(async () => {
+					const win = await computer.window(42);
+					await win.ref("e1").doubleClick({ button: "right" });
+					await (await win.ref("e1")).doubleClick({ count: 3 });
+					const found = await win.find({ role: "button" });
+					await found[0].doubleClick();
+					await computer.run(async ({ desktop }) => {
+						await desktop.ref("e1").doubleClick();
+						const [el] = await (await desktop.window(42)).find({ role: "button" });
+						await el.doubleClick();
+					});
+					return { json: JSON.stringify(found), keys: Object.keys(found), spread: [...found].length };
+				})()`,
+				realm,
+			);
+			expect({ ...shape, json: JSON.parse(shape.json) }).toEqual({
+				json: [expect.objectContaining({ ref: "e1", role: "button" })],
+				keys: ["0"],
+				spread: 1,
+			});
+			expect(native.axCalls.filter(call => (call as unknown[])[0] === "axClick")).toEqual([
+				["axClick", "e1", { button: "right", count: 2 }],
+				["axClick", "e1", { count: 2 }],
+				["axClick", "e1", { count: 2 }],
+				["axClick", "e1", { count: 2 }],
+				["axClick", "e1", { count: 2 }],
+			]);
+			const misuse = await runInContext(
+				`(async () => {
+					const win = await computer.window(42);
+					const found = await win.find({ role: "button", title: "Run" });
+					const messages = [];
+					for (const misuse of [() => found.press(), () => win.ref(found.ref)]) {
+						try {
+							await misuse();
+						} catch (error) {
+							messages.push(error.message);
+						}
+					}
+					return messages;
+				})()`,
+				realm,
+			);
+			expect(misuse).toHaveLength(2);
+			expect(misuse[0]).toContain("find() returns an array (length 1), not one element, so it has no press()");
+			expect(misuse[0]).toContain("const [el] = await win.find(");
+			expect(misuse[1]).toContain("find() returns an array (length 1), not one element, so it has no ref;");
+		} finally {
+			await prelude.invoke({ action: "close" }, context);
+		}
+	});
+
+	it("double-clicks Python elements and names the element attribute read on find()'s list", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const native = new RefCallSession();
+		const prelude = workerPrelude(session, native);
+		definitions = [prelude];
+		try {
+			const result = await executePython(
+				[
+					"import copy",
+					"win = await computer.window(42)",
+					'await win.ref("e1").doubleClick(button="right")',
+					'found = await win.find({"role": "button"})',
+					"await found[0].doubleClick()",
+					"try:",
+					"    await found.press()",
+					"except AttributeError as error:",
+					"    print(error)",
+					"print(hasattr(found, 'click'), hasattr(found, 'nope'))",
+					"print([element.ref for element in found], found)",
+					"print(type(copy.copy(found)).__name__, type(copy.deepcopy(found)).__name__)",
+				].join("\n"),
+				{
+					cwd: process.cwd(),
+					sessionId: `computer-element-shape-py-${crypto.randomUUID()}`,
+					toolSession: session,
+					kernelMode: "per-call",
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			const lines = result.output.trim().split("\n");
+			expect(lines[0]).toContain("find() returns a list (length 1), not one element, so it has no press");
+			expect(lines[0]).toContain("el = (await win.find(query))[0]");
+			expect(lines[1]).toBe("False False");
+			expect(lines[2]).toStartWith("['e1'] [<");
+			expect(lines[3]).toBe("list list");
+			expect(native.axCalls.filter(call => (call as unknown[])[0] === "axClick")).toEqual([
+				["axClick", "e1", { button: "right", count: 2 }],
+				["axClick", "e1", { count: 2 }],
+			]);
+		} finally {
+			await prelude.invoke({ action: "close" }, { session, toolCallId: "element-shape-py-close" });
+		}
+	});
+
 	it("treats text-only Python host responses as unavailable capabilities", async () => {
 		const calls: unknown[] = [];
 		let definitions: readonly EvalPreludeDefinition[] = [];
@@ -1067,6 +1302,124 @@ describe("computer worker round trips", () => {
 			sourceWidth: 128,
 			sourceHeight: 64,
 		});
+	});
+
+	it("marks a screenshot taken behind the lock screen, and only then", async () => {
+		for (const locked of [true, false]) {
+			const transport = new MemoryTransport();
+			const native = new FakeNativeSession();
+			native.screenLocked = locked;
+			new ComputerWorkerCore(transport, () => native);
+
+			const result = await runWorker(transport, `locked-${locked}`, "return await desktop.screenshot()");
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const [caption] = result.payload.displays.filter(block => block.type === "text");
+			const lines = caption?.type === "text" ? caption.text.split("\n") : [];
+			if (locked) {
+				expect(lines).toHaveLength(2);
+				expect(lines[1]).toBe(SCREEN_LOCKED_CAPTURE_NOTE);
+				expect(result.payload.screenshots[0]?.screenLocked).toBe(true);
+				expect(result.payload.returnValue).toMatchObject({ screenLocked: true });
+			} else {
+				expect(lines).toHaveLength(1);
+				expect(result.payload.screenshots[0]).not.toHaveProperty("screenLocked");
+				expect(result.payload.returnValue).not.toHaveProperty("screenLocked");
+			}
+		}
+	});
+
+	it("tells the model a run ended on a locked screen without refusing its input", async () => {
+		for (const locked of [true, false]) {
+			const session = toolSession();
+			const native = new FakeNativeSession();
+			native.screenLocked = locked;
+			const prelude = workerPrelude(session, native);
+			const result = await prelude.invoke(
+				{ action: "run", code: "await desktop.screenshot({ silent: true }); await desktop.click(1, 2)" },
+				{ session, toolCallId: `locked-run-${locked}`, signal: new AbortController().signal },
+			);
+			expect(native.clickCount).toBe(1);
+			const notes = result.content.filter(block => block.type === "text" && block.text.startsWith("Note: "));
+			if (locked) {
+				expect(result.content[0]).toMatchObject({
+					type: "text",
+					text: expect.stringMatching(/^Note: when this run ended the screen is locked\. /),
+				});
+			} else {
+				expect(notes).toEqual([]);
+			}
+		}
+	});
+
+	it("keeps a failed run's own error first and adds the lock state after it", async () => {
+		for (const locked of [true, false]) {
+			const transport = new MemoryTransport();
+			const native = new FakeNativeSession();
+			native.screenLocked = locked;
+			new ComputerWorkerCore(transport, () => native);
+			const result = await runWorker(
+				transport,
+				`failed-${locked}`,
+				'await desktop.screenshot({ silent: true }); await desktop.click(1, 2); assert(false, "verification failed")',
+			);
+			expect(native.clickCount).toBe(1);
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			const [first, ...rest] = result.error.message.split("\n");
+			expect(first).toBe("verification failed");
+			if (locked) expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\. /);
+			else expect(rest).toEqual([]);
+		}
+	});
+
+	it("scopes a display-sleep notice to the session's display", async () => {
+		const session = toolSession();
+		const native = new FakeNativeSession();
+		native.displayAsleep = true;
+		const prelude = workerPrelude(session, native);
+		const result = await prelude.invoke(
+			{ action: "run", code: "await desktop.click(1, 2)" },
+			{ session, toolCallId: "asleep-run", signal: new AbortController().signal },
+		);
+		const [note] = result.content;
+		const text = note?.type === "text" ? note.text : "";
+		expect(text).toMatch(/^Note: when this run ended the session's display is asleep\. /);
+		expect(text).toContain("Nothing on that display can be captured or clicked until it wakes.");
+		expect(text).toContain("`computer.display`");
+	});
+
+	it("adds the lock state to a run timed out by a hung native call without reading capabilities", async () => {
+		const started = Promise.withResolvers<void>();
+		const hung = Promise.withResolvers<DesktopCapture>();
+		class HungSession extends FakeNativeSession {
+			/** Native capabilities reads queue behind the hung call when no snapshot exists. */
+			blockingReads = 0;
+			override get capabilities(): DesktopCapabilities {
+				this.blockingReads += 1;
+				return super.capabilities;
+			}
+			override async capture(): Promise<DesktopCapture> {
+				started.resolve();
+				// Stuck in the OS: cancellation does not settle it.
+				return hung.promise;
+			}
+		}
+		const native = new HungSession();
+		native.screenLocked = true;
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+		const pending = runWorker(transport, "hung", "await desktop.screenshot({ silent: true })", false, 50);
+		await started.promise;
+		const result = await pending;
+		// Let the script's runtime finish so later tests can start theirs.
+		hung.reject(new Error("released"));
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		const [first, ...rest] = result.error.message.split("\n");
+		expect(first).toBe("Computer code execution timed out after 50ms");
+		expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\. /);
+		expect(native.blockingReads).toBe(0);
 	});
 
 	it("blocks read-only click after capture before invoking native input", async () => {
@@ -1311,6 +1664,73 @@ describe("computer worker round trips", () => {
 		});
 	});
 
+	describe("window selector misses", () => {
+		const desktopWindows: DesktopWindow[] = [
+			windowFixture,
+			{ ...windowFixture, id: "43", title: "", focused: false },
+			{ ...windowFixture, id: "7", app: "Finder", title: "Downloads", pid: 9, focused: false },
+			{ ...windowFixture, id: "8", app: "TextEdit", title: "notes.txt", pid: 10, focused: false },
+			{ ...windowFixture, id: "9", app: "TextEdit", title: "draft.txt", pid: 10, focused: false },
+		];
+
+		async function missMessage(windows: DesktopWindow[], selector: string): Promise<string> {
+			const transport = new MemoryTransport();
+			const native = new FakeNativeSession();
+			native.listWindows = async () => windows;
+			new ComputerWorkerCore(transport, () => native);
+			const result = await runWorker(transport, "window-miss", `await desktop.window(${selector})`);
+			expect(result.ok).toBe(false);
+			return result.ok ? "" : result.error.message;
+		}
+
+		it("leads with the requested app's windows when its title filter misses", async () => {
+			const message = await missMessage(desktopWindows, '{ app: "textedit", title: "report" }');
+			expect(message.split("\n").slice(0, 3)).toEqual([
+				'no window matches {"app":"textedit","title":"report"}',
+				'Open windows by app (id "title"):',
+				'- TextEdit: 8 "notes.txt", 9 "draft.txt"',
+			]);
+		});
+
+		it("says the app has no window and lists every app's windows, untitled ones included", async () => {
+			const lines = (await missMessage(desktopWindows, '{ app: "Calendar" }')).split("\n");
+			expect(lines).toContain('No open window belongs to an app matching "Calendar".');
+			expect(lines).toContain('- Code: 42 "Editor", 43 ""');
+			expect(lines).toContain('- Finder: 7 "Downloads"');
+			expect(lines).toContain('- TextEdit: 8 "notes.txt", 9 "draft.txt"');
+		});
+
+		it("lists untitled windows by id after titled ones, as when macOS hides other apps' titles", async () => {
+			const blank = (id: string): DesktopWindow => ({
+				...windowFixture,
+				id,
+				app: "Notes",
+				title: "",
+				focused: false,
+			});
+			const message = await missMessage(
+				[windowFixture, blank("50"), blank("51"), blank("52"), { ...blank("53"), title: "Inbox" }],
+				'"404"',
+			);
+			expect(message.split("\n")).toContain('- Notes: 53 "Inbox", 50 "", 51 "", 1 more');
+		});
+
+		it("bounds the listing on a desktop with many apps and long titles", async () => {
+			const crowded = Array.from({ length: 40 }, (_, app) =>
+				Array.from({ length: 4 }, (_, index) => ({
+					...windowFixture,
+					id: `${app}-${index}`,
+					app: `App ${String(app).padStart(2, "0")}`,
+					title: "t".repeat(300),
+					focused: false,
+				})),
+			).flat();
+			const message = await missMessage(crowded, '{ app: "Calendar" }');
+			expect(message.length).toBeLessThan(5_000);
+			expect(message.split("\n").at(-1)).toBe("- 28 more apps with 112 windows");
+		});
+	});
+
 	it("resolves ref() to a populated live element and find() to every match", async () => {
 		const transport = new MemoryTransport();
 		new ComputerWorkerCore(transport, () => new FakeNativeSession());
@@ -1349,7 +1769,45 @@ describe("computer worker round trips", () => {
 			new ComputerWorkerCore(transport, () => new TwoWindowSession());
 			const result = await runWorker(transport, "numeric-miss", `await desktop.window(${id})`);
 			expect(result.ok).toBe(false);
-			if (!result.ok) expect(result.error.message).toBe(`no window matches ${id}`);
+			if (!result.ok) expect(result.error.message.split("\n")[0]).toBe(`no window matches ${id}`);
+		});
+	});
+
+	describe("more windows than the listing cap", () => {
+		class CrowdedSession extends FakeNativeSession {
+			override async listWindows(): Promise<DesktopWindow[]> {
+				const front = Array.from({ length: 59 }, (_, index) => ({
+					...windowFixture,
+					id: String(index + 100),
+					app: "Front",
+					focused: false,
+				}));
+				return [...front, { ...windowFixture, id: "999", app: "Rear", focused: false }];
+			}
+		}
+
+		it("caps the listing after filtering and finds a window behind the cap by id or app", async () => {
+			const transport = new MemoryTransport();
+			new ComputerWorkerCore(transport, () => new CrowdedSession());
+			const result = await runWorker(
+				transport,
+				"crowded-desktop",
+				'({ listed: (await desktop.windows()).length, filtered: (await desktop.windows({ app: "rear" })).map(w => w.id), byId: (await desktop.window(999)).app, byApp: (await desktop.window({ app: "rear" })).id })',
+			);
+			expect(result.ok).toBe(true);
+			if (result.ok)
+				expect(result.payload.returnValue).toEqual({ listed: 48, filtered: ["999"], byId: "Rear", byApp: "999" });
+		});
+
+		it("lists at most 48 candidates for an ambiguous filter", async () => {
+			const transport = new MemoryTransport();
+			new ComputerWorkerCore(transport, () => new CrowdedSession());
+			const result = await runWorker(transport, "crowded-ambiguous", 'await desktop.window({ app: "front" })');
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.error.message).toContain("147 Front");
+			expect(result.error.message).not.toContain("148 Front");
+			expect(result.error.message).toContain("… 11 more");
 		});
 	});
 
@@ -1405,6 +1863,71 @@ describe("computer worker round trips", () => {
 		);
 		expect(clicked.ok).toBe(true);
 		expect(native.clickCount).toBe(1);
+	});
+
+	it("returns find() results as plain arrays whose element calls name the pick, and gates element doubleClick as exec", async () => {
+		const transport = new MemoryTransport();
+		const axClicks: unknown[] = [];
+		new ComputerWorkerCore(
+			transport,
+			() =>
+				new (class extends FakeNativeSession {
+					override async axClick(ref: string, opts?: PointerOptions | null): Promise<void> {
+						axClicks.push([ref, opts]);
+					}
+				})(),
+		);
+
+		const found = await runWorker(
+			transport,
+			"call-find",
+			renderComputerCall([
+				{ method: "window", args: ["42"] },
+				{ method: "find", args: [{ role: "button" }] },
+			]),
+			true,
+		);
+		expect(found.ok).toBe(true);
+		if (found.ok) expect(found.payload.returnValue).toEqual([expect.objectContaining({ ref: "e1", role: "button" })]);
+
+		const misuse = await runWorker(
+			transport,
+			"find-misuse",
+			'await (await (await desktop.window(42)).find({ role: "button" })).doubleClick()',
+		);
+		expect(misuse.ok).toBe(false);
+		if (!misuse.ok) {
+			expect(misuse.error.message).toContain(
+				"find() returns an array (length 1), not one element, so it has no doubleClick()",
+			);
+		}
+		const fieldRead = await runWorker(
+			transport,
+			"find-field-read",
+			'(await (await desktop.window(42)).find({ role: "button" })).enabled',
+		);
+		expect(fieldRead.ok).toBe(false);
+		if (!fieldRead.ok) {
+			expect(fieldRead.error.message).toContain(
+				"find() returns an array (length 1), not one element, so it has no enabled;",
+			);
+		}
+
+		const doubleClick = [
+			{ method: "ref", args: ["e1"] },
+			{ method: "doubleClick", args: [] },
+		];
+		const blocked = await runWorker(transport, "call-double-click-ro", renderComputerCall(doubleClick), true);
+		expect(blocked.ok).toBe(false);
+		expect(axClicks).toEqual([]);
+		const clicked = await runWorker(
+			transport,
+			"call-double-click",
+			renderComputerCall(doubleClick),
+			isReadOnlyComputerCall(doubleClick),
+		);
+		expect(clicked.ok).toBe(true);
+		expect(axClicks).toEqual([["e1", { count: 2 }]]);
 	});
 
 	it("applies the current read-only policy to a retained writable window", async () => {
@@ -1735,6 +2258,10 @@ describe("expanded computer APIs", () => {
 					"win = await computer.window(42)",
 					"items = await win.menu.items('File')",
 					"await win.menu.select(items[0]['path'])",
+					"await win.menu.select('File', 'Save')",
+					"await win.menu.select(path=['File', 'Save'])",
+					"print((await win.menu.items(path='File'))[0]['path'])",
+					"try:\n    await win.menu.select('File', None)\nexcept Exception as error:\n    print('select-none:', error)",
 					"obs = await win.observe(silent=True)",
 					"await win.click(60, 30)",
 					"monitor = await computer.display('display-1')",
@@ -1754,9 +2281,250 @@ describe("expanded computer APIs", () => {
 			);
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain("1 display-1 False");
+			expect(result.output).toContain("['File', 'Save']");
+			expect(result.output).toContain("select-none: menu.select requires a menu path");
+			expect(result.output).toContain('got ["File",null]');
 			expect(native.controlActive).toBe(false);
+			expect(native.operations.filter(operation => operation.startsWith("menu:"))).toEqual([
+				"menu:42:File/Save",
+				"menu:42:File/Save",
+				"menu:42:File/Save",
+			]);
 		} finally {
 			await prelude.invoke({ action: "close" }, { session, toolCallId: "expanded-py" });
+		}
+	});
+
+	it("takes a menu path as one title, an array, or separate titles, and names those forms when it is malformed", async () => {
+		const session = toolSession();
+		const native = new FakeNativeSession();
+		const prelude = workerPrelude(session, native);
+		const context = { session, toolCallId: "menu-path-js" };
+		const realm = createContext({
+			__omp_display__: () => {},
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				const result = await prelude.invoke(parameters, context);
+				return { text: "", details: result.details };
+			},
+		});
+		runInContext(prelude.javascript, realm);
+		try {
+			const items = await runInContext(
+				`(async () => {
+					const win = await computer.window(42);
+					await win.menu.select("File", "Save");
+					await win.menu.select(["File", "Save"]);
+					return [await win.menu.items("File", "Save"), await win.menu.items(["File"]), await win.menu.items()];
+				})()`,
+				realm,
+			);
+			expect(items.map((list: Array<{ path: string[] }>) => list[0]!.path)).toEqual([
+				["File", "Save", "Save"],
+				["File", "Save"],
+				["Save"],
+			]);
+			expect(native.operations).toEqual(["menu:42:File/Save", "menu:42:File/Save"]);
+			const forms =
+				'requires a menu path of non-empty titles: one title ("File"), an array (["File", "Export…"]), or separate titles ("File", "Export…")';
+			for (const [call, got] of [
+				["select()", "no path"],
+				['select(["File"], "Save")', '[["File"],"Save"]'],
+				['select("File", "")', '["File",""]'],
+				['select("File", undefined)', '["File",null]'],
+			]) {
+				await expect(
+					runInContext(`(async () => (await computer.window(42)).menu.${call})()`, realm),
+				).rejects.toThrow(`menu.select ${forms}; got ${got}`);
+			}
+			expect(native.operations).toHaveLength(2);
+
+			// Worker-side code may pass an optional path on as `undefined`, or a value JSON cannot show.
+			const transport = new MemoryTransport();
+			new ComputerWorkerCore(transport, () => native);
+			const root = await runWorker(
+				transport,
+				"menu-undefined",
+				"return (await (await desktop.window(42)).menu.items(undefined))[0].path",
+			);
+			expect(root.ok ? root.payload.returnValue : root.error).toEqual(["Save"]);
+			for (const [code, got] of [
+				["menu.select(1n)", "bigint"],
+				["menu.select((() => { const path = []; path.push(path); return path; })())", "an array"],
+			]) {
+				const result = await runWorker(transport, `menu-${got}`, `await (await desktop.window(42)).${code}`);
+				expect(result.ok ? undefined : result.error).toMatchObject({
+					isToolError: true,
+					message: `menu.select ${forms}; got ${got}`,
+				});
+			}
+		} finally {
+			await prelude.invoke({ action: "close" }, context);
+		}
+	});
+
+	it("names the helper and argument for a missing or non-string text argument before any native call", async () => {
+		class ArgumentSession extends FakeNativeSession {
+			readonly calls: string[] = [];
+			override async axNode(ref: string): Promise<AxNode> {
+				this.calls.push(`axNode:${ref}`);
+				return axNode;
+			}
+			override async axSetValue(ref: string, _value: string): Promise<void> {
+				this.calls.push(`axSetValue:${ref}`);
+			}
+			override async axPerform(ref: string, _action: string): Promise<void> {
+				this.calls.push(`axPerform:${ref}`);
+			}
+			override async typeText(target: string, _text: string): Promise<void> {
+				this.calls.push(`typeText:${target}`);
+			}
+			override async keyChord(target: string, _keys: string[]): Promise<void> {
+				this.calls.push(`keyChord:${target}`);
+			}
+			override async openApplication(id: string) {
+				this.calls.push(`open:${id}`);
+				return super.openApplication(id);
+			}
+		}
+		const transport = new MemoryTransport();
+		const native = new ArgumentSession();
+		new ComputerWorkerCore(transport, () => native);
+		for (const [code, message] of [
+			['await desktop.ref("e1").setValue()', "setValue(value) requires a string, got undefined"],
+			['await desktop.ref("e1").setValue(42)', "setValue(value) requires a string, got number"],
+			['await desktop.ref("e1").perform("")', 'perform(action) requires a non-empty string, got ""'],
+			["desktop.ref()", "ref(ref) requires a non-empty string, got undefined"],
+			["(await desktop.window(42)).ref(null)", "ref(ref) requires a non-empty string, got null"],
+			["await (await desktop.window(42)).type()", "type(text) requires a string, got undefined"],
+			["await desktop.type(['a'])", "type(text) requires a string, got an array"],
+			[
+				"await desktop.press()",
+				'press(chord) requires a key chord such as "cmd+shift+p" or ["cmd", "shift", "p"], got undefined',
+			],
+			[
+				"await desktop.press(['cmd', 1])",
+				'press(chord) requires a key chord such as "cmd+shift+p" or ["cmd", "shift", "p"], got an array',
+			],
+			["await desktop.apps.open()", "apps.open(id) requires a non-empty string, got undefined"],
+			// Last: reverting the fix would hand undefined to the real clipboard.
+			["await desktop.clipboard.write()", "clipboard.write(text) requires a string, got undefined"],
+		]) {
+			const result = await runWorker(transport, `argument-${code}`, code);
+			expect(result.ok ? undefined : result.error).toMatchObject({ isToolError: true, message });
+		}
+		// A read-only run still reports the read-only refusal first.
+		const readOnly = await runWorker(transport, "argument-read-only", 'await desktop.ref("e1").setValue()', true);
+		expect(readOnly.ok ? undefined : readOnly.error.message).toBe(
+			"read-only run: 'setValue' requires read_only: false",
+		);
+		// The JavaScript facade's direct ref call checks the argument before the ref lookup too.
+		const session = toolSession();
+		const prelude = workerPrelude(session, native);
+		const context = { session, toolCallId: "argument-facade" };
+		const realm = createContext({
+			__omp_display__: () => {},
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				const result = await prelude.invoke(parameters, context);
+				return { text: "", details: result.details };
+			},
+		});
+		runInContext(prelude.javascript, realm);
+		try {
+			await expect(runInContext('computer.ref("e1").setValue()', realm)).rejects.toThrow(
+				"setValue(value) requires a string, got undefined",
+			);
+			await expect(runInContext('computer.ref("e1").perform()', realm)).rejects.toThrow(
+				"perform(action) requires a non-empty string, got undefined",
+			);
+		} finally {
+			await prelude.invoke({ action: "close" }, context);
+		}
+		expect(native.calls).toEqual([]);
+	});
+
+	it("leaves a printed observe() tree out of the JavaScript value's display, but keeps ax readable", async () => {
+		const session = toolSession();
+		const native = new ZoomNativeSession();
+		const prelude = workerPrelude(session, native);
+		const context = { session, toolCallId: "observe-once-js" };
+		const printed: string[] = [];
+		const realm = createContext({
+			__omp_display__: (text: string) => printed.push(text),
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				const result = await prelude.invoke(parameters, context);
+				const text = result.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("\n");
+				return { text, details: result.details };
+			},
+		});
+		runInContext(prelude.javascript, realm);
+		try {
+			const [mutated, observation, silent] = await runInContext(
+				`(async () => {
+					const win = await computer.window(42);
+					const options = { silent: true };
+					const pending = win.observe(options);
+					options.silent = false;
+					const mutated = await pending;
+					return [mutated, await win.observe(), await win.observe({ silent: true })];
+				})()`,
+				realm,
+			);
+			expect(printed.join("\n").split("- button [ref=e1]")).toHaveLength(2);
+			expect(observation.ax).toBe("- button [ref=e1]");
+			// Eval displays a trailing value as its structured clone.
+			expect(structuredClone(observation)).not.toHaveProperty("ax");
+			expect(structuredClone(observation)).toMatchObject({ nodeCount: 1, truncated: false });
+			expect({ ...observation }).not.toHaveProperty("ax");
+			expect(JSON.parse(JSON.stringify(observation))).not.toHaveProperty("ax");
+			expect(structuredClone(silent)).toMatchObject({ ax: "- button [ref=e1]", nodeCount: 1 });
+			// The call ran silent, so its value keeps the only copy of the tree.
+			expect(structuredClone(mutated)).toMatchObject({ ax: "- button [ref=e1]" });
+		} finally {
+			await prelude.invoke({ action: "close" }, context);
+		}
+	});
+
+	it("prints a trailing Python observe() tree once and keeps ax readable", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const native = new ZoomNativeSession();
+		const prelude = workerPrelude(session, native);
+		definitions = [prelude];
+		const run = (code: string) =>
+			executePython(code, {
+				cwd: process.cwd(),
+				sessionId: `computer-observe-once-${crypto.randomUUID()}`,
+				toolSession: session,
+				kernelMode: "per-call",
+			});
+		// Everything the model reads from a cell: printed text and structured displays.
+		const trees = async (call: string) => {
+			const result = await run(`win = await computer.window(42)\n${call}`);
+			expect(result.exitCode).toBe(0);
+			return `${result.output}${JSON.stringify(result.displayOutputs)}`.split("- button [ref=e1]").length - 1;
+		};
+		try {
+			for (const call of [
+				"await win.observe()",
+				"display(await win.observe())",
+				"await win.observe(silent=True)",
+				"await win.observe({'silent': True})",
+				"await win.observe({'silent': True}, silent=None)",
+				"await win.observe({'silent': True}, silent=False)",
+				"await win.observe({'silent': False}, silent=True)",
+			]) {
+				expect([call, await trees(call)]).toEqual([call, 1]);
+			}
+			const read = await run(
+				"obs = await (await computer.window(42)).observe()\nprint(obs['ax'] == '- button [ref=e1]')",
+			);
+			expect(read.output.trim().split("\n").at(-1)).toBe("True");
+			const pickled = await run(
+				"import pickle\nobs = await (await computer.window(42)).observe()\ncopy = pickle.loads(pickle.dumps(obs))\nprint(type(copy) is dict and copy == dict(obs) and 'ax' in copy)",
+			);
+			expect(pickled.output.trim().split("\n").at(-1)).toBe("True");
+		} finally {
+			await prelude.invoke({ action: "close" }, { session, toolCallId: "observe-once-py" });
 		}
 	});
 
@@ -1879,6 +2647,198 @@ describe("computer supervisor recovery", () => {
 		// cache, so a fresh session yielded undefined until a run happened.
 		const direct = await supervisor.capabilities(snapshot(true));
 		expect(direct).toEqual(capabilities);
+		await supervisor.close();
+	});
+});
+
+describe("display hold follows the agent turn", () => {
+	async function runTurn(transport: MemoryTransport, id: string, code: string, displayTurn?: number) {
+		transport.inbound({ type: "run", id, code, timeoutMs: 2_000, session: snapshot(false, displayTurn) });
+		const message = await transport.waitFor(candidate => candidate.type === "result" && candidate.id === id);
+		if (message.type !== "result" || !message.ok) throw new Error(`run ${id} failed`);
+		return message.payload.returnValue;
+	}
+
+	it("holds the display for a run inside a turn, and the turn's end releases only the hold", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+
+		expect(
+			await runTurn(transport, "turn-1", "globalThis.kept = (await desktop.windows())[0].id; return kept;", 1),
+		).toBe("42");
+		expect(native.displayHolds).toEqual(["turn"]);
+		await native.acquireControl();
+		const before = { cancel: native.cancelCount, retire: native.retireCount, close: native.closeCount };
+
+		transport.inbound({ type: "release-display", turn: 1 });
+		expect(native.displayHolds).toEqual(["turn", "release"]);
+		expect({ cancel: native.cancelCount, retire: native.retireCount, close: native.closeCount }).toEqual(before);
+		expect(native.controlState()).toEqual({ active: true });
+
+		// A run of the ended turn that arrives after its end (work outliving the turn) is left to the grace period.
+		await runTurn(transport, "turn-1-late", "return kept;", 1);
+		expect(native.displayHolds).toEqual(["turn", "release"]);
+
+		// The next turn's first run holds it again, in the same native session and runtime.
+		expect(await runTurn(transport, "turn-2", "return kept;", 2)).toBe("42");
+		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
+	});
+
+	it("leaves a run outside any turn to the native grace period", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+		await runTurn(transport, "no-turn", "return (await desktop.windows()).length;");
+		expect(native.displayHolds).toEqual([]);
+	});
+
+	it("holds the display again for a run whose turn goes on after a dialog", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+		transport.inbound({
+			type: "run",
+			id: "confirming",
+			code: 'await desktop.control.acquire({ reason: "Edit" }); return 1;',
+			timeoutMs: 2_000,
+			session: snapshot(false, 1),
+		});
+		const confirm = await transport.waitFor(
+			message => message.type === "control-request" && message.runId === "confirming",
+		);
+		if (confirm.type !== "control-request") throw new Error("Expected the run's control confirmation");
+		expect(native.displayHolds).toEqual(["turn"]);
+		// The confirmation dialog ends turn 1; the answer resumes it as turn 2.
+		transport.inbound({ type: "release-display", turn: 1 });
+		transport.inbound({ type: "resume-display", from: 5, turn: 6 });
+		expect(native.displayHolds).toEqual(["turn", "release"]);
+		transport.inbound({ type: "resume-display", from: 1, turn: 2 });
+		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
+		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: true } });
+		await transport.waitFor(message => message.type === "result" && message.id === "confirming");
+
+		// With no run of that turn active, a resume holds nothing.
+		transport.inbound({ type: "resume-display", from: 2, turn: 3 });
+		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
+	});
+
+	it("carries a turn resumed while a cold run starts into that run's hold", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		const created = Promise.withResolvers<void>();
+		new ComputerWorkerCore(transport, async () => {
+			await created.promise;
+			return native;
+		});
+		transport.inbound({ type: "run", id: "cold", code: "return 1;", timeoutMs: 2_000, session: snapshot(false, 1) });
+		// A dialog opens and is answered while the native session is still being created.
+		transport.inbound({ type: "release-display", turn: 1 });
+		transport.inbound({ type: "resume-display", from: 1, turn: 2 });
+		created.resolve();
+		await transport.waitFor(message => message.type === "result" && message.id === "cold");
+		expect(native.displayHolds).toEqual(["turn"]);
+	});
+
+	it("numbers runs by the owner's turn and releases the owner's sessions once when it ends", async () => {
+		const owner = `computer-turn-${crypto.randomUUID()}`;
+		const snapshots: ComputerSessionSnapshot[] = [];
+		const releases: number[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalKernelOwnerId: () => owner };
+		const prelude = createComputerPrelude(session, () => ({
+			async run(_code, _timeoutMs, runSnapshot) {
+				snapshots.push(runSnapshot);
+				return { displays: [], returnValue: undefined, screenshots: [] };
+			},
+			async capabilities() {
+				return capabilities;
+			},
+			releaseDisplay(turn) {
+				releases.push(turn);
+			},
+			async close() {},
+		}));
+		const context = { session, toolCallId: "computer-turn", signal: new AbortController().signal };
+		const run = () => prelude.invoke({ action: "run", code: "await desktop.windows()" }, context);
+
+		// No agent turn (SDK or eval use): the run keeps the grace period.
+		await run();
+		beginComputerTurnForOwner(owner);
+		await run();
+		await run();
+		expect(releases).toEqual([]);
+		endComputerTurnForOwner(owner);
+		expect(releases).toEqual([1]);
+		endComputerTurnForOwner(owner);
+		expect(releases).toEqual([1]);
+		await run();
+		beginComputerTurnForOwner(owner);
+		await run();
+		endComputerTurnForOwner(owner);
+		expect(snapshots.map(entry => entry.displayTurn)).toEqual([undefined, 1, 1, undefined, 2]);
+		expect(releases).toEqual([1, 2]);
+		await prelude.invoke({ action: "close" }, context);
+	});
+
+	it("sends the turn's end to a running worker and starts none for it", async () => {
+		const sent: ComputerWorkerInbound[] = [];
+		let workers = 0;
+		const supervisor = new ComputerSupervisor(
+			toolSession(),
+			() => {
+				workers += 1;
+				const worker = new SupervisorWorker(true);
+				const send = worker.send.bind(worker);
+				worker.send = message => {
+					sent.push(message);
+					send(message);
+				};
+				return worker;
+			},
+			{ startMs: 200, closeMs: 200 },
+		);
+		supervisor.releaseDisplay(1);
+		expect(workers).toBe(0);
+		await supervisor.run("1", 1_000, snapshot(false, 2));
+		supervisor.releaseDisplay(2);
+		expect(sent.map(message => message.type)).toEqual(["run", "release-display"]);
+		expect(sent[1]).toEqual({ type: "release-display", turn: 2 });
+		expect(workers).toBe(1);
+		await supervisor.close();
+	});
+
+	it("holds the display for a run whose turn goes on while its worker is still starting", async () => {
+		const native = new FakeNativeSession();
+		const ready = Promise.withResolvers<void>();
+		const supervisor = new ComputerSupervisor(
+			toolSession(),
+			() => {
+				const transport = new MemoryTransport();
+				new ComputerWorkerCore(transport, () => native);
+				return {
+					send: message => transport.inbound(message),
+					onMessage: handler => {
+						transport.listeners.add(handler);
+						void ready.promise.then(() => handler({ type: "ready" }));
+						return () => {
+							transport.listeners.delete(handler);
+						};
+					},
+					onError: () => () => {},
+					terminate: async () => {
+						transport.inbound({ type: "close" });
+					},
+				};
+			},
+			{ startMs: 1_000, closeMs: 200 },
+		);
+		const run = supervisor.run("return 1;", 2_000, snapshot(false, 1));
+		// A dialog opens and is answered before the cold worker's handshake, so before the run reaches it.
+		supervisor.releaseDisplay(1);
+		supervisor.resumeDisplay(1, 2);
+		ready.resolve();
+		await run;
+		expect(native.displayHolds).toEqual(["turn"]);
 		await supervisor.close();
 	});
 });

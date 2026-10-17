@@ -700,7 +700,17 @@ export function agentLoopContinue(
 			const newMessages: AgentMessage[] = [];
 			const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 
-			stream.push({ type: "agent_start" });
+			const resumeTail = unpairedToolCallTail(currentContext.messages);
+			stream.push(
+				resumeTail
+					? {
+							type: "agent_start",
+							resumedToolCallIds: resumeTail.content.flatMap(block =>
+								block.type === "toolCall" ? [block.id] : [],
+							),
+						}
+					: { type: "agent_start" },
+			);
 
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
 		} catch (err) {
@@ -2228,17 +2238,15 @@ async function streamAssistantResponse(
 							}
 						}
 						finalMessage = snapshotAssistantMessage(finalMessage);
-						// Unhealed DSML tool-call markup must never reach history: replaying
-						// it teaches the model to keep writing calls as text (#10556). Strip
-						// it before the context, the UI, and the session see the message.
-						// Only DSML-speaking models qualify; from others it is prose.
-						if (
-							dsmlLeakRecoveryEnabled &&
-							finalMessage.stopReason === "stop" &&
-							!finalMessage.content.some(block => block.type === "toolCall") &&
-							removeDsmlToolMarkupLeak(finalMessage)
-						) {
-							dsmlLeakMessages.add(finalMessage);
+						// Unhealed DSML markup must not reach history, including reasoning
+						// and turns with a valid structured call. Only a failed text-only
+						// call needs the recovery nudge.
+						if (dsmlLeakRecoveryEnabled) {
+							const hasToolCall = finalMessage.content.some(block => block.type === "toolCall");
+							const removed = removeDsmlToolMarkupLeak(finalMessage);
+							if (removed && finalMessage.stopReason === "stop" && !hasToolCall) {
+								dsmlLeakMessages.add(finalMessage);
+							}
 						}
 						// Expand inline macros (and any other registered rewrite) on the
 						// finalized message before it reaches the context, the UI, or tool
@@ -3570,13 +3578,15 @@ async function executeToolCalls(
 							executionArgs,
 							record.signal,
 							partialResult => {
-								stream.push({
+								const event: Extract<AgentEvent, { type: "tool_execution_update" }> = {
 									type: "tool_execution_update",
 									toolCallId: toolCall.id,
 									toolName: toolCall.name,
 									args: executionArgs,
 									partialResult: coerceToolResult(partialResult).result,
-								});
+								};
+								if (stream.done) config.onDetachedToolUpdate?.(event);
+								else stream.push(event);
 							},
 							toolContext,
 						);
@@ -3642,20 +3652,17 @@ async function executeToolCalls(
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
 		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
-		if (interrupted && abortedDuringExecution) {
-			// This tool's own signal fired AND it failed to produce a result. The
-			// execution may already have performed partial work before throwing on
-			// abort, so preserve that distinction in the placeholder metadata.
+		if (record.interruptible && interrupted && abortedDuringExecution) {
+			// Queued steering/asides abort only interruptible tools. An external
+			// user abort can also fail a non-interruptible tool (e.g. cancelled
+			// ask); keep its actual error instead of attributing it to the queue.
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
 		} else {
-			// No interrupt on this signal, or the tool finished before the interrupt landed
-			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
-			// its real result: a completed tool already ran its side effects, so the model must
-			// see what actually happened (a genuine non-zero exit / error result) rather than a
-			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
-			// on the batch leaves non-interruptible tools' signals untouched — their genuine
-			// errors survive here too.
+			// A tool that finished before the interrupt landed (`completedToolExecution`)
+			// keeps its real result even if its signal aborted around completion:
+			// the model must see the work it actually performed (#4752).
+			// Non-interruptible tools also retain errors from external user aborts.
 			emitToolResult(record, result, isError);
 		}
 
