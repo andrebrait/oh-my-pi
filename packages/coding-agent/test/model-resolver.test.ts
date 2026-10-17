@@ -1272,7 +1272,7 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result).toEqual(["openai/gpt-4o"]);
 	});
 
-	test("a requested @default inherits the parent's active model over the configured default role", () => {
+	test("a per-call @default inherits the parent's active model over the configured default role", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "openai/gpt-4o", definition: "anthropic/claude-sonnet-4-5" },
 		});
@@ -1281,6 +1281,7 @@ describe("resolveAgentModelPatterns", () => {
 			expect(
 				resolveAgentModelSelection({
 					requestModel,
+					perCallRequest: true,
 					settingsOverride: "@definition",
 					agentModel: "@definition",
 					settings,
@@ -1290,7 +1291,9 @@ describe("resolveAgentModelPatterns", () => {
 		}
 
 		// Without an active model the configured default is still the tail.
-		expect(resolveAgentModelPatterns({ requestModel: "@default", settings })).toEqual(["openai/gpt-4o"]);
+		expect(resolveAgentModelPatterns({ requestModel: "@default", perCallRequest: true, settings })).toEqual([
+			"openai/gpt-4o",
+		]);
 
 		// An explicit selector and a non-default role alias are unaffected.
 		expect(
@@ -1305,7 +1308,7 @@ describe("resolveAgentModelPatterns", () => {
 		).toEqual(["anthropic/claude-sonnet-4-5"]);
 	});
 
-	test("a default alias with a thinking suffix inherits the active model at the requested level", () => {
+	test("a per-call default alias with a thinking suffix inherits the active model at the requested level", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "openai/gpt-4o", definition: "anthropic/claude-sonnet-4-5" },
 		});
@@ -1314,6 +1317,7 @@ describe("resolveAgentModelPatterns", () => {
 			expect(
 				resolveAgentModelSelection({
 					requestModel,
+					perCallRequest: true,
 					settingsOverride: "@definition",
 					agentModel: "@definition",
 					settings,
@@ -1324,14 +1328,25 @@ describe("resolveAgentModelPatterns", () => {
 
 		// A bare `@default` inherits an unsuffixed parent selector verbatim.
 		expect(
-			resolveAgentModelPatterns({ requestModel: "@default", settings, activeModelPattern: "zai/glm-5.2" }),
+			resolveAgentModelPatterns({
+				requestModel: "@default",
+				perCallRequest: true,
+				settings,
+				activeModelPattern: "zai/glm-5.2",
+			}),
 		).toEqual(["zai/glm-5.2"]);
 		// A bare alias also preserves a parent's existing suffix.
 		expect(
-			resolveAgentModelPatterns({ requestModel: "@default", settings, activeModelPattern: "zai/glm-5.2:high" }),
+			resolveAgentModelPatterns({
+				requestModel: "@default",
+				perCallRequest: true,
+				settings,
+				activeModelPattern: "zai/glm-5.2:high",
+			}),
 		).toEqual(["zai/glm-5.2:high"]);
 		const selection = resolveAgentModelSelection({
 			requestModel: "@default:low",
+			perCallRequest: true,
 			settings,
 			activeModelPattern: "anthropic/claude-sonnet-4-5:high",
 		});
@@ -1339,15 +1354,30 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result.model).toBe(mockModels[0]);
 		expect(result.thinkingLevel).toBe(Effort.Low);
 		// Without an active model the configured default carries the suffix.
-		expect(resolveAgentModelPatterns({ requestModel: "*:xhigh", settings })).toEqual(["openai/gpt-4o:xhigh"]);
+		expect(resolveAgentModelPatterns({ requestModel: "*:xhigh", perCallRequest: true, settings })).toEqual([
+			"openai/gpt-4o:xhigh",
+		]);
 		// A suffixed non-default alias still expands its configured role.
 		expect(
 			resolveAgentModelPatterns({ requestModel: "@definition:high", settings, activeModelPattern: "zai/glm-5.2" }),
 		).toEqual(["anthropic/claude-sonnet-4-5:high"]);
-		// The agent definition's own suffixed `@default` inherits the same way.
-		expect(
-			resolveAgentModelPatterns({ agentModel: "@default:high", settings, activeModelPattern: "zai/glm-5.2" }),
-		).toEqual(["zai/glm-5.2:high"]);
+	});
+
+	test("outside a per-call request `@default:level` expands modelRoles.default and keeps its role", () => {
+		const settings = Settings.isolated({ modelRoles: { default: "openai/gpt-4o" } });
+		const parent = "anthropic/claude-sonnet-4-5";
+		// The parent runs another model; frontmatter and overrides still name the configured default role,
+		// whose retry-fallback chain the child inherits.
+		for (const source of [
+			{ agentModel: "*:high" },
+			{ agentModel: ["@default:high"] },
+			{ settingsOverride: "@default:high" },
+		]) {
+			expect(resolveAgentModelSelection({ ...source, settings, activeModelPattern: parent })).toEqual({
+				patterns: ["openai/gpt-4o:high"],
+				role: "default",
+			});
+		}
 	});
 
 	test("inherited thinking preserves literal suffix model ids when the base model is available", () => {
@@ -1356,6 +1386,7 @@ describe("resolveAgentModelPatterns", () => {
 			const literalModel = { ...baseModel, id: `runtime:${suffix}` };
 			const selection = resolveAgentModelSelection({
 				requestModel: "@default:high",
+				perCallRequest: true,
 				activeModelPattern: `example/runtime:${suffix}`,
 			});
 			const result = resolveModelOverride(selection.patterns, { getAvailable: () => [baseModel, literalModel] });
@@ -1373,6 +1404,7 @@ describe("resolveAgentModelPatterns", () => {
 		});
 		const selection = resolveAgentModelSelection({
 			requestModel: "@default:high,@smol",
+			perCallRequest: true,
 			settingsOverride: "openai/gpt-4o",
 			agentModel: "openai/gpt-4o",
 			settings,
@@ -1394,6 +1426,7 @@ describe("resolveAgentModelPatterns", () => {
 		});
 		const selection = resolveAgentModelSelection({
 			requestModel: ["@smol", "@default:high"],
+			perCallRequest: true,
 			settings,
 			activeModelPattern: "anthropic/claude-sonnet-4-5",
 		});
@@ -1437,26 +1470,6 @@ describe("resolveAgentModelPatterns", () => {
 			});
 
 			expect(selection.role).toBe("task");
-			const result = parseModelPattern(selection.patterns[0]!, mockModels);
-			expect(result.model).toBe(mockModels[0]);
-			expect(result.thinkingLevel).toBe(Effort.High);
-			expect(result.explicitThinkingLevel).toBe(true);
-		}
-	});
-
-	test("suffixed unset task aliases inherit the active model at the requested effort without a role", () => {
-		const settings = Settings.isolated({
-			modelRoles: { default: "openai/gpt-4o" },
-		});
-
-		for (const agentModel of ["@task:high", "pi/task:high"]) {
-			const selection = resolveAgentModelSelection({
-				agentModel,
-				settings,
-				activeModelPattern: "anthropic/claude-sonnet-4-5:low",
-			});
-
-			expect(selection.role).toBeUndefined();
 			const result = parseModelPattern(selection.patterns[0]!, mockModels);
 			expect(result.model).toBe(mockModels[0]);
 			expect(result.thinkingLevel).toBe(Effort.High);
