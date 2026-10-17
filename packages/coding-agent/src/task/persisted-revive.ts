@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import { validateAgentAccountPools } from "../config/account-pools";
+import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveAgentAdvisorRolePattern } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
@@ -31,6 +32,7 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
+import { assertPerCallModelApproved } from "./model-approval";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
@@ -260,6 +262,23 @@ export function createPersistedSubagentReviverFactory(
 					asyncJobManager: ctx.session.asyncJobManager,
 					parentAgentId: ref.parentId,
 					oauthAccountPools,
+					// A per-call model is held to the operator's current grants, not the transcript's.
+					...(init.perCallModel
+						? {
+								assertDispatchModel: (model: Model) =>
+									assertPerCallModelApproved(
+										model,
+										{
+											settings: ctx.settings,
+											agentName: init.agent ?? ref.displayName,
+											parentModelPattern: ctx.session.model
+												? `${ctx.session.model.provider}/${ctx.session.model.id}`
+												: undefined,
+										},
+										ctx.modelRegistry,
+									),
+							}
+						: {}),
 					expectedAgentRef: expectedRef,
 					taskDepth,
 					toolNames: revivedToolNames,
