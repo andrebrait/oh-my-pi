@@ -60,6 +60,7 @@ import type {
 	AgentTurnEndContext,
 	AsideMessage,
 	PrepareQueuedMessages,
+	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
 	StreamFn,
 	ToolCallContext,
@@ -384,8 +385,6 @@ interface CursorToolResultEntry {
 	 */
 	additionalContext?: string;
 }
-
-type QueuedMessageQueue = "steering" | "followUp";
 
 interface LiveSteeredEntry {
 	message: AgentMessage;
@@ -1009,7 +1008,7 @@ export class Agent {
 		this.#queuedMessageClaims[queue] = claim;
 		const preparationSignal = AbortSignal.any([signal, claim.controller.signal]);
 		try {
-			const preparation = await prepare(messages, preparationSignal);
+			const preparation = await prepare(messages, preparationSignal, queue);
 			signal.throwIfAborted();
 			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
 			const additional = preparation?.commit();
@@ -1387,6 +1386,20 @@ export class Agent {
 	steer(m: AgentMessage) {
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
+		this.#emitQueueChanged();
+	}
+
+	/**
+	 * Move the given pending steering messages (by identity) ahead of the rest,
+	 * keeping both groups' relative order, so one-at-a-time delivery takes them
+	 * first. Messages no longer pending, including a claimed batch already
+	 * being delivered, are ignored.
+	 */
+	prioritizeSteering(messages: readonly AgentMessage[]): void {
+		const wanted = new Set(messages);
+		const front = this.#steeringQueue.filter(message => wanted.has(message));
+		if (front.every((message, index) => this.#steeringQueue[index] === message)) return;
+		this.#steeringQueue = [...front, ...this.#steeringQueue.filter(message => !wanted.has(message))];
 		this.#emitQueueChanged();
 	}
 

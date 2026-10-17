@@ -11,6 +11,7 @@ import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import type { ModelPickerRegistry } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -53,7 +54,12 @@ import {
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
-import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import type {
+	AgentHubOpenOptions,
+	InteractiveModeContext,
+	SelectOnlyModelSelectorOptions,
+	SessionPickHandler,
+} from "../../modes/types";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -92,6 +98,7 @@ import type { ToolSession } from "../../tools";
 import { AskTool, type AskToolInput } from "../../tools/ask";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { sanitizeDisplayWarnings, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { captureBrowserSession } from "../../utils/browser-session";
 import { copyToClipboard } from "../../utils/clipboard";
@@ -188,7 +195,14 @@ function loadProviderAuthUi(): ProviderAuthUiModules {
 }
 
 /** Menus that open at most once: a repeat request focuses the open one. */
-type MenuKind = "settings" | "model-picker" | "model-hub" | "agents-dashboard" | "agent-hub" | "usage-dashboard";
+type MenuKind =
+	| "settings"
+	| "model-picker"
+	| "model-picker-select"
+	| "model-hub"
+	| "agents-dashboard"
+	| "agent-hub"
+	| "usage-dashboard";
 
 /** An open menu: registered when the request runs, filled once its component mounts. */
 interface OpenMenu {
@@ -327,6 +341,7 @@ export class SelectorController {
 	}
 
 	showSettingsSelector(): void {
+		if (this.#unavailableWhenHosted("Settings")) return;
 		if (this.#focusOpenMenu("settings")) return;
 		const menu = this.#claimMenu("settings");
 		getAvailableThemes()
@@ -719,12 +734,97 @@ export class SelectorController {
 		this.ctx.session.setThinkingLevel(level);
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void {
+		if (options?.selectOnly) {
+			this.#showModelPicker({ selectOnly: options.selectOnly });
+			return;
+		}
+		if (this.ctx.hostedClientMode) {
+			// The host's `set_model` is session-only, so one picker covers both gestures; there is no role editing.
+			void this.#showHostedModelPicker();
+			return;
+		}
 		if (options?.temporaryOnly) {
 			this.#showModelPicker();
 			return;
 		}
 		this.#showModelHub({});
+	}
+
+	/** A hosted client has no local session or settings to change: say so instead of opening what would change them. */
+	#unavailableWhenHosted(what: string): boolean {
+		if (!this.ctx.hostedClientMode) return false;
+		this.ctx.showStatus(`${what} is unavailable when attached`);
+		return true;
+	}
+
+	/**
+	 * Hosted client: pick from the models the HOST can use (this client's registry has neither its credentials nor
+	 * its custom models). The pick is the host's `set_model`; the new model reaches this status line as the host's
+	 * state, and no local role, setting, or session changes.
+	 */
+	async #showHostedModelPicker(): Promise<void> {
+		const host = this.ctx.hostedClient;
+		if (!host) {
+			this.ctx.showStatus("Not connected to the session host yet");
+			return;
+		}
+		let models: Model[];
+		try {
+			models = await host.availableModels();
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+		const registry: ModelPickerRegistry = {
+			getError: () => undefined,
+			getAvailable: () => models,
+			getAll: () => models,
+			refreshIfStale: async () => false,
+		};
+		const { ModelPickerComponent } = loadModelOverlayComponents();
+		const current = this.ctx.session.model;
+		this.#showModelPickerOverlay(
+			done =>
+				new ModelPickerComponent(
+					this.ctx.ui,
+					createModelBrowserSource(this.ctx.settings),
+					registry,
+					[],
+					{
+						onPick: async model => {
+							try {
+								await host.setModel(model.provider, model.id);
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+							}
+							done();
+						},
+						onCancel: done,
+					},
+					{ currentSelector: current ? `${current.provider}/${current.id}` : undefined },
+				),
+		);
+	}
+
+	#showModelPickerOverlay(createPicker: (done: () => void) => Component): void {
+		let closed = false;
+		const done = () => {
+			if (closed) return;
+			closed = true;
+			overlayHandle.hide();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const picker = createPicker(done);
+		const overlayHandle = this.ctx.ui.showOverlay(picker, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(picker);
+		this.ctx.ui.requestRender();
 	}
 
 	/**
@@ -786,27 +886,45 @@ export class SelectorController {
 	 * bottom-anchored overlay over the transcript. The current model is
 	 * highlighted and preselected; a leading `@` searches ctrl+p quick roles.
 	 */
-	#showModelPicker(): void {
-		if (this.#focusOpenMenu("model-picker")) return;
+	#showModelPicker(options?: { selectOnly?: SelectOnlyModelSelectorOptions }): void {
+		const selectOnly = options?.selectOnly;
+		const menuKind = selectOnly ? "model-picker-select" : "model-picker";
+		const closeOpenMenu = (kind: MenuKind) => {
+			const open = this.#openMenus.get(kind);
+			if (!open) return;
+			open.handle?.hide();
+			this.#releaseMenu(kind, open);
+		};
+		if (selectOnly) {
+			closeOpenMenu("model-picker");
+			closeOpenMenu("model-picker-select");
+		} else {
+			closeOpenMenu("model-picker-select");
+			if (this.#focusOpenMenu("model-picker")) return;
+		}
 		const { ModelPickerComponent } = loadModelOverlayComponents();
 		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		const current = this.ctx.session.model;
 		const quickRoleOrder = cfgCycleOrder.get(this.ctx.settings);
 		const quickRoleCycle = this.ctx.session.getRoleModelCycle(quickRoleOrder);
-		const currentSelector = current ? `${current.provider}/${current.id}` : undefined;
+		const currentSelector = selectOnly
+			? selectOnly.currentSelector
+			: current
+				? `${current.provider}/${current.id}`
+				: undefined;
 		// Preselect the effective Task model in task mode: the configured override,
 		// else the session model (the bundled task agent inherits it by default).
 		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
-		let closed = false;
+		const menu = this.#claimMenu(menuKind);
 		const done = () => {
-			if (closed) return;
-			closed = true;
+			if (this.#openMenus.get(menuKind) !== menu) return;
 			menu.handle?.hide();
-			this.#releaseMenu("model-picker", menu);
+			this.#releaseMenu(menuKind, menu);
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
+		const isCurrent = () => this.#openMenus.get(menuKind) === menu;
 		const picker = new ModelPickerComponent(
 			this.ctx.ui,
 			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
@@ -814,6 +932,16 @@ export class SelectorController {
 			this.ctx.session.scopedModels,
 			{
 				onPick: async (model, selector, { overContext }) => {
+					if (!isCurrent()) return;
+					if (selectOnly) {
+						done();
+						try {
+							await selectOnly.onSelect(selector);
+						} catch (error) {
+							this.ctx.showError(sanitizeErrorLine(error));
+						}
+						return;
+					}
 					try {
 						// Over-context pick: close the picker first so the compaction
 						// loader is visible.
@@ -825,6 +953,7 @@ export class SelectorController {
 					}
 				},
 				onPickRole: async entry => {
+					if (!isCurrent() || selectOnly) return;
 					try {
 						await this.ctx.session.applyRoleModel(entry);
 						this.ctx.statusLine.invalidate();
@@ -839,6 +968,7 @@ export class SelectorController {
 					}
 				},
 				onPickTask: (_model, selector) => {
+					if (!isCurrent() || selectOnly) return;
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
 					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
@@ -858,9 +988,9 @@ export class SelectorController {
 				quickRoles: quickRoleCycle?.models,
 				quickRoleOrder,
 				currentQuickRole: quickRoleCycle?.models[quickRoleCycle.currentIndex]?.role,
+				selectOnly: selectOnly !== undefined,
 			},
 		);
-		const menu = this.#claimMenu("model-picker");
 		this.#mountMenu(menu, picker, () => {
 			const handle = this.ctx.ui.showOverlay(picker, {
 				anchor: "bottom-center",
@@ -1267,6 +1397,7 @@ export class SelectorController {
 	}
 
 	showUserMessageSelector(): void {
+		if (this.#unavailableWhenHosted("Rewinding")) return;
 		const entries = this.ctx.sessionManager.getBranch().filter(isTranscriptEntry);
 		if (entries.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
@@ -1455,6 +1586,7 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
+		if (this.#unavailableWhenHosted("The session tree")) return;
 		const tree = this.ctx.sessionManager.getTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
@@ -1722,7 +1854,8 @@ export class SelectorController {
 		return result;
 	}
 
-	async showSessionSelector(source?: ForeignSessionSource): Promise<void> {
+	async showSessionSelector(source?: ForeignSessionSource, onSelect?: SessionPickHandler): Promise<void> {
+		if (this.#unavailableWhenHosted("Switching sessions")) return;
 		let sessions: SessionInfo[];
 		let onSelectSession: (session: SessionInfo) => Promise<boolean>;
 		let selectorOptions: SessionSelectorOptions<SessionInfo>;
@@ -1782,21 +1915,30 @@ export class SelectorController {
 				: undefined;
 			onSelectSession = session => this.handleResumeSession(session.path);
 			selectorOptions = {
-				onDelete: async (session: SessionInfo) => {
-					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
-						return false;
-					}
-					const storage = new FileSessionStorage();
-					try {
-						await storage.deleteSessionWithArtifacts(session.path);
-						return true;
-					} catch (error) {
-						throw new Error(
-							`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
-							{ cause: error },
-						);
-					}
-				},
+				...(!onSelect
+					? {
+							onDelete: async (session: SessionInfo) => {
+								if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
+									return false;
+								}
+								const storage = new FileSessionStorage();
+								try {
+									await storage.deleteSessionWithArtifacts(session.path);
+									return true;
+								} catch (error) {
+									throw new Error(
+										`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
+										{ cause: error },
+									);
+								}
+							},
+						}
+					: {
+							title: "Select a Session to Consult",
+							actionLabel: "Select",
+							scopeLabel: false,
+							showCwd: true,
+						}),
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAllForPicker(),
 				pinnedIds,
@@ -1817,6 +1959,17 @@ export class SelectorController {
 			sessions,
 			async (session: SessionInfo) => {
 				selector.lockInput();
+				if (onSelect) {
+					// Selection-only callers may open a follow-up picker; remove this
+					// fullscreen overlay before invoking them.
+					done();
+					try {
+						await onSelect(session);
+					} catch (error) {
+						this.ctx.showError(sanitizeErrorLine(error));
+					}
+					return;
+				}
 				let keepOpen = false;
 				try {
 					const success = await onSelectSession(session);
@@ -1891,6 +2044,7 @@ export class SelectorController {
 	}
 
 	async handleResumeSession(sessionPath: string, options?: { settingsFlushed?: boolean }): Promise<boolean> {
+		if (this.#unavailableWhenHosted("Switching sessions")) return false;
 		const previousCwd = this.ctx.sessionManager.getCwd();
 		// Flush pending settings writes before switching sessions so a save
 		// failure leaves the session, process project dir, and Settings in the
@@ -2379,6 +2533,7 @@ export class SelectorController {
 	}
 
 	async showDebugSelector(): Promise<void> {
+		if (this.#unavailableWhenHosted("The debug panel")) return;
 		const { DebugSelectorComponent } = await import("../../debug");
 		this.showSelector(done => {
 			const selector = new DebugSelectorComponent(this.ctx, done);
@@ -2408,6 +2563,7 @@ export class SelectorController {
 	}
 
 	showAgentHub(observers: SessionObserverRegistry, options?: AgentHubOpenOptions): void {
+		if (this.#unavailableWhenHosted("The agent hub")) return;
 		// A repeat request reuses the open hub, still honoring its deep link (`/hub` → activity).
 		const reuseOpenHub = (): boolean => {
 			const open = this.#openMenus.get("agent-hub")?.component;

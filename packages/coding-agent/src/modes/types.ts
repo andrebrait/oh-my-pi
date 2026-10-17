@@ -9,6 +9,7 @@ import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { TrackSegment } from "@oh-my-pi/pi-tui/chrome/segment-track";
+import type { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import type { Settings } from "../config/settings";
 import type {
 	AutocompleteProviderFactory,
@@ -19,18 +20,27 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions, PlanReviewChoice, PlanReviewRequestedEvent } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+	PlanReviewChoice,
+	PlanReviewRequestedEvent,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
+import type { HostedClientLink } from "../session-host/hosted-client";
+import type { RpcSessionOrigin } from "./rpc/rpc-types";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
 import type { ShakeMode } from "../session/shake-types";
 import type { DictationTarget } from "../stt";
+import type { SessionInfo } from "../session/session-listing";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { LspStartupServerInfo } from "../tools";
@@ -91,8 +101,17 @@ export interface InteractiveModeInitOptions {
 	autoStartCollab?: boolean;
 }
 
+export interface ShutdownOptions {
+	/** Process exit status once the terminal is restored. Default 0. */
+	exitCode?: number;
+	/** Written to stderr after the terminal is restored, in place of the resume or detach hint. */
+	farewell?: string;
+}
+
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
 	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
+
+export type SessionPickHandler = (session: SessionInfo) => void | Promise<void>;
 
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
@@ -109,6 +128,13 @@ export interface ShowStatusOptions {
 	toast?: boolean;
 }
 
+export interface SelectOnlyModelSelectorOptions {
+	/** Use the selected `provider/id` for the caller's operation without mutating session defaults. */
+	onSelect: (selector: string) => void | Promise<void>;
+	/** `provider/id` initially highlighted in the picker. */
+	currentSelector?: string;
+}
+
 export interface AgentHubOpenOptions {
 	requireContent?: boolean;
 	armCloseTap?: boolean;
@@ -118,6 +144,7 @@ export interface AgentHubOpenOptions {
 export interface InteractiveModeContext {
 	// UI access
 	ui: TUI;
+	readonly composer: Pick<Composer, "setRunActive">;
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
@@ -149,6 +176,8 @@ export interface InteractiveModeContext {
 	readonly viewSession: AgentSession;
 	/** Id of the focused agent, undefined when the main session is attached. */
 	readonly focusedAgentId: string | undefined;
+	/** Set while a tool-approval dialog owns the composer: its drafts steer the main session awaiting that approval, even from a focused agent's view. */
+	approvalOwnsComposer?: boolean;
 	/** Focus the main view on an agent's live session (delegates to SessionFocusController.focusAgent). */
 	focusAgentSession(id: string): Promise<void>;
 	/** Focus the focused agent's parent session, falling back to main (delegates to focusParent). */
@@ -176,6 +205,29 @@ export interface InteractiveModeContext {
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	/**
+	 * True from before `init()` until this process leaves hosted mode: this UI is (or is about to become) a
+	 * client of a session host. TUI-owned automation (timers, local model calls, plan/goal/loop machinery) must
+	 * not run, and input (submit, slash commands, keys, selectors) goes to the host through {@link hostedClient}
+	 * or is refused: it never falls through to the local replica session, also while the link is still
+	 * connecting. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
+	 */
+	hostedClientMode: boolean;
+	/** The link to the session host once connected; routes input and answers dialogs. Set by the caller of `HostedClientLink.connect`. */
+	hostedClient?: HostedClientLink;
+	/**
+	 * Hosted client only: where the host session on screen keeps its files, as its snapshot (or a relocation notice)
+	 * reported it. Links in the host's transcript resolve here (relative paths against `cwd`, `local://` under the root the
+	 * host itself resolved for it) instead of the terminal's own directory, which keeps the footer, completion, and `@file` to itself.
+	 * Set by the link before each snapshot's transcript is painted (a snapshot without it is refused), so unlike
+	 * {@link hostedClient} it exists for the first repaint; unset when the link ends, and then links resolve locally.
+	 */
+	hostOrigin?: RpcSessionOrigin;
+	/**
+	 * Hosted client only, set by the hosted startup: replace the connected session host by `target` (a host id, a
+	 * session id, or a session path); with no target a selector over the live hosts opens. Reports its own failures.
+	 */
+	attachHostedSession?: (target?: string) => Promise<void>;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -282,7 +334,7 @@ export interface InteractiveModeContext {
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
-	shutdown(): Promise<void>;
+	shutdown(options?: ShutdownOptions): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
@@ -414,6 +466,12 @@ export interface InteractiveModeContext {
 	): Promise<void>;
 	renderInitialMessages(options?: { preserveExistingChat?: boolean; clearTerminalHistory?: boolean }): Promise<void>;
 	/**
+	 * Re-resolve the links of the transcript on screen against where the view's links resolve now, and give the
+	 * assistant messages already painted their new destinations, without repainting the transcript. For a hosted
+	 * view whose session moved without being replaced; a reply still streaming gets its destinations when it closes.
+	 */
+	refreshTranscriptLinks(): Promise<void>;
+	/**
 	 * In-place transcript rewind: drop the rendered components at/after
 	 * `message` when none of their rows reached native scrollback. Returns
 	 * false when the caller must fall back to a destructive
@@ -500,7 +558,7 @@ export interface InteractiveModeContext {
 	showAgentsDashboard(): void;
 	/** Open the fullscreen git UI, optionally pinned to a revision (`/git <rev>`). */
 	showGitUi(revision?: string): void;
-	showModelSelector(options?: { temporaryOnly?: boolean }): void;
+	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void;
 	/** Session-only switch to an already-resolved model (`/switch <selector>`); compacts first when over context. */
 	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void>;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
@@ -509,7 +567,7 @@ export interface InteractiveModeContext {
 	showTreeSelector(): void;
 	/** Open the `/effort` picker over the levels the current model accepts. */
 	showThinkingSelector(): void;
-	showSessionSelector(source?: ForeignSessionSource): void;
+	showSessionSelector(source?: ForeignSessionSource, onSelect?: SessionPickHandler): void;
 	/** Settle side requests before replacing the session or deleting its artifacts. */
 	prepareSessionSwitch(): Promise<void>;
 	handleResumeSession(sessionPath: string): Promise<void>;
@@ -627,7 +685,11 @@ export interface InteractiveModeContext {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined>;
 	hideHookInput(): void;
 	showHookEditor(
 		title: string,
@@ -637,6 +699,11 @@ export interface InteractiveModeContext {
 	): Promise<string | undefined>;
 	hideHookEditor(): void;
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void;
+	/** Present the rich multi-question ask dialog on the editor surface (queued behind any open dialog). */
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 	showHookCustom<T>(
 		factory: (
 			tui: TUI,

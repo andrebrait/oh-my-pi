@@ -767,6 +767,27 @@ interface DiskQueueOptions {
 	epoch?: number;
 }
 
+/**
+ * Replication tap: the in-memory entry and the active leaf as it stands when the tap is called. Taps are called in the
+ * order entries were recorded, and the leaf is the manager's current one, which may name an entry recorded after
+ * `entry` that has not been announced yet (a batch's earlier entries, or one a tap appended while being called).
+ */
+export type EntryAppendedListener = (entry: SessionEntry, leafId: string | null) => void;
+
+/** What {@link SessionManager.snapshotForReplication} returns: the journal a replica starts from, with its leaf and name. */
+export interface ReplicationSnapshot {
+	header: SessionHeader;
+	entries: SessionEntry[];
+	leafId: string | null;
+	sessionName: string | undefined;
+}
+
+/** A session title and where it came from. */
+interface TitleState {
+	title: string | undefined;
+	source: SessionTitleSource | undefined;
+}
+
 interface AtomicEntryBatch {
 	collecting: boolean;
 	entryIds: Set<string>;
@@ -935,10 +956,43 @@ export class SessionManager {
 	#draftOnlySessionCleanupArmed = false;
 
 	/**
-	 * Collab replication tap: invoked for every appended entry with the
-	 * in-memory (pre-blob-externalization) entry, so inline images survive.
+	 * Replication taps (collab host, session host): invoked for every appended
+	 * entry with the in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
-	onEntryAppended?: (entry: SessionEntry) => void;
+	readonly #entryListeners = new Set<EntryAppendedListener>();
+
+	/**
+	 * `listener(entry, leafId)`, called in the order entries were recorded. `leafId` is the active leaf at that moment,
+	 * which is not `entry.id` for an off-branch append, nor for any entry whose successors are announced right after
+	 * it. Entries recorded while an atomic batch publishes (the batch's own and any concurrent ones, titles included)
+	 * are announced when it settles; an entry a listener records while being called is announced after those already
+	 * waiting, never in front of them.
+	 */
+	subscribeEntryAppended(listener: EntryAppendedListener): () => void {
+		this.#entryListeners.add(listener);
+		return () => {
+			this.#entryListeners.delete(listener);
+		};
+	}
+
+	readonly #relocationListeners = new Set<() => void>();
+
+	/**
+	 * `listener()` after this session's location changed: {@link moveTo} (`/move`, `/wt`, and the inverse move of
+	 * {@link rollbackMove}) repointed the session file or the cwd. Read the new location from the manager. Not called
+	 * for a move that changed nothing or was refused; a move that failed after repointing still reports what it did.
+	 * The id never changes, so no entry is appended and no session change is announced.
+	 */
+	subscribeRelocated(listener: () => void): () => void {
+		this.#relocationListeners.add(listener);
+		return () => {
+			this.#relocationListeners.delete(listener);
+		};
+	}
+
+	#notifyRelocated(): void {
+		for (const listener of this.#relocationListeners) this.#invokePersistenceObserver(listener, undefined);
+	}
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -959,6 +1013,15 @@ export class SessionManager {
 	#atomicPersistenceTail: Promise<void> = Promise.resolve();
 	/** Observer notifications withheld until their entries are proven durable. */
 	#pendingDurabilityNotifications: SessionEntry[] = [];
+	/** Entries recorded and not yet announced to the replication taps, oldest first. */
+	readonly #entriesToAnnounce: SessionEntry[] = [];
+	/** An announcement is running: entries recorded by a tap queue behind the ones waiting. */
+	#announcingEntries = false;
+	/**
+	 * For each title entry this manager recorded, the title state it replaced. While the entry is unannounced that is
+	 * the title replication shows (see {@link snapshotForReplication}); once announced it is never read again.
+	 */
+	readonly #titleBefore = new WeakMap<SessionEntry, TitleState>();
 	/** Bumped on every sync rewrite / chain reset so stale queued tasks become no-ops. */
 	#diskEpoch = 0;
 	/**
@@ -1356,14 +1419,15 @@ export class SessionManager {
 	}
 
 	#notifyDurableEntries(entries: readonly SessionEntry[] = []): void {
-		const notifications = [...this.#pendingDurabilityNotifications, ...entries];
-		this.#pendingDurabilityNotifications = [];
 		const seen = new Set<string>();
-		for (const entry of notifications) {
+		const announce: SessionEntry[] = [];
+		for (const entry of [...this.#pendingDurabilityNotifications, ...entries]) {
 			if (seen.has(entry.id)) continue;
 			seen.add(entry.id);
-			this.#notifyEntryAppended(entry);
+			announce.push(entry);
 		}
+		this.#pendingDurabilityNotifications = [];
+		this.#announceEntries(announce);
 	}
 
 	async #authoritativelyRewriteCurrentStateLocked(operationError: Error): Promise<void> {
@@ -1643,6 +1707,8 @@ export class SessionManager {
 			}
 			this.#clearDiskError();
 			if (this.#storage.defersSyncPublish) {
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
 				// The publish is only queued: record nothing and stay non-current
 				// until the backend confirms (hV-oB). A racing rewrite still
 				// carries the last confirmed token, so the store's queue-time
@@ -1742,8 +1808,8 @@ export class SessionManager {
 	 * the writer close and the full-file replace, and loops on
 	 * `#atomicRewriteDirty` so any fenced append that lands during the rewrite
 	 * is captured before the task resolves. Returns `false` when the disk epoch
-	 * moved (a superseding synchronous rewrite has taken over) so callers skip
-	 * their post-publish state updates.
+	 * moved so callers skip current-marking updates; a body that landed before
+	 * that change still advances the durable byte record after readback.
 	 */
 	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
 		if (this.#released) return false;
@@ -1782,7 +1848,16 @@ export class SessionManager {
 					}
 					throw error;
 				}
-				if (this.#diskEpoch !== epoch) return false;
+				if (this.#diskEpoch !== epoch) {
+					try {
+						if (textMatchesLines(await this.#storage.readText(sessionFile), body.lines)) {
+							this.#recordFullRewrite(body.bytes);
+						}
+					} catch {
+						// A superseding rewrite owns the durability record when its body cannot be read back.
+					}
+					return false;
+				}
 				this.#recordFullRewrite(body.bytes);
 			} while (this.#atomicRewriteDirty);
 			return true;
@@ -1965,15 +2040,36 @@ export class SessionManager {
 		);
 	}
 
-	#notifyEntryAppended(entry: SessionEntry): void {
-		const callback = this.onEntryAppended;
-		if (callback) {
-			try {
-				callback(entry);
-			} catch (err) {
-				logger.warn("collab entry hook failed", { error: String(err) });
+	/**
+	 * Call the replication taps for `entries`, oldest first, each with the active leaf as it stands at that moment.
+	 * One announcement runs at a time: an entry a tap records meanwhile queues behind the ones still waiting, so a tap
+	 * never learns of an entry before the entries it was recorded after (and so before the entry that is its parent).
+	 */
+	#announceEntries(entries: readonly SessionEntry[]): void {
+		this.#entriesToAnnounce.push(...entries);
+		if (this.#announcingEntries) return;
+		this.#announcingEntries = true;
+		try {
+			for (let entry = this.#entriesToAnnounce.shift(); entry; entry = this.#entriesToAnnounce.shift()) {
+				const leafId = this.#index.leafId();
+				for (const listener of this.#entryListeners) {
+					try {
+						listener(entry, leafId);
+					} catch (err) {
+						logger.warn("entry-appended listener failed", { error: String(err) });
+					}
+				}
 			}
+		} finally {
+			this.#announcingEntries = false;
 		}
+	}
+
+	/** An entry recorded while an atomic batch publishes is announced when the batch settles, after the batch's own. */
+	#queueEntryAnnouncement(entry: SessionEntry): void {
+		const batch = this.#atomicEntryBatch;
+		if (batch) batch.deferredNotifications.push(entry);
+		else this.#announceEntries([entry]);
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
@@ -2071,7 +2167,12 @@ export class SessionManager {
 		}
 	}
 
-	#recordEntry(entry: SessionEntry): void {
+	/**
+	 * Record `entry` and announce it to the replication taps. `keepLeaf` names the leaf an off-branch append
+	 * (`appendMessageToBranch`, `appendModelUsage`) leaves in place: it is restored here, before the announcement,
+	 * so a tap never observes the off-branch entry as the leaf.
+	 */
+	#recordEntry(entry: SessionEntry, keepLeaf?: { leafId: string | null }): void {
 		if (this.#released) {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
@@ -2083,13 +2184,14 @@ export class SessionManager {
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
-		if (batch && !batch.collecting) {
+		// An off-branch append leaves the leaf where it was, so it is not an external move of the leaf for a rollback.
+		if (batch && !batch.collecting && !keepLeaf) {
 			batch.externalLeafChanged = true;
 			batch.externalLeafId = entry.id;
 		}
+		if (keepLeaf) this.#index.setLeaf(keepLeaf.leafId);
 		this.#appendToSessionFile(entry);
-		if (batch) batch.deferredNotifications.push(entry);
-		else this.#notifyEntryAppended(entry);
+		this.#queueEntryAnnouncement(entry);
 	}
 
 	#rollbackAtomicEntryBatch(batch: AtomicEntryBatch): void {
@@ -2162,6 +2264,7 @@ export class SessionManager {
 		this.#artifactManager = new ArtifactManager(
 			sessionFile.slice(0, -JSONL_SUFFIX_LENGTH),
 			pendingCopy?.sessionFile === sessionFile ? pendingCopy.done : undefined,
+			this.getSeanceSourceArtifactsDir() ?? undefined,
 		);
 		this.#artifactManagerSessionFile = sessionFile;
 		return this.#artifactManager;
@@ -2548,6 +2651,7 @@ export class SessionManager {
 			this.#sessionFileRelocating = { source, dest };
 		}
 
+		const before = { sessionFile: this.#sessionFile, cwd: this.#cwd };
 		try {
 			if (this.#persist && this.#sessionFile) {
 				this.#storage.ensureDirSync(nextSessionDir);
@@ -2674,6 +2778,7 @@ export class SessionManager {
 			this.#sessionFileRelocating = null;
 			// The destination is ours or untouched now.
 			destination?.release();
+			if (this.#sessionFile !== before.sessionFile || this.#cwd !== before.cwd) this.#notifyRelocated();
 		}
 	}
 
@@ -3169,6 +3274,11 @@ export class SessionManager {
 		return artifactsDirectoryFor(this.#sessionFile);
 	}
 
+	/** Source artifacts a seance fork reads in place; null for ordinary sessions. */
+	getSeanceSourceArtifactsDir(): string | null {
+		return artifactsDirectoryFor(this.#header?.seanceSource);
+	}
+
 	adoptArtifactManager(manager: ArtifactManager): void {
 		this.#adoptedArtifactManager = manager;
 	}
@@ -3324,6 +3434,7 @@ export class SessionManager {
 		if (!title) return false;
 
 		const previousTitle = this.#sessionName;
+		const previousSource = this.#titleSource;
 		const timestamp = nowIso();
 		this.#sessionName = title;
 		this.#titleSource = source;
@@ -3341,9 +3452,17 @@ export class SessionManager {
 		};
 		if (previousTitle) entry.previousTitle = previousTitle;
 		if (trigger) entry.trigger = trigger;
+		this.#titleBefore.set(entry, { title: previousTitle, source: previousSource });
 		this.#entries.push(entry);
 		this.#index.insert(entry);
-		this.#notifyEntryAppended(entry);
+		// Recorded while an atomic batch publishes, a title is a concurrent entry like any other: a rollback keeps it
+		// (and the leaf it moved to), and its announcement follows the batch's instead of overtaking it.
+		const batch = this.#atomicEntryBatch;
+		if (batch && !batch.collecting) {
+			batch.externalLeafChanged = true;
+			batch.externalLeafId = entry.id;
+		}
+		this.#queueEntryAnnouncement(entry);
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
@@ -3368,19 +3487,88 @@ export class SessionManager {
 	/**
 	 * Append a foreign (host-authored) entry verbatim, preserving its
 	 * `id`/`parentId`. Used by collab guests to mirror the host session.
+	 *
+	 * `authoritative` marks the entry as part of a host's sequenced stream (a hosted client): `leafId` is the host's
+	 * active leaf when the entry was announced, and replaces the leaf the append would pick (an off-branch append
+	 * leaves the host on its branch). A title change updates this manager's title state as the host's own did, without
+	 * journaling a second `title_change`. The host announces entries in the order it recorded them but names the leaf
+	 * it has by then, which can be an entry announced right after this one (a batch's last entry): until that entry
+	 * arrives the leaf stays where it is. Without `authoritative` the entry simply becomes the leaf, as before.
 	 */
-	ingestReplicatedEntry(entry: SessionEntry): void {
-		this.#recordEntry(entry);
+	ingestReplicatedEntry(entry: SessionEntry, authoritative?: { leafId: string | null }): void {
+		if (entry.type === TITLE_CHANGE_ENTRY_TYPE) {
+			this.#titleBefore.set(entry, { title: this.#sessionName, source: this.#titleSource });
+		}
+		if (!authoritative) {
+			this.#recordEntry(entry);
+			return;
+		}
+		const { leafId } = authoritative;
+		const materialized = leafId === null || leafId === entry.id || this.#index.has(leafId);
+		this.#recordEntry(entry, { leafId: materialized ? leafId : this.#index.leafId() });
+		if (entry.type === TITLE_CHANGE_ENTRY_TYPE) this.#adoptTitleChange(entry);
+	}
+
+	/** The title state `setSessionName` would have set for an already recorded `title_change` entry. */
+	#adoptTitleChange(entry: TitleChangeEntry): void {
+		this.#sessionName = entry.title;
+		this.#titleSource = entry.source;
+		if (entry.source === "user") this.#titleRevision++;
+		this.#titleUpdatedAt = entry.timestamp;
+		this.#header.title = entry.title;
+		this.#header.titleSource = entry.source;
+		this.#notifySessionNameListeners();
 	}
 
 	/**
-	 * The live header and entries, for collab replication. Nothing is copied:
-	 * the host mutates entries in place on rewrite paths, so callers must not
-	 * mutate what this returns and must serialize it synchronously, before any
-	 * such rewrite can run.
+	 * Snapshot the session for replication: the header and entries, and the leaf and name that go
+	 * with them. Entries are deep-copied by default (`structuredClone`), because the host mutates
+	 * them in place on rewrite paths and a caller that keeps the snapshot must not share references.
+	 * Pass the identity for no copy: the caller must then not mutate what this returns and must
+	 * serialize it synchronously, before any such rewrite can run (the collab welcome does).
+	 *
+	 * `announcedOnly` limits the snapshot to what the {@link subscribeEntryAppended} taps have been told, for a client
+	 * that is then sent every later announcement: each entry reaches it exactly once, here or as its announcement.
+	 * Left out are the entries of an atomic batch that is still publishing (staged, and recorded meanwhile: they may
+	 * yet roll back, and are announced after the commit), entries withheld until they are proven durable, and entries
+	 * queued for announcement. The leaf is the live one, or its nearest announced ancestor. While a title entry is
+	 * among the entries left out, the title is the one the earliest of them replaced, wherever that entry is waiting
+	 * (an open batch, the durability hold, or the announcement queue). With nothing left out it is the live snapshot.
 	 */
-	snapshotForReplication(): { header: SessionHeader; entries: readonly SessionEntry[] } {
-		return { header: this.#header, entries: this.#entries };
+	snapshotForReplication(
+		copy: <T>(value: T) => T = structuredClone,
+		options: { announcedOnly?: boolean } = {},
+	): ReplicationSnapshot {
+		if (!options.announcedOnly) {
+			return {
+				header: copy(this.#header),
+				entries: copy(this.#entries),
+				leafId: this.#index.leafId(),
+				sessionName: this.#sessionName,
+			};
+		}
+		const unannounced = new Set<string>();
+		for (const entry of this.#atomicEntryBatch?.deferredNotifications ?? []) unannounced.add(entry.id);
+		for (const entry of this.#pendingDurabilityNotifications) unannounced.add(entry.id);
+		for (const entry of this.#entriesToAnnounce) unannounced.add(entry.id);
+		let leafId = this.#index.leafId();
+		while (leafId !== null && unannounced.has(leafId)) leafId = this.#index.get(leafId)?.parentId ?? null;
+		let header = this.#header;
+		let sessionName = this.#sessionName;
+		for (const entry of this.#entries) {
+			if (entry.type !== TITLE_CHANGE_ENTRY_TYPE || !unannounced.has(entry.id)) continue;
+			const before = this.#titleBefore.get(entry);
+			if (!before) throw new Error(`Title entry ${entry.id} was recorded without the title it replaced`);
+			header = { ...this.#header, title: before.title, titleSource: before.source };
+			sessionName = before.title;
+			break;
+		}
+		return {
+			header: copy(header),
+			entries: copy(this.#entries.filter(entry => !unannounced.has(entry.id))),
+			leafId,
+			sessionName,
+		};
 	}
 
 	/**
@@ -3426,11 +3614,10 @@ export class SessionManager {
 			runtime: currentRuntimeIdentity(),
 			message,
 		};
-		// The leaf is restored below, so the entry never joins the active branch;
+		// The leaf stays where it was, so the entry never joins the active branch;
 		// keep it out of any branch view already handed out.
 		this.#index.detachBranchView();
-		this.#recordEntry(entry);
-		this.#index.setLeaf(activeLeafId);
+		this.#recordEntry(entry, { leafId: activeLeafId });
 		return entry.id;
 	}
 
@@ -3455,9 +3642,8 @@ export class SessionManager {
 			...usage,
 			...(activeLeafId !== owner.parentId ? { activeLeafId } : {}),
 		};
-		this.#recordEntry(entry);
-		// Through #setLeaf so an in-flight atomic batch restores this leaf, not the usage entry, on rollback.
-		if (activeLeafId !== owner.parentId) this.#setLeaf(activeLeafId);
+		// Off the active branch the leaf stays where it was (restored before listeners see the entry).
+		this.#recordEntry(entry, activeLeafId === owner.parentId ? undefined : { leafId: activeLeafId });
 		return entry.id;
 	}
 
@@ -4014,6 +4200,12 @@ export class SessionManager {
 	 * auto-named `<timestamp>_<id>.jsonl` in `sessionDir`). Artifacts are copied
 	 * recursively by default; nested agents that deliberately share their parent's
 	 * artifact root may disable this with `copyArtifacts: false`.
+	 *
+	 * `seance` creates a read-only consult fork instead: artifacts stay in the
+	 * source (the header's `seanceSource` points lookups at them), inherited
+	 * workspace roots are dropped, and the source's `session_init` contracts
+	 * become inert `source_session_init` custom entries so revival never
+	 * mistakes them for the fork's own.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -4026,6 +4218,7 @@ export class SessionManager {
 			sessionFile?: string;
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
+			seance?: boolean;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -4058,9 +4251,15 @@ export class SessionManager {
 		);
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
-		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
+		manager.#additionalDirectories = options?.seance
+			? []
+			: (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
+		if (options?.seance) {
+			manager.#header.seanceSource = path.resolve(sourcePath);
+			SessionManager.#neutralizeSessionInits(history);
+		}
 		manager.#sessionName = manager.#header.title;
 		manager.#titleSource = manager.#header.titleSource;
 		manager.#titleUpdatedAt = nowIso();
@@ -4074,10 +4273,27 @@ export class SessionManager {
 		}
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
-		if (options?.copyArtifacts !== false) {
+		if (!options?.seance && options?.copyArtifacts !== false) {
 			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
 		}
 		return manager;
+	}
+
+	/** Replace inherited `session_init` entries, in place, with inert custom entries keeping the same tree position. */
+	static #neutralizeSessionInits(history: SessionEntry[]): void {
+		for (let index = 0; index < history.length; index++) {
+			const entry = history[index]!;
+			if (entry.type !== "session_init") continue;
+			const neutralized: CustomEntry = {
+				type: "custom",
+				customType: "source_session_init",
+				id: entry.id,
+				parentId: entry.parentId,
+				timestamp: entry.timestamp,
+				data: entry,
+			};
+			history[index] = neutralized;
+		}
 	}
 
 	/**
@@ -4240,6 +4456,7 @@ export class SessionManager {
 	): Promise<{
 		cwd: string;
 		init: PersistedSessionInit | null;
+		seanceSource?: string;
 	} | null> {
 		let header: SessionHeader | undefined;
 		const initEntries: FileEntry[] = [];
@@ -4258,7 +4475,11 @@ export class SessionManager {
 		}
 		// A missing, empty, or invalid file has no usable session.
 		if (!header) return null;
-		return { cwd: header.cwd ?? getProjectDir(), init: extractSessionInit(initEntries) };
+		return {
+			cwd: header.cwd ?? getProjectDir(),
+			init: extractSessionInit(initEntries),
+			seanceSource: header.seanceSource,
+		};
 	}
 	/** Continue the most recent session, or create a new one if none exists. */
 	static async continueRecent(

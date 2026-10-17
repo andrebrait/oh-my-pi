@@ -737,6 +737,10 @@ describe("AgentSession auto-compaction progress guard", () => {
 				}),
 			}),
 		);
+		expect(session.getLastAssistantMessage()).toMatchObject({
+			stopReason: "error",
+			errorMessage: assistantMsg.errorMessage,
+		});
 	});
 
 	it("restores the persisted overflow error when compaction skips without committing", async () => {
@@ -902,8 +906,8 @@ describe("AgentSession auto-compaction progress guard", () => {
 
 	it("drops a length stop and retries after handoff recovery commits", async () => {
 		cfgCompactionMethodOrder.set(session.settings, ["handoff", "soft"]);
-		// Over threshold: the window, not the output cap, ran out, so recovery compacts.
-		cfgCompactionThresholdTokens.set(session.settings, 10_000);
+		// Prompt over threshold: the window, not the output cap, ran out, so recovery compacts.
+		cfgCompactionThresholdTokens.set(session.settings, 5_000);
 		cfgCompactionEnabled.set(session.settings, true);
 		cfgCompactionKeepRecentTokens.set(session.settings, 1);
 		compactHookEnabled = false;
@@ -1057,6 +1061,57 @@ describe("AgentSession auto-compaction progress guard", () => {
 			expect(session.agent.state.messages.at(-1)).toMatchObject({
 				role: "developer",
 				content: [{ type: "text", text: expect.stringContaining("1024-token output limit") }],
+			});
+		});
+
+		describe("with a configured threshold below prompt plus the discarded output", () => {
+			// #15870: the cut output never reaches the next request, so a prompt
+			// under `compaction.thresholdTokens` is not an exhausted window even when
+			// prompt + output (here 10_000 + 1_024) crosses it.
+			beforeEach(() => {
+				cfgCompactionThresholdTokens.set(session.settings, 10_500);
+			});
+
+			it.each([
+				{ source: "prompt buckets", contextTokens: undefined },
+				// Authoritative occupancy (Cursor checkpoints) includes the cut output.
+				{ source: "reported context occupancy", contextTokens: 11_024 },
+			])(
+				"retries a reasoning-only turn with the length-stop hint instead of compacting ($source)",
+				async ({ contextTokens }) => {
+					const handoffSpy = vi.spyOn(compactionModule, "generateHandoffFromContext");
+					const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+					const message = lengthStop([
+						{ type: "thinking", thinking: "unfinished reasoning", thinkingSignature: "sig" },
+					]);
+					message.usage.contextTokens = contextTokens;
+
+					await endTurn(message);
+
+					expect(handoffSpy).not.toHaveBeenCalled();
+					expect(continueSpy).toHaveBeenCalledTimes(1);
+					expect(session.agent.state.messages.at(-1)).toMatchObject({
+						role: "developer",
+						content: [{ type: "text", text: expect.stringContaining("1024-token output limit") }],
+					});
+				},
+			);
+
+			it("keeps a truncated deliverable instead of compacting it away", async () => {
+				cfgCompactionKeepRecentTokens.set(session.settings, 1);
+				sessionManager.appendMessage({ role: "user", content: "earlier request", timestamp: Date.now() });
+				const handoffSpy = vi
+					.spyOn(compactionModule, "generateHandoffFromContext")
+					.mockResolvedValue("handoff document");
+				const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+				const truncated = lengthStop([{ type: "text", text: "half an answer" }]);
+
+				await endTurn(truncated);
+
+				expect(handoffSpy).not.toHaveBeenCalled();
+				expect(continueSpy).not.toHaveBeenCalled();
+				expect(sessionManager.getBranch().at(-1)).toMatchObject({ type: "message", message: truncated });
+				expect(session.agent.state.messages).toContain(truncated);
 			});
 		});
 	});
@@ -1689,6 +1744,34 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress[0].level).toBe("warning");
 	});
 
+	it("reports the overflow error as the run's outcome when an overflow recovery still does not fit", async () => {
+		// Print mode and the task executor read the outcome after settle through
+		// getLastAssistantMessage(); the retry branch dropped the failed turn from
+		// active context, so without a retained failure they report an earlier
+		// assistant message as a clean finish.
+		seedPriorTurns();
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 205000, contextWindow: 200000, percent: 102.5 });
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = overflowAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(session.getLastAssistantMessage()).toMatchObject({
+			stopReason: "error",
+			errorMessage: assistantMsg.errorMessage,
+		});
+	});
+
 	it("auto-continues (no warning) when a shake rescue frees the oversized tail", async () => {
 		activateOngoingGoal("shake-rescue");
 		// The escalation contract: compaction cut at the only turn boundary but the
@@ -1797,7 +1880,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		});
 		const dropSpy = vi.spyOn(session, "dropImages").mockImplementation(async () => {
 			imagesDropped = true;
-			return { removed: 2 };
+			return { removed: 2, tokensFreed: 0 };
 		});
 
 		const notices = collectNotices();
