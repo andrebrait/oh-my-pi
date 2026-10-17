@@ -31,8 +31,8 @@ export const cfgTaskIsolationEnabled = register({
 	ui: {
 		tab: "tasks",
 		group: "Isolation",
-		label: "Isolate Subagents",
-		description: "Run subagents in an isolated copy of the checkout and integrate their changes afterwards",
+		label: "Allow Isolated Subagents",
+		description: "Allow per-task isolation with `isolated: true`; tasks without it run in the shared checkout",
 	},
 });
 
@@ -288,6 +288,74 @@ export const cfgTaskEnableEffort = register({
 		label: "Per-Task Effort",
 		description:
 			"Expose the optional effort parameter on task spawns, allowing callers to override each subagent's thinking level",
+	},
+});
+
+export const cfgTaskPerCallModel = register({
+	id: "task.perCallModel",
+	type: "enum",
+	values: ["off", "unpinned", "on"] as const,
+	default: "off",
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Per-Call Model",
+		description:
+			"Whether task items, eval agent() and workpool() accept a per-call model. A requested model must be one the operator configured (roles, fallback chains, agent models, overrides) or the parent's live model.",
+		options: [
+			{
+				value: "off",
+				label: "Off",
+				description:
+					"Hide `model`; task calls that still pass it have it dropped or rejected, eval calls are rejected",
+			},
+			{
+				value: "unpinned",
+				label: "Unpinned",
+				description:
+					"Accept `model` only for agents whose own model doesn't change routing (no task.agentModelOverrides entry; bundled `task` counts until modelRoles.task is set)",
+			},
+			{ value: "on", label: "On", description: "Accept `model` for every agent" },
+		],
+	},
+});
+
+export const cfgTaskPerCallModelAllow = register({
+	id: "task.perCallModelAllow",
+	type: "array",
+	default: [] as string[],
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Per-Call Model Allowlist",
+		description:
+			'Chat roles or model patterns a per-call model may use, e.g. ["@smol", "@review", "anthropic/*"]. A listed role includes its retry fallback chain (subject to task.perCallModelFallbacks); list "@default" to allow the parent\'s model. Empty: every configured chat role, agent model and override, plus the parent\'s model.',
+	},
+});
+
+export const cfgTaskPerCallModelFallbacks = register({
+	id: "task.perCallModelFallbacks",
+	type: "enum",
+	values: ["select", "runtime", "off"] as const,
+	default: "select",
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Per-Call Model Fallbacks",
+		description: "How retry fallback chain models (retry.fallbackChains) apply to per-call models.",
+		options: [
+			{
+				value: "select",
+				label: "Select",
+				description: "Chain models can be requested directly and used as runtime fallbacks",
+			},
+			{
+				value: "runtime",
+				label: "Runtime only",
+				description: "Chain models are used only when the requested model fails over",
+			},
+			{ value: "off", label: "Off", description: "No fallback: the subagent fails instead of switching models" },
+		],
 	},
 });
 

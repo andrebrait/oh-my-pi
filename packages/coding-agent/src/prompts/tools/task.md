@@ -15,8 +15,10 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 # Inputs
 `name`: CamelCase ≤32, auto-generated if omitted; address agent by name.{{#if structured}} `outputSchema` overrides agent/session schemas.{{/if}}
 `solutionSpace`: describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
+{{#if seanceGuidance}}{{seanceGuidance}}{{/if}}
 {{#if evalToolsEnabled}}`tools`: eval-defined, run in your kernel.
 {{/if}}{{#if effortEnabled}}`effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
+{{/if}}{{#if perCallModelEnabled}}`model`: selector or ordered array for this spawn only (`provider/model[:level]`, configured role like `@smol`, `@default` = parent's live model){{#if batchEnabled}}; per `tasks[]` item{{/if}}. Only operator-configured models (roles, fallbacks, agent models, overrides) or the parent's.{{#if perCallModelUnpinnedOnly}} Agents with their own configured model reject it.{{/if}} Omit unless needed. Requested model unavailable → stop and report; NEVER substitute another.
 {{/if}}{{#if structured}}`schemaMode`: default permissive warns after retries; strict fails.
 {{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.

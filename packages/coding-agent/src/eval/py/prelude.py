@@ -162,7 +162,15 @@ if "__omp_prelude_loaded__" not in globals():
             p = _artifact_file(path)
             if p is None:
                 # Another session's, or no artifacts dir was injected: the read tool searches every registered one.
-                return _read_through_tool(f"{path}:raw", offset, limit)
+                # A bounded raw read locates the file without inlining it; a bare `:raw` read refuses files over 50 KB.
+                located = _bridge_call("read", {"path": f"{path}:raw:1-1"})
+                details = located.get("details") if isinstance(located, dict) else None
+                file_path = details.get("resolvedPath") if isinstance(details, dict) else None
+                if not isinstance(file_path, str):
+                    # An extension's replacement `read` may name no file: its own text for the selected lines is the answer.
+                    return _read_through_tool(f"{path}:raw", offset, limit)
+                # Once located, the file is read like this session's artifacts and plain paths: read() is no read-tool policy gate.
+                p = Path(file_path)
         elif _should_delegate_read(path):
             return _read_through_tool(path, offset, limit)
         else:
@@ -1059,6 +1067,7 @@ if "__omp_prelude_loaded__" not in globals():
         apply=None,
         merge=None,
         tools=None,
+        model=None,
     ):
         """Start a background subagent and return its handle."""
         args = {"prompt": prompt}
@@ -1078,6 +1087,8 @@ if "__omp_prelude_loaded__" not in globals():
             args["merge"] = bool(merge)
         if tools is not None:
             args["tools"] = list(tools)
+        if model is not None:
+            args["model"] = model
         result = _bridge_call("__agent__", args)
         if not isinstance(result, dict) or not isinstance(result.get("id"), str):
             raise RuntimeError("agent() did not return a handle")
@@ -1123,7 +1134,7 @@ if "__omp_prelude_loaded__" not in globals():
         def __repr__(self):
             return f"<workpool {self.name} ({self.agent}) {self.limit} agents>"
 
-    def workpool(agent=None, *, name=None, context=None, tools=None):
+    def workpool(agent=None, *, name=None, context=None, tools=None, model=None):
         """Create a pool of keep-alive subagents."""
         args = {"op": "create"}
         if agent is not None:
@@ -1134,6 +1145,8 @@ if "__omp_prelude_loaded__" not in globals():
             args["context"] = context
         if tools is not None:
             args["tools"] = list(tools)
+        if model is not None:
+            args["model"] = model
         result = _bridge_call("__workpool__", args)
         if not isinstance(result, dict) or not isinstance(result.get("name"), str):
             raise RuntimeError("workpool() did not return a pool")

@@ -333,7 +333,9 @@ import type {
 	InteractiveModeInitOptions,
 	InteractiveSelectorDialogOptions,
 	RenderSessionContextOptions,
+	SessionPickHandler,
 	ShowStatusOptions,
+	SelectOnlyModelSelectorOptions,
 	SubmittedUserInput,
 } from "./types";
 import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -1803,8 +1805,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#toolUiContextSetter = setToolUIContext;
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
+		// An MCP sign-in can wait for the user mid-turn; like the auto-QA and cfg:// prompts below, it runs as a wait for
+		// the user (AgentSession.waitForUser).
 		this.mcpManager?.setAuthHandler((serverName, challenge) =>
-			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
+			this.session.waitForUser(() => new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge)),
 		);
 		this.#eventBus = eventBus;
 		this.#subagentEventBus = subagentEventBus;
@@ -2128,14 +2132,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		// `Settings.instance` is the disk-backed singleton; passing it explicitly
 		// guarantees the decision persists even when the prompt is triggered
 		// from a subagent whose own `Settings` is an in-memory snapshot.
-		setAutoQaConsentHandler(() => this.#promptAutoQaConsent(), Settings.instance);
+		setAutoQaConsentHandler(() => this.session.waitForUser(() => this.#promptAutoQaConsent()), Settings.instance);
 		// Same wiring for cfg:// writes: every settings change the agent makes is
 		// confirmed here, and `/save` persists to disk. Subagents and headless
 		// sessions are refused by the handler before reaching this host. Changes
 		// to this session's settings get the settings panel's in-process side
 		// effects (a `defaultThinkingLevel` change also switches the live session).
 		setCfgApprovalHost({
-			approve: (request, options) => this.#promptCfgChange(request, options?.signal),
+			// With `ask.timeout` set the prompt settles on its own and the turn goes on, so it stays agent time,
+			// like a timed `ask`.
+			approve: (request, options) =>
+				askTimeoutMs(this.session.settings) === undefined
+					? this.session.waitForUser(() => this.#promptCfgChange(request, options?.signal))
+					: this.#promptCfgChange(request, options?.signal),
 			applied: change => {
 				if (change.settings !== this.session.settings) return;
 				this.#selectorController.handleSettingChange(change.path, change.value);
@@ -2204,6 +2213,32 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.hookWidgetContainerBelow,
 			],
 			{
+				// Roots that collapse without new transcript output must not raise the
+				// post-run chrome floor: user-driven ones (editor drafts, dialogs and
+				// selectors, staged attachments, reports, queued messages, dismissible
+				// panels and the error banner). Any root listed in neither set counts
+				// as persistent: once it holds its height after a run the floor rises
+				// to it, and its later collapse floats the editor until output fills
+				// in. Classify every new root that can collapse on its own.
+				transientChrome: [
+					this.editorContainer,
+					this.attachmentChipsContainer,
+					this.reportContainer,
+					this.pendingMessagesContainer,
+					this.btwContainer,
+					this.omfgContainer,
+					this.cleanseContainer,
+					this.errorBannerContainer,
+				],
+				// HUDs that clear themselves on a timer or registry change (todos,
+				// background subagents, model cycle, progress). Their first paint can be
+				// their tallest (a restored todo list on resume), so it is never a baseline.
+				selfClearingChrome: [
+					this.todoContainer,
+					this.subagentContainer,
+					this.modelCycleContainer,
+					this.progressHudContainer,
+				],
 				// Natively the HUD pills lead the dock, queued messages sit between
 				// the working row and the composer, and the attachment chips live
 				// inside the composer.
@@ -2388,6 +2423,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			// so that paint does not build it on the JS thread. Fresh sessions skip it
 			// and pay the cost lazily on the first highlight, if any.
 			if (this.session.messages.length > 0) void warmHighlighter();
+			// Open the model API connection while the user reads the first frame.
+			this.session.prewarmModelConnection();
 			if (!$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
 				this.#inputController.prewarmTinyTitleModel();
 			}
@@ -2447,6 +2484,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.session.subscribe(event => {
 				if (event.type === "model_changed") {
 					this.#scheduleComposerStatusPersist();
+					this.session.prewarmModelConnection();
 				}
 				if (event.type === "config_warnings_changed") {
 					this.#syncConfigWarningHeader();
@@ -5012,10 +5050,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// write/edit guard. The standing handler below consumes plan-approval
 		// dispatches.
 		const planAugmentations: string[] = [];
+		// A shadowing extension tool named `write` has no `xd://` transport, so plan
+		// approval would never dispatch and the turn would loop on propose writes
+		// forever (issue #14030). Drop it from the active set rather than carrying it
+		// over: keeping it active breaks both the read-only guarantee and approval.
 		if (this.session.hasBuiltInTool("write")) {
 			planAugmentations.push("write");
+		} else if (previousTools.includes("write")) {
+			this.showWarning(
+				"Plan mode: the `write` tool is provided by an extension and cannot submit plans. Disable it to use plan mode.",
+			);
 		}
-		const uniquePlanTools = [...new Set([...previousTools, ...planAugmentations])];
+		const uniquePlanTools = [...new Set([...previousTools.filter(name => name !== "write"), ...planAugmentations])];
 
 		this.#planModePreviousToolPresentation = {
 			enabled: previousTools.filter(name => !isMCPToolName(name)),
@@ -8273,7 +8319,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		void this.#selectorController.showGitTui(revision);
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+	showModelSelector(options?: { temporaryOnly?: boolean; selectOnly?: SelectOnlyModelSelectorOptions }): void {
 		this.#selectorController.showModelSelector(options);
 	}
 
@@ -8301,8 +8347,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showThinkingSelector();
 	}
 
-	showSessionSelector(source?: ForeignSessionSource): void {
-		void this.#selectorController.showSessionSelector(source);
+	showSessionSelector(source?: ForeignSessionSource, onSelect?: SessionPickHandler): void {
+		void this.#selectorController.showSessionSelector(source, onSelect);
 	}
 
 	async handleResumeSession(sessionPath: string): Promise<void> {
