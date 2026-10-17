@@ -140,7 +140,7 @@ class View {
 					JSON.stringify(
 						this.local.buildTranscriptSessionContext({
 							collapseCompactedHistory: false,
-							keepDanglingToolCalls: false,
+							keepInFlightToolCalls: false,
 						}).messages,
 					),
 				);

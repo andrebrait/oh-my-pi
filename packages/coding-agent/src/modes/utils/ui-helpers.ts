@@ -1214,7 +1214,7 @@ export class UiHelpers {
 		const { viewSession } = this.ctx;
 		const context = viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-			keepDanglingToolCalls: viewSession.isStreaming,
+			keepInFlightToolCalls: viewSession.isStreaming,
 		});
 		await refreshAssistantMessageLinkTargets(
 			this.ctx,
