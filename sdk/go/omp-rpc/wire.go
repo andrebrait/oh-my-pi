@@ -2205,6 +2205,8 @@ func (v *ContextUsage) decodeFrom(raw map[string]json.RawMessage) error {
 type QueuedMessagesState struct {
 	Steering []string `json:"steering"`
 	FollowUp []string `json:"followUp"`
+	// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	LiveSteered int64 `json:"liveSteered"`
 }
 
 func (v *QueuedMessagesState) UnmarshalJSON(data []byte) error {
@@ -2216,6 +2218,7 @@ func (v *QueuedMessagesState) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "QueuedMessagesState"}
 	d.required("steering", &out.Steering)
 	d.required("followUp", &out.FollowUp)
+	d.defaulted("liveSteered", &out.LiveSteered, `0`)
 	if d.err != nil {
 		return d.err
 	}
@@ -2561,7 +2564,7 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("queuedMessageCount", &out.QueuedMessageCount, `0`)
 	d.defaulted("hasPendingAsyncWork", &out.HasPendingAsyncWork, `false`)
 	d.defaulted("isSettled", &out.IsSettled, `false`)
-	d.defaulted("queuedMessages", &out.QueuedMessages, `{"steering":[],"followUp":[]}`)
+	d.defaulted("queuedMessages", &out.QueuedMessages, `{"steering":[],"followUp":[],"liveSteered":0}`)
 	d.defaulted("todoPhases", &out.TodoPhases, `[]`)
 	d.scalarOrArray("systemPrompt")
 	d.defaulted("systemPrompt", &out.SystemPrompt, `[]`)
@@ -2642,12 +2645,13 @@ func (v *FastModeResult) decodeFrom(raw map[string]json.RawMessage) error {
 }
 
 type CompactionResult struct {
-	Summary          string                     `json:"summary"`
-	FirstKeptEntryID string                     `json:"firstKeptEntryId"`
-	TokensBefore     int64                      `json:"tokensBefore"`
-	ShortSummary     *string                    `json:"shortSummary,omitempty"`
-	Details          json.RawMessage            `json:"details,omitempty"`
-	PreserveData     map[string]json.RawMessage `json:"preserveData,omitempty"`
+	Summary                      string                     `json:"summary"`
+	FirstKeptEntryID             string                     `json:"firstKeptEntryId"`
+	TokensBefore                 int64                      `json:"tokensBefore"`
+	ShortSummary                 *string                    `json:"shortSummary,omitempty"`
+	Details                      json.RawMessage            `json:"details,omitempty"`
+	PreserveData                 map[string]json.RawMessage `json:"preserveData,omitempty"`
+	ProviderReplayThroughEntryID *string                    `json:"providerReplayThroughEntryId,omitempty"`
 }
 
 func (v *CompactionResult) UnmarshalJSON(data []byte) error {
@@ -2663,6 +2667,7 @@ func (v *CompactionResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("shortSummary", &out.ShortSummary)
 	d.optional("details", &out.Details)
 	d.optional("preserveData", &out.PreserveData)
+	d.optional("providerReplayThroughEntryId", &out.ProviderReplayThroughEntryID)
 	if d.err != nil {
 		return d.err
 	}
@@ -3513,7 +3518,10 @@ func (v *NotifyType) UnmarshalJSON(data []byte) error {
 	return unknownValue("NotifyType", s)
 }
 
-type AgentStartEvent struct{}
+type AgentStartEvent struct {
+	// Calls of an unpaired assistant tail a continued run executes before its first model request.
+	ResumedToolCallIds []string `json:"resumedToolCallIds,omitempty"`
+}
 
 func (v *AgentStartEvent) UnmarshalJSON(data []byte) error {
 	return decodeWith(data, "AgentStartEvent", v.decodeFrom)
@@ -3523,6 +3531,7 @@ func (v *AgentStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	var out AgentStartEvent
 	d := fieldDecoder{raw: raw, owner: "AgentStartEvent"}
 	d.constant("type", "agent_start")
+	d.optional("resumedToolCallIds", &out.ResumedToolCallIds)
 	if d.err != nil {
 		return d.err
 	}
@@ -4370,6 +4379,8 @@ func (v GoalUpdatedEvent) MarshalJSON() ([]byte, error) {
 type QueueUpdateEvent struct {
 	Steering []string `json:"steering"`
 	FollowUp []string `json:"followUp"`
+	// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	LiveSteered int64 `json:"liveSteered"`
 }
 
 func (v *QueueUpdateEvent) UnmarshalJSON(data []byte) error {
@@ -4382,6 +4393,7 @@ func (v *QueueUpdateEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "queue_update")
 	d.required("steering", &out.Steering)
 	d.required("followUp", &out.FollowUp)
+	d.defaulted("liveSteered", &out.LiveSteered, `0`)
 	if d.err != nil {
 		return d.err
 	}

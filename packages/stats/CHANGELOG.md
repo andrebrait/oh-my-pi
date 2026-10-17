@@ -2,9 +2,37 @@
 
 ## [Unreleased]
 
+## [18.11.0] - 2026-10-14
+
 ### Fixed
 
-- Fixed Ultrafast turns not counting toward the Premium Reqs stat: each message now records the service tier its provider reported serving, and the backfill counts it without needing discovery metadata ([#14471](https://github.com/can1357/oh-my-pi/pull/14471) by [@eggpeat](https://github.com/eggpeat)).
+- Providers → Subscription windows no longer mixes Codex 5-hour and 7-day quotas across plans: Team and weekly-only (ProLite) accounts now share the 7-day row, the 5-hour row counts only accounts that have one, and labels no longer flip with whichever account reported last ([#15664](https://github.com/can1357/oh-my-pi/issues/15664))
+
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Usage recorded at $0 for a model whose catalog price changes on a date (Gemini 4 Argon, Devin SWE-2) is now priced at the rate in force on the request's date, instead of staying $0 like peak/off-peak tariff usage ([#15620](https://github.com/can1357/oh-my-pi/pull/15620) by [@eggpeat](https://github.com/eggpeat))
+
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed the stats dashboard favicon so dashboard tabs and bookmarks display the OMP icon correctly.
+
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved dashboard responsiveness and efficiency by reducing unnecessary data refreshes and re-rendering, speeding up session synchronization, database access, package imports, and usage, model, and time-series requests, and avoiding repeated downloads of unchanged traces.
+- Dashboard requests are now cancelled when no longer needed, improving responsiveness when switching sessions or closing trace views during loading.
+
+## [18.7.0] - 2026-10-06
+
+### Fixed
+
+- Fixed Ultrafast turns not being counted toward the Premium Requests statistic.
+- Fixed the desktop stats dashboard menu button so it no longer appears unnecessarily or dims the page without opening navigation.
 
 ## [18.6.0] - 2026-10-03
 
