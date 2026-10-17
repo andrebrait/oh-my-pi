@@ -15,7 +15,13 @@ export const eventDefs = {
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
 
-	AgentStartEvent: { type: "'agent_start'" },
+	AgentStartEvent: {
+		type: "'agent_start'",
+		"resumedToolCallIds?": doc(
+			"string[]",
+			"Calls of an unpaired assistant tail a continued run executes before its first model request.",
+		),
+	},
 	AgentEndEvent: {
 		type: "'agent_end'",
 		messages: doc(
@@ -163,6 +169,10 @@ export const eventDefs = {
 					"Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.",
 				),
 				0,
+			),
+			"attachments?": doc(
+				"QueueAttachments",
+				"Session-host socket clients only; absent means unknown, not that no chip carries one.",
 			),
 		},
 		"Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes.",

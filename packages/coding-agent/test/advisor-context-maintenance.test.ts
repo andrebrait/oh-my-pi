@@ -878,6 +878,35 @@ describe("AgentSession advisor context maintenance", () => {
 		expect(JSON.stringify(advisor.state.messages)).toContain("same-provider native summary");
 	});
 
+	it("replays the kept tail after a native compaction that stopped before it", async () => {
+		const { advisor, nativeModel } = createAdvisorFallbackHarness();
+		const compactionItem = { type: "compaction", encrypted_content: "prefix-only-state" };
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "prefix-only native summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 42,
+			preserveData: {
+				openaiRemoteCompaction: {
+					provider: nativeModel.provider,
+					replacementHistory: [compactionItem],
+					compactionItem,
+				},
+			},
+			// The kept tail did not fit the window, so the native payload covers
+			// history only through the entry before it.
+			providerReplayThroughEntryId: preparation.lastSummarizedEntryId,
+		}));
+
+		await session.prompt("small current update");
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		const preparation = compactSpy.mock.calls[0]![0];
+		expect(preparation.recentMessages.length).toBeGreaterThan(0);
+		const [summary, ...rest] = advisor.state.messages;
+		expect(summary?.role).toBe("compactionSummary");
+		expect(rest.slice(0, preparation.recentMessages.length)).toEqual(preparation.recentMessages);
+	});
+
 	it("skips unauthenticated advisor candidates before enforcing the native boundary", async () => {
 		const { advisor, apiKeySpy, crossProviderModel, nativeModel, sameProviderModel, settings } =
 			createAdvisorFallbackHarness();

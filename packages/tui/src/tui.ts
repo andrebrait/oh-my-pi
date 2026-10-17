@@ -36,6 +36,7 @@ import {
 	encodeKittyDeleteImage,
 	encodeKittyDeletePlacement,
 	encodeKittyPlacementLine,
+	getTerminalBackgroundColor,
 	ImageProtocol,
 	isImageProtocolForced,
 	isInsideTerminalMultiplexer,
@@ -46,6 +47,7 @@ import {
 	synchronizedOutputUserOverride,
 	TERMINAL,
 } from "./terminal-capabilities";
+import { onTerminalBackgroundFallbackChange } from "./theme/theme";
 import { compositeLineAt } from "./render/composite";
 import { tmuxMultiplexer } from "./multiplexers/tmux";
 import {
@@ -913,6 +915,8 @@ export class TUI extends Container {
 	#debugNextWindowTop = 0;
 	#inputListeners = new Set<InputListener>();
 	#startListeners = new Set<StartListener>();
+	/** True from the end of start() until stop(): the terminal modes start listeners enable are live. */
+	#started = false;
 	#paintListeners = new Set<PaintListener>();
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
@@ -1005,6 +1009,7 @@ export class TUI extends Container {
 	#forceViewportRepaintOnNextRender = false;
 	#hasEverRendered = false;
 	#stopped = false;
+	#appearanceReportUnsubscribe: (() => void) | undefined;
 	#cancelPostmortemRestore?: () => void;
 	/** True between a `deferInput` start() and enableInput(). */
 	#inputDeferred = false;
@@ -1093,6 +1098,7 @@ export class TUI extends Container {
 	overlayStack: {
 		component: Component;
 		options?: OverlayOptions;
+		/** Focus restored after closing; tracks live focus changes beneath an input-less key holder. */
 		preFocus: Component | null;
 		hidden: boolean;
 		/**
@@ -1222,6 +1228,9 @@ export class TUI extends Container {
 	setFocus(component: Component | null): void {
 		const holder = this.#getKeyHolderOverlay();
 		if (holder && !isOverlayFocusTarget(holder.component, component)) {
+			if (!holder.component.handleInput && this.#focusedComponent === holder.component) {
+				holder.preFocus = component;
+			}
 			const currentFocus = this.#focusedComponent;
 			component = isOverlayFocusTarget(holder.component, currentFocus) ? currentFocus : holder.component;
 		}
@@ -1472,6 +1481,34 @@ export class TUI extends Container {
 
 	start(options?: TUIStartOptions): void {
 		this.#stopped = false;
+		this.#appearanceReportUnsubscribe?.();
+		let backgroundRgb: number | undefined;
+		let subscribed = true;
+		const repaintForBackgroundChange = () => {
+			if (!subscribed || this.#stopped) return;
+			const nextBackgroundRgb = getTerminalBackgroundColor();
+			// Track RGB before the SIXEL guard: the startup OSC 11 reply usually
+			// arrives before DA1 enables SIXEL, so revisiting the same color once
+			// SIXEL is live must not replay identical rows.
+			if (nextBackgroundRgb === backgroundRgb) return;
+			backgroundRgb = nextBackgroundRgb;
+			if (TERMINAL.imageProtocol !== ImageProtocol.Sixel) return;
+			// Track RGB even during optimistic native ownership: fallback paints
+			// with the latest color, so a later return to the startup RGB must repaint.
+			// Never write rows while the native surface still owns rendering.
+			if (this.#nativeLive) return;
+			this.invalidate();
+			// Match theme changes: replay owned history on direct terminals, but
+			// leave multiplexer scrollback intact and repaint only the viewport.
+			this.requestRender(true, { clearScrollback: !isInsideTerminalMultiplexer() });
+		};
+		const unsubscribe = this.terminal.onAppearanceReport?.(repaintForBackgroundChange);
+		const unsubscribeFallback = onTerminalBackgroundFallbackChange(repaintForBackgroundChange);
+		this.#appearanceReportUnsubscribe = () => {
+			subscribed = false;
+			unsubscribe?.();
+			unsubscribeFallback();
+		};
 		this.#debugPaint = undefined;
 		this.#debugServer?.stop();
 		this.#debugServer = undefined;
@@ -1599,16 +1636,14 @@ export class TUI extends Container {
 			() => this.stop(),
 			{ deferInput: this.#inputDeferred, isLoopStalled: () => this.#watchdog.isStalled() },
 		);
+		// ProcessTerminal.start() resets the previous owner's RGB. Seed only
+		// after that reset so an identical OSC 11 reply still repaints fallback rows.
+		backgroundRgb = TERMINAL.imageProtocol === ImageProtocol.Sixel ? getTerminalBackgroundColor() : undefined;
 		if (this.#stopped) return;
 		this.#cancelPostmortemRestore?.();
 		this.#cancelPostmortemRestore = postmortem.register("tui-restore", () => this.stop());
-		for (const listener of this.#startListeners) {
-			try {
-				listener();
-			} catch {
-				// Startup listeners are feature hooks; one broken hook must not prevent rendering.
-			}
-		}
+		for (const listener of this.#startListeners) this.#runStartListener(listener);
+		this.#started = !this.#stopped;
 		this.terminal.hideCursor();
 		this.#recordHardwareCursorHidden();
 		if (!this.#inputDeferred) {
@@ -2373,11 +2408,27 @@ export class TUI extends Container {
 		if (this.#heldInput !== undefined && this.#heldFocus === previous) this.#heldFocus = next;
 	}
 
+	/**
+	 * Register a hook that re-enables terminal modes on every start(). A hook
+	 * added while the TUI is already running (a prepaint composer starts it
+	 * before the interactive mode wires its controllers) missed that start, so
+	 * it runs immediately instead of waiting for a stop/start cycle that may
+	 * never come.
+	 */
 	addStartListener(listener: StartListener): () => void {
 		this.#startListeners.add(listener);
+		if (this.#started) this.#runStartListener(listener);
 		return () => {
 			this.#startListeners.delete(listener);
 		};
+	}
+
+	#runStartListener(listener: StartListener): void {
+		try {
+			listener();
+		} catch {
+			// Startup listeners are feature hooks; one broken hook must not prevent rendering.
+		}
 	}
 
 	addInputListener(listener: InputListener): () => void {
@@ -2563,6 +2614,8 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.#appearanceReportUnsubscribe?.();
+		this.#appearanceReportUnsubscribe = undefined;
 		this.#cancelPostmortemRestore?.();
 		this.#cancelPostmortemRestore = undefined;
 		this.#debugServer?.stop();
@@ -2632,6 +2685,7 @@ export class TUI extends Container {
 		// (and live-session ghosts are already bounded by the inline-image budget).
 		this.#clearSixelProbeState();
 		this.#stopped = true;
+		this.#started = false;
 		this.#watchdog.stop();
 		if (this.#renderTimer) {
 			this.#renderTimer.cancel();
@@ -2697,6 +2751,13 @@ export class TUI extends Container {
 			return;
 		}
 		this.#requestOrdinaryRender();
+	}
+
+	/** Run `callback` after `delayMs` on the render scheduler's clock, unless the TUI has stopped. */
+	scheduleAfter(delayMs: number, callback: () => void): RenderTimer {
+		return this.#renderScheduler.scheduleRender(() => {
+			if (!this.#stopped) callback();
+		}, delayMs);
 	}
 
 	/**
@@ -2914,9 +2975,9 @@ export class TUI extends Container {
 			this.#inputRenderGraceUntilMs = this.#renderScheduler.now() + TUI.#INPUT_RENDER_GRACE_MS;
 		}
 
-		// A focused input owner can reserve its gesture before TUI-wide listeners
+		// The effective input owner can reserve its gesture before TUI-wide listeners
 		// and debug shortcuts see the key, then handle the raw event exactly once.
-		const focusedForCapture = this.#focusedComponent;
+		const focusedForCapture = this.#inputTarget();
 		if (
 			focusedForCapture?.handleInput &&
 			(!isKeyRelease(data) || focusedForCapture.wantsKeyRelease) &&
@@ -2955,20 +3016,26 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Pass input to focused component (including Ctrl+C).
-		// The focused component can decide how to handle Ctrl+C.
-		// Opted-in components only dirty their focused subtree. Unregistered
-		// components retain the legacy full compose because their callbacks may
-		// mutate siblings; focus changes also require the new surface to paint.
-		const focused = this.#focusedComponent;
-		if (focused?.handleInput) {
+		const target = this.#inputTarget();
+		if (target?.handleInput) {
 			// Filter out key release events unless component opts in
-			if (isKeyRelease(data) && !focused.wantsKeyRelease) {
+			if (isKeyRelease(data) && !target.wantsKeyRelease) {
 				return;
 			}
-			focused.handleInput(data);
+			target.handleInput(data);
 			this.requestRender();
 		}
+	}
+
+	/**
+	 * Component that receives keyboard input. An input-less key-holding overlay
+	 * leaves input with the focus it displaced; other focus owners keep their input.
+	 */
+	#inputTarget(): Component | null {
+		const focused = this.#focusedComponent;
+		if (focused?.handleInput) return focused;
+		const holder = this.#getKeyHolderOverlay();
+		return holder?.component === focused ? holder.preFocus : null;
 	}
 
 	/**
