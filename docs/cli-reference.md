@@ -287,7 +287,11 @@ In Tern, a hosted terminal reports the host's session file and directory, never 
 
 #### Connection loss
 
-The terminal does not reconnect automatically. When the connection ends unexpectedly (the host exits or is killed, the socket breaks, a host update cannot be applied, or the host had to drop an update larger than the 64 MiB RPC frame limit), the terminal prints what happened, including whether the host process is still running, and exits with status 1. Rejoin with `omp attach <hostId>`. A session whose snapshot alone exceeds that limit cannot be attached: the attach fails with that reason and leaves the host running. A command whose outcome is unknown after a loss is never sent again on its own. `/detach` and `/exit` never reconnect. Automatic reconnect is a required follow-up before hosted sessions can become the default.
+When the connection breaks unexpectedly, the terminal shows `Connection to session host <hostId> lost; reconnecting…` and reconnects on its own, catching up on what it missed. While it reconnects, a message you send is refused and stays in the editor. If the host stays unreachable for 30 seconds, the terminal prints `connection lost (host <hostId> still running; omp attach <hostId>)` and exits with status 1; rejoin with `omp attach <hostId>`. A host update the terminal cannot apply, or one the host had to drop because it is larger than the 64 MiB RPC frame limit, does not reconnect: the terminal prints what failed and exits with status 1. A session whose snapshot alone exceeds that limit cannot be attached: the attach fails with that reason and leaves the host running.
+
+If the host process exited, the terminal asks whether to reopen the session in a new host. The new host starts with this terminal's launch flags (none when it was started with `omp attach`). Declining exits with status 1 and `host exited`. A session that was never saved to a file has nothing to reopen, so it exits the same way without asking.
+
+A command whose outcome is unknown after a loss is never sent again on its own. An extension dialog that was open when the connection broke, or that you answered just before, comes back after the reconnect if the host is still waiting for its answer. `/detach` and `/exit` never reconnect. `/detach` while reconnecting leaves quietly; `/exit` while reconnecting cannot stop the host, so it exits with status 1 and names the host that is still running.
 
 #### What works when attached
 

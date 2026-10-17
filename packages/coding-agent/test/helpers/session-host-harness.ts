@@ -194,6 +194,18 @@ export interface HostProxy {
 	inject(frame: object): void;
 	/** Cut every client's connection, like a network failure. */
 	drop(): void;
+	/** Destroy every new client connection on accept, as if the host could not be reached. */
+	refuse(): void;
+	/** How many client connections `refuse` has destroyed. */
+	refused(): number;
+	/** Accept new client connections and never answer them, as if the host had hung. */
+	hold(): void;
+	/** Forward new client connections again (the default). */
+	accept(): void;
+	/** Stop passing what the connected clients send on to the host, as if it were lost on the way. */
+	mute(): void;
+	/** What {@link mute} kept from the host. */
+	muted(): string;
 	close(): void;
 }
 
@@ -208,17 +220,36 @@ export async function startProxy(
 ): Promise<HostProxy> {
 	const socketPath = path.join(dir, "proxy.sock");
 	const clients = new Set<net.Socket>();
+	/** The upstream connection of each client piped straight to the host. */
+	const upstreams = new Map<net.Socket, net.Socket>();
+	let mode: "accept" | "refuse" | "hold" = "accept";
+	let refused = 0;
+	let muted = "";
 	const server = net.createServer(client => {
+		if (mode === "refuse") {
+			refused++;
+			client.destroy();
+			return;
+		}
+		if (mode === "hold") {
+			clients.add(client);
+			client.on("error", () => {});
+			client.on("close", () => clients.delete(client));
+			return;
+		}
 		const upstream = net.connect(entry.endpoint);
 		clients.add(client);
-		if (options.refuseExit === undefined) client.pipe(upstream);
-		else forwardRefusingExit(client, upstream, options.refuseExit);
+		if (options.refuseExit === undefined) {
+			client.pipe(upstream);
+			upstreams.set(client, upstream);
+		} else forwardRefusingExit(client, upstream, options.refuseExit);
 		upstream.pipe(client);
 		// A reset ends the pair; `close` always follows.
 		for (const socket of [client, upstream]) {
 			socket.on("error", () => {});
 			socket.on("close", () => {
 				clients.delete(client);
+				upstreams.delete(client);
 				client.destroy();
 				upstream.destroy();
 			});
@@ -235,6 +266,24 @@ export async function startProxy(
 		drop: (): void => {
 			for (const client of clients) client.destroy();
 		},
+		refuse: (): void => {
+			mode = "refuse";
+		},
+		refused: (): number => refused,
+		hold: (): void => {
+			mode = "hold";
+		},
+		accept: (): void => {
+			mode = "accept";
+		},
+		mute: (): void => {
+			for (const [client, upstream] of upstreams) {
+				client.unpipe(upstream);
+				client.on("data", chunk => void (muted += String(chunk)));
+				client.resume();
+			}
+		},
+		muted: (): string => muted,
 		close: (): void => void server.close(),
 	};
 }

@@ -130,7 +130,7 @@ Triggered by plain `omp` with `tui.hosted: true`, `omp --resume <session>` with 
 | `/exit` from the last client | disposes the session, removes its registry entry, exits |
 | SIGTERM/SIGINT to the host | clean dispose, then exit |
 | SIGHUP to the host | ignored |
-| Host crash | P2: the client shows "host exited" (or the connection-loss reason) and exits with status 1. Showing the exit code or signal, and offering to reopen the session in a new host, belong to the P3 automatic-reconnect work. The lease died with the host, so the file is reusable. |
+| Host crash | The client offers to reopen the session in a new host; declining (or an in-memory session) shows "host exited" and exits with status 1. The exit code or signal is not shown: a detached host is not the client's child, so its exit status is not observable from the client. The lease died with the host, so the file is reusable. |
 
 Stopping an orphaned host is `omp attach <id>`, then `/exit`.
 
@@ -194,8 +194,8 @@ Estimates are `[INFERENCE]` from code reading.
 | Phase | Delivers | Estimate |
 |---|---|---|
 | P1 | `RpcConnection` and `RpcDispatcher` split; socket/pipe transport; `--mode host`; registry; handshake, snapshot, `seq`, ring, `session_replaced`, `clients_changed`; arbitration; `detach` and `exit`; `omp attach` listing. ompweb can switch to it immediately. | 1–2 weeks |
-| P2 | Minimal TUI client behind `tui.hosted`, merged in a working state: spawn or connect a host, render from a local replica fed by snapshot and `entry`/event frames, prompt/abort/steer/queue, model and thinking, extension dialogs, headless builtins forwarded to the host as `prompt` text (there is no `slash_command` command until P3), `/detach`, `/exit`, `/attach`, `omp attach <target>`. TUI-owned automation is off in client mode; every other command reports "unavailable when attached". A lost connection ends the client with status 1. | 2–3 weeks |
-| P3 | Parity follow-ups, each merged separately: plan, goal, loop, idle compaction and recap move to the session or host; tree and fork; `/btw` host ownership (with can1357/oh-my-pi#14110); extension status/widget/title replay; `--solo`; a delta `message_update` projection with client-side accumulation (see Stream volume); automatic reconnect after an unexpected transport loss, using host identity, epoch, and sequence replay with snapshot fallback, which is also where "offer to reopen the session in a new host" after a host crash lands. Explicit detach/exit never reconnects; uncertain mutating commands are not silently resent. | 1–2 weeks per group |
+| P2 | Minimal TUI client behind `tui.hosted`, merged in a working state: spawn or connect a host, render from a local replica fed by snapshot and `entry`/event frames, prompt/abort/steer/queue, model and thinking, extension dialogs, headless builtins forwarded to the host as `prompt` text (there is no `slash_command` command until P3), `/detach`, `/exit`, `/attach`, `omp attach <target>`. TUI-owned automation is off in client mode; every other command reports "unavailable when attached". A lost connection ended the client with status 1 until P3 reconnect. | 2–3 weeks |
+| P3 | Parity follow-ups, each merged separately: plan, goal, loop, idle compaction and recap move to the session or host; tree and fork; `/btw` host ownership (with can1357/oh-my-pi#14110); extension status/widget/title replay; `--solo`; a delta `message_update` projection with client-side accumulation (see Stream volume); automatic reconnect after an unexpected transport loss, using host identity, epoch, and sequence replay with snapshot fallback, with "offer to reopen the session in a new host" after a host crash (delivered). Explicit detach/exit never reconnects; uncertain mutating commands are not silently resent. | 1–2 weeks per group |
 | P4 | The parity table has no "not yet ported" rows, automatic reconnect is implemented, and the delta projection has landed → default flips. Later, delete the setting and the in-process interactive path. Print mode, ACP, and subagents stay in-process. | about 1 week |
 
 ## Error contracts
@@ -205,7 +205,7 @@ Estimates are `[INFERENCE]` from code reading.
 | Host fails to start | Client exits non-zero and prints the host log path |
 | Bad or missing token | `error{code:"unauthorized"}`, then close |
 | Resume outside the ring or with a stale epoch | Full `attached` snapshot |
-| Host dies mid-turn | P2: "host exited" and exit status 1. The offer to reopen in a new host is part of the P3 reconnect work |
+| Host dies mid-turn | The client offers to reopen the session in a new host; declining shows "host exited" and exits with status 1 |
 | Switch to a hosted file | `session_hosted{hostId}`; the client offers `/attach` |
 | Late UI answer | Ignored; that client already received `cancel` |
 | Stale `ifEpoch` or `ifLeaf` | `error{code:"stale"}`; command not executed; client keeps the input for resend |

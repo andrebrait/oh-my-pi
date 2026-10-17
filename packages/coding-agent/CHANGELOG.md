@@ -55,6 +55,7 @@
 - Hosted sessions now generate idle recaps and run idle compaction once, even with no terminals attached; composing a draft in any attached terminal suppresses both ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 - RPC: added the socket-only `set_idle_activity` command, with which a UI client reports whether it holds an unsent draft (a boolean, never the text). It is answered at once, even while another command runs. Hosted sessions emit the new `idle_recap` event (the full recap reply, journaled in the history database and never added to the transcript) to subscribed clients; `RpcClient.setIdleActivity()` accepts `ifEpoch`/`ifLeaf` preconditions, and the Python, Go and Rust SDKs gain the matching command and event ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 - SDK: `AgentSession.enableIdleMaintenance()` and `refreshIdleMaintenance()` let an owner opt a session in to the idle recap and idle compaction; `AgentSessionEvent` gains `idle_recap` ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
+- Hosted sessions reconnect automatically after a lost connection and offer to reopen the session in a new host when its host exited ([#15685](https://github.com/can1357/oh-my-pi/pull/15685) by [@andrebrait](https://github.com/andrebrait))
 
 ### Changed
 
