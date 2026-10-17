@@ -105,6 +105,7 @@ import {
 	Snowflake,
 	stringProperty,
 	toError,
+	untilAborted,
 	withTimeout,
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
@@ -378,6 +379,7 @@ import {
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "./exit-diagnostics";
+import { IdleMaintenance, type IdleMaintenanceOptions } from "./idle-maintenance";
 import { IrcBridge, type IrcBridgeHost } from "./irc-bridge";
 import {
 	buildLaunchCompletionBatchMessage,
@@ -937,6 +939,8 @@ export class AgentSession implements SettingsScope {
 	#autoQaEnabled = false;
 	/** Teardowns registered via {@link addDisposer} (including settings listeners bound to this session); drained on dispose. */
 	#disposers: Array<() => void> = [];
+	/** Idle recap and idle compaction, once the owner opts in via {@link enableIdleMaintenance}. */
+	#idleMaintenance: IdleMaintenance | undefined;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -1457,6 +1461,43 @@ export class AgentSession implements SettingsScope {
 	#wakeForIrc(records: AgentMessage[]): void {
 		if (this.#modeExitDrainSuppressionDepth > 0) {
 			this.#irc.queueAside(records);
+			return;
+		}
+		// Idle compaction rewrites history without owning a turn. Wait it out without claiming
+		// the session (an in-flight wake would make input typed meanwhile find it busy), then
+		// decide afresh.
+		const idleCompaction = this.#maintenance.waitForIdleCompaction();
+		if (idleCompaction) {
+			const promptGeneration = this.#promptGeneration;
+			const sessionGeneration = this.#sessionGeneration;
+			void idleCompaction
+				.then(async () => {
+					// A transition (/new, /clear, a switch) aborts long before it replaces the transcript, so
+					// let it settle first: only then does the session generation say which transcript is live.
+					if (this.isSessionTransitioning) await this.waitForSessionTransition();
+					// The transcript these records were sent to was replaced (/new, /clear, a switch): drop them with it.
+					if (
+						this.#sessionGeneration !== sessionGeneration &&
+						(await this.#sessionGenerationChanged(sessionGeneration))
+					) {
+						return;
+					}
+					if (this.#isDisposed || this.#promptGeneration !== promptGeneration) {
+						// An abort or disposal supersedes the wake: the records wait for the next turn.
+						this.#irc.queueAside(records);
+						return;
+					}
+					if (this.hasAdmittedSubmission) {
+						// Input admitted during the compaction goes first. Prompt setup folds pending IRC
+						// into its turn; whatever is still pending once it settles wakes as usual.
+						this.#irc.queueAside(records);
+						await this.waitForAdmittedSubmissions();
+						this.#resumeStrandedIrcAsides();
+						return;
+					}
+					this.#wakeForIrc(records);
+				})
+				.catch(error => logger.warn("IRC wake after idle compaction failed", { error: String(error) }));
 			return;
 		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
@@ -2123,8 +2164,20 @@ export class AgentSession implements SettingsScope {
 				const keepalive = new EventLoopKeepalive();
 				try {
 					this.#schedulePostPromptTask(
-						async () => {
+						async signal => {
 							try {
+								// Idle compaction rewrites history without owning a turn; flush into the compacted context.
+								// Cancellation (abort, session change, disposal) stops the wait at once instead of holding
+								// their post-prompt drain behind the compaction; abort re-requests the flush once it settles.
+								const idleCompaction = this.#maintenance.waitForIdleCompaction();
+								if (idleCompaction) {
+									try {
+										await untilAborted(signal, idleCompaction);
+									} catch {
+										this.yieldQueue.cancelIdleFlushScheduling();
+										return;
+									}
+								}
 								await run();
 							} finally {
 								keepalive[Symbol.dispose]();
@@ -2653,6 +2706,27 @@ export class AgentSession implements SettingsScope {
 	/** Registers teardown to run when this session is disposed (e.g. handle listeners bound to it). */
 	addDisposer(dispose: () => void): void {
 		this.#disposers.push(dispose);
+	}
+
+	/**
+	 * Opt this session in to autonomous idle maintenance (the idle recap and idle compaction, both governed by
+	 * their settings). One scheduler per session: repeating the call keeps the first owner's probes, so a view that
+	 * re-asserts itself cannot duplicate work or displace them. A passive replica never runs maintenance, and a
+	 * disposed session cannot start any. Teardown is registered with {@link addDisposer}.
+	 */
+	enableIdleMaintenance(options: IdleMaintenanceOptions = {}): void {
+		if (this.passiveReplica || this.#isDisposed || this.#idleMaintenance) return;
+		const maintenance = new IdleMaintenance(this, event => this.#emit(event), options);
+		this.#idleMaintenance = maintenance;
+		this.addDisposer(() => maintenance.dispose());
+	}
+
+	/**
+	 * The owner's inputs to idle maintenance changed (draft, focus, a scheduled turn that went away): abort work
+	 * that is no longer wanted and re-arm whatever the current idle stretch still owes. No-op until enabled.
+	 */
+	refreshIdleMaintenance(): void {
+		this.#idleMaintenance?.refresh();
 	}
 
 	/**
@@ -5522,6 +5596,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#beginSessionTransition(): Disposable {
+		// Before anything awaits: a reload keeps the session id, so only the transition itself can supersede
+		// a pending idle check or an in-flight recap that belong to the transcript being replaced.
+		this.#idleMaintenance?.invalidate();
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
@@ -6148,6 +6225,9 @@ export class AgentSession implements SettingsScope {
 		// calls, and error state. agent.reset() keeps the model and system prompt.
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
+		// The cleared context is a new transcript: an aside or held message captured for the old one drops
+		// its record instead of landing here (mirrors newSession()).
+		this.#sessionGeneration++;
 		this.#pendingNextTurnMessages = [];
 		this.#experimentalContextNotesReminder = undefined;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -7545,12 +7625,12 @@ export class AgentSession implements SettingsScope {
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
 		const submittedAt = Date.now();
-		// A manual `/compact` disconnects the agent until its cleanup re-drains
-		// preserved queues; `/handoff` commits a new history after its side request.
-		// Neither may overlap an ordinary turn. A prompt parked by `/compact`
-		// supersedes its interrupted-turn resume only if it claims the session;
-		// locally handled commands and failed dispatches release that claim.
-		const release = await this.#maintenance.waitForManualMaintenanceCleanup();
+		// Idle compaction rewrites history without owning a prompt. Manual `/compact`
+		// reconnects the agent after preserving queues; `/handoff` commits a new
+		// history. Prompt setup waits for all three, and a prompt parked by a manual
+		// pass supersedes its interrupted-turn resume only if it claims the session.
+		// Locally handled commands and failed dispatches release that claim.
+		const release = await this.#maintenance.waitForMaintenanceCleanup();
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
 		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
 		try {
@@ -7838,9 +7918,9 @@ export class AgentSession implements SettingsScope {
 		},
 	): Promise<boolean> {
 		// Same barrier/claim protocol as prompt(): skill invocations, collab peer
-		// prompts and the CLI initial message must not start during manual
+		// prompts and the CLI initial message must not start during idle/manual
 		// compaction or before a handoff commits its history.
-		const release = await this.#maintenance.waitForManualMaintenanceCleanup();
+		const release = await this.#maintenance.waitForMaintenanceCleanup();
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
 		if (!release) return this.#dispatchCustomPrompt(message, options, outcome);
 		try {
@@ -9136,8 +9216,30 @@ export class AgentSession implements SettingsScope {
 			| undefined,
 		outcome: PromptDispatchOutcome,
 	): Promise<boolean> {
-		// Captured before the normalization await below — see #sessionGeneration's doc comment.
+		// Captured before the awaits below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
+		// A message that may start a turn waits out idle compaction, as prompt() does; plain appends do not.
+		const idleCompaction =
+			options?.triggerTurn || options?.deliverAs === "aside" ? this.#maintenance.waitForIdleCompaction() : undefined;
+		if (idleCompaction) {
+			const promptGeneration = this.#promptGeneration;
+			await idleCompaction;
+			// A transition (/new, /clear, a switch) aborts long before it replaces the transcript, so let it
+			// settle first: only then does the session generation tell an abort from a session change.
+			if (this.isSessionTransitioning) await this.waitForSessionTransition();
+			// A session change or disposal during the wait drops the message with the transcript it was sent to.
+			if (
+				this.#isDisposed ||
+				(this.#sessionGeneration !== sessionGeneration && (await this.#sessionGenerationChanged(sessionGeneration)))
+			) {
+				return false;
+			}
+			// An abort supersedes only the turn. The message stays in this session's transcript, as it did when the
+			// aborted turn had already started, and is delivered like any message that triggers none.
+			if (this.#promptGeneration !== promptGeneration) {
+				options = { ...options, triggerTurn: false, deliverAs: undefined };
+			}
+		}
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const suppressQueueChip = options?.deliverAs === "nextTurn" || options?.deliverAs === "aside";
 		const details =
