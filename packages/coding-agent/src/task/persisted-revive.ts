@@ -32,6 +32,7 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
+import { discoverAgents, getAgent } from "./discovery";
 import { assertPerCallModelApproved } from "./model-approval";
 import { cfgTaskAgentAccountPools } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
@@ -200,6 +201,23 @@ export function createPersistedSubagentReviverFactory(
 			const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(ctx.settings));
 			const oauthAccountPools =
 				init.agent && Object.hasOwn(agentAccountPools, init.agent) ? agentAccountPools[init.agent] : undefined;
+			// The agent's own model grants a per-call worker only while that agent is still configured.
+			const perCallAgentModel =
+				init.perCallModel && init.agent
+					? getAgent(
+							[
+								...(
+									await discoverAgents(
+										ctx.session.sessionManager.getCwd(),
+										undefined,
+										ctx.session.effectiveExtensionRoots,
+									)
+								).agents,
+								...ctx.session.getSessionAgents(),
+							],
+							init.agent,
+						)?.model
+					: undefined;
 			const persistedModelPattern = restoredSeance
 				? restoredSeance.modelPattern
 				: init.modelRole && init.modelRole !== "default"
@@ -271,6 +289,7 @@ export function createPersistedSubagentReviverFactory(
 										{
 											settings: ctx.settings,
 											agentName: init.agent ?? ref.displayName,
+											agentModel: perCallAgentModel,
 											parentModelPattern: ctx.session.model
 												? `${ctx.session.model.provider}/${ctx.session.model.id}`
 												: undefined,
