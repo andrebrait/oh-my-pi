@@ -296,7 +296,16 @@ function validateTaskInput(item: TaskItem | undefined, label: string, fileEnable
 	return undefined;
 }
 
-function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnabled: boolean): string | undefined {
+/**
+ * `isSeanceItem` marks items for the advertised bundled seance, whose own
+ * `model` is checked by {@link validateSeanceParams}, not the per-call rules.
+ */
+function validateSpawnParams(
+	params: TaskParams,
+	batchEnabled: boolean,
+	fileEnabled: boolean,
+	isSeanceItem: (agent: string | undefined) => boolean,
+): string | undefined {
 	const tasks = params.tasks;
 	if (
 		!fileEnabled &&
@@ -318,7 +327,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 			if (inputError) return inputError;
 			const effortError = validateEffort(item.effort, label);
 			if (effortError) return effortError;
-			const modelError = invalidModelSelectorReason(item.model, label);
+			const modelError = isSeanceItem(item.agent) ? undefined : invalidModelSelectorReason(item.model, label);
 			if (modelError) return modelError;
 		}
 		const seen = new Map<string, string>();
@@ -343,7 +352,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 	return (
 		validateTaskInput(params, "The call", fileEnabled) ??
 		validateEffort(params.effort, "The call") ??
-		invalidModelSelectorReason(params.model, "The call")
+		(isSeanceItem(params.agent) ? undefined : invalidModelSelectorReason(params.model, "The call"))
 	);
 }
 
@@ -468,7 +477,12 @@ function planSpawns(
 	const params = repairTaskParams(rawParams as TaskParams);
 	const error =
 		validateShapeParams(batchEnabled, params) ??
-		validateSpawnParams(params, batchEnabled, fileEnabled) ??
+		validateSpawnParams(
+			params,
+			batchEnabled,
+			fileEnabled,
+			agent => seanceAdvertised && (agent?.trim() || defaultAgent) === SEANCE_AGENT_NAME,
+		) ??
 		validateSeanceParams({ params, batchEnabled, defaultAgent, seanceAdvertised });
 	if (error) return error;
 	const items = resolveSpawnItems(params);
