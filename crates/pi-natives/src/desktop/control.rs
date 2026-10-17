@@ -289,6 +289,11 @@ pub(crate) fn user_activity() -> u64 {
 
 static OWNED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes tests that take this process's input ownership, which is one
+/// per process: the ownership tests here and worker tests that send input.
+#[cfg(test)]
+pub(crate) static OWNERSHIP_TEST: Mutex<()> = Mutex::new(());
+
 struct ProcessLease;
 impl ProcessLease {
 	fn acquire() -> CoreResult<Self> {
@@ -425,11 +430,23 @@ struct KernelLease(std::fs::File);
 #[cfg(unix)]
 impl KernelLease {
 	fn acquire() -> CoreResult<Self> {
-		// A fixed per-login-user inode coordinates independently launched hosts.
-		// Never unlink it: unlinking a locked inode would create two lock domains.
+		Self::at(&Self::path())
+	}
+
+	/// A fixed per-login-user inode coordinates independently launched hosts.
+	/// Never unlink it: unlinking a locked inode would create two lock domains.
+	#[cfg(not(test))]
+	fn path() -> std::path::PathBuf {
 		// SAFETY: geteuid has no preconditions.
 		let uid = unsafe { libc::geteuid() };
-		Self::at(&std::path::PathBuf::from(format!("/tmp/pi-desktop-input-{uid}.lock")))
+		std::path::PathBuf::from(format!("/tmp/pi-desktop-input-{uid}.lock"))
+	}
+
+	/// nextest runs every test in its own process; a per-process inode keeps
+	/// concurrent test processes and a live host from contending for input.
+	#[cfg(test)]
+	fn path() -> std::path::PathBuf {
+		std::env::temp_dir().join(format!("pi-desktop-input-test-{}.lock", std::process::id()))
 	}
 
 	fn at(path: &std::path::Path) -> CoreResult<Self> {
@@ -495,7 +512,7 @@ impl KernelLease {
 			Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
 			System::Threading::{CreateMutexW, WaitForSingleObject},
 		};
-		let name: Vec<u16> = "Local\\PiDesktopInput-v1\0".encode_utf16().collect();
+		let name = Self::name();
 		// SAFETY: nul-terminated name and default security descriptor are valid.
 		let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
 		if handle.is_null() {
@@ -515,6 +532,21 @@ impl KernelLease {
 		}
 		Err(DesktopError::input_failed("cannot acquire desktop ownership mutex"))
 	}
+
+	/// Nul-terminated mutex name shared by every host in the login session.
+	#[cfg(not(test))]
+	fn name() -> Vec<u16> {
+		"Local\\PiDesktopInput-v1\0".encode_utf16().collect()
+	}
+
+	/// nextest runs every test in its own process; a per-process mutex keeps
+	/// concurrent test processes and a live host from contending for input.
+	#[cfg(test)]
+	fn name() -> Vec<u16> {
+		format!("Local\\PiDesktopInput-test-{}\0", std::process::id())
+			.encode_utf16()
+			.collect()
+	}
 }
 
 #[cfg(windows)]
@@ -532,8 +564,6 @@ impl Drop for KernelLease {
 mod tests {
 	use super::*;
 
-	static OWNERSHIP_TEST: Mutex<()> = Mutex::new(());
-
 	/// Real ownership without OS event monitoring: lifecycle regressions must
 	/// not depend on an interactive desktop or Accessibility permissions.
 	fn grant_for_test(source: &CancellationSource) {
@@ -543,6 +573,12 @@ mod tests {
 			running: AtomicBool::new(false),
 		};
 		*source.0.state.lock() = Some(Arc::new(owner));
+	}
+
+	/// Removes this process's private kernel lock (see `KernelLease::path`).
+	fn remove_test_lock() {
+		#[cfg(unix)]
+		let _ = std::fs::remove_file(KernelLease::path());
 	}
 
 	#[test]
@@ -582,6 +618,7 @@ mod tests {
 		drop((old, fresh, queued));
 		drop(source);
 		drop(KernelOwner::acquire().expect("session destruction releases ownership"));
+		remove_test_lock();
 	}
 
 	#[test]
@@ -596,6 +633,7 @@ mod tests {
 		assert!(!source.control_active());
 		assert!(fresh.check().is_err());
 		drop(KernelOwner::acquire().expect("idle Escape releases kernel ownership"));
+		remove_test_lock();
 	}
 
 	#[test]
