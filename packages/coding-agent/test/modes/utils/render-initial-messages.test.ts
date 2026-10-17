@@ -99,6 +99,7 @@ function makeCtx(): RenderInitialMessagesTestContext {
 		showStatus: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		resetTranscript: () => ctx.chatContainer.disposeChildren(),
+		proseGithubRepo: () => () => undefined,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, transcriptSpy, llmContextSpy, renderSessionContextSpy };
@@ -226,6 +227,7 @@ function makeRenderCtx(
 			renderChunk?: () => void,
 		) => helpers.renderSessionContextIncrementally(context, options, renderChunk),
 		showStatus: vi.fn(),
+		proseGithubRepo: () => () => undefined,
 	} as unknown as InteractiveModeContext;
 	const helpers = new UiHelpers(ctx);
 	return { ctx, chatContainer };
@@ -266,6 +268,7 @@ describe("UiHelpers.renderInitialMessages — queued messages", () => {
 		vi.spyOn(ctx.viewSession, "getQueuedMessages").mockReturnValue({
 			steering: ["steer now"],
 			followUp: ["queued one", "queued two"],
+			liveSteered: 0,
 		});
 
 		await new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
@@ -333,6 +336,55 @@ describe("UiHelpers.renderInitialMessages — responsiveness", () => {
 		expect(afterReplay).not.toContain("VISIBLE_OLD_TRANSCRIPT");
 		expect(afterReplay).toContain("replacement 255");
 		expect(requestRender.mock.calls.filter(([force]) => force === true)).toEqual([[true, { clearScrollback: true }]]);
+	});
+
+	it("commits only the latest replay when a second one starts mid-replay", async () => {
+		// Leaving a focused subagent while its transcript is still replaying starts
+		// the main session's replay on top of it. Overlapping replays captured each
+		// other's staged container as the visible one, so the screen kept rows of
+		// both sessions, lost the head of the older one, and cleared scrollback twice.
+		await Settings.init({ inMemory: true });
+		let current = transcriptWith(
+			Array.from({ length: 320 }, (_, index) => ({ role: "user", content: `SUBAGENT-${index}`, timestamp: index })),
+		);
+		const { ctx, chatContainer } = makeRenderCtx(current);
+		vi.spyOn(ctx.viewSession, "buildTranscriptSessionContext").mockImplementation(() => current);
+		const helpers = new UiHelpers(ctx);
+		const firstChunk = Promise.withResolvers<void>();
+		const renderIncrementally = ctx.renderSessionContextIncrementally;
+		ctx.renderSessionContextIncrementally = (context, options) =>
+			renderIncrementally(context, options, () => firstChunk.resolve());
+		const requestRender = ctx.ui.requestRender as Mock<(...args: unknown[]) => void>;
+
+		const subagentReplay = helpers.renderInitialMessages({ clearTerminalHistory: true });
+		await firstChunk.promise;
+		current = transcriptWith(
+			Array.from({ length: 3 }, (_, index) => ({ role: "user", content: `MAIN-${index}`, timestamp: index })),
+		);
+		const mainReplay = helpers.renderInitialMessages({ clearTerminalHistory: true });
+		await Promise.all([subagentReplay, mainReplay]);
+
+		const rendered = Bun.stripANSI(chatContainer.render(100).join("\n"));
+		expect(ctx.chatContainer).toBe(chatContainer);
+		expect(rendered).not.toContain("SUBAGENT-");
+		expect(rendered.match(/MAIN-\d+/g)).toEqual(["MAIN-0", "MAIN-1", "MAIN-2"]);
+		expect(requestRender.mock.calls.filter(([force]) => force === true)).toEqual([[true, { clearScrollback: true }]]);
+		expect(ctx.initialChatRendered).toBeTrue();
+	});
+
+	it("reopens live display when a replay fails before it starts rebuilding", async () => {
+		// The display gate closes when a replay is requested; a replay that throws
+		// while reading the transcript must not leave live messages hidden.
+		await Settings.init({ inMemory: true });
+		const { ctx } = makeRenderCtx(transcriptWith([{ role: "user", content: "hello", timestamp: 0 }]));
+		vi.spyOn(ctx.viewSession, "buildTranscriptSessionContext").mockImplementation(() => {
+			throw new Error("transcript unavailable");
+		});
+		ctx.initialChatRendered = true;
+		const helpers = new UiHelpers(ctx);
+
+		await expect(helpers.renderInitialMessages()).rejects.toThrow("transcript unavailable");
+		expect(ctx.initialChatRendered).toBeTrue();
 	});
 
 	it("yields across a large parallel read-result batch", async () => {

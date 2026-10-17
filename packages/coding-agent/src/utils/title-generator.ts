@@ -17,6 +17,7 @@ import {
 import { StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
 import { writeTerminalSequence } from "@oh-my-pi/pi-tui";
 import { isNativeRendering, onNativeRenderingChange } from "@oh-my-pi/pi-tui/native/state";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import { SPINNER_FRAMES } from "@oh-my-pi/pi-tui/theme/symbols";
 import { $env, isTerminalHeadless, isWsl, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -634,6 +635,11 @@ function writeTerminalTitle(title: string, recomposeStaticOnFailure = false): vo
 	lastTerminalTitle = next;
 }
 
+/**
+ * Set the session's base terminal title: the session name, which a generated
+ * title carries in the card form `<icon> <CODE>: <name>` that Tern indexes
+ * parked panes by, else the cwd.
+ */
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
 	// An authoritative session title (rename, new session, focus swap) supersedes
 	// any extension override so the base title tracks the real session again.
@@ -652,8 +658,22 @@ export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: s
 	reportTernSession();
 }
 
+/**
+ * Whether the effective symbol preset is `nerd`: under `nf+emoji` title icons,
+ * the title fork then asks the model for a Nerd Fonts glyph to head the title.
+ */
+export function nerdGlyphsActive(): boolean {
+	return typeof theme !== "undefined" && theme.getSymbolPreset() === "nerd";
+}
+
 /** The OSC 1337 user variable Tern reads the session file from. */
 const TERN_SESSION_FILE_VAR = "omp_session_file";
+/**
+ * The OSC 1337 user variable telling Tern this omp understands `--restore`, set to
+ * `1` before each session file report: Tern's daemon then relaunches it after a
+ * crash with `--restore <file>` instead of `--resume <file>`.
+ */
+const TERN_RESTORE_VAR = "omp_restore";
 
 /** The live session as Tern hears about it (read from the interactive session manager). */
 export interface TerminalSessionSource {
@@ -685,8 +705,8 @@ export function setTerminalSessionSource(source: TerminalSessionSource | undefin
 /**
  * Tell Tern (`TERM_PROGRAM=tern`, nowhere else) what changed about the session:
  * the file as an OSC 1337 user variable holding its absolute path in base64 (no
- * file removes the variable), and the working directory as OSC 7
- * (`file://host/path`), as a shell reports it at each prompt.
+ * file removes the variable), preceded by {@link TERN_RESTORE_VAR}, and the working
+ * directory as OSC 7 (`file://host/path`), as a shell reports it at each prompt.
  */
 export function reportTernSession(): void {
 	if (terminalTitleRuntime.disposed || $env.TERM_PROGRAM?.toLowerCase() !== "tern") return;
@@ -696,6 +716,7 @@ export function reportTernSession(): void {
 	if (resolvedFile !== reportedSessionFile) {
 		reportedSessionFile = resolvedFile;
 		const value = resolvedFile ? `=${Buffer.from(resolvedFile).toString("base64")}` : "";
+		if (resolvedFile) writeTerminalSequence(`\x1b]1337;SetUserVar=${TERN_RESTORE_VAR}=MQ==\x07`);
 		writeTerminalSequence(`\x1b]1337;SetUserVar=${TERN_SESSION_FILE_VAR}${value}\x07`);
 	}
 	// Without a session the shell takes the directory back at its next prompt.
@@ -764,6 +785,7 @@ const TITLE_IDLE_SEPARATOR = ">";
 const TITLE_ATTENTION_SEPARATOR = "!";
 
 const terminalTitleRuntime: {
+	/** The classic title's label: the session name, else the cwd. */
 	label: string | undefined;
 	/** The session's own name, without the cwd fallback `label` uses. */
 	sessionName: string | undefined;
