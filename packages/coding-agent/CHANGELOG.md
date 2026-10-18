@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added per-role skill visibility control for subagents via agent frontmatter: `skills` (allowlist globs; `"none"`/`[]` lists none), `hideSkills` (denylist globs, highest precedence), and `unhideSkills` (re-exposes skills whose `SKILL.md` sets `hide: true`) — see [#4570](https://github.com/can1357/oh-my-pi/issues/4570). Controls the rendered `<skills>` block only; hidden skills remain loadable via `skill://<name>` (and `/skill:<name>` where the session has a slash dispatcher, i.e. the main session). Vibe workers (`vibe_spawn`) resolve the parent session's skill list through the same per-role filter (bundled vibe agents set no visibility frontmatter, so the listing passes through unchanged); `autoloadSkills` preloads any named skill, including one hidden from the listing.
+
 ## [18.20.0] - 2026-11-12
 
 ### Breaking Changes
