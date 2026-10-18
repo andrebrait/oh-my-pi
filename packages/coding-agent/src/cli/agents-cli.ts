@@ -65,6 +65,9 @@ function toFrontmatter(agent: AgentDefinition): Record<string, unknown> {
 	if (agent.output !== undefined) frontmatter.output = agent.output;
 	if (agent.blocking) frontmatter.blocking = true;
 	if (agent.structured) frontmatter.structured = true;
+	if (agent.skills !== undefined) frontmatter.skills = agent.skills;
+	if (agent.hideSkills !== undefined) frontmatter.hideSkills = agent.hideSkills;
+	if (agent.unhideSkills !== undefined) frontmatter.unhideSkills = agent.unhideSkills;
 
 	return frontmatter;
 }
