@@ -774,8 +774,6 @@ describe("a hosted client's controls", () => {
 		["retry", input => input.editor.onRetry?.(), "Retry is unavailable when attached"],
 		["plan mode key", input => input.editor.handleInput("\x1bP"), "Plan mode is unavailable when attached"],
 		["live mode key", input => input.editor.handleInput("\x0c"), "Live mode is unavailable when attached"],
-		["session tree", input => input.ctx.showTreeSelector(), "The session tree is unavailable when attached"],
-		["rewind", input => input.ctx.showUserMessageSelector(), "Rewinding is unavailable when attached"],
 		["session switcher", input => input.ctx.showSessionSelector(), "Switching sessions is unavailable when attached"],
 		["debug panel", input => void input.ctx.showDebugSelector(), "The debug panel is unavailable when attached"],
 		["settings", input => input.ctx.showSettingsSelector(), "Settings is unavailable when attached"],
@@ -793,14 +791,21 @@ describe("a hosted client's controls", () => {
 		input.expectNothingRanLocally();
 	});
 
-	it("does not open the rewind selector on a double Esc", async () => {
+	it("opens the rewind selector over the host's transcript on a double Esc", async () => {
 		const host = await fixture.startHost();
 		const input = await HostedInput.open(host);
+		await input.submit("one");
+		await waitFor(() =>
+			input.local.sessionManager
+				.getEntries()
+				.some(entry => entry.type === "message" && entry.message.role === "assistant"),
+		);
+		await waitFor(() => !input.hostLink.isStreaming);
 
 		input.editor.onEscape?.();
 		input.editor.onEscape?.();
 
-		expect(input.statuses.some(status => status.endsWith("is unavailable when attached"))).toBe(true);
+		expect(input.overlays).toHaveLength(1);
 		input.expectNothingRanLocally();
 	});
 

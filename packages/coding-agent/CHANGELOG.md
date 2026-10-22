@@ -254,6 +254,7 @@
 - Idle recap and idle compaction now run from one session-owned scheduler. Clearing a draft re-arms the recap and compaction that the stretch still owes, and a view that is returned to receives the recap it still owed; the former per-terminal timers dropped both ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
 - RPC: delta `message_update` frames (`messageUpdates: "delta"`) now carry the block on start/end events and the message on a restart, so a client can rebuild the streaming message; session-host clients can select the projection in their `hello` (`capabilities.messageUpdates`), which also covers a resume's replay ([#16220](https://github.com/can1357/oh-my-pi/pull/16220) by [@andrebrait](https://github.com/andrebrait))
 - Hosted sessions stream replies as deltas and rebuild them in the client, so a long reply no longer sends the whole message again with every update ([#16220](https://github.com/can1357/oh-my-pi/pull/16220) by [@andrebrait](https://github.com/andrebrait))
+- Hosted terminals run `/new`, `/fork`, `/tree`, `/branch`, the double-Esc rewind, branch summaries and tree labels on the session host, and every attached terminal follows; a change from a view the host has moved past is refused instead of applied to another branch. RPC gains `navigate_tree`, `abort_branch_summary` and `set_label` for this ([#16221](https://github.com/can1357/oh-my-pi/pull/16221) by [@andrebrait](https://github.com/andrebrait))
 
 ### Changed
 

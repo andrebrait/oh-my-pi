@@ -152,6 +152,7 @@ type OrderedInputOutcome = "local" | "cancelled" | "admitted" | "builtin-agent";
 const PRECONDITION_EXEMPT: ReadonlySet<string> = new Set([
 	"abort",
 	"abort_bash",
+	"abort_branch_summary",
 	"abort_retry",
 	"detach",
 	"exit",
@@ -1763,6 +1764,64 @@ export class RpcServer {
 					await this.#emitAvailableCommandsUpdate();
 				}
 				return rpcSuccess(id, result.type, result.data);
+			}
+
+			case "navigate_tree": {
+				if (typeof command.entryId !== "string") return rpcError(id, "navigate_tree", "entryId must be a string");
+				// As `fork`: a run would keep writing into the branch the leaf just left.
+				if (session.isBusyForSnapshot) {
+					const busy = new SessionBusyError("navigate the session tree");
+					return rpcError(id, "navigate_tree", busy.message, "session_busy");
+				}
+				await this.#btw.close();
+				const leafBefore = session.sessionManager.getLeafId();
+				// A goal continuation waiting to start is held until the navigation ends, then resumes (same session).
+				const result = await this.#withGoalReattach(
+					async () => {
+						const navigated = await session.navigateTree(command.entryId, {
+							summarize: command.summarize === true,
+							customInstructions:
+								typeof command.customInstructions === "string" ? command.customInstructions : undefined,
+							// Only to detect a re-answer, which moves nothing yet: refused below, since it needs a picker here.
+							allowAskReopen: true,
+						});
+						// The leaf moves without an entry frame, so clients follow the snapshot of a `tree` replacement.
+						if (!navigated.cancelled && session.sessionManager.getLeafId() !== leafBefore) {
+							this.#inputGate.commitSessionChange(command);
+							this.#replacing = this.#replace("tree", this.#goalReattached);
+						}
+						return navigated;
+					},
+					() => false,
+					true,
+				);
+				await this.#replacing;
+				if (result.reopenAsk) {
+					return rpcError(
+						id,
+						"navigate_tree",
+						"Re-answering an ask is not available over RPC; select another entry",
+					);
+				}
+				return rpcSuccess(id, "navigate_tree", {
+					cancelled: result.cancelled,
+					aborted: result.aborted,
+					editorText: result.editorText,
+				});
+			}
+
+			case "abort_branch_summary": {
+				session.abortBranchSummary();
+				return rpcSuccess(id, "abort_branch_summary");
+			}
+
+			case "set_label": {
+				if (typeof command.entryId !== "string") return rpcError(id, "set_label", "entryId must be a string");
+				if (command.label !== undefined && typeof command.label !== "string") {
+					return rpcError(id, "set_label", "label must be a string");
+				}
+				session.sessionManager.appendLabelChange(command.entryId, command.label);
+				return rpcSuccess(id, "set_label");
 			}
 
 			case "open_session": {

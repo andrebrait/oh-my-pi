@@ -68,7 +68,7 @@ export interface TestSessionOptions {
 	extensionFactory?: ExtensionFactory;
 	/** Settings over the harness default (`compaction.enabled: false`). */
 	settings?: Readonly<Record<string, unknown>>;
-	/** Serves side-channel requests (the idle recap), which would otherwise reach for the network. */
+	/** Serves side-channel requests (the idle recap, branch summaries), which would otherwise reach for the network. */
 	sideStreamFn?: StreamFn;
 }
 

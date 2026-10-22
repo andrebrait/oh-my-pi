@@ -48,6 +48,7 @@ import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { restoreDetachedDraft } from "../../slash-commands/helpers/draft";
+import { runOnHost } from "../../slash-commands/helpers/hosted";
 import { parseSlashCommand, parseSubcommand } from "../../slash-commands/helpers/parse";
 import { isTinyLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
@@ -696,10 +697,10 @@ export class InputController {
 		}
 
 		for (const key of this.ctx.keybindings.getKeys("app.session.new")) {
-			this.ctx.editor.setCustomKeyHandler(
-				key,
-				this.#local("New session", () => this.ctx.handleNewCommand()),
-			);
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (this.ctx.hostedClientMode) void runOnHost(this.ctx, link => link.newSession(), "New session started");
+				else void this.ctx.handleNewCommand();
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.tree")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showTreeSelector());

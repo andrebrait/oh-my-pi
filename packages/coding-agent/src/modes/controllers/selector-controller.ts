@@ -67,6 +67,7 @@ import type {
 	SelectOnlyModelSelectorOptions,
 	SessionPickHandler,
 } from "../../modes/types";
+import type { NavigateTreeResult } from "../../session/agent-session";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -84,6 +85,7 @@ import { readSessionInfo, type SessionInfo } from "../../session/session-listing
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
 import { FileSessionStorage } from "../../session/session-storage";
+import type { HostedClientLink } from "../../session-host/hosted-client";
 import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
@@ -754,6 +756,20 @@ export class SelectorController {
 		return true;
 	}
 
+	/** Hosted, before the link to the host is up: nothing can navigate yet. */
+	#unavailableWhileConnecting(): boolean {
+		if (!this.ctx.hostedClientMode || this.ctx.hostedClient) return false;
+		this.ctx.showStatus("Not connected to the session host yet");
+		return true;
+	}
+
+	/** The session host this view is attached to, `undefined` in-process; throws when the link dropped meanwhile. */
+	#host(): HostedClientLink | undefined {
+		if (!this.ctx.hostedClientMode) return undefined;
+		if (!this.ctx.hostedClient) throw new Error("Not connected to the session host yet");
+		return this.ctx.hostedClient;
+	}
+
 	/**
 	 * Hosted client: pick from the models the HOST can use (this client's registry has neither its credentials nor
 	 * its custom models). The pick is the host's `set_model`; the new model reaches this status line as the host's
@@ -1413,7 +1429,7 @@ export class SelectorController {
 	}
 
 	showUserMessageSelector(): void {
-		if (this.#unavailableWhenHosted("Rewinding")) return;
+		if (this.#unavailableWhileConnecting()) return;
 		const entries = this.ctx.sessionManager.getBranch().filter(isTranscriptEntry);
 		if (entries.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
@@ -1519,22 +1535,29 @@ export class SelectorController {
 			this.ctx.showStatus("Already at this point");
 			return;
 		}
-		const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+		// Hosted views repaint from the host's replacement and take no in-place truncation.
+		const treeRewind = this.ctx.hostedClientMode ? undefined : this.#treeRewindBoundary(entryId, realLeafId);
 		try {
-			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
+			const host = this.#host();
+			// Hosted: the host moves its leaf; this view follows its `tree` replacement before the call returns.
+			const result = host
+				? await host.navigateTree(entryId)
+				: await this.ctx.session.navigateTree(entryId, { summarize: false });
 			if (result.cancelled) {
 				done();
 				this.ctx.showStatus("Navigation cancelled");
 				return;
 			}
-			const fastRewind =
-				treeRewind !== undefined &&
-				this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
-				this.ctx.truncateTranscriptFromMessage(treeRewind.message);
-			if (!fastRewind) {
-				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+			if (!host) {
+				const fastRewind =
+					treeRewind !== undefined &&
+					this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+					this.ctx.truncateTranscriptFromMessage(treeRewind.message);
+				if (!fastRewind) {
+					await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+				}
+				await this.ctx.reloadTodos();
 			}
-			await this.ctx.reloadTodos();
 			if (result.editorText && (isUserTarget || !this.ctx.editor.getText().trim())) {
 				this.ctx.editor.setDraft(result.editorText, result.editorImages);
 			}
@@ -1604,7 +1627,7 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
-		if (this.#unavailableWhenHosted("The session tree")) return;
+		if (this.#unavailableWhileConnecting()) return;
 		const tree = this.ctx.sessionManager.getTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
@@ -1642,8 +1665,8 @@ export class SelectorController {
 					// Pure-rewind probe (before navigation mutates the leaf): when the
 					// target sits on the current leaf's path and no summary is added,
 					// the post-navigation transcript is a strict prefix of the rendered
-					// one and the tail can be dropped in place.
-					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+					// one and the tail can be dropped in place. Hosted views repaint from the host's replacement.
+					const treeRewind = this.ctx.hostedClientMode ? undefined : this.#treeRewindBoundary(entryId, realLeafId);
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and
@@ -1686,7 +1709,12 @@ export class SelectorController {
 
 					if (wantsSummary) {
 						this.ctx.editor.onEscape = () => {
-							this.ctx.session.abortBranchSummary();
+							// Hosted: the summary runs on the host, where `abort` would queue behind the navigation.
+							if (!this.ctx.hostedClientMode) this.ctx.session.abortBranchSummary();
+							else
+								void Promise.try(() => this.#host()?.abortBranchSummary()).catch(error =>
+									this.ctx.showError(error instanceof Error ? error.message : String(error)),
+								);
 						};
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						summaryLoader = new Loader(
@@ -1701,11 +1729,16 @@ export class SelectorController {
 					}
 
 					try {
-						let result = await this.ctx.session.navigateTree(entryId, {
-							summarize: wantsSummary,
-							customInstructions,
-							allowAskReopen: true,
-						});
+						const host = this.#host();
+						// Hosted: the host navigates (an `ask` re-answer it refuses) and this view follows its `tree`
+						// replacement before the call returns, so the rebuild below is the host's, not this view's.
+						let result: NavigateTreeResult = host
+							? await host.navigateTree(entryId, { summarize: wantsSummary, customInstructions })
+							: await this.ctx.session.navigateTree(entryId, {
+									summarize: wantsSummary,
+									customInstructions,
+									allowAskReopen: true,
+								});
 
 						// Selecting an `ask` toolResult doesn't land the leaf directly —
 						// re-open the picker with the original questions first, then
@@ -1735,19 +1768,21 @@ export class SelectorController {
 							return;
 						}
 
-						// Update UI — rebuild the display transcript for the new leaf (the
-						// context from navigateTree is the LLM context, not the transcript).
-						const fastRewind =
-							treeRewind !== undefined &&
-							!wantsSummary &&
-							!result.summaryEntry &&
-							!result.askReanswerCommitted &&
-							this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
-							this.ctx.truncateTranscriptFromMessage(treeRewind.message);
-						if (!fastRewind) {
-							await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+						if (!host) {
+							// Update UI — rebuild the display transcript for the new leaf (the
+							// context from navigateTree is the LLM context, not the transcript).
+							const fastRewind =
+								treeRewind !== undefined &&
+								!wantsSummary &&
+								!result.summaryEntry &&
+								!result.askReanswerCommitted &&
+								this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+								this.ctx.truncateTranscriptFromMessage(treeRewind.message);
+							if (!fastRewind) {
+								await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+							}
+							await this.ctx.reloadTodos();
 						}
-						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setDraft(result.editorText, result.editorImages);
 						}
@@ -1776,7 +1811,12 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				(entryId, label) => {
-					this.ctx.sessionManager.appendLabelChange(entryId, label);
+					// Hosted: the label is the host's; it reaches every view (this one too) as an entry.
+					if (!this.ctx.hostedClientMode) this.ctx.sessionManager.appendLabelChange(entryId, label);
+					else
+						void Promise.try(() => this.#host()?.setLabel(entryId, label)).catch(error =>
+							this.ctx.showError(error instanceof Error ? error.message : String(error)),
+						);
 					this.ctx.ui.requestRender();
 				},
 				cfgTreeFilterMode.get(settings),

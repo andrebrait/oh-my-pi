@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -215,6 +215,32 @@ describe("RpcServer sequencing", () => {
 		await a.command({ type: "prompt", message: "after" });
 		expect(await a.next(f => f.type === "prompt_result" && f.id === "c1")).toMatchObject({ status: "completed" });
 		expect(session.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("lets a peer's tree navigation cancel input that an extension input hook still holds", async () => {
+		const atHook = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		await startServer(
+			{ handler: { content: ["ok"] } },
+			{
+				inputHook: async text => {
+					if (!text.startsWith("hold:")) return;
+					atHook.resolve();
+					await release.promise;
+				},
+			},
+		);
+		const first = session.sessionManager.appendMessage({ role: "user", content: "earlier", timestamp: 1 });
+		session.sessionManager.appendMessage(makeAssistantMessage());
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		a.write({ id: "held", type: "prompt", message: "hold: first" });
+		await atHook.promise;
+		// Accepted after a's input and moving the leaf: the held prompt was written for the branch it left.
+		expect(await b.command({ type: "navigate_tree", entryId: first })).toMatchObject({ success: true });
+		release.resolve();
+		expect(await a.next(f => f.type === "prompt_result" && f.id === "held")).toMatchObject({ status: "aborted" });
+		expect(session.sessionManager.getLeafId()).toBeNull();
 	});
 
 	it("refuses open_session onto a session another host owns, keeping the open session and asking about the resolved file", async () => {
@@ -439,6 +465,234 @@ describe("RpcServer sequencing", () => {
 				.filter(entry => entry.type === "message")
 				.map(entry => entry.id),
 		).toEqual([userEntry!.id, replyEntry!.id]);
+	});
+
+	describe("navigate_tree", () => {
+		/** Two finished turns through `a`; returns the [user, assistant, user, assistant] message entry ids. */
+		async function twoTurns(a: TestClient): Promise<string[]> {
+			for (const [turn, message] of ["one", "two"].entries()) {
+				await a.command({ type: "prompt", message });
+				await a.next(
+					f => f.type === "agent_end" && a.frames.filter(x => x.type === "agent_end").length === turn + 1,
+				);
+			}
+			return session.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.id] : []));
+		}
+
+		it("moves the leaf in the same file and reports reason tree with the new leaf to every client", async () => {
+			await startServer({ handler: { content: ["ok"] } });
+			const a = new TestClient(server);
+			const b = new TestClient(server);
+			server.attach(a.conn);
+			server.attach(b.conn);
+			const [, firstReply, secondUser] = await twoTurns(a);
+			const sourceFile = session.sessionFile;
+			const before = server.epoch;
+
+			expect(
+				await a.command({
+					type: "navigate_tree",
+					entryId: firstReply,
+					ifEpoch: before,
+					ifLeaf: session.sessionManager.getLeafId(),
+				}),
+			).toMatchObject({ success: true, data: { cancelled: false } });
+
+			const replaced = await b.next(f => f.type === "session_replaced");
+			// The requesting client gets the replacement before its response.
+			const order = (match: (f: Record<string, unknown>) => boolean) => a.frames.findIndex(match);
+			expect(order(f => f.type === "session_replaced")).toBeGreaterThanOrEqual(0);
+			expect(order(f => f.type === "session_replaced")).toBeLessThan(
+				order(f => f.type === "response" && f.command === "navigate_tree"),
+			);
+			expect(replaced).toMatchObject({
+				epoch: before + 1,
+				reason: "tree",
+				sessionFile: sourceFile,
+				snapshot: { leafId: firstReply },
+			});
+			expect(session.sessionFile).toBe(sourceFile);
+			expect(session.sessionManager.getLeafId()).toBe(firstReply);
+			expect(session.messages).toHaveLength(2);
+
+			// A user message rewinds past itself and hands its text back for the editor.
+			expect(await a.command({ type: "navigate_tree", entryId: secondUser })).toMatchObject({
+				success: true,
+				data: { cancelled: false, editorText: "two" },
+			});
+		});
+
+		it("refuses a stale leaf and leaves the leaf where it was", async () => {
+			await startServer({ handler: { content: ["ok"] } });
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			const [, firstReply] = await twoTurns(a);
+			const leaf = session.sessionManager.getLeafId();
+
+			expect(await a.command({ type: "navigate_tree", entryId: firstReply, ifLeaf: firstReply })).toMatchObject({
+				success: false,
+				code: "stale",
+				leafId: leaf,
+			});
+			expect(session.sessionManager.getLeafId()).toBe(leaf);
+		});
+
+		it("refuses while a run is streaming", async () => {
+			const release = Promise.withResolvers<void>();
+			session = await createTestSession(dir, { handler: { content: ["ok"] } }, release.promise);
+			server = await RpcServer.start(session, {});
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			await a.command({ type: "prompt", message: "hi" });
+			await a.next(f => f.type === "message_update");
+			const [userEntry] = session.sessionManager.getEntries().filter(entry => entry.type === "message");
+			const leaf = session.sessionManager.getLeafId();
+
+			expect(await a.command({ type: "navigate_tree", entryId: userEntry!.id })).toMatchObject({
+				success: false,
+				code: "session_busy",
+			});
+			expect(session.sessionManager.getLeafId()).toBe(leaf);
+			release.resolve();
+			await a.next(f => f.type === "agent_end");
+		});
+
+		it("stops a branch summary on abort_branch_summary and stays where it was", async () => {
+			const summarizing = Promise.withResolvers<void>();
+			await startServer(
+				{ handler: { content: ["ok"] } },
+				{
+					// The summary request hangs until it is aborted.
+					sideStreamFn: async (_model, _context, options) => {
+						summarizing.resolve();
+						const { promise, reject } = Promise.withResolvers<never>();
+						options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+						return promise;
+					},
+				},
+			);
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			const [, firstReply] = await twoTurns(a);
+			const leaf = session.sessionManager.getLeafId();
+			const epoch = server.epoch;
+
+			const navigated = a.command({ type: "navigate_tree", entryId: firstReply, summarize: true });
+			await summarizing.promise;
+			expect(await a.command({ type: "abort_branch_summary", ifEpoch: epoch - 1 })).toMatchObject({ success: true });
+
+			expect(await navigated).toMatchObject({ success: true, data: { cancelled: true, aborted: true } });
+			expect(session.sessionManager.getLeafId()).toBe(leaf);
+			expect(server.epoch).toBe(epoch);
+		});
+
+		it("holds a waiting goal continuation during the navigation and runs it afterwards", async () => {
+			const summarizing = Promise.withResolvers<void>();
+			await startServer(
+				{ handler: { content: ["ok"] } },
+				{
+					settings: { "goal.continuationModes": ["rpc"] },
+					sideStreamFn: async (_model, _context, options) => {
+						summarizing.resolve();
+						const { promise, reject } = Promise.withResolvers<never>();
+						options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+						return promise;
+					},
+				},
+			);
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			const [, firstReply] = await twoTurns(a);
+			expect(await a.command({ type: "goal", op: "create", objective: "keep going" })).toMatchObject({
+				success: true,
+			});
+			// The continuation decided at the next yield waits here: decided, not yet started.
+			const idle = Promise.withResolvers<void>();
+			const waiting = Promise.withResolvers<void>();
+			const waitForIdle = spyOn(session, "waitForIdle").mockImplementation(() => {
+				waiting.resolve();
+				return idle.promise;
+			});
+			await a.command({ type: "prompt", message: "go" });
+			await a.next(f => f.type === "agent_end" && a.frames.filter(x => x.type === "agent_end").length === 3);
+			await waiting.promise;
+			waitForIdle.mockRestore();
+
+			const navigated = a.command({ type: "navigate_tree", entryId: firstReply, summarize: true });
+			await summarizing.promise;
+			// Mid-navigation the continuation's wait ends; it must neither start nor be lost.
+			idle.resolve();
+			await idle.promise;
+			await a.command({ type: "abort_branch_summary" });
+			expect(await navigated).toMatchObject({ success: true, data: { cancelled: true, aborted: true } });
+
+			const response = a.frames.findIndex(f => f.type === "response" && f.command === "navigate_tree");
+			const startsBefore = a.frames.slice(0, response).filter(f => f.type === "agent_start").length;
+			await a.next(
+				f => f.type === "agent_start" && a.frames.filter(x => x.type === "agent_start").length > startsBefore,
+			);
+			// Three turns (two seeded, "go") started before the response; the continuation only after it.
+			expect(startsBefore).toBe(3);
+			await a.command({ type: "goal", op: "drop" });
+		});
+
+		it("refuses to re-answer an ask, changing nothing", async () => {
+			await startServer({ handler: { content: ["ok"] } });
+			const a = new TestClient(server);
+			server.attach(a.conn);
+			const manager = session.sessionManager;
+			manager.appendMessage({ role: "user", content: "deploy", timestamp: 1 });
+			manager.appendMessage({
+				...makeAssistantMessage(),
+				content: [
+					{
+						type: "toolCall",
+						id: "ask-1",
+						name: "ask",
+						arguments: {
+							questions: [
+								{ id: "target", question: "Where?", options: [{ label: "staging" }, { label: "prod" }] },
+							],
+						},
+					},
+				],
+				stopReason: "toolUse",
+			});
+			const answer = manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "ask-1",
+				toolName: "ask",
+				content: [{ type: "text", text: "User selected: staging" }],
+				isError: false,
+				timestamp: 2,
+			});
+			manager.appendMessage(makeAssistantMessage());
+			const leaf = manager.getLeafId();
+
+			const refused = await a.command({ type: "navigate_tree", entryId: answer });
+			expect(refused).toMatchObject({ success: false, command: "navigate_tree" });
+			expect(refused.error).toContain("ask");
+			expect(manager.getLeafId()).toBe(leaf);
+		});
+	});
+
+	it("appends a label through set_label and sends it to every client as an entry", async () => {
+		await startServer({ handler: { content: ["ok"] } });
+		const a = new TestClient(server);
+		const b = new TestClient(server);
+		server.attach(a.conn);
+		server.attach(b.conn);
+		await a.command({ type: "prompt", message: "one" });
+		await a.next(f => f.type === "agent_end");
+		const [userEntry] = session.sessionManager.getEntries().filter(entry => entry.type === "message");
+
+		expect(
+			await a.command({ type: "set_label", entryId: userEntry!.id, label: "start", ifEpoch: server.epoch }),
+		).toMatchObject({ success: true });
+		const labelled = await b.next(f => f.type === "entry" && isRecord(f.entry) && f.entry.type === "label");
+		expect(labelled.entry).toMatchObject({ type: "label", targetId: userEntry!.id, label: "start" });
+		expect(session.sessionManager.getLabel(userEntry!.id)).toBe("start");
+		expect(await a.command({ type: "set_label", entryId: "nope", label: "x" })).toMatchObject({ success: false });
 	});
 
 	it("reports goal state through get_state, goal and the attach snapshot on every connection", async () => {

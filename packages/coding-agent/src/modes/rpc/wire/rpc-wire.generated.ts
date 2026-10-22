@@ -753,6 +753,14 @@ export interface BranchResult {
 	cancelled: boolean;
 }
 
+export interface NavigateTreeResult {
+	cancelled: boolean;
+	/** Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved. */
+	aborted?: boolean;
+	/** The target was a user message: its text, for the editor; the leaf moved to its parent. */
+	editorText?: string;
+}
+
 export interface TokenUsage {
 	input: number;
 	output: number;
@@ -2032,6 +2040,19 @@ export interface ForkParams {
 	entryId?: string;
 }
 
+export interface NavigateTreeParams {
+	entryId: string;
+	/** Summarize the abandoned branch at the target. */
+	summarize?: boolean;
+	/** Instructions for the summarizer. */
+	customInstructions?: string;
+}
+
+export interface SetLabelParams {
+	entryId: string;
+	label?: string;
+}
+
 export interface GetBranchMessagesResult {
 	messages: BranchMessage[];
 }
@@ -2186,6 +2207,9 @@ export interface RpcWireCommands {
 	switch_session: { params: SwitchSessionParams; result: CancellationResult };
 	branch: { params: BranchParams; result: BranchResult };
 	fork: { params: ForkParams; result: CancellationResult };
+	navigate_tree: { params: NavigateTreeParams; result: NavigateTreeResult };
+	abort_branch_summary: { params: undefined; result: undefined };
+	set_label: { params: SetLabelParams; result: undefined };
 	get_branch_messages: { params: undefined; result: GetBranchMessagesResult };
 	get_last_assistant_text: { params: undefined; result: GetLastAssistantTextResult };
 	set_session_name: { params: SetSessionNameParams; result: undefined };

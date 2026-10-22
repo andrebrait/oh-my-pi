@@ -376,7 +376,8 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
  * Commands that skip the serial queue entirely; see {@link dispatchRpcInputFrame}.
  * (`prompt` and `steer_subagent` are also backgrounded there, but start through
  * the serial tail.) `btw_cancel` is synchronous and must overtake a `btw` still
- * starting or a long serial command.
+ * starting or a long serial command; `abort_branch_summary` likewise overtakes
+ * the `navigate_tree` whose summary it stops.
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
 const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
@@ -385,6 +386,7 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 	"live_start",
 	"btw_cancel",
 	"set_idle_activity",
+	"abort_branch_summary",
 ]);
 
 /**
@@ -479,6 +481,7 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 	switch_session: true,
 	branch: true,
 	fork: true,
+	navigate_tree: true,
 	open_session: true,
 };
 

@@ -133,9 +133,11 @@ export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = 
 
 /**
  * Builtins that keep running in this process while the UI is a client of a session host: they read or move only
- * what is on this screen or this machine (hotkeys, clipboard, links) or end this client.
+ * what is on this screen or this machine (hotkeys, clipboard, links) or end this client. `bare`: only without
+ * arguments, where the command sends the host its own RPC command (`/new`, `/fork`, `/tree`, `/branch`; `/fork pane`
+ * stays refused).
  */
-const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true>> = {
+const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true | "bare">> = {
 	hotkeys: true,
 	copy: true,
 	open: true,
@@ -143,6 +145,10 @@ const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true>> = {
 	attach: true,
 	exit: true,
 	quit: true,
+	new: "bare",
+	fork: "bare",
+	tree: "bare",
+	branch: "bare",
 };
 
 /**
@@ -169,14 +175,19 @@ export async function executeBuiltinSlashCommand(
 	if (runtime.ctx.hostedClientMode) {
 		// Decided before the arguments check below, whose `false` means "ordinary prompt": for a hosted client that
 		// would hand a command that cannot run here, or that takes no arguments, to the host's model.
-		const local = HOSTED_LOCAL_COMMANDS[command.name] === true;
+		const rule = HOSTED_LOCAL_COMMANDS[command.name];
+		// Runs here only without arguments (`/fork`, `/tree`); with them it is a different, unavailable command.
+		const bare = rule === "bare";
+		const local = rule === true || (bare && parsed.args.length === 0);
 		const takesNoArgs = parsed.args.length > 0 && !command.allowArgs;
-		const refusal =
-			!local && !command.handle
-				? `/${command.name} is unavailable when attached`
-				: takesNoArgs
-					? `/${command.name} takes no arguments`
-					: undefined;
+		// Refused outright, except a bare-only command given arguments it never takes (`/new now`): that one runs
+		// here when bare, so its arguments are what is wrong.
+		const unavailable = !local && !command.handle && !(bare && takesNoArgs);
+		const refusal = unavailable
+			? `/${bare ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
+			: takesNoArgs
+				? `/${command.name} takes no arguments`
+				: undefined;
 		if (refusal !== undefined) {
 			runtime.ctx.showStatus(refusal);
 			// Nothing ran and nothing was sent: the submission goes back to the editor.

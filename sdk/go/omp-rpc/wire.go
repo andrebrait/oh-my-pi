@@ -3395,6 +3395,31 @@ func (v *BranchResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type NavigateTreeResult struct {
+	Cancelled bool `json:"cancelled"`
+	// Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved.
+	Aborted *bool `json:"aborted,omitempty"`
+	// The target was a user message: its text, for the editor; the leaf moved to its parent.
+	EditorText *string `json:"editorText,omitempty"`
+}
+
+func (v *NavigateTreeResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "NavigateTreeResult", v.decodeFrom)
+}
+
+func (v *NavigateTreeResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out NavigateTreeResult
+	d := fieldDecoder{raw: raw, owner: "NavigateTreeResult"}
+	d.required("cancelled", &out.Cancelled)
+	d.optional("aborted", &out.Aborted)
+	d.optional("editorText", &out.EditorText)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type TokenUsage struct {
 	Input      int64 `json:"input"`
 	Output     int64 `json:"output"`
@@ -8967,6 +8992,38 @@ func (c Commands) Fork(ctx context.Context, p ForkCommand) (CancellationResult, 
 	var out CancellationResult
 	err := c.call(ctx, "fork", p, 0, &out)
 	return out, err
+}
+
+// NavigateTreeCommand holds the parameters of "navigate_tree".
+type NavigateTreeCommand struct {
+	EntryID string `json:"entryId"`
+	// Summarize the abandoned branch at the target.
+	Summarize *bool `json:"summarize,omitempty"`
+	// Instructions for the summarizer.
+	CustomInstructions *string `json:"customInstructions,omitempty"`
+}
+
+// NavigateTree sends "navigate_tree": Move the session's leaf to an entry in the same file, optionally summarizing the branch it leaves; refused while busy.
+func (c Commands) NavigateTree(ctx context.Context, p NavigateTreeCommand) (NavigateTreeResult, error) {
+	var out NavigateTreeResult
+	err := c.call(ctx, "navigate_tree", p, 600*time.Second, &out)
+	return out, err
+}
+
+// AbortBranchSummary sends "abort_branch_summary": Stop a running `navigate_tree` branch summary; the navigation is cancelled.
+func (c Commands) AbortBranchSummary(ctx context.Context) error {
+	return c.call(ctx, "abort_branch_summary", nil, 0, nil)
+}
+
+// SetLabelCommand holds the parameters of "set_label".
+type SetLabelCommand struct {
+	EntryID string  `json:"entryId"`
+	Label   *string `json:"label,omitempty"`
+}
+
+// SetLabel sends "set_label": Set or clear (omit `label`) an entry's label; the label entry reaches clients as an `entry` frame.
+func (c Commands) SetLabel(ctx context.Context, p SetLabelCommand) error {
+	return c.call(ctx, "set_label", p, 0, nil)
 }
 
 // GetBranchMessages sends "get_branch_messages": List user messages that can be branched from.

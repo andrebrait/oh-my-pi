@@ -170,6 +170,9 @@ type RpcCommandBody =
 	| { id?: string; type: "switch_session"; sessionPath: string; provider?: string; modelId?: string }
 	| { id?: string; type: "branch"; entryId: string }
 	| { id?: string; type: "fork"; entryId?: string }
+	| { id?: string; type: "navigate_tree"; entryId: string; summarize?: boolean; customInstructions?: string }
+	| { id?: string; type: "abort_branch_summary" }
+	| { id?: string; type: "set_label"; entryId: string; label?: string }
 	| { id?: string; type: "get_branch_messages" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
@@ -361,6 +364,15 @@ export interface RpcOpenSessionResult {
 	resumed: boolean;
 	sessionId: string;
 	sessionFile?: string;
+}
+
+/** `navigate_tree` result. */
+export interface RpcNavigateTreeResult {
+	cancelled: boolean;
+	/** Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved. */
+	aborted?: boolean;
+	/** The target was a user message: its text, for the editor (the leaf moved to its parent). */
+	editorText?: string;
 }
 
 /** `remove_queued_message` result. */
@@ -814,6 +826,9 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "branch"; success: true; data: { text: string; cancelled: boolean } }
 	| { id?: string; type: "response"; command: "fork"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "navigate_tree"; success: true; data: RpcNavigateTreeResult }
+	| { id?: string; type: "response"; command: "abort_branch_summary"; success: true }
+	| { id?: string; type: "response"; command: "set_label"; success: true }
 	| {
 			id?: string;
 			type: "response";

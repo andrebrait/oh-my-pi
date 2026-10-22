@@ -958,6 +958,15 @@ class BranchResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class NavigateTreeResult:
+    cancelled: bool
+    aborted: bool | None = None
+    """Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved."""
+    editor_text: str | None = None
+    """The target was a user message: its text, for the editor; the leaf moved to its parent."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class TokenUsage:
     input: int
     output: int
@@ -2501,6 +2510,15 @@ def parse_branch_result(value: object, path: str = "BranchResult") -> BranchResu
     )
 
 
+def parse_navigate_tree_result(value: object, path: str = "NavigateTreeResult") -> NavigateTreeResult:
+    payload = expect_object(value, path)
+    return NavigateTreeResult(
+        cancelled=required(payload, "cancelled", decode_bool, path),
+        aborted=optional(payload, "aborted", decode_bool, path),
+        editor_text=optional(payload, "editorText", decode_str, path),
+    )
+
+
 def parse_token_usage(value: object, path: str = "TokenUsage") -> TokenUsage:
     payload = expect_object(value, path)
     return TokenUsage(
@@ -4037,6 +4055,29 @@ class WireClient:
             params["entryId"] = entry_id
         return parse_cancellation_result(self._command("fork", params), "fork")
 
+    def navigate_tree(self, entry_id: str, *, summarize: bool | None = None, custom_instructions: str | None = None) -> NavigateTreeResult:
+        """Move the session's leaf to an entry in the same file, optionally summarizing the branch it leaves; refused while busy."""
+        params: dict[str, object] = {}
+        params["entryId"] = entry_id
+        if summarize is not None:
+            params["summarize"] = summarize
+        if custom_instructions is not None:
+            params["customInstructions"] = custom_instructions
+        return parse_navigate_tree_result(self._command("navigate_tree", params, timeout=600), "navigate_tree")
+
+    def abort_branch_summary(self) -> None:
+        """Stop a running `navigate_tree` branch summary; the navigation is cancelled."""
+        params: dict[str, object] = {}
+        self._command("abort_branch_summary", params)
+
+    def set_label(self, entry_id: str, *, label: str | None = None) -> None:
+        """Set or clear (omit `label`) an entry's label; the label entry reaches clients as an `entry` frame."""
+        params: dict[str, object] = {}
+        params["entryId"] = entry_id
+        if label is not None:
+            params["label"] = label
+        self._command("set_label", params)
+
     def get_branch_messages(self) -> tuple[BranchMessage, ...]:
         """List user messages that can be branched from."""
         params: dict[str, object] = {}
@@ -4471,6 +4512,7 @@ __all__ = [
     "ModelCost",
     "ModelCycleResult",
     "ModelInfo",
+    "NavigateTreeResult",
     "NegotiateProtocolResult",
     "NoticeEvent",
     "NotifyType",
@@ -4675,6 +4717,7 @@ __all__ = [
     "parse_model_cost",
     "parse_model_cycle_result",
     "parse_model_info",
+    "parse_navigate_tree_result",
     "parse_negotiate_protocol_result",
     "parse_notice_event",
     "parse_notification",

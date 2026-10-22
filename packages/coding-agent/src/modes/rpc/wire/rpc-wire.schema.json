@@ -683,6 +683,39 @@
 				"clientOmit": []
 			},
 			{
+				"name": "navigate_tree",
+				"doc": "Move the session's leaf to an entry in the same file, optionally summarizing the branch it leaves; refused while busy.",
+				"params": "NavigateTreeParams",
+				"result": "NavigateTreeResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": 600000,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "abort_branch_summary",
+				"doc": "Stop a running `navigate_tree` branch summary; the navigation is cancelled.",
+				"params": null,
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "set_label",
+				"doc": "Set or clear (omit `label`) an entry's label; the label entry reaches clients as an `entry` frame.",
+				"params": "SetLabelParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "get_branch_messages",
 				"doc": "List user messages that can be branched from.",
 				"params": null,
@@ -3492,6 +3525,25 @@
 			},
 			"required": [
 				"text",
+				"cancelled"
+			]
+		},
+		"NavigateTreeResult": {
+			"type": "object",
+			"properties": {
+				"cancelled": {
+					"type": "boolean"
+				},
+				"aborted": {
+					"type": "boolean",
+					"description": "Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved."
+				},
+				"editorText": {
+					"type": "string",
+					"description": "The target was a user message: its text, for the editor; the leaf moved to its parent."
+				}
+			},
+			"required": [
 				"cancelled"
 			]
 		},
@@ -7656,6 +7708,39 @@
 					"type": "string"
 				}
 			}
+		},
+		"NavigateTreeParams": {
+			"type": "object",
+			"properties": {
+				"entryId": {
+					"type": "string"
+				},
+				"summarize": {
+					"type": "boolean",
+					"description": "Summarize the abandoned branch at the target."
+				},
+				"customInstructions": {
+					"type": "string",
+					"description": "Instructions for the summarizer."
+				}
+			},
+			"required": [
+				"entryId"
+			]
+		},
+		"SetLabelParams": {
+			"type": "object",
+			"properties": {
+				"entryId": {
+					"type": "string"
+				},
+				"label": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"entryId"
+			]
 		},
 		"GetBranchMessagesResult": {
 			"type": "object",
