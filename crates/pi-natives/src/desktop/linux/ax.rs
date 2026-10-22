@@ -278,7 +278,7 @@ impl AtSpiAx {
 }
 
 fn atspi_window_id(frame: &ObjectRefOwned) -> String {
-	let name = frame.name().map(ToString::to_string).unwrap_or_default();
+	let name = frame.name().map_or_default(ToString::to_string);
 	format!("atspi:{name}:{}", frame.path())
 }
 
@@ -491,6 +491,8 @@ impl AxBackend for AtSpiAx {
 				bounds,
 				actions,
 				child_count,
+				identity: None,
+				partial: false,
 			})
 		})
 	}

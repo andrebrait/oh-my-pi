@@ -109,6 +109,8 @@ When assistant updates arrive and rules exist:
 - for tools exposing `matcherEntries(args)`, the streamed payload is projected per touched file into `{ path, digest }` entries (added lines only, same-path sections/hunks merged); each entry is checked in isolation via `checkSnapshot(entry.digest, perFileContext)` under its own file path and stream key (`<toolcall>#<path>`), so a path-scoped rule like `tool:edit(*.ts)` never fires on text belonging to a sibling Markdown hunk in a multi-file payload
 - otherwise, for tools exposing a combined `matcherDigest` (edit/write), replace the scoped buffer with the reconstructed source snapshot and call `checkSnapshot(snapshot, matchContext)`; otherwise append the delta into the scoped manager buffer and call `checkDelta(delta, matchContext)` (synchronous regex matching either way)
 - `checkDelta` skips buffering entirely for text/thinking sources when no registered rule allows that source (`canMatchText`/`canMatchThinking`), so unmatched prose/thinking deltas pay no buffering cost
+- matching is incremental: a condition that cannot cross a newline (no `s` flag, nothing in it matches `\n`) is re-tested only from the start of the line holding the previous buffer end, so it gives the full-scan result on every delta; a condition that can span lines is re-scanned over the whole buffer only while it is ≤4 KB or once it has grown 25% since the last full scan
+- `text_end`, `thinking_end`, and `toolcall_end` run a final whole-buffer check (`TtsrCheckOptions.final`), so a cross-line match deferred by the growth throttle is still caught before the block closes; `checkDelta` defaults to `final: false`, `checkSnapshot` to `final: true` (one-shot callers such as the CLI stay exact)
 
 AST matching does not run in the streaming listener. The awaited `beforeToolCall` hook checks the finalized, validated execution arguments using the same per-file or combined source snapshot. An interrupt blocks the tool before its side effects, marks the assistant turn aborted, and follows the existing TTSR injection/retry path; `never` mode allows execution and attaches its reminder to the result. Streaming regex matching remains synchronous.
 
@@ -174,6 +176,8 @@ Non-interrupting matches split by `matchContext.source`:
   {{content}}
   </system-reminder>
   ```
+
+  The opening line depends on where the rule comes from: a bundled `builtin-defaults` rule says a built-in style rule matched and asks the model to check what it wrote against the rule, exceptions included, and fix only a real violation; every other rule says a user-defined rule matched and must be complied with.
 
 - **Bridged AgentTool calls (Cursor exec handlers, eval).** These dispatches bypass the agent loop, so `afterToolCall` never runs for them. Finalized inner calls are checked at the `ExtensionToolWrapper` boundary, which passes the call's tool context to `TtsrCoordinator.afterBridgedToolCall`. When that context carries an `addAdditionalContext` sink, the reminder is delivered through it as passive context (the Cursor exec bridge installs a sink whenever the session supplies a tool context, and delivers after its buffered results on the next provider request) and the bridged result stays untouched. A bridged call with no sink has no trusted channel, so the reminder is prepended to its result as a leading text block instead; eval-bridged calls take this fallback today. Prelude host calls (`browser.*`, `computer.*`, `tab.run`) are not AgentTool dispatches and stay outside this path.
 
@@ -298,7 +302,7 @@ A rule with `question` is judged: its natural-language question goes to the `jud
 
 - A yes-probability ≥ 0.7 flags the rule. Flagged rules pass through `TtsrManager.claim()`, which drops rules another verdict already claimed or that the repeat policy blocks, and marks the rest injected in memory; one rule flagged by several outputs is therefore delivered once.
 - Verdicts arriving after a session replacement (`/new`, session switch) are dropped.
-- Survivors emit `ttsr_triggered` and are rendered with `ttsr-warning.md` into a hidden `ttsr-injection` custom message (`details.rules`), sent with `deliverAs: "aside"`: mid-run it joins the next step without interrupting; on an idle session it starts a turn. Its `message_end` persists the `ttsr_injection` entry.
+- Survivors emit `ttsr_triggered` and are rendered with `ttsr-warning.md` into a hidden `ttsr-injection` custom message (`details.rules`), sent with `deliverAs: "aside"`: mid-run it joins the next step without interrupting (a running interruptible `wait` ends); on an idle session it starts a turn. Its `message_end` persists the `ttsr_injection` entry.
 - The session's `onBeforeYield` hook awaits in-flight judgments (up to 5s) before the agent loop drains asides and stops, so a warning about the final reply or last tool call lands in the same run. Later verdicts still arrive as asides.
 - Judge failures (no credentials, timeouts, parse errors) are logged and deliver nothing.
 
