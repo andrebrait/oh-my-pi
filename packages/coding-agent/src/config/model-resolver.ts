@@ -26,6 +26,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ModelRoleLookup } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import type { Api, Effort, KnownProvider, Model, ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { resolveBareVariantSelector, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { collapseVariantId, stripThinkingVariantSuffix } from "@oh-my-pi/pi-catalog/compat/taxonomy";
@@ -38,7 +39,6 @@ import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
-import MODEL_PRIO from "../priority.json" with { type: "json" };
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -67,6 +67,8 @@ function isKnownProvider(provider: string): provider is KnownProvider {
 
 /**
  * Pick the first auto-selectable provider-default model in availability order.
+ * A provider's default is the model its discovery marks as the account default
+ * (`isProviderDefault`), else its bundled `default-model`.
  *
  * When `hasConcreteCredential` is supplied and at least one available model
  * belongs to a provider with a concrete credential, the candidate pool is
@@ -102,18 +104,18 @@ export function pickDefaultAvailableModel(
 					});
 					return concrete.length > 0 ? concrete : autoSelectable;
 				})();
-	const firstDefault = models.find(
-		model => isKnownProvider(model.provider) && DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id,
+	const accountDefaultProviders = new Set(
+		models.filter(model => model.isProviderDefault).map(model => model.provider),
 	);
+	const isDefaultForProvider = (model: Model<Api>): boolean =>
+		accountDefaultProviders.has(model.provider)
+			? model.isProviderDefault === true
+			: isKnownProvider(model.provider) && DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id;
+	const firstDefault = models.find(isDefaultForProvider);
 	if (!firstDefault) return models[0];
 
 	const providerPriority = buildModelProviderPriorityRank();
-	const sharedDefaultMatches = models.filter(
-		model =>
-			model.id === firstDefault.id &&
-			isKnownProvider(model.provider) &&
-			DEFAULT_MODEL_PER_PROVIDER[model.provider] === model.id,
-	);
+	const sharedDefaultMatches = models.filter(model => model.id === firstDefault.id && isDefaultForProvider(model));
 	return [...sharedDefaultMatches].sort((a, b) => {
 		const aRank = providerPriority.get(a.provider.toLowerCase()) ?? Number.POSITIVE_INFINITY;
 		const bRank = providerPriority.get(b.provider.toLowerCase()) ?? Number.POSITIVE_INFINITY;
@@ -1102,19 +1104,21 @@ function shouldInheritDefaultBeforePriority(role: ModelRole): boolean {
 }
 
 /**
- * Roles that have no priority.json chain of their own reuse another role's
+ * Roles that have no catalog default chain (`roleDefaultModels()`) reuse another role's
  * list. The advisor — a second-opinion reviewer — uses a configured `slow`
  * role before that list, but never inherits the primary's model when `slow`
  * is unset, so it stays a distinct strong model out of the box. The `tiny`
  * role — the override for online title/classifier tasks — resolves through
  * `smol` so it picks the same configured, inherited, or built-in fast model.
  * The `memory` role first reuses a configured/effective `tiny` role, then the
- * same `smol` priority list.
+ * same `smol` priority list. The `widget` role — the author of background-job
+ * widget specs — resolves exactly like `smol` until configured on its own.
  */
-const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, keyof typeof MODEL_PRIO>> = {
+const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, string>> = {
 	advisor: "slow",
 	memory: "smol",
 	tiny: "smol",
+	widget: "smol",
 };
 
 interface ConfiguredRoleFallback {
@@ -1127,6 +1131,7 @@ const ROLE_CONFIGURED_FALLBACK: Partial<Record<ModelRole, ConfiguredRoleFallback
 	advisor: { role: "slow", configuredOnly: true },
 	memory: { role: "tiny", configuredOnly: false },
 	tiny: { role: "smol", configuredOnly: false },
+	widget: { role: "smol", configuredOnly: false },
 };
 
 function hasOwnKey<T extends object>(value: T, key: PropertyKey): key is keyof T {
@@ -1137,12 +1142,13 @@ function hasOwnKey<T extends object>(value: T, key: PropertyKey): key is keyof T
 export function rolePriorityDefaults(role: string): string[] {
 	const alias = hasOwnKey(ROLE_PRIORITY_ALIAS, role) ? ROLE_PRIORITY_ALIAS[role] : undefined;
 	const key = alias ?? role;
-	return hasOwnKey(MODEL_PRIO, key) ? normalizeModelPatternList(MODEL_PRIO[key]) : [];
+	const defaults = roleDefaultModels();
+	return hasOwnKey(defaults, key) ? normalizeModelPatternList([...defaults[key]]) : [];
 }
 
 /** Resolve aliases inside a configured pattern list without leaking cycles to model matching. */
 function resolveNestedRolePatterns(
-	value: string,
+	value: string | string[],
 	roleDefaults: string[],
 	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
@@ -1205,7 +1211,11 @@ function resolveConfiguredRolePattern(
 
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
-	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
+	// Built-in defaults chain to other roles (judge: `@tiny`, `@smol`, `@default`). Left unexpanded, the
+	// matcher reads them as literal ids and `@default` fuzzy-matches Vertex ids like `claude-opus-4-8@default`.
+	const roleDefaults = isModelRole(role)
+		? resolveNestedRolePatterns(rolePriorityDefaults(role), [], settings, visited)
+		: [];
 	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
 	const fallbackPatterns =
 		configured ||
@@ -1739,6 +1749,16 @@ export async function resolveModelOverrideWithAuthFallback(
 	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
 		return { ...primary, authFallbackUsed: false };
+	}
+	// The ordered override list is the caller's own fallback chain: an
+	// authenticated later entry beats the parent's model.
+	for (const pattern of resolveConfiguredModelPatterns(modelPatterns, settings)) {
+		const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
+		if (!candidate.model || modelsAreEqual(candidate.model, primary.model)) continue;
+		const candidateKey = await modelRegistry.getApiKey(candidate.model, sessionId);
+		if (candidateKey === kNoAuth || isAuthenticated(candidateKey)) {
+			return { ...candidate, authFallbackUsed: false };
+		}
 	}
 
 	const fallback = resolveModelOverride([parentActiveModelPattern], lookupRegistry, settings);
@@ -2487,7 +2507,7 @@ export async function findSmolModel(
 	}
 
 	// 2. Try priority chain
-	for (const pattern of MODEL_PRIO.smol) {
+	for (const pattern of roleDefaultModels().smol) {
 		// Try exact match with provider prefix
 		const providerMatch = availableModels.find(m => `${m.provider}/${m.id}`.toLowerCase() === pattern);
 		if (providerMatch) return providerMatch;
@@ -2527,7 +2547,7 @@ export async function findSlowModel(
 	}
 
 	// 2. Try priority chain
-	for (const pattern of MODEL_PRIO.slow) {
+	for (const pattern of roleDefaultModels().slow) {
 		// Try exact match first
 		const exactMatch = parseModelPattern(pattern, availableModels, undefined).model;
 		if (exactMatch) return exactMatch;
