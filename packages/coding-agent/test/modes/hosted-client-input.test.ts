@@ -919,6 +919,8 @@ interface Tap {
 	/** Keep what the host writes to the client from reaching it, until {@link Tap.releaseReplies}. */
 	holdReplies(): void;
 	releaseReplies(): void;
+	/** Cut every open connection, as a lost transport would; new connections still pass through. */
+	drop(): void;
 	close(): void;
 }
 
@@ -992,6 +994,9 @@ async function tapHost(entry: SessionHostEntry): Promise<Tap> {
 		releaseReplies: () => {
 			holding = false;
 			for (const write of held.splice(0)) write();
+		},
+		drop: () => {
+			for (const socket of sockets) socket.destroy();
 		},
 		close: () => {
 			server.close();
@@ -1746,5 +1751,29 @@ describe("a hosted client's idle activity", () => {
 			// The input detaches in teardown, and that needs the answers it is owed.
 			tap.releaseReplies();
 		}
+	}, 30_000);
+
+	it("tells the host again that nothing is being composed after a reconnect, so it can recap", async () => {
+		const { host, side } = await startRecapHost();
+		const tap = await tapHost(await fixture.entry(host));
+		// After the input has left through it, and before the fixture ends.
+		hostStops.push(async () => tap.close());
+		const input = await HostedInput.open();
+		await input.connect(host, tap.entry);
+		await until(() => tap.acceptedReports() === 1, "the host to accept the first report");
+
+		// The new connection starts with no report: until the view says otherwise, it may hold a draft.
+		tap.drop();
+		await until(() => input.hostLink.reconnecting, "the reconnect to start");
+		await until(() => !input.hostLink.reconnecting, "the reconnect to finish");
+		await until(() => tap.acceptedReports() === 2, "the host to accept a report on the new connection");
+
+		vi.useFakeTimers();
+		const recapped = nextIdleRecap(host.session);
+		await runTurn(host.session);
+		expect(await drive(recapped)).toBe(RECAP);
+		expect(side.calls).toHaveLength(1);
+		expect(input.errors).toEqual([]);
+		expect(input.closed).toEqual([]);
 	}, 30_000);
 });

@@ -252,6 +252,8 @@
 - The `computer` tool no longer takes over your screen for macOS drags and holds on sliders, scroll bars, splitters and steppers, modified clicks, right-clicks and scrolls; they run in the background ([#15185](https://github.com/can1357/oh-my-pi/pull/15185) by [@will-bogusz](https://github.com/will-bogusz))
 - `RpcClient.steer()`, `followUp()`, and `setThinkingLevel()` now reject with `RpcCommandError` when the server reports a failure instead of resolving silently ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
 - Idle recap and idle compaction now run from one session-owned scheduler. Clearing a draft re-arms the recap and compaction that the stretch still owes, and a view that is returned to receives the recap it still owed; the former per-terminal timers dropped both ([can1357/oh-my-pi#14468](https://github.com/can1357/oh-my-pi/pull/14468) by [@andrebrait](https://github.com/andrebrait)).
+- RPC: delta `message_update` frames (`messageUpdates: "delta"`) now carry the block on start/end events and the message on a restart, so a client can rebuild the streaming message; session-host clients can select the projection in their `hello` (`capabilities.messageUpdates`), which also covers a resume's replay ([#16220](https://github.com/can1357/oh-my-pi/pull/16220) by [@andrebrait](https://github.com/andrebrait))
+- Hosted sessions stream replies as deltas and rebuild them in the client, so a long reply no longer sends the whole message again with every update ([#16220](https://github.com/can1357/oh-my-pi/pull/16220) by [@andrebrait](https://github.com/andrebrait))
 
 ### Changed
 

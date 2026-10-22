@@ -206,6 +206,8 @@ export interface HostProxy {
 	mute(): void;
 	/** What {@link mute} kept from the host. */
 	muted(): string;
+	/** Every frame line the host sent through the proxy, over every connection, in arrival order. */
+	received(): string[];
 	close(): void;
 }
 
@@ -225,6 +227,7 @@ export async function startProxy(
 	let mode: "accept" | "refuse" | "hold" = "accept";
 	let refused = 0;
 	let muted = "";
+	let downstream = "";
 	const server = net.createServer(client => {
 		if (mode === "refuse") {
 			refused++;
@@ -239,6 +242,7 @@ export async function startProxy(
 		}
 		const upstream = net.connect(entry.endpoint);
 		clients.add(client);
+		upstream.on("data", (chunk: Buffer) => void (downstream += chunk.toString("utf8")));
 		if (options.refuseExit === undefined) {
 			client.pipe(upstream);
 			upstreams.set(client, upstream);
@@ -270,6 +274,7 @@ export async function startProxy(
 			mode = "refuse";
 		},
 		refused: (): number => refused,
+		received: (): string[] => downstream.split("\n").filter(line => line.length > 0),
 		hold: (): void => {
 			mode = "hold";
 		},

@@ -7,16 +7,32 @@ import type { AssistantMessageEvent } from "@oh-my-pi/pi-ai";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type {
 	RpcAgentSessionEventFrame,
-	RpcDeltaMessageUpdateFrame,
+	RpcDeltaAssistantMessageEvent,
 	RpcMessageUpdates,
 	RpcProjectedSessionEventFrame,
 } from "./rpc-types";
 
-/** Drops the accumulated snapshot a streaming event carries; `done` and `error` have none. */
-function withoutPartial(event: AssistantMessageEvent): RpcDeltaMessageUpdateFrame["assistantMessageEvent"] {
-	if (!("partial" in event)) return event;
-	const { partial: _partial, ...increment } = event;
-	return increment;
+/** Drops the accumulated snapshot a streaming event carries, keeping what a client needs to rebuild it; `done` and `error` have none. */
+function toDelta(event: AssistantMessageEvent): RpcDeltaAssistantMessageEvent {
+	switch (event.type) {
+		case "done":
+		case "error":
+			return event;
+		case "start": {
+			const { partial, ...rest } = event;
+			return { ...rest, message: partial };
+		}
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta": {
+			const { partial: _partial, ...increment } = event;
+			return increment;
+		}
+		default: {
+			const { partial, ...rest } = event;
+			return { ...rest, block: partial.content[event.contentIndex] };
+		}
+	}
 }
 
 /**
@@ -89,7 +105,7 @@ export class RpcSessionEventForwarder {
 			this.#output({
 				...frame,
 				message: { role: frame.message.role },
-				assistantMessageEvent: withoutPartial(frame.assistantMessageEvent),
+				assistantMessageEvent: toDelta(frame.assistantMessageEvent),
 			});
 			return;
 		}

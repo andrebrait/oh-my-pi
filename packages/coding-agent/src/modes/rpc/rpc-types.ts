@@ -6,7 +6,14 @@
  */
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	Effort,
+	ImageContent,
+	Model,
+	ToolExample,
+} from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { SkillDiagnosticAnalysisRecord } from "../../extensibility/skill-diagnostic-controller";
@@ -46,7 +53,10 @@ export type {
 // RPC Commands (stdin)
 // ============================================================================
 
-/** `set_event_filter` projection: `"full"` keeps both accumulated snapshots in `message_update`, `"delta"` sends only the increment. */
+/**
+ * `message_update` projection (`set_event_filter`, or a socket hello's capabilities): `"full"` keeps both accumulated
+ * snapshots, `"delta"` replaces them with the block a start/end event touches (see {@link RpcDeltaAssistantMessageEvent}).
+ */
 export type RpcMessageUpdates = "full" | "delta";
 
 /**
@@ -439,7 +449,8 @@ export interface RpcHelloFrame {
 	token: string;
 	protocolVersion: 1 | 2;
 	client: { kind: string; label?: string };
-	capabilities: { ui: boolean };
+	/** `messageUpdates` sets the connection's `message_update` projection before `attached`/`resumed`; absent or unknown = `"full"`. */
+	capabilities: { ui: boolean; messageUpdates?: RpcMessageUpdates };
 	/** Ignored, so the client gets `attached`, unless `hostId` names this host. */
 	resume?: { hostId: string; epoch: number; lastSeq: number };
 }
@@ -924,14 +935,31 @@ export type RpcMessageEventType = "message_start" | "message_update" | "message_
 export type RpcMessageEventFrame = Extract<AgentSessionEvent, { type: RpcMessageEventType }> & { messageId: string };
 
 type WithoutPartial<T> = T extends unknown ? Omit<T, "partial"> : never;
+type DeltaOf<Type extends AssistantMessageEvent["type"]> = WithoutPartial<
+	Extract<AssistantMessageEvent, { type: Type }>
+>;
 
-/** Raw-protocol opt-in projection; terminal subtype fields are preserved. */
+/**
+ * `assistantMessageEvent` of a delta `message_update`: `*_delta` carries only the increment, every other block event
+ * the block it opened or closed (`partial.content[contentIndex]`), and a re-`start` the whole message it restarts from.
+ */
+export type RpcDeltaAssistantMessageEvent =
+	| DeltaOf<"text_delta" | "thinking_delta" | "toolcall_delta">
+	| (DeltaOf<
+			"text_start" | "text_end" | "thinking_start" | "thinking_end" | "toolcall_start" | "toolcall_end" | "image_end"
+	  > & {
+			block: AssistantMessage["content"][number];
+	  })
+	| (DeltaOf<"start"> & { message: AssistantMessage })
+	| Extract<AssistantMessageEvent, { type: "done" | "error" }>;
+
+/** Opt-in projection (`messageUpdates: "delta"`): enough to rebuild the message client-side; terminal subtypes pass through. */
 export type RpcDeltaMessageUpdateFrame = Omit<
 	Extract<RpcMessageEventFrame, { type: "message_update" }>,
 	"message" | "assistantMessageEvent"
 > & {
 	message: Pick<AgentMessage, "role">;
-	assistantMessageEvent: WithoutPartial<AssistantMessageEvent>;
+	assistantMessageEvent: RpcDeltaAssistantMessageEvent;
 };
 
 /**

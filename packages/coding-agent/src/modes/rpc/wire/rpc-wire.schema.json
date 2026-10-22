@@ -2289,7 +2289,7 @@
 				"delta"
 			],
 			"type": "string",
-			"description": "`set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`."
+			"description": "`message_update` projection (`set_event_filter`, or a socket hello's capabilities): `delta` replaces the accumulated snapshots with the block a start/end event touches."
 		},
 		"TodoStatus": {
 			"enum": [
@@ -5693,6 +5693,10 @@
 				"ui": {
 					"type": "boolean",
 					"description": "Receive extension UI requests."
+				},
+				"messageUpdates": {
+					"$ref": "#/$defs/MessageUpdates",
+					"description": "`message_update` projection from the first frame on, including a resume's replay; absent or unknown = `full`. A later `set_event_filter` replaces it."
 				}
 			},
 			"required": [

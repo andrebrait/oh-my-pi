@@ -2680,7 +2680,7 @@ impl CacheWarmingMode {
 	}
 }
 
-/// `set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`.
+/// `message_update` projection (`set_event_filter`, or a socket hello's capabilities): `delta` replaces the accumulated snapshots with the block a start/end event touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MessageUpdates {
 	#[serde(rename = "full")]
@@ -4751,6 +4751,9 @@ pub struct ClientIdentity {
 pub struct ClientCapabilities {
 	/// Receive extension UI requests.
 	pub ui: bool,
+	/// `message_update` projection from the first frame on, including a resume's replay; absent or unknown = `full`. A later `set_event_filter` replaces it.
+	#[serde(rename = "messageUpdates", default, skip_serializing_if = "Option::is_none")]
+	pub message_updates: Option<MessageUpdates>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessageEvent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent } from "@oh-my-pi/pi-ai";
 import { MAX_RPC_FRAME_BYTES, RpcFrameEncoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { RpcMessageIdStamper, RpcSessionEventForwarder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-events";
 import type { RpcProjectedSessionEventFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -72,14 +72,71 @@ describe("RpcSessionEventForwarder", () => {
 			const { partial: _partial, ...expected } = assistantMessageEvent as AssistantMessageEvent & {
 				partial?: unknown;
 			};
-			expect(frames.at(-1)).toEqual({
+			expect(frames.at(-1)).toMatchObject({
 				...event,
 				message: { role: "assistant" },
 				assistantMessageEvent: expected,
 				messageId: "msg-1",
 			});
+			expect(frames.at(-1)).toHaveProperty("message", { role: "assistant" });
+			expect(frames.at(-1)).not.toHaveProperty("assistantMessageEvent.partial");
 			expect(JSON.stringify(event)).toBe(before);
 		}
+	});
+
+	test("a delta stream carries each block once, at its start and end", () => {
+		const message = makeAssistantMessage();
+		const text = { type: "text" as const, text: "hello", textSignature: "sig-1" };
+		const thinking = { type: "thinking" as const, thinking: "hmm", thinkingSignature: "sig-2" };
+		const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
+		const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "file" } };
+		message.content = [text, thinking, image, toolCall] as unknown as typeof message.content;
+		const frames: RpcProjectedSessionEventFrame[] = [];
+		const { forwarder, forward } = eventPipeline(frame => frames.push(frame));
+		forwarder.setFilter(null, "delta");
+		const send = (assistantMessageEvent: AssistantMessageEvent) =>
+			forward({ type: "message_update", message, assistantMessageEvent });
+		send({ type: "start", partial: message });
+		send({ type: "text_start", contentIndex: 0, partial: message });
+		send({ type: "text_delta", contentIndex: 0, delta: "hello", partial: message });
+		send({ type: "text_end", contentIndex: 0, content: "hello", partial: message });
+		send({ type: "thinking_start", contentIndex: 1, partial: message });
+		send({ type: "thinking_delta", contentIndex: 1, delta: "hmm", partial: message });
+		send({ type: "thinking_end", contentIndex: 1, content: "hmm", partial: message });
+		send({ type: "image_end", contentIndex: 2, content: image, partial: message });
+		send({ type: "toolcall_start", contentIndex: 3, partial: message });
+		send({ type: "toolcall_delta", contentIndex: 3, delta: "{}", partial: message });
+		send({ type: "toolcall_end", contentIndex: 3, toolCall, partial: message });
+		const events = frames.flatMap(frame => (frame.type === "message_update" ? [frame.assistantMessageEvent] : []));
+
+		expect(events).toEqual([
+			{ type: "start", message },
+			{ type: "text_start", contentIndex: 0, block: text },
+			{ type: "text_delta", contentIndex: 0, delta: "hello" },
+			{ type: "text_end", contentIndex: 0, content: "hello", block: text },
+			{ type: "thinking_start", contentIndex: 1, block: thinking },
+			{ type: "thinking_delta", contentIndex: 1, delta: "hmm" },
+			{ type: "thinking_end", contentIndex: 1, content: "hmm", block: thinking },
+			{ type: "image_end", contentIndex: 2, content: image, block: image },
+			{ type: "toolcall_start", contentIndex: 3, block: toolCall },
+			{ type: "toolcall_delta", contentIndex: 3, delta: "{}" },
+			{ type: "toolcall_end", contentIndex: 3, toolCall, block: toolCall },
+		]);
+		for (const event of events) expect(event).not.toHaveProperty("partial");
+	});
+
+	test("full projection is unchanged", () => {
+		const message = makeAssistantMessage();
+		const frames: RpcProjectedSessionEventFrame[] = [];
+		const { forward } = eventPipeline(frame => frames.push(frame));
+		const event: AgentSessionEvent = {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ok", partial: message },
+		};
+		forward(event);
+		expect(frames).toEqual([{ ...event, messageId: "msg-1" }]);
+		expect(JSON.stringify(frames[0])).toBe(JSON.stringify({ ...event, messageId: "msg-1" }));
 	});
 
 	test("switching projection mid-message keeps identity and omission restores byte-identical full updates", () => {
@@ -137,6 +194,51 @@ describe("RpcSessionEventForwarder", () => {
 		forwarder.setFilter(null, "full");
 		forward(event);
 		expect(JSON.parse(lines[0]).type).toBe("rpc_chunk");
+	});
+
+	test("delta streaming stays linear in the message size", () => {
+		// The spec's burst probe: one 100 KB message in 2000 text blocks, 6000 `message_update`s.
+		const blockCount = 2000;
+		const text = "x".repeat(50);
+		const payload = blockCount * text.length;
+		const bytes = { full: 0, delta: 0 };
+		const encoders = { full: new RpcFrameEncoder(), delta: new RpcFrameEncoder() };
+		encoders.full.setProtocolVersion(2);
+		encoders.delta.setProtocolVersion(2);
+		const stamper = new RpcMessageIdStamper();
+		const full = new RpcSessionEventForwarder(frame => {
+			for (const line of encoders.full.encodeFrames(frame)) bytes.full += Buffer.byteLength(line);
+		});
+		const delta = new RpcSessionEventForwarder(frame => {
+			for (const line of encoders.delta.encodeFrames(frame)) bytes.delta += Buffer.byteLength(line);
+		});
+		delta.setFilter(null, "delta");
+		let updates = 0;
+		const send = (assistantMessageEvent: AssistantMessageEvent & { partial: AssistantMessage }) => {
+			const stamped = stamper.stamp({
+				type: "message_update",
+				message: assistantMessageEvent.partial,
+				assistantMessageEvent,
+			});
+			full.forward(stamped);
+			delta.forward(stamped);
+			updates++;
+		};
+		const base = makeAssistantMessage();
+		stamper.stamp({ type: "message_start", message: { ...base, content: [] } });
+		// Snapshots as the agent loop makes them: a new message per event, finished blocks shared by reference.
+		let content: AssistantMessage["content"] = [];
+		for (let contentIndex = 0; contentIndex < blockCount; contentIndex++) {
+			content = [...content, { type: "text", text: "" }];
+			send({ type: "text_start", contentIndex, partial: { ...base, content } });
+			content = content.with(contentIndex, { type: "text", text });
+			send({ type: "text_delta", contentIndex, delta: text, partial: { ...base, content } });
+			send({ type: "text_end", contentIndex, content: text, partial: { ...base, content } });
+		}
+
+		expect(updates).toBe(6000);
+		expect(bytes.delta).toBeLessThanOrEqual(3 * payload + updates * 400);
+		expect(bytes.full).toBeGreaterThanOrEqual(100 * bytes.delta);
 	});
 	test("keeps one messageId per message while an external record nests inside a streaming reply", () => {
 		const frames: RpcProjectedSessionEventFrame[] = [];

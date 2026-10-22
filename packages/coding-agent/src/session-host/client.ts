@@ -8,7 +8,7 @@ import type { Subprocess } from "bun";
 import { ipcDuplex } from "../ipc/ipc-duplex";
 import { ensurePrivateDir, pidAlive } from "../ipc/private-endpoint";
 import { type RpcAgentProcess, RpcClient } from "../modes/rpc/rpc-client";
-import type { RpcHelloFrame } from "../modes/rpc/rpc-types";
+import type { RpcHelloFrame, RpcMessageUpdates } from "../modes/rpc/rpc-types";
 import { resolveCliEntryCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
 import {
 	listSessionHosts,
@@ -26,6 +26,8 @@ export interface ConnectSessionHostOptions {
 	entry: Pick<SessionHostEntry, "endpoint" | "token">;
 	client: { kind: string; label?: string };
 	ui: boolean;
+	/** `message_update` projection from the first frame on (replay included); default `"full"`. */
+	messageUpdates?: RpcMessageUpdates;
 	/** From the `attached` frame (`hostId`) and the last `seq`/`epoch` seen; a mismatched host answers with a snapshot. */
 	resume?: { hostId: string; epoch: number; lastSeq: number };
 	/** Dial deadline; default 3 s. A Windows pipe whose instances are all busy is waited out until it passes. */
@@ -46,7 +48,7 @@ export async function connectSessionHost(options: ConnectSessionHostOptions): Pr
 		token: options.entry.token,
 		protocolVersion: 2,
 		client: options.client,
-		capabilities: { ui: options.ui },
+		capabilities: { ui: options.ui, messageUpdates: options.messageUpdates },
 		resume: options.resume,
 	};
 	socket.write(`${JSON.stringify(hello)}\n`);

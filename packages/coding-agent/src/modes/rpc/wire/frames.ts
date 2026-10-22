@@ -217,7 +217,13 @@ export const frameDefs = {
 		"Socket clients: client presence changed.",
 	),
 	ClientIdentity: { kind: "string", "label?": "string" },
-	ClientCapabilities: { ui: doc("boolean", "Receive extension UI requests.") },
+	ClientCapabilities: {
+		ui: doc("boolean", "Receive extension UI requests."),
+		"messageUpdates?": doc(
+			"MessageUpdates",
+			"`message_update` projection from the first frame on, including a resume's replay; absent or unknown = `full`. A later `set_event_filter` replaces it.",
+		),
+	},
 	ResumePoint: { hostId: "string", epoch: "number.integer", lastSeq: "number.integer" },
 	HelloFrame: doc(
 		{

@@ -760,6 +760,36 @@ describe("session host", () => {
 		await stopWith(host, [a, same, foreign]);
 	});
 
+	it("applies a hello's messageUpdates to the replay that follows, and treats an unknown value as full", async () => {
+		const host = await startHost();
+		const a = await rawClient({});
+		const attached = await a.next(isHandshake);
+		a.write({ id: "p", type: "prompt", message: "hi" });
+		await a.next(f => f.type === "agent_end");
+		const isUpdate = (f: Record<string, unknown>): boolean => f.type === "message_update";
+		expect(a.frames.filter(isUpdate).length).toBeGreaterThan(0);
+		expect(a.frames.filter(isUpdate).every(f => isRecord(f.message) && "content" in f.message)).toBe(true);
+
+		const b = await rawClient({
+			capabilities: { ui: false, messageUpdates: "delta" },
+			resume: { hostId: host.hostId, epoch: attached.epoch, lastSeq: attached.seq },
+		});
+		expect((await b.next(isHandshake)).type).toBe("resumed");
+		await b.next(f => f.type === "agent_end");
+		const replayed = b.frames.filter(isUpdate);
+		expect(replayed).toHaveLength(a.frames.filter(isUpdate).length);
+		for (const frame of replayed) expect(frame.message).toEqual({ role: "assistant" });
+
+		const c = await rawClient({
+			capabilities: { ui: false, messageUpdates: "sparse" },
+			resume: { hostId: host.hostId, epoch: attached.epoch, lastSeq: attached.seq },
+		});
+		expect((await c.next(isHandshake)).type).toBe("resumed");
+		await c.next(f => f.type === "agent_end");
+		expect(c.frames.filter(isUpdate)).toEqual(a.frames.filter(isUpdate));
+		await stopWith(host, [a, b, c]);
+	});
+
 	it("gives an RpcClient the seq of the last frame it decoded, from which a resume replays nothing", async () => {
 		const host = await startHost();
 		const client = await attachClient(host);

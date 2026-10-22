@@ -378,7 +378,7 @@ export type QueuedMessageQueue = "steering" | "followUp";
 
 export type CacheWarmingMode = "off" | "streaming" | "idle";
 
-/** `set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`. */
+/** `message_update` projection (`set_event_filter`, or a socket hello's capabilities): `delta` replaces the accumulated snapshots with the block a start/end event touches. */
 export type MessageUpdates = "full" | "delta";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
@@ -1423,6 +1423,8 @@ export interface ClientIdentity {
 export interface ClientCapabilities {
 	/** Receive extension UI requests. */
 	ui: boolean;
+	/** `message_update` projection from the first frame on, including a resume's replay; absent or unknown = `full`. A later `set_event_filter` replaces it. */
+	messageUpdates?: MessageUpdates;
 }
 
 export interface ResumePoint {
