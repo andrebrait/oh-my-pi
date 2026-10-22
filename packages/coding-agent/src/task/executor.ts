@@ -4076,6 +4076,8 @@ export interface FollowUpTurnOptions {
 	id: string;
 	/** Agent definition the session was originally spawned with (drives progress labels + finalize). */
 	agent: AgentDefinition;
+	/** Definition name reported as the `subagent_stop` event's `agent_type`; see {@link IrcWakeTurnMonitorOptions.agentType}. */
+	agentType?: string;
 	/** The follow-up message; sent as the turn's user prompt (with {@link restore}, only the run's label). */
 	message: string;
 	/**
@@ -4237,7 +4239,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		const stopHook = new SubagentStopHook(
 			{
 				agentId: id,
-				agentType: agent.name,
+				agentType: options.agentType ?? agent.name,
 				parentSessionId: options.parentSessionId,
 				parentSessionFile: options.parentSessionFile,
 			},
