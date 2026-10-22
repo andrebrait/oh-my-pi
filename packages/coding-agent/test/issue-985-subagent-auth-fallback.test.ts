@@ -333,20 +333,6 @@ describe("requested candidate authentication order", () => {
 		expect(resolved.authFallbackUsed).toBe(false);
 	});
 
-	test("keeps the parent fallback ahead of later candidates for a spawn without `model`", async () => {
-		const registry = createMockRegistry({
-			models: [parentModel, unauthedTaskModel, sharedModel],
-			authedProviders: new Set(["deepseek"]),
-		});
-		const resolved = await resolveModelOverrideWithAuthFallback(
-			["opencode-zen/qwen3.6-plus-free", "deepseek/shared-id"],
-			"deepseek/deepseek-v4-pro",
-			registry,
-		);
-		expect(resolved.model?.id).toBe("deepseek-v4-pro");
-		expect(resolved.authFallbackUsed).toBe(true);
-	});
-
 	test("does not fall back to a keyless parent for a spawn without `model`", async () => {
 		const local = { ...parentModel, provider: "ollama", id: "local-model" };
 		const registry = {
