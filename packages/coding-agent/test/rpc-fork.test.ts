@@ -91,6 +91,17 @@ describe("RPC fork", () => {
 		expect(fork.header.parentSession).toBe(source.sessionId);
 	}, 30_000);
 
+	test("navigate_tree moves the leaf within the same session file", async () => {
+		const [, firstReply] = await seedTwoTurns();
+		const source = await client.getState();
+
+		expect(await client.navigateTree(firstReply!)).toMatchObject({ cancelled: false });
+
+		const navigated = await client.getState();
+		expect(navigated.sessionFile).toBe(source.sessionFile);
+		expect(navigated.messageCount).toBe(2);
+	}, 30_000);
+
 	test("rejects ids that are not transcript messages without switching sessions", async () => {
 		await seedTwoTurns();
 		await client.setThinkingLevel(ThinkingLevel.High);
