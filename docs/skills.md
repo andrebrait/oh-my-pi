@@ -55,7 +55,7 @@ Supported frontmatter fields on the skill type:
 - `description?: string`
 - `globs?: string[]`
 - `alwaysApply?: boolean`
-- `hide?: boolean`
+- `hide?: boolean` (author-controlled model visibility; `true` keeps the skill loaded but omits it from the model prompt)
 - `disableModelInvocation?: boolean` (Agent Skills equivalent of `hide`; normalized from kebab-case `disable-model-invocation`)
 - additional keys are preserved as unknown metadata by conventional scanners
 - `enabled: false` skips a skill in conventional scanners and Skillshare discovery
@@ -111,6 +111,7 @@ Capability dedup key is skill name; the first item with a given name wins in the
 - `disabledExtensions` entries with `skill:<name>`
 - `ignoredSkills` (exclude; glob patterns)
 - `includeSkills` (include allowlist; glob patterns; empty means include all)
+- `skills.optInSkills` (name-glob list; matched skills remain loaded but are hidden from the model prompt)
 
 Filter order is:
 
@@ -118,6 +119,8 @@ Filter order is:
 2. source enabled
 3. not ignored
 4. included (if include list present)
+
+`skills.optInSkills` is not a removal filter. After provider, custom-directory, and managed-skill discovery and name deduplication are complete, its Bun-style glob patterns are matched against each skill's raw and final resolved name, so hiding `tdd` also hides a `<namespace>/tdd` collision alias, and `superpowers/*` hides one namespace. Matches are marked hidden from the model prompt but remain loaded and accessible through `skill://<name>` and `/skill:<name>`. Unlike the author-controlled `hide` frontmatter, it needs no edit to the skill's files, so it works for plugin and registry installs that an update would overwrite. `omp skill list --json` reports the effective `hide`.
 
 The `agents` provider (`.agent[s]/skills`) has its own `enableAgentsUser`/`enableAgentsProject` toggles — disabling Claude/Codex/Pi does **not** turn it off. Foreign user-level providers are opt-in through `enabledProviders`; their project roots still load by default. Native OMP sources and marketplace plugins registered under `~/.omp/plugins` also load by default. For `claude-plugins`, the opt-in controls only plugins from Claude Code's own user registry.
 
@@ -215,6 +218,14 @@ Content type:
 - other files => `text/plain`
 
 No fallback search is performed for missing assets.
+
+MCP-advertised skills:
+
+- When no loaded skill owns the name in a `skill://` URL, `read` serves the resource an MCP server advertises under exactly that URI (for example Figma's `skill://figma/figma-use/SKILL.md`), like `mcp://skill://…` but with line selectors. Ownership is decided on the normalized URL as above, so a loaded bare or namespaced skill always wins; URI templates are matched only through an explicit `mcp://`.
+- The read waits for MCP servers that are still connecting or listing their resources, exactly as an `mcp://` read does, before reporting `Unknown skill`; the wait is bounded by the MCP connect/request timeouts and ends when the read is cancelled.
+- Actions that need a local file (`%load`, plan-mode write checks, the `:img` selector) report `Unknown skill` without contacting MCP.
+- MCP-served text keeps `read`'s normal result limits; only local skill files read whole.
+- `omp read` starts MCP servers only when a read reaches an MCP resource, so reading a local skill never spawns them.
 
 ## Skills vs AGENTS.md, commands, tools, hooks
 

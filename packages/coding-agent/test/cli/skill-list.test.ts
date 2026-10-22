@@ -95,6 +95,31 @@ describe("runSkillsCommand", () => {
 			await removeWithRetries(directory);
 		}
 	});
+
+	test("expands a tilde custom directory against the home directory", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), `omp-skills-tilde-${Snowflake.next()}-`));
+		// `os.homedir()` is stubbed to `tempHome` above, so `~/example-skills`
+		// names this fixture directory.
+		const skillsRoot = path.join(tempHome, "example-skills");
+		await fs.mkdir(path.join(skillsRoot, "demo"), { recursive: true });
+		await Bun.write(
+			path.join(skillsRoot, "demo", "SKILL.md"),
+			"---\nname: demo\ndescription: Home-relative demo.\n---\n\n# Demo\n",
+		);
+
+		try {
+			const result = await runSkillsCommand({
+				cwd: directory,
+				skillsSettings: { customDirectories: ["~/example-skills"] },
+			});
+			// The listing must agree with the loader: a tilde entry resolves
+			// against the home directory, not against the inspected directory.
+			expect(result.skills.map(skill => skill.name)).toEqual(["demo"]);
+			expect(result.skills[0]?.filePath).toBe(path.join(skillsRoot, "demo", "SKILL.md"));
+		} finally {
+			await removeWithRetries(directory);
+		}
+	});
 });
 
 describe("handleSkillList", () => {
@@ -145,6 +170,51 @@ describe("handleSkillList", () => {
 		for (const row of rows) expect(row).toMatch(/^[^\t]+\t/);
 		expect(stderr).toContain('warning: name collision: "calendar"');
 	});
+
+	// Hosts such as omp-web read `hide` from this listing to show which skills
+	// the model sees, so the configured policy must reach it. `calendar`
+	// collides across two directories, so the second copy is `second/calendar`.
+	for (const [pattern, expected] of [
+		// A bare name also hides the collision alias (raw-name match).
+		["calendar", { calendar: true, "second/calendar": true, reviewer: false }],
+		// A namespace pattern matches the final name only.
+		["second/*", { calendar: false, "second/calendar": true, reviewer: false }],
+	] as const) {
+		test(`--json reports skills.optInSkills ${pattern} from config as hidden`, async () => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), `omp-skills-list-${Snowflake.next()}-`));
+			for (const [root, name] of [
+				["first", "calendar"],
+				["second", "calendar"],
+				["first", "reviewer"],
+			] as const) {
+				await Bun.write(
+					path.join(directory, root, name, "SKILL.md"),
+					`---\nname: ${name}\ndescription: ${root} ${name}.\n---\n\n# ${name}\n`,
+				);
+			}
+			await Bun.write(
+				path.join(directory, ".omp", "config.yml"),
+				`skills:\n  customDirectories:\n    - first\n    - second\n  optInSkills:\n    - "${pattern}"\n`,
+			);
+
+			let stdout = "";
+			const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(chunk => {
+				stdout += chunk.toString();
+				return true;
+			});
+			const stderrSpy = spyOn(process.stderr, "write").mockImplementation(() => true);
+			try {
+				expect(await handleSkillList([], directory, true)).toBe(0);
+			} finally {
+				stdoutSpy.mockRestore();
+				stderrSpy.mockRestore();
+				await removeWithRetries(directory);
+			}
+
+			const { skills } = JSON.parse(stdout) as { skills: Array<{ name: string; hide: boolean }> };
+			expect(Object.fromEntries(skills.map(skill => [skill.name, skill.hide]))).toEqual(expected);
+		});
+	}
 
 	test("rejects a target that is not a directory", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), `omp-skills-list-${Snowflake.next()}-`));

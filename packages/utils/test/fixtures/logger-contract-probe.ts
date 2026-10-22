@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getLogPath } from "../../src/dirs";
 import * as logger from "../../src/logger";
 
 const scenario = process.argv[2];
@@ -58,6 +59,9 @@ switch (scenario) {
 		error.code = "E_FIXTURE";
 		error.detail = { retry: false };
 		logger.error("error-matrix", { error });
+		const wrappedError = new Error("wrapped");
+		wrappedError.stack = "WRAPPED_STACK";
+		logger.error("tojson-error", { wrapped: { toJSON: () => ({ err: wrappedError }) } });
 		disableTransports();
 		break;
 	}
@@ -112,6 +116,7 @@ switch (scenario) {
 	case "default-file":
 		logger.info("mode-default", { mode: "default" });
 		disableTransports();
+		writeResult({ logPath: getLogPath() });
 		break;
 	case "file-only":
 		logger.setTransports({ console: false, file: primaryDir });
