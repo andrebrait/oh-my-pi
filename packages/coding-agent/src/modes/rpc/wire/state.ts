@@ -17,10 +17,10 @@ export const stateDefs = {
 	CacheWarmingMode: "'off' | 'streaming' | 'idle'",
 	MessageUpdates: doc(
 		"'full' | 'delta'",
-		"`set_event_filter` projection: `delta` drops the accumulated snapshots from `message_update`.",
+		"`message_update` projection (`set_event_filter`, or a socket hello's capabilities): `delta` replaces the accumulated snapshots with the block a start/end event touches.",
 	),
 	TodoStatus: "'pending' | 'in_progress' | 'completed' | 'abandoned' | 'blocked'",
-	GoalOp: "'get' | 'create' | 'resume' | 'pause' | 'drop'",
+	GoalOp: "'get' | 'create' | 'replace' | 'resume' | 'pause' | 'drop' | 'budget' | 'guided'",
 	GoalStatus: "'active' | 'paused' | 'budget-limited' | 'complete' | 'dropped'",
 	SlashCommandSource: "'builtin' | 'skill' | 'extension' | 'custom' | 'mcp_prompt' | 'file'",
 	SubagentSubscriptionLevel: doc(
@@ -52,6 +52,10 @@ export const stateDefs = {
 			),
 		},
 		"Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`.",
+	),
+	QueueAttachments: doc(
+		{ steering: "boolean[]", followUp: "boolean[]" },
+		"Which queued chips carry an attachment (an image, or its source or description) their text does not; entry `i` describes chip `i`.",
 	),
 	ToolDescriptor: { name: "string", description: "string", "parameters?": "unknown", "examples?": "unknown[]" },
 	Goal: doc(
@@ -185,6 +189,7 @@ export const stateDefs = {
 			"boolean",
 			"Only ever `true`: the images exceeded the transport limit and were omitted; the removal still happened.",
 		),
+		"refused?": doc("'attachments'", "Nothing was removed: `refuseAttachments` was set and the prompt carries one."),
 	},
 	PromoteQueuedMessageResult: { promoted: "boolean" },
 	RestoredQueuedMessage: doc(
@@ -208,6 +213,14 @@ export const stateDefs = {
 	),
 	BranchMessage: { entryId: "string", text: "string" },
 	BranchResult: { text: "string", cancelled: "boolean" },
+	NavigateTreeResult: {
+		cancelled: "boolean",
+		"aborted?": doc("boolean", "Only ever `true`: `abort_branch_summary` stopped the summary; nothing moved."),
+		"editorText?": doc(
+			"string",
+			"The target was a user message: its text, for the editor; the leaf moved to its parent.",
+		),
+	},
 	TokenUsage: {
 		input: "number.integer",
 		output: "number.integer",

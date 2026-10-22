@@ -20,13 +20,21 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions, PlanReviewChoice, PlanReviewRequestedEvent } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+	PlanReviewChoice,
+	PlanReviewRequestedEvent,
+} from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
-import type { AgentSession } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
+import type { HostedClientLink } from "../session-host/hosted-client";
+import type { RpcSessionOrigin } from "./rpc/rpc-types";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
@@ -66,7 +74,6 @@ export type SubmittedUserInput = {
 	text: string;
 	images?: ImageContent[];
 	imageLinks?: (string | undefined)[];
-	customType?: string;
 	/** Route through `session.prompt(text, { synthetic: true })` so the text lands
 	 *  as a hidden agent-authored `developer` message rather than a visible user
 	 *  turn. Used by the `c`/`.` continue shortcut. */
@@ -76,7 +83,6 @@ export type SubmittedUserInput = {
 	 *  `session.prompt({ userInitiated })` so it clears advisor auto-resume
 	 *  suppression even though it is synthetic. */
 	userInitiated?: boolean;
-	display?: boolean;
 	/** Queue intent if the session is (or becomes) busy when this submission is
 	 *  dispatched: "steer" (interrupt the active turn) or "followUp" (process after
 	 *  it). Normal user Enter carries "steer" to match the streaming-branch Enter;
@@ -91,6 +97,13 @@ export interface InteractiveModeInitOptions {
 	clearInitialTerminalHistory?: boolean;
 	/** Opt into hosting when the caller owns outer startup readiness and shutdown. */
 	autoStartCollab?: boolean;
+}
+
+export interface ShutdownOptions {
+	/** Process exit status once the terminal is restored. Default 0. */
+	exitCode?: number;
+	/** Written to stderr after the terminal is restored, in place of the resume or detach hint. */
+	farewell?: string;
 }
 
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
@@ -161,6 +174,8 @@ export interface InteractiveModeContext {
 	readonly sessionName: string | undefined;
 	/** Session the transcript/editor/status are attached to: the focused agent's, else `session`. */
 	readonly viewSession: AgentSession;
+	/** Bind idle maintenance to the local view, or release UI activity bindings on null; hosted replicas never activate. */
+	syncIdleMaintenanceView(target?: AgentSession | null): void;
 	/** Id of the focused agent, undefined when the main session is attached. */
 	readonly focusedAgentId: string | undefined;
 	/** Set while a tool-approval dialog owns the composer: its drafts steer the main session awaiting that approval, even from a focused agent's view. */
@@ -192,6 +207,29 @@ export interface InteractiveModeContext {
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	/**
+	 * True from before `init()` until this process leaves hosted mode: this UI is (or is about to become) a
+	 * client of a session host. TUI-owned automation (timers, local model calls, plan/goal/loop machinery) must
+	 * not run, and input (submit, slash commands, keys, selectors) goes to the host through {@link hostedClient}
+	 * or is refused: it never falls through to the local replica session, also while the link is still
+	 * connecting. Set before `init()`; unlike {@link hostedClient}, it does not wait for the connection.
+	 */
+	hostedClientMode: boolean;
+	/** The link to the session host once connected; routes input and answers dialogs. Set by the caller of `HostedClientLink.connect`. */
+	hostedClient?: HostedClientLink;
+	/**
+	 * Hosted client only: where the host session on screen keeps its files, as its snapshot (or a relocation notice)
+	 * reported it. Links in the host's transcript resolve here (relative paths against `cwd`, `local://` under the root the
+	 * host itself resolved for it) instead of the terminal's own directory, which keeps the footer, completion, and `@file` to itself.
+	 * Set by the link before each snapshot's transcript is painted (a snapshot without it is refused), so unlike
+	 * {@link hostedClient} it exists for the first repaint; unset when the link ends, and then links resolve locally.
+	 */
+	hostOrigin?: RpcSessionOrigin;
+	/**
+	 * Hosted client only, set by the hosted startup: replace the connected session host by `target` (a host id, a
+	 * session id, or a session path); with no target a selector over the live hosts opens. Reports its own failures.
+	 */
+	attachHostedSession?: (target?: string) => Promise<void>;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -216,8 +254,8 @@ export interface InteractiveModeContext {
 	todoExpanded: boolean;
 	planModeEnabled: boolean;
 	vibeModeEnabled: boolean;
-	goalModeEnabled: boolean;
-	goalModePaused: boolean;
+	readonly goalModeEnabled: boolean;
+	readonly goalModePaused: boolean;
 	loopModeEnabled: boolean;
 	loopModePaused: boolean;
 	loopPrompt?: string;
@@ -298,7 +336,7 @@ export interface InteractiveModeContext {
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
-	shutdown(): Promise<void>;
+	shutdown(options?: ShutdownOptions): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
@@ -373,8 +411,6 @@ export interface InteractiveModeContext {
 			text: string;
 			images?: ImageContent[];
 			imageLinks?: (string | undefined)[];
-			customType?: string;
-			display?: boolean;
 			streamingBehavior?: "steer" | "followUp";
 		},
 		options?: { preserveDraft?: boolean; clearEditor?: boolean },
@@ -429,6 +465,12 @@ export interface InteractiveModeContext {
 		renderChunk?: () => void,
 	): Promise<void>;
 	renderInitialMessages(options?: { preserveExistingChat?: boolean; clearTerminalHistory?: boolean }): Promise<void>;
+	/**
+	 * Re-resolve the links of the transcript on screen against where the view's links resolve now, and give the
+	 * assistant messages already painted their new destinations, without repainting the transcript. For a hosted
+	 * view whose session moved without being replaced; a reply still streaming gets its destinations when it closes.
+	 */
+	refreshTranscriptLinks(): Promise<void>;
 	/**
 	 * In-place transcript rewind: drop the rendered components at/after
 	 * `message` when none of their rows reached native scrollback. Returns
@@ -610,12 +652,14 @@ export interface InteractiveModeContext {
 	handleGuidedGoalCommand(rest?: string, input?: Pick<SubmittedUserInput, "images" | "imageLinks">): Promise<boolean>;
 	/** True while `/guided-goal` is interviewing the user and no goal record exists yet. */
 	isGuidedGoalInterviewActive(): boolean;
+	/** Repaint the goal segment of the status line from the session's goal state. */
+	updateGoalModeStatus(): void;
+	/** Present a goal-related session event (`goal_updated`, `agent_end`): the status line and the guided-interview flag. */
+	handleGoalSessionEvent(event: AgentSessionEvent): void;
 	handleLoopCommand(args?: string): Promise<string | undefined>;
 	setLoopPrompt(prompt: string): void;
 	armLoopAutoSubmit(): void;
 	disableLoopMode(message?: string): void;
-	cancelGoalContinuation(): void;
-	disableGoalMode(message?: string): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
 	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
@@ -643,7 +687,11 @@ export interface InteractiveModeContext {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined>;
 	hideHookInput(): void;
 	showHookEditor(
 		title: string,
@@ -653,6 +701,11 @@ export interface InteractiveModeContext {
 	): Promise<string | undefined>;
 	hideHookEditor(): void;
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void;
+	/** Present the rich multi-question ask dialog on the editor surface (queued behind any open dialog). */
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 	showHookCustom<T>(
 		factory: (
 			tui: TUI,

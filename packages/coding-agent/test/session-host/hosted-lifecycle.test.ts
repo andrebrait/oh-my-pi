@@ -1,0 +1,1091 @@
+/**
+ * How a hosted terminal comes and goes: moving to another host with `/attach`, ending with `/exit` or `/detach`, and
+ * what it leaves on disk. Real session hosts over real sockets. The terminal is a recording `InteractiveModeContext`
+ * where a test only needs the calls the link and the commands make on it, and a real `InteractiveMode` (its own
+ * shutdown and teardown) where the question is what is left on disk.
+ */
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ensurePrivateDir, pidAlive } from "@oh-my-pi/pi-coding-agent/ipc/private-endpoint";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import type { InteractiveModeContext, ShutdownOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
+import * as prediction from "@oh-my-pi/pi-coding-agent/predict/client";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { HostedClientLink } from "@oh-my-pi/pi-coding-agent/session-host/hosted-client";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	attachHostedUi,
+	ensureSessionHost,
+	type HostLaunch,
+	hostedReplicaDir,
+} from "@oh-my-pi/pi-coding-agent/session-host/hosted-startup";
+import {
+	listSessionHosts,
+	newHostId,
+	SESSION_HOST_REGISTRY_VERSION,
+	type SessionHostEntry,
+	writeHostEntry,
+} from "@oh-my-pi/pi-coding-agent/session-host/registry";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import { cfgWorktreeOnStart } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { attachCommand, resumeCommand } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
+import { type IpcConnection, IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
+import { postmortem, setTerminalHeadless, setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
+import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
+import { createTestSession } from "../helpers/rpc-server-harness";
+import {
+	type HostProxy,
+	type IsolatedConfigRoot,
+	isolateConfigRoot,
+	listTree,
+	SessionHostFixture,
+	startProxy,
+	type TestSessionHost,
+	waitFor,
+} from "../helpers/session-host-harness";
+
+// The proxy is a unix socket in front of the host's endpoint; Windows hosts listen on named pipes.
+const itPosix = it.skipIf(process.platform === "win32");
+
+let fixture: SessionHostFixture;
+let config: IsolatedConfigRoot;
+const terminals: Terminal[] = [];
+const hostedModes: HostedMode[] = [];
+const proxies: HostProxy[] = [];
+const servers: IpcServer[] = [];
+
+beforeAll(async () => {
+	await initTheme();
+});
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+	fixture = await SessionHostFixture.create();
+	// The terminal's replica directory lives under the base config root.
+	config = isolateConfigRoot();
+});
+
+afterEach(async () => {
+	for (const terminal of terminals.splice(0)) await terminal.close();
+	for (const hosted of hostedModes.splice(0)) await hosted.close();
+	for (const proxy of proxies.splice(0)) proxy.close();
+	await Promise.all(servers.splice(0).map(server => server.close()));
+	setWordPredictionHost(undefined);
+	vi.restoreAllMocks();
+	await config.restore();
+	await fixture.dispose();
+	resetSettingsForTest();
+});
+
+/** The text of every user message a session holds, oldest first. */
+function userTexts(session: AgentSession): string[] {
+	return session.messages.flatMap(message => {
+		if (message.role !== "user") return [];
+		const { content } = message;
+		if (typeof content === "string") return [content];
+		return [content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("")];
+	});
+}
+
+/** One finished turn on the host from a throwaway client. */
+async function seedTurn(host: TestSessionHost, text: string): Promise<void> {
+	const client = await fixture.client(host);
+	await client.start();
+	await client.promptAndWait(text);
+	await client.detach();
+}
+
+/** A hosted terminal's context: a passive replica, and a record of what the link and the commands asked of it. */
+class Terminal {
+	readonly statuses: string[] = [];
+	readonly errors: string[] = [];
+	readonly shutdowns: (ShutdownOptions | undefined)[] = [];
+	/** What the host selector offered each time it opened. */
+	readonly offered: string[][] = [];
+	/** The user's answer to the host selector. */
+	readonly choice = Promise.withResolvers<string | undefined>();
+	/** Every text a command handed back to the editor. */
+	readonly editorRestores: string[] = [];
+	readonly ctx: InteractiveModeContext;
+	/** While set, every host event waits in the view's handler, and the frames behind it wait too: the view lags the host. */
+	eventGate: PromiseWithResolvers<void> | undefined;
+
+	private constructor(readonly local: AgentSession) {
+		this.ctx = createInteractiveModeContext({
+			session: local,
+			sessionManager: local.sessionManager,
+			hostedClientMode: true,
+			eventController: {
+				handleEvent: async () => {
+					await this.eventGate?.promise;
+				},
+				resetTranscriptAnchors: () => {},
+				takeDisplaceableComponents: () => [],
+				restorePendingToolResults: () => {},
+			},
+			statusLine: { setCollabStatus: () => {} },
+			editor: {
+				setText: () => {},
+				setCollapsedText: text => void this.editorRestores.push(text),
+				getExpandedText: () => "",
+				pendingImages: [],
+				pendingImageLinks: [],
+			},
+			showStatus: message => void this.statuses.push(message),
+			showError: message => void this.errors.push(message),
+			showHookSelector: async (_title, options) => {
+				this.offered.push(options.map(option => (typeof option === "string" ? option : option.label)));
+				return this.choice.promise;
+			},
+			shutdown: async options => void this.shutdowns.push(options),
+		});
+	}
+
+	static async open(): Promise<Terminal> {
+		const dir = await fs.mkdtemp(path.join(fixture.dir, "terminal-"));
+		const mock = { handler: { content: ["never asked"] } };
+		const local = await createTestSession(dir, mock, undefined, { passiveReplica: true });
+		const terminal = new Terminal(local);
+		terminals.push(terminal);
+		return terminal;
+	}
+
+	/** The connection this terminal is on now. */
+	get link(): HostedClientLink {
+		const { hostedClient } = this.ctx;
+		if (!hostedClient) throw new Error("the terminal is not attached");
+		return hostedClient;
+	}
+
+	/** The user messages the terminal shows. */
+	get transcript(): string[] {
+		return userTexts(this.local);
+	}
+
+	/** The `/attach` slash command as the editor submits it: with `target`, or without one to pick from a selector. */
+	async slashAttach(target?: string): Promise<void> {
+		await executeBuiltinSlashCommand(target === undefined ? "/attach" : `/attach ${target}`, { ctx: this.ctx });
+	}
+
+	async close(): Promise<void> {
+		this.eventGate?.resolve();
+		await this.ctx.hostedClient?.detach();
+		await this.local.dispose();
+	}
+}
+
+/** A terminal attached to `host` as `omp attach` attaches it; `via`: another entry for the same host, such as a proxy's. */
+async function attached(host: TestSessionHost, via?: SessionHostEntry): Promise<Terminal> {
+	const terminal = await Terminal.open();
+	const entry = via ?? (await fixture.entry(host));
+	await attachHostedUi(terminal.ctx, {
+		entry,
+		launch: { cwd: fixture.dir, args: [], registryDir: fixture.registryDir },
+	});
+	return terminal;
+}
+
+interface StandIn {
+	entry: SessionHostEntry;
+	/** How many clients have said hello. */
+	hellos(): number;
+	/** End the connection of every client that is being held. */
+	dropClients(): void;
+}
+
+/**
+ * A registered endpoint that looks live to the registry but is not a session host. A client that says hello is
+ * dropped at once or, with `hold`, left waiting until `dropClients`: a connect still in flight.
+ */
+async function standInHost(hold: boolean): Promise<StandIn> {
+	await ensurePrivateDir(fixture.registryDir, "test");
+	const hostId = newHostId();
+	const endpoint = ipcEndpoint(fixture.registryDir, hostId);
+	const held: IpcConnection[] = [];
+	let hellos = 0;
+	servers.push(
+		await IpcServer.listen(endpoint, { framing: "raw" }, connection => {
+			// The registry's liveness probe connects and stays silent; a client speaks first.
+			let spoke = false;
+			connection.startRaw(
+				() => {
+					if (spoke) return;
+					spoke = true;
+					hellos++;
+					if (hold) held.push(connection);
+					else connection.destroy();
+				},
+				() => {},
+			);
+		}),
+	);
+	const entry: SessionHostEntry = {
+		version: SESSION_HOST_REGISTRY_VERSION,
+		hostId,
+		pid: process.pid,
+		endpoint,
+		token: "t".repeat(64),
+		cwd: fixture.dir,
+		sessionFile: undefined,
+		title: undefined,
+		clients: 0,
+		busy: false,
+		startedAt: Date.now(),
+	};
+	await writeHostEntry(entry, fixture.registryDir);
+	return {
+		entry,
+		hellos: () => hellos,
+		dropClients: () => {
+			for (const connection of held.splice(0)) connection.destroy();
+		},
+	};
+}
+
+describe("/attach in a hosted terminal", () => {
+	it("leaves the previous host running and takes over the view of the chosen one", async () => {
+		const first = await fixture.startHost();
+		const second = await fixture.startHost();
+		await seedTurn(first, "on the first host");
+		await seedTurn(second, "on the second host");
+		const terminal = await attached(first);
+		expect(terminal.transcript).toEqual(["on the first host"]);
+
+		await terminal.slashAttach(second.hostId);
+
+		expect(terminal.link.hostId).toBe(second.hostId);
+		expect(terminal.transcript).toEqual(["on the second host"]);
+		await fixture.waitForClients(first, 0);
+		await fixture.waitForClients(second, 1);
+		expect(first.exited).toBe(false);
+		expect(terminal.errors).toEqual([]);
+		// One local copy, of the host on screen.
+		expect((await listTree(hostedReplicaDir())).map(name => name.slice(0, 16))).toEqual([second.hostId]);
+	}, 20_000);
+
+	it("returns to the previous host with a fresh snapshot when the target cannot be reached", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "already here");
+		const target = await standInHost(false);
+		const terminal = await attached(host);
+		const copyBefore = await listTree(hostedReplicaDir());
+
+		await terminal.slashAttach(target.entry.hostId);
+
+		expect(terminal.errors).toEqual([expect.stringContaining(`Could not attach to host ${target.entry.hostId}`)]);
+		expect(terminal.statuses).toContain(`Back on session host ${host.hostId}`);
+		expect(terminal.shutdowns).toEqual([]);
+		expect(terminal.link.hostId).toBe(host.hostId);
+		expect(terminal.transcript).toEqual(["already here"]);
+		// The view was rebuilt from a new snapshot: a copy of its own, not the one the first connection left.
+		const copyAfter = await listTree(hostedReplicaDir());
+		expect(copyAfter).toHaveLength(1);
+		expect(copyAfter).not.toEqual(copyBefore);
+		// And it is a live connection: a prompt through it runs a turn on the host.
+		await terminal.link.prompt("still connected");
+		await waitFor(() => host.session.messages.filter(message => message.role === "assistant").length === 2);
+		expect(userTexts(host.session)).toEqual(["already here", "still connected"]);
+		expect(target.hellos()).toBe(1);
+	}, 20_000);
+
+	it("ends the process with status 1 when the target cannot be reached and the previous host is gone", async () => {
+		const host = await fixture.startHost();
+		const target = await standInHost(true);
+		const terminal = await attached(host);
+
+		const switching = terminal.slashAttach(target.entry.hostId);
+		// The terminal has left the previous host and waits on the target.
+		await waitFor(() => target.hellos() === 1);
+		await host.stop();
+		target.dropClients();
+		await switching;
+
+		const attempt = `Could not attach to host ${target.entry.hostId}, and could not return to host ${host.hostId}`;
+		expect(terminal.shutdowns).toEqual([{ exitCode: 1, farewell: expect.stringContaining(attempt) }]);
+		expect(terminal.ctx.hostedClient).toBeUndefined();
+		expect(await listTree(hostedReplicaDir())).toEqual([]);
+	}, 20_000);
+
+	it("refuses a second /attach while a connection is in flight, and accepts one again afterwards", async () => {
+		const first = await fixture.startHost();
+		const second = await fixture.startHost();
+		const target = await standInHost(true);
+		const terminal = await attached(first);
+
+		const switching = terminal.slashAttach(target.entry.hostId);
+		await waitFor(() => target.hellos() === 1);
+		await terminal.slashAttach(second.hostId);
+
+		expect(terminal.statuses).toEqual(["Already switching session hosts"]);
+		expect((await fixture.entry(second)).clients).toBe(0);
+
+		target.dropClients();
+		await switching;
+		expect(terminal.link.hostId).toBe(first.hostId);
+
+		await terminal.slashAttach(second.hostId);
+		expect(terminal.link.hostId).toBe(second.hostId);
+	}, 20_000);
+
+	it("refuses a second /attach while the host selector is open, and follows the choice made in it", async () => {
+		const first = await fixture.startHost();
+		const second = await fixture.startHost();
+		const terminal = await attached(first);
+
+		const choosing = terminal.slashAttach();
+		await waitFor(() => terminal.offered.length === 1);
+		// The selector lists the other hosts only.
+		expect(terminal.offered[0]).toHaveLength(1);
+		expect(terminal.offered[0][0]).toContain(second.hostId);
+
+		await terminal.slashAttach(second.hostId);
+		expect(terminal.statuses).toEqual(["Already switching session hosts"]);
+		expect(terminal.link.hostId).toBe(first.hostId);
+		expect((await fixture.entry(second)).clients).toBe(0);
+
+		terminal.choice.resolve(terminal.offered[0][0]);
+		await choosing;
+		expect(terminal.link.hostId).toBe(second.hostId);
+	}, 20_000);
+
+	itPosix(
+		"is not ended by a link it left with /attach that finishes failing afterwards",
+		async () => {
+			const first = await fixture.startHost();
+			const second = await fixture.startHost();
+			await seedTurn(second, "on the second host");
+			const proxy = await startProxy(await fixture.entry(first), fixture.dir);
+			proxies.push(proxy);
+			const terminal = await attached(first, proxy.entry);
+			// The failing link deletes its copy before it reports: hold it there while /attach takes the view.
+			const held = Promise.withResolvers<void>();
+			const drop = SessionManager.prototype.dropSession;
+			const dropping = vi.spyOn(SessionManager.prototype, "dropSession").mockImplementationOnce(async function (
+				this: SessionManager,
+				file: string,
+			) {
+				await held.promise;
+				return drop.call(this, file);
+			});
+
+			// A replacement without a session header cannot be applied: the link fails closed.
+			proxy.inject({
+				type: "session_replaced",
+				seq: 1_000_000,
+				epoch: terminal.link.epoch + 1,
+				sessionFile: "unused",
+				reason: "new",
+				snapshot: { pendingUi: [], entries: [], clients: [] },
+			});
+			await waitFor(() => dropping.mock.calls.length === 1);
+			await terminal.slashAttach(second.hostId);
+			expect(terminal.link.hostId).toBe(second.hostId);
+			held.resolve();
+			// The link reports through `onClosed` in the same turn as this error.
+			await waitFor(() => terminal.errors.some(error => error.startsWith("Hosted session view stopped")));
+
+			expect(terminal.shutdowns).toEqual([]);
+			expect(terminal.link.hostId).toBe(second.hostId);
+			expect(terminal.transcript).toEqual(["on the second host"]);
+		},
+		20_000,
+	);
+
+	itPosix(
+		"is not ended by a link it left when that link finishes failing while /attach is still connecting",
+		async () => {
+			const host = await fixture.startHost();
+			await seedTurn(host, "already here");
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const target = await standInHost(true);
+			const terminal = await attached(host, proxy.entry);
+			const held = Promise.withResolvers<void>();
+			const drop = SessionManager.prototype.dropSession;
+			const dropping = vi.spyOn(SessionManager.prototype, "dropSession").mockImplementationOnce(async function (
+				this: SessionManager,
+				file: string,
+			) {
+				await held.promise;
+				return drop.call(this, file);
+			});
+
+			proxy.inject({
+				type: "session_replaced",
+				seq: 1_000_000,
+				epoch: terminal.link.epoch + 1,
+				sessionFile: "unused",
+				reason: "new",
+				snapshot: { pendingUi: [], entries: [], clients: [] },
+			});
+			await waitFor(() => dropping.mock.calls.length === 1);
+			const switching = terminal.slashAttach(target.entry.hostId);
+			// The terminal has left the failing link and waits on the target when that link reports.
+			await waitFor(() => target.hellos() === 1);
+			held.resolve();
+			await waitFor(() => terminal.errors.some(error => error.startsWith("Hosted session view stopped")));
+			target.dropClients();
+			await switching;
+
+			expect(terminal.shutdowns).toEqual([]);
+			expect(terminal.statuses).toContain(`Back on session host ${host.hostId}`);
+			expect(terminal.transcript).toEqual(["already here"]);
+		},
+		20_000,
+	);
+});
+
+describe("/new and /fork in a hosted terminal", () => {
+	it("/new on one terminal starts a new session on the host and every terminal follows", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "before new");
+		const a = await attached(host);
+		const b = await attached(host);
+		const sessionId = host.session.sessionManager.getSessionId();
+		const epochs = [a.link.epoch, b.link.epoch];
+		expect(a.transcript).toEqual(["before new"]);
+
+		await executeBuiltinSlashCommand("/new", { ctx: a.ctx });
+
+		expect(a.errors).toEqual([]);
+		expect(host.session.sessionManager.getSessionId()).not.toBe(sessionId);
+		// The command returns once its own view shows the new session; the peer follows on its own time.
+		expect(a.link.epoch).toBeGreaterThan(epochs[0]!);
+		expect(a.transcript).toEqual([]);
+		await waitFor(() => b.link.epoch > epochs[1]!);
+		expect(b.transcript).toEqual([]);
+	}, 20_000);
+
+	it("/new with arguments says it takes none and keeps the input", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attached(host);
+		const sessionId = host.session.sessionManager.getSessionId();
+
+		await executeBuiltinSlashCommand("/new now", { ctx: terminal.ctx });
+
+		expect(terminal.statuses).toContain("/new takes no arguments");
+		expect(terminal.editorRestores).toEqual(["/new now"]);
+		expect(host.session.sessionManager.getSessionId()).toBe(sessionId);
+	}, 20_000);
+
+	it("/fork forks the host session at the view's leaf", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "before fork");
+		const terminal = await attached(host);
+		const sessionFile = host.session.sessionFile;
+		const epoch = terminal.link.epoch;
+
+		await executeBuiltinSlashCommand("/fork", { ctx: terminal.ctx });
+
+		expect(terminal.errors).toEqual([]);
+		expect(host.session.sessionFile).not.toBe(sessionFile);
+		expect(userTexts(host.session)).toEqual(["before fork"]);
+		expect(terminal.link.epoch).toBeGreaterThan(epoch);
+		expect(terminal.transcript).toEqual(["before fork"]);
+	}, 20_000);
+
+	it("/fork from a view the host has moved past is refused and changes nothing", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "first");
+		const a = await attached(host);
+		const epoch = a.link.epoch;
+		// A's view stays on its leaf while another client's turn lands on the host.
+		a.eventGate = Promise.withResolvers<void>();
+		await seedTurn(host, "from b");
+		const sessionFile = host.session.sessionFile;
+		const leafId = host.session.sessionManager.getLeafId();
+		expect(a.link.leafId).not.toBe(leafId);
+
+		await executeBuiltinSlashCommand("/fork", { ctx: a.ctx });
+
+		expect(a.errors).toEqual(["Session tree moved"]);
+		// Nothing ran: the command goes back to the editor for the user to resend.
+		expect(a.editorRestores).toEqual(["/fork"]);
+		expect(host.session.sessionFile).toBe(sessionFile);
+		expect(host.session.sessionManager.getLeafId()).toBe(leafId);
+		a.eventGate.resolve();
+		await waitFor(() => a.transcript.length === 2);
+		expect(a.link.epoch).toBe(epoch);
+	}, 20_000);
+
+	it("/fork pane stays unavailable when attached", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "first");
+		const terminal = await attached(host);
+		const sessionFile = host.session.sessionFile;
+
+		await executeBuiltinSlashCommand("/fork pane", { ctx: terminal.ctx });
+
+		expect(terminal.statuses).toContain("/fork pane is unavailable when attached");
+		expect(host.session.sessionFile).toBe(sessionFile);
+	}, 20_000);
+});
+
+describe("/exit in a hosted terminal", () => {
+	it("stops the host that has no other client, and exits normally", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attached(host);
+
+		await executeBuiltinSlashCommand("/exit", { ctx: terminal.ctx });
+
+		await waitFor(() => host.exited);
+		expect(terminal.shutdowns).toEqual([undefined]);
+		expect(terminal.ctx.hostedClient).toBeUndefined();
+	}, 20_000);
+
+	itPosix(
+		"exits with status 1 and names the host when the host refuses, leaving that host running",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir, { refuseExit: "exit refused" });
+			proxies.push(proxy);
+			const terminal = await attached(host, proxy.entry);
+
+			await executeBuiltinSlashCommand("/exit", { ctx: terminal.ctx });
+
+			const farewell = `Could not stop session host ${host.hostId}: exit refused`;
+			expect(terminal.shutdowns).toEqual([{ exitCode: 1, farewell }]);
+			expect(terminal.ctx.hostedClient).toBeUndefined();
+			await fixture.waitForClients(host, 0);
+			expect(host.exited).toBe(false);
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+		},
+		20_000,
+	);
+});
+
+/**
+ * A real `InteractiveMode` as a hosted terminal: its own shutdown and teardown run. `postmortem.quit` and stderr are
+ * observed instead of taken, so a test sees the exit status and what the process told the user.
+ */
+class HostedMode {
+	readonly #stderr: string[] = [];
+	/** Settles with the exit status once `shutdown` ended the process. */
+	readonly exited = Promise.withResolvers<number>();
+
+	private constructor(
+		readonly mode: InteractiveMode,
+		readonly local: AgentSession,
+	) {
+		vi.spyOn(postmortem, "quit").mockImplementation(async code => {
+			this.exited.resolve(code ?? 0);
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+			this.#stderr.push(String(chunk));
+			return true;
+		});
+	}
+
+	/** A mode on a fresh passive replica, initialized as a hosted terminal's is; not attached to a host yet. */
+	static async open(): Promise<HostedMode> {
+		const dir = await fs.mkdtemp(path.join(fixture.dir, "mode-"));
+		const mock = { handler: { content: ["never asked"] } };
+		const local = await createTestSession(dir, mock, undefined, { passiveReplica: true });
+		vi.spyOn(prediction, "textPredictionBackend").mockReturnValue({
+			complete: async () => null,
+			feedback: () => {},
+		});
+		vi.spyOn(prediction, "syncTextPrediction").mockImplementation(() => {});
+		const mode = new InteractiveMode(local, "test");
+		mode.hostedClientMode = true;
+		mode.ui.requestRender = vi.fn();
+		mode.ui.terminal.drainInput = async () => {};
+		// Painting the transcript is not what these tests are about.
+		vi.spyOn(mode, "renderInitialMessages").mockResolvedValue(undefined);
+		await mode.init({ suppressWelcomeIntro: true });
+		const hosted = new HostedMode(mode, local);
+		hostedModes.push(hosted);
+		return hosted;
+	}
+
+	/** The startup wiring of `omp attach`: the link is registered, and a connection that ends ends the process. */
+	async attach(
+		entry: SessionHostEntry,
+		launch: HostLaunch = { cwd: fixture.dir, args: [], registryDir: fixture.registryDir },
+		options?: { reconnectTimeoutMs?: number },
+	): Promise<void> {
+		await attachHostedUi(this.mode, { entry, launch }, options);
+	}
+
+	/** What the process printed to stderr, without styling. */
+	get printed(): string {
+		return Bun.stripANSI(this.#stderr.join(""));
+	}
+
+	async close(): Promise<void> {
+		await this.mode.hostedClient?.detach();
+		if (!this.mode.isShuttingDown) this.mode.stop();
+		await this.local.dispose();
+	}
+}
+
+describe("a hosted terminal's shutdown", () => {
+	it("/detach leaves the host running and its own copy of the transcript gone, without a resume hint", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hosted = await HostedMode.open();
+		await hosted.attach(await fixture.entry(host));
+		// The copy exists while attached.
+		expect(await listTree(hostedReplicaDir())).toEqual([expect.stringMatching(/\.jsonl$/)]);
+
+		await executeBuiltinSlashCommand("/detach", { ctx: hosted.mode });
+
+		expect(await hosted.exited.promise).toBe(0);
+		expect(hosted.printed).toContain(attachCommand(host.hostId));
+		expect(hosted.printed).not.toContain("--resume");
+		// Disposing the replica's session after the link left must not write the copy back (the exit record).
+		expect(await listTree(hostedReplicaDir())).toEqual([]);
+		await fixture.waitForClients(host, 0);
+		expect(host.exited).toBe(false);
+	}, 20_000);
+
+	itPosix(
+		"saves no draft beside a copy that a lost connection already deleted",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const hosted = await HostedMode.open();
+			await hosted.attach(proxy.entry, undefined, { reconnectTimeoutMs: 1000 });
+			hosted.mode.editor.setText("unsent words");
+
+			proxy.refuse();
+			proxy.drop();
+
+			expect(await hosted.exited.promise).toBe(1);
+			expect(hosted.printed).toContain("connection lost");
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+			await fixture.waitForClients(host, 0);
+			expect(host.exited).toBe(false);
+		},
+		20_000,
+	);
+
+	itPosix(
+		"/exit while reconnecting exits with status 1 and names the host it leaves running",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const hosted = await HostedMode.open();
+			await hosted.attach(proxy.entry);
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => hosted.mode.hostedClient?.reconnecting === true);
+
+			await executeBuiltinSlashCommand("/exit", { ctx: hosted.mode });
+
+			expect(await hosted.exited.promise).toBe(1);
+			expect(hosted.printed).toContain(`Could not stop session host ${host.hostId}`);
+			expect(hosted.printed).toContain(`omp attach ${host.hostId}`);
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+			await fixture.waitForClients(host, 0);
+			expect(host.exited).toBe(false);
+		},
+		20_000,
+	);
+
+	itPosix(
+		"/detach while reconnecting exits normally",
+		async () => {
+			const host = await fixture.startHost();
+			const proxy = await startProxy(await fixture.entry(host), fixture.dir);
+			proxies.push(proxy);
+			const hosted = await HostedMode.open();
+			await hosted.attach(proxy.entry);
+			proxy.refuse();
+			proxy.drop();
+			await waitFor(() => hosted.mode.hostedClient?.reconnecting === true);
+
+			await executeBuiltinSlashCommand("/detach", { ctx: hosted.mode });
+
+			expect(await hosted.exited.promise).toBe(0);
+			expect(await listTree(hostedReplicaDir())).toEqual([]);
+			expect(host.exited).toBe(false);
+		},
+		20_000,
+	);
+
+	it("does not offer to resume the host's session when it quits before the link is registered", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hosted = await HostedMode.open();
+		// The window between the first snapshot being on screen and `ctx.hostedClient` being set.
+		const link = await HostedClientLink.connect({
+			ctx: hosted.mode,
+			entry: await fixture.entry(host),
+			replicaDir: hostedReplicaDir(),
+			onClosed: () => {},
+		});
+		try {
+			const sessionId = hosted.mode.sessionManager.getSessionId();
+			// The copy is on disk, which is what a resume hint for an ordinary session requires.
+			expect(hosted.mode.sessionManager.isSessionOnDisk()).toBe(true);
+
+			await hosted.mode.shutdown();
+
+			expect(hosted.printed).not.toContain(resumeCommand(sessionId));
+		} finally {
+			await link.detach();
+		}
+	}, 20_000);
+});
+
+function git(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+	return result.stdout.toString().trim();
+}
+
+describe("a hosted terminal's startup automation", () => {
+	it("creates no worktree under worktree.onStart: the host's session stays where it is", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hosted = await HostedMode.open();
+		cfgWorktreeOnStart.set(hosted.local.settings, "create");
+		await hosted.attach(await fixture.entry(host));
+		// The terminal's directory is a primary git checkout with commits: the place `worktree.onStart` acts on.
+		const cwd = hosted.mode.sessionManager.getCwd();
+		const replica = hosted.mode.sessionManager.getSessionFile();
+		git(cwd, "init", "-q", "-b", "main");
+		await Bun.write(path.join(cwd, "tracked.txt"), "base\n");
+		git(cwd, "add", "tracked.txt");
+		git(cwd, "commit", "-q", "-m", "init");
+		const savedCwd = process.cwd();
+		const savedWorktreesDir = setWorktreesDir(path.join(fixture.dir, "worktrees"));
+		try {
+			await hosted.mode.maybeAutoCreateWorktree();
+
+			expect(git(cwd, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+			expect(git(cwd, "branch", "--list", "wt/*")).toBe("");
+			expect(hosted.mode.sessionManager.getCwd()).toBe(cwd);
+			expect(hosted.mode.sessionManager.getSessionFile()).toBe(replica);
+		} finally {
+			process.chdir(savedCwd);
+			setWorktreesDir(savedWorktreesDir);
+		}
+	}, 20_000);
+});
+
+// Tern relaunches `omp --resume <file>` from the session file a terminal advertises after its daemon restarts.
+describe("a hosted terminal in Tern", () => {
+	const SESSION_FILE_VAR = /\x1b\]1337;SetUserVar=omp_session_file(?:=([^\x07]*))?\x07/g;
+	let writes = "";
+	let prevHeadless = false;
+	let ttyDescriptor: PropertyDescriptor | undefined;
+	let prevTermProgram: string | undefined;
+
+	beforeEach(() => {
+		prevHeadless = setTerminalHeadless(true);
+		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+		prevTermProgram = Bun.env.TERM_PROGRAM;
+		Bun.env.TERM_PROGRAM = "tern";
+		writes = "";
+		// Restored by the shared `vi.restoreAllMocks`, after the modes close: their teardown still writes.
+		vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			writes += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
+			return true;
+		});
+	});
+
+	afterEach(() => {
+		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+		else Reflect.deleteProperty(process.stdout, "isTTY");
+		if (prevTermProgram === undefined) delete Bun.env.TERM_PROGRAM;
+		else Bun.env.TERM_PROGRAM = prevTermProgram;
+		setTerminalHeadless(prevHeadless);
+	});
+
+	/** Every session file the terminal advertised, oldest first; `undefined`: withdrawn. */
+	function advertised(): (string | undefined)[] {
+		return [...writes.matchAll(SESSION_FILE_VAR)].map(match =>
+			match[1] === undefined ? undefined : Buffer.from(match[1], "base64").toString(),
+		);
+	}
+
+	it("advertises the host's session file, never its replica, through the host's moves and new sessions", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "a finished turn");
+		const hostFile = host.session.sessionManager.getSessionFile();
+		if (!hostFile) throw new Error("the host has no session file");
+		const hosted = await HostedMode.open();
+		// Only after init: a terminal that is not headless at init owns stdin, and the runner's stdin ending reads as a hangup.
+		setTerminalHeadless(false);
+		await hosted.attach(await fixture.entry(host));
+
+		expect(advertised().at(-1)).toBe(path.resolve(hostFile));
+
+		// `/move` on the host: the session, now somewhere else, is what a relaunch must reopen.
+		const moved = path.join(fixture.dir, "moved-project");
+		await fs.mkdir(moved, { recursive: true });
+		await host.session.moveSession(moved);
+		const movedFile = host.session.sessionManager.getSessionFile();
+		if (!movedFile) throw new Error("the host has no session file after the move");
+		await waitFor(() => advertised().at(-1) === path.resolve(movedFile));
+		expect(writes).toContain(`\x1b]7;file://${os.hostname()}${moved}\x07`);
+
+		await host.session.newSession();
+		const nextFile = host.session.sessionManager.getSessionFile();
+		if (!nextFile || nextFile === hostFile) throw new Error("the host did not move to a new session file");
+		await waitFor(() => advertised().at(-1) === path.resolve(nextFile));
+
+		// Leaving withdraws it: nothing this terminal can resume is left behind.
+		await hosted.mode.hostedClient?.detach();
+		expect(advertised().at(-1)).toBeUndefined();
+		expect(advertised().filter(file => file?.startsWith(hostedReplicaDir()))).toEqual([]);
+	}, 20_000);
+});
+
+describe("goal mode in a hosted terminal", () => {
+	const continuations = (session: AgentSession): number =>
+		session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation")
+			.length;
+	/** The host decided nothing more: no goal turn waiting, none running. */
+	const quiet = (session: AgentSession): boolean =>
+		session.goalMode?.continuationPending === false && !session.isStreaming && !session.hasAdmittedSubmission;
+
+	async function attachedMode(host: TestSessionHost): Promise<HostedMode> {
+		const hosted = await HostedMode.open();
+		await hosted.attach(await fixture.entry(host));
+		return hosted;
+	}
+
+	it("/goal from one terminal sets the host's goal, sends the objective once, and every terminal shows it", async () => {
+		const host = await fixture.startHost();
+		const a = await attachedMode(host);
+		const b = await attachedMode(host);
+		const status = vi.spyOn(b.mode.statusLine, "setGoalModeStatus");
+
+		await executeBuiltinSlashCommand("/goal ship the release", { ctx: a.mode });
+
+		expect(host.session.getGoalModeState()?.goal).toMatchObject({ objective: "ship the release", status: "active" });
+		expect(a.mode.goalModeEnabled).toBe(true);
+		await waitFor(() => b.mode.goalModeEnabled);
+		expect(status).toHaveBeenLastCalledWith({ enabled: true, paused: false });
+		await waitFor(() => quiet(host.session) && continuations(host.session) === 1);
+		expect(userTexts(host.session).filter(text => text === "ship the release")).toHaveLength(1);
+
+		await executeBuiltinSlashCommand("/goal pause", { ctx: b.mode });
+
+		expect(host.session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(b.mode.goalModePaused).toBe(true);
+		await waitFor(() => a.mode.goalModePaused);
+	}, 30_000);
+
+	it("the host continues the goal with every terminal detached", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+		await terminal.mode.startGoalAtStartup("keep going");
+		await terminal.mode.hostedClient?.detach();
+		await fixture.waitForClients(host, 0);
+
+		await waitFor(() => quiet(host.session) && continuations(host.session) === 1);
+		expect(host.session.getGoalModeState()?.goal).toMatchObject({ objective: "keep going", status: "active" });
+		expect(userTexts(host.session)).toEqual(["keep going"]);
+	}, 30_000);
+
+	it("a /goal the host refuses stays in the editor", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+		const showError = vi.spyOn(terminal.mode, "showError");
+		// Plan mode on the host; this terminal does not know it.
+		host.session.setPlanModeState({ enabled: true, planFilePath: "plan.md" });
+
+		await executeBuiltinSlashCommand("/goal ship it", { ctx: terminal.mode });
+
+		expect(showError).toHaveBeenCalledWith("Exit plan mode before starting a goal.");
+		expect(terminal.mode.editor.getText()).toBe("/goal ship it");
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		expect(terminal.mode.goalModeEnabled).toBe(false);
+	}, 20_000);
+
+	it("a terminal that attaches later shows the host's goal from the snapshot", async () => {
+		const host = await fixture.startHost();
+		// The host's startup reattach has run once a client attached.
+		await seedTurn(host, "first");
+		await host.session.goalMode?.handle({ op: "create", objective: "keep going" });
+
+		const terminal = await attachedMode(host);
+
+		expect(terminal.mode.goalModeEnabled).toBe(true);
+		expect(terminal.local.getGoalModeState()?.goal.objective).toBe("keep going");
+	}, 20_000);
+
+	it("a goal the host completes is gone from the terminal once that turn ends", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+		await host.session.goalMode?.handle({ op: "create", objective: "finish it" });
+		await waitFor(() => terminal.mode.goalModeEnabled);
+		// The agent completed it; the host journals it after that turn's end and sends no update.
+		await host.session.goalRuntime.completeGoalFromTool();
+		await waitFor(() => terminal.local.getGoalModeState()?.mode === "exiting");
+		const status = vi.spyOn(terminal.mode.statusLine, "setGoalModeStatus");
+
+		await seedTurn(host, "wrap up");
+
+		await waitFor(() => terminal.local.getGoalModeState() === undefined);
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		// The status line was repainted once the goal was cleared.
+		expect(status).toHaveBeenCalled();
+		expect(status).toHaveBeenLastCalledWith(undefined);
+	}, 20_000);
+
+	it("a goal dropped from one terminal is gone from every terminal", async () => {
+		const host = await fixture.startHost();
+		const a = await attachedMode(host);
+		const b = await attachedMode(host);
+		await executeBuiltinSlashCommand("/goal ship the release", { ctx: a.mode });
+		await waitFor(() => b.mode.goalModeEnabled);
+		vi.spyOn(a.mode, "showHookConfirm").mockResolvedValue(true);
+
+		await executeBuiltinSlashCommand("/goal drop", { ctx: a.mode });
+
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		expect(a.local.getGoalModeState()).toBeUndefined();
+		await waitFor(() => b.local.getGoalModeState() === undefined);
+		const shown = vi.spyOn(b.mode, "showStatus");
+		await executeBuiltinSlashCommand("/goal show", { ctx: b.mode });
+		expect(shown).toHaveBeenCalledWith("No goal set.");
+	}, 30_000);
+
+	it("a goal op from a stale view is refused by the host", async () => {
+		const host = await fixture.startHost();
+		await seedTurn(host, "first");
+		const a = await attached(host);
+		// A's view lags while another client replaces the host's session.
+		a.eventGate = Promise.withResolvers<void>();
+		await seedTurn(host, "from b");
+		const b = await fixture.client(host);
+		await b.start();
+		await b.newSession();
+		await b.detach();
+
+		await expect(a.link.goal({ op: "create", objective: "for the old session" })).rejects.toThrow();
+		expect(host.session.getGoalModeState()).toBeUndefined();
+		a.eventGate.resolve();
+	}, 20_000);
+
+	it("the guided-goal interview ends in the terminal when the host's agent creates the goal", async () => {
+		const host = await fixture.startHost();
+		const terminal = await attachedMode(host);
+
+		await executeBuiltinSlashCommand("/guided-goal ship it", { ctx: terminal.mode });
+		expect(terminal.mode.isGuidedGoalInterviewActive()).toBe(true);
+		await waitFor(() => quiet(host.session));
+		await host.session.goalMode?.handle({ op: "create", objective: "ship it" });
+
+		await waitFor(() => terminal.mode.goalModeEnabled);
+		// The interview is over for good: once that goal is dropped, `c` is no longer an answer to it.
+		await host.session.goalMode?.handle({ op: "drop" });
+		await waitFor(() => !terminal.mode.goalModeEnabled);
+		expect(terminal.mode.isGuidedGoalInterviewActive()).toBe(false);
+	}, 20_000);
+});
+
+/** A host that boots without network: a dummy key makes the model available, and discovery hits a closed port. */
+const MODEL_ARGS = [
+	"--no-extensions",
+	"--no-skills",
+	"--no-rules",
+	"--provider",
+	"anthropic",
+	"--model",
+	"claude-sonnet-4-5",
+];
+
+describe("a hosted terminal whose host process died", () => {
+	let launch: HostLaunch;
+	/** Every host a test started; a failed test must not leave a detached host running. */
+	const spawned: number[] = [];
+
+	beforeEach(async () => {
+		const dir = await fs.mkdtemp(path.join(fixture.dir, "spawned-"));
+		await Bun.write(
+			path.join(dir, "models.yml"),
+			"providers:\n  anthropic:\n    baseUrl: http://127.0.0.1:9\n    apiKey: test-dummy-key\n",
+		);
+		launch = {
+			cwd: dir,
+			args: MODEL_ARGS,
+			sessionDir: path.join(dir, "sessions"),
+			registryDir: fixture.registryDir,
+			env: { PI_CODING_AGENT_DIR: dir, HOME: dir, USERPROFILE: dir },
+		};
+	});
+
+	afterEach(async () => {
+		// Leave a reopened host before killing it, so the terminal's detach is not cut off mid-request.
+		for (const hosted of hostedModes.splice(0)) await hosted.close();
+		for (const pid of spawned.splice(0)) if (pidAlive(pid)) process.kill(pid, "SIGKILL");
+	});
+
+	/** A spawned host serving a session file that holds one user message, and a terminal attached to it. */
+	async function attachedToSpawnedHost(
+		reopen: boolean,
+	): Promise<{ hosted: HostedMode; entry: SessionHostEntry; file: string; statuses: () => string[] }> {
+		const manager = SessionManager.create(launch.cwd, launch.sessionDir);
+		manager.appendMessage({ role: "user", content: "a finished turn", timestamp: Date.now() });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		await manager.close();
+		if (!file) throw new Error("session was not given a file");
+		const entry = await ensureSessionHost(file, launch);
+		spawned.push(entry.pid);
+		const hosted = await HostedMode.open();
+		const showStatus = vi.spyOn(hosted.mode, "showStatus");
+		vi.spyOn(hosted.mode, "showHookConfirm").mockImplementation(async (title, message) => {
+			expect([title, message]).toEqual(["Session host exited", "Reopen this session in a new host?"]);
+			return reopen;
+		});
+		await hosted.attach(entry, launch);
+		expect(userTexts(hosted.local)).toEqual(["a finished turn"]);
+		return { hosted, entry, file, statuses: () => showStatus.mock.calls.map(([text]) => text) };
+	}
+
+	it("offers to reopen a session whose host died, and reopens it", async () => {
+		const { hosted, entry, file, statuses } = await attachedToSpawnedHost(true);
+
+		process.kill(entry.pid, "SIGKILL");
+
+		let reopened: SessionHostEntry | undefined;
+		await waitFor(async () => {
+			const hosts = await listSessionHosts(fixture.registryDir);
+			reopened = hosts.find(
+				host =>
+					host.hostId !== entry.hostId &&
+					host.sessionFile &&
+					path.resolve(host.sessionFile) === path.resolve(file),
+			);
+			return reopened !== undefined;
+		}, 120_000);
+		if (!reopened) throw new Error("no new host");
+		spawned.push(reopened.pid);
+		const newHostId = reopened.hostId;
+		await waitFor(() => hosted.mode.hostedClient?.hostId === newHostId, 30_000);
+
+		expect(userTexts(hosted.local)).toEqual(["a finished turn"]);
+		expect(statuses()).toContain(`Reopened the session in host ${newHostId}`);
+		expect(Bun.peek.status(hosted.exited.promise)).toBe("pending");
+	}, 150_000);
+
+	it("exits with status 1 when the reopen is declined", async () => {
+		const { hosted, entry } = await attachedToSpawnedHost(false);
+
+		process.kill(entry.pid, "SIGKILL");
+
+		expect(await hosted.exited.promise).toBe(1);
+		expect(hosted.printed).toContain("host exited");
+		expect(await listTree(hostedReplicaDir())).toEqual([]);
+	}, 150_000);
+});

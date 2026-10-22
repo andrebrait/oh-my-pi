@@ -39,6 +39,14 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		result: { protocolVersion: "number.integer" },
 	},
 	{
+		name: "detach",
+		doc: "Session-host socket clients: leave; the session keeps running. Unknown on stdio.",
+	},
+	{
+		name: "exit",
+		doc: "Session-host socket clients: leave, and stop the host when no other client remains. Unknown on stdio.",
+	},
+	{
 		name: "prompt",
 		doc: "Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.",
 		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior" },
@@ -50,7 +58,18 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
-		params: { message: "string", queue: "QueuedMessageQueue" },
+		params: {
+			message: "string",
+			queue: "QueuedMessageQueue",
+			"match?": doc(
+				"'first' | 'last'",
+				"`last`: the newest prompt whose chip text is `message`; default `first` (raw text, then chip text).",
+			),
+			"refuseAttachments?": doc(
+				"boolean",
+				'Remove nothing, answering `refused: "attachments"`, when the prompt carries an attachment.',
+			),
+		},
 		result: "RemoveQueuedMessageResult",
 	},
 	{
@@ -101,7 +120,23 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "goal",
 		doc: "Read or change goal mode with the lifecycle of the interactive `/goal` command.",
-		params: { op: "GoalOp", "objective?": "string", "token_budget?": "number.integer" },
+		params: {
+			op: "GoalOp",
+			"objective?": doc("string", "`create`/`replace`: the objective."),
+			"token_budget?": doc(
+				"number.integer",
+				"`create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.",
+			),
+			"submitObjective?": doc(
+				"boolean",
+				"`create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.",
+			),
+			"images?": doc(
+				"ImageContent[]",
+				"Images submitted with the objective (`submitObjective`) or the `guided` kickoff.",
+			),
+			"rough?": doc("string", "`guided`: the rough idea the interview starts from."),
+		},
 		result: "GoalResult",
 	},
 	{
@@ -110,6 +145,12 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		params: { enabled: "boolean" },
 		result: { enabled: "boolean" },
 		unwrap: "enabled",
+	},
+	{
+		name: "set_idle_activity",
+		doc: "Socket clients only: report whether this client has an unsent draft, so host-owned idle maintenance (recap and idle compaction) stays out of its way. Answered at once, even while another command runs. Like any write it honors the common `ifEpoch` precondition; generated SDK methods send none and bind to the current epoch.",
+		params: { isComposing: "boolean" },
+		result: { isComposing: "boolean" },
 	},
 	{
 		name: "get_available_commands",
@@ -273,6 +314,23 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		doc: "Fork into a new session file: history through `entryId`, or the whole session.",
 		params: { "entryId?": "string" },
 		result: "CancellationResult",
+	},
+	{
+		name: "navigate_tree",
+		doc: "Move the session's leaf to an entry in the same file, optionally summarizing the branch it leaves; refused while busy.",
+		params: {
+			entryId: "string",
+			"summarize?": doc("boolean", "Summarize the abandoned branch at the target."),
+			"customInstructions?": doc("string", "Instructions for the summarizer."),
+		},
+		result: "NavigateTreeResult",
+		timeoutMs: 600_000,
+	},
+	{ name: "abort_branch_summary", doc: "Stop a running `navigate_tree` branch summary; the navigation is cancelled." },
+	{
+		name: "set_label",
+		doc: "Set or clear (omit `label`) an entry's label; the label entry reaches clients as an `entry` frame.",
+		params: { entryId: "string", "label?": "string" },
 	},
 	{
 		name: "get_branch_messages",

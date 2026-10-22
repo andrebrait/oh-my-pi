@@ -101,9 +101,12 @@ fn smoke_real_server() {
 
 	let created = client
 		.call(&GoalCommand {
-			op:           GoalOp::Create,
-			objective:    Some("smoke objective".into()),
-			token_budget: Some(5000),
+			op:               GoalOp::Create,
+			objective:        Some("smoke objective".into()),
+			token_budget:     Some(5000),
+			submit_objective: None,
+			images:           None,
+			rough:            None,
 		})
 		.unwrap();
 	println!(
@@ -114,11 +117,25 @@ fn smoke_real_server() {
 			.map(|goal| (&goal.objective, goal.status))
 	);
 	let paused = client
-		.call(&GoalCommand { op: GoalOp::Pause, objective: None, token_budget: None })
+		.call(&GoalCommand {
+			op:               GoalOp::Pause,
+			objective:        None,
+			token_budget:     None,
+			submit_objective: None,
+			images:           None,
+			rough:            None,
+		})
 		.unwrap();
 	println!("goal pause: {:?}", paused.goal.as_ref().map(|goal| goal.status));
 	let dropped = client
-		.call(&GoalCommand { op: GoalOp::Drop, objective: None, token_budget: None })
+		.call(&GoalCommand {
+			op:               GoalOp::Drop,
+			objective:        None,
+			token_budget:     None,
+			submit_objective: None,
+			images:           None,
+			rough:            None,
+		})
 		.unwrap();
 	println!("goal drop: {:?}", dropped.goal.as_ref().map(|goal| goal.status));
 

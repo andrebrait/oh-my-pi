@@ -168,9 +168,12 @@ fn command_encoding() {
 	let frame = encode_command("req_3", &GetStateCommand {}).unwrap();
 	assert_eq!(frame, json!({"id": "req_3", "type": "get_state"}));
 	let goal = GoalCommand {
-		op:           GoalOp::Create,
-		objective:    Some("ship".into()),
-		token_budget: None,
+		op:               GoalOp::Create,
+		objective:        Some("ship".into()),
+		token_budget:     None,
+		submit_objective: None,
+		images:           None,
+		rough:            None,
 	};
 	assert_eq!(
 		encode_command("req_4", &goal).unwrap(),

@@ -34,6 +34,7 @@ export const cfgGoalContinuationModes = register({
 		tab: "tasks",
 		group: "Modes",
 		label: "Goal Continuation Modes",
-		description: 'Run modes where active goals may auto-continue between turns ("interactive", "rpc")',
+		description:
+			'Run modes where active goals may auto-continue between turns ("interactive": the TUI and session hosts, "rpc": --mode rpc)',
 	},
 });

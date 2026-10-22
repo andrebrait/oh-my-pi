@@ -156,10 +156,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			newSession: newOptions =>
 				wrapSessionChange(
 					async () => {
-						const success = await session.newSession({ parentSession: newOptions?.parentSession });
-						if (success && newOptions?.setup) {
-							await newOptions.setup(session.sessionManager);
-						}
+						const success = await session.newSession({
+							parentSession: newOptions?.parentSession,
+							setup: newOptions?.setup,
+						});
 						return { cancelled: !success };
 					},
 					{ detachesRun: true },

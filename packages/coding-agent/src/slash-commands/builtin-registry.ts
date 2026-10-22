@@ -1,4 +1,4 @@
-import { clearSubmittedText } from "./helpers/draft";
+import { clearSubmittedText, restoreDetachedDraft } from "./helpers/draft";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { COLLAB_GUEST_ALLOWED_COMMANDS } from "../collab/guest";
 import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "./builtin-collaboration";
@@ -132,11 +132,38 @@ export function buildTuiBuiltinSlashCommands(runtime: TuiSlashCommandRuntime): R
 export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = BUILTIN_SLASH_COMMAND_REGISTRY;
 
 /**
+ * Builtins that keep running in this process while the UI is a client of a session host: they read or move only
+ * what is on this screen or this machine (hotkeys, clipboard, links) or end this client, or they send the host
+ * their own RPC command (`/goal`, `/guided-goal`). `bare`: only without arguments, where the command sends the host
+ * its own RPC command (`/new`, `/fork`, `/tree`, `/branch`; `/fork pane` stays refused).
+ */
+const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true | "bare">> = {
+	hotkeys: true,
+	copy: true,
+	open: true,
+	detach: true,
+	attach: true,
+	exit: true,
+	quit: true,
+	goal: true,
+	"guided-goal": true,
+	new: "bare",
+	fork: "bare",
+	tree: "bare",
+	branch: "bare",
+};
+
+/**
  * Execute a builtin slash command in the interactive TUI.
  *
  * Returns `false` when no builtin matched. Returns `true` when a command
  * consumed the input entirely. Returns a `string` when the command was handled
  * but remaining text should be sent as a prompt.
+ *
+ * A hosted client (`ctx.hostedClientMode`) runs only {@link HOSTED_LOCAL_COMMANDS} here. A command with a
+ * headless `handle` returns `false` as well, so the caller sends the submitted text to the host, which runs it;
+ * the rest cannot run anywhere. Those, and any builtin given arguments it does not take, stay in the editor
+ * with a status: for a hosted client the generic "not a command" `false` below would reach the host's model.
  */
 export async function executeBuiltinSlashCommand(
 	text: string,
@@ -147,6 +174,36 @@ export async function executeBuiltinSlashCommand(
 
 	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
 	if (!command) return false;
+	if (runtime.ctx.hostedClientMode) {
+		// Decided before the arguments check below, whose `false` means "ordinary prompt": for a hosted client that
+		// would hand a command that cannot run here, or that takes no arguments, to the host's model.
+		const rule = HOSTED_LOCAL_COMMANDS[command.name];
+		// Runs here only without arguments (`/fork`, `/tree`); with them it is a different, unavailable command.
+		const bare = rule === "bare";
+		const local = rule === true || (bare && parsed.args.length === 0);
+		const takesNoArgs = parsed.args.length > 0 && !command.allowArgs;
+		// Refused outright, except a bare-only command given arguments it never takes (`/new now`): that one runs
+		// here when bare, so its arguments are what is wrong.
+		const unavailable = !local && !command.handle && !(bare && takesNoArgs);
+		const refusal = unavailable
+			? `/${bare ? `${command.name} ${parsed.args}` : command.name} is unavailable when attached`
+			: takesNoArgs
+				? `/${command.name} takes no arguments`
+				: undefined;
+		if (refusal !== undefined) {
+			runtime.ctx.showStatus(refusal);
+			// Nothing ran and nothing was sent: the submission goes back to the editor.
+			const { editor } = runtime.ctx;
+			if (runtime.draftDetached) {
+				restoreDetachedDraft(editor, text, runtime.input?.images, runtime.input?.imageLinks);
+			} else {
+				editor.setCollapsedText(text);
+			}
+			return true;
+		}
+		// The host runs what has a headless handler; the caller sends it the submitted text unchanged.
+		if (!local) return false;
+	}
 	if (parsed.args.length > 0 && !command.allowArgs) {
 		return false;
 	}
