@@ -276,16 +276,15 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				// `setup` runs inside the session's goal hold, before goal mode reattaches.
+				const success = await this.ctx.session.newSession({
+					parentSession: options?.parentSession,
+					setup: options?.setup,
+				});
 				if (!success) {
 					return { cancelled: true };
 				}
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
-				}
 
 				// Reset and update status line
 				this.ctx.statusLine.invalidate();
@@ -510,14 +509,12 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				const success = await this.ctx.session.newSession({
+					parentSession: options?.parentSession,
+					setup: options?.setup,
+				});
 				if (!success) {
 					return { cancelled: true };
-				}
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
 				}
 
 				// Clear UI state

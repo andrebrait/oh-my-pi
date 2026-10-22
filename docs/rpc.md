@@ -150,7 +150,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "set_slow_mode", enabled: boolean }`
-- `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
+- `{ id?, type: "goal", op: "get" | "create" | "replace" | "resume" | "pause" | "drop" | "budget" | "guided", objective?: string, token_budget?: number, submitObjective?: boolean, images?: ImageContent[], rough?: string }`
 - `{ id?, type: "set_ask_dialog", enabled: boolean }`
 - `{ id?, type: "set_idle_activity", isComposing: boolean, ifEpoch?: number }` (socket connections only; see [Idle maintenance](#idle-maintenance))
 - `{ id?, type: "get_available_commands" }`
@@ -574,14 +574,34 @@ including those made by the agent's `goal` tool.
 - `create` needs `goal.enabled`, a non-empty `objective`, and no active or paused
   goal. It is refused in plan mode, and `token_budget` must be a positive integer.
   It adds the `goal` tool to the active tools.
+- `replace` swaps the objective (and optional `token_budget`) of the active goal,
+  as `/goal set` does over an active goal; a run in flight is told about it.
+- `create` and `replace` take `submitObjective: true` (and optional `images`): the
+  objective is then submitted as a user prompt, visible once, as the goal's first
+  turn instead of a hidden continuation. The command answers once the prompt is
+  admitted, not when its turn ends. Such a prompt (like the `guided` kickoff) is not
+  a `prompt` command: no `prompt_result` reports it; its turn still emits the usual
+  events, `agent_end`, and `session_settled`.
+- `budget` sets the active goal's `token_budget` (a positive integer); without
+  `token_budget` it clears the budget. It is refused for a paused or completed goal.
+  A raised budget lets a budget-limited goal continue.
+- `guided` starts the `/guided-goal` interview: it adds the `goal` tool before any
+  goal exists, so the agent can finish with `goal create`, and sends the interview
+  as a hidden message (optional `rough` idea and `images`), queued behind a run in
+  flight. It is refused like `create` over an active or paused goal.
 - `resume` resumes a paused goal (refused in plan mode). `pause` and `drop` restore
   the active tools from before the goal started.
-- Failures are ordinary `success: false` responses.
+- Failures are ordinary `success: false` responses. On a session host the command
+  takes the usual `ifEpoch`/`ifLeaf` write preconditions.
 
 Goals do not continue on their own over RPC unless `goal.continuationModes`
-contains `"rpc"`; this covers `--mode rpc`, `--mode rpc-ui` and `--mode host`. When enabled,
-`create`/`resume` and each terminal `agent_end` decide whether to start another goal
-turn, sent as a hidden `goal-continuation` message.
+contains `"rpc"`; this covers `--mode rpc` and `--mode rpc-ui`. A session host
+(`--mode host`) counts as `"interactive"`, like the in-process TUI it stands in for,
+so default settings continue goals there whether or not a client is attached, once
+per idle whatever the number of clients, about 800 ms after the run yields. When
+enabled, `create`/`resume` and each terminal `agent_end` decide whether to start
+another goal turn, sent as a hidden `goal-continuation` custom message attributed to
+the agent (`attribution: "agent"`).
 
 - The turn starts once the yielding run has fully unwound. At that moment the goal
   must still be active, the session idle with nothing queued, plan mode off, open
@@ -589,9 +609,10 @@ turn, sent as a hidden `goal-continuation` message.
 - While the turn is decided but not yet started, `get_state.isSettled`,
   `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
   `session_settled` follows if the continuation is abandoned.
-- `abort` stops continuation before the abort takes effect and pauses the
-  interrupted goal, so a later prompt does not restart it; only `goal resume` does
-  (or `drop` and a new `create`).
+- An interrupting abort (`abort`, `abort_and_prompt`, `abort_and_restore_queue`, or an
+  extension's `ctx.abort()`) stops continuation before the abort takes effect and
+  pauses the interrupted goal, so a later prompt does not restart it; only
+  `goal resume` does (or `drop` and a new `create`).
 - Continuation also stops after a goal turn with no new tool activity. The next
   turn that is not itself a goal continuation (a host prompt, steer or follow-up,
   for example) re-arms it.

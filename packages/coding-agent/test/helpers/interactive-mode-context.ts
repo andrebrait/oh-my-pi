@@ -311,6 +311,8 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		flushPendingModelSwitch: vi.fn(async () => {}),
 		reloadTodos: vi.fn(async () => {}),
 		setTodos: vi.fn(),
+		updateGoalModeStatus: vi.fn(),
+		handleGoalSessionEvent: vi.fn(),
 	} satisfies ContextOverrides;
 	layer(ctx, overrides, RESOLVED_AHEAD);
 	return ctx as unknown as InteractiveModeContext;

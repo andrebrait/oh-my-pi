@@ -16,7 +16,6 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessageEvent, ImageContent, Model, Usage } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
-import type { RpcGoalResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
 import type { RpcMessagesPage } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-messages";
 import type {
 	RpcAbortAndRestoreQueueResult,
@@ -81,6 +80,7 @@ import type {
 import type * as Wire from "@oh-my-pi/pi-coding-agent/modes/rpc/wire/rpc-wire.generated";
 import type { RestoredQueuedMessage } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionStats } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { RpcGoalResult } from "@oh-my-pi/pi-coding-agent/session/goal-mode";
 import type { BtwHistoryRecord, BtwHistoryTurn } from "@oh-my-pi/pi-coding-agent/session/btw-history";
 import type { UsageLimitState } from "@oh-my-pi/pi-coding-agent/session/usage-limit";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";

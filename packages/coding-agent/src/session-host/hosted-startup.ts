@@ -207,13 +207,13 @@ export function createHostLaunch(options: {
 
 /**
  * Refuse launch options a host cannot honor. They are errors, never silently dropped: dropping `--fork` would open
- * the original session, dropping `--goal` would start the session without the goal asked for (and running it here
- * would start local goal mode, which a terminal that only mirrors a host never does), and a flag only an extension
- * registers cannot be told from a typo (or from the prompt it would swallow) without loading the extensions this
- * terminal deliberately does not load.
+ * the original session, and a flag only an extension registers cannot be told from a typo (or from the prompt it
+ * would swallow) without loading the extensions this terminal deliberately does not load. `--goal` seeds a new
+ * session, so it is refused with `omp attach`; a launch that finds the session already hosted refuses it too
+ * ({@link ensureHostForResolvedSession}).
  */
 export function assertHostedLaunchSupported(
-	parsed: Pick<Args, "fork" | "fromClaude" | "fromCodex" | "goal" | "unrecognizedFlags">,
+	parsed: Pick<Args, "attach" | "fork" | "fromClaude" | "fromCodex" | "goal" | "unrecognizedFlags">,
 ): void {
 	if (parsed.fork !== undefined) {
 		throw new CliUsageError("--fork is not supported with hosted sessions (tui.hosted, omp attach)");
@@ -224,8 +224,8 @@ export function assertHostedLaunchSupported(
 	if (parsed.fromCodex) {
 		throw new CliUsageError("--from-codex is not supported with hosted sessions (tui.hosted, omp attach)");
 	}
-	if (parsed.goal !== undefined) {
-		throw new CliUsageError("--goal is not supported with hosted sessions (tui.hosted, omp attach)");
+	if (parsed.goal !== undefined && parsed.attach !== undefined) {
+		throw new CliUsageError("--goal starts a new session, so it cannot be combined with omp attach");
 	}
 	if (parsed.unrecognizedFlags.length > 0) {
 		throw new CliUsageError(
@@ -262,11 +262,13 @@ async function openedByAnotherProcess(sessionFile: string): Promise<boolean> {
  *
  * `restore` (`--restore`): a host this call starts goes on with what the session's last process left unfinished. A
  * host that already runs the session is attached to as it is: its process is alive, so nothing was interrupted.
+ *
+ * `requireNewHost`: the flag (`--goal`) that only a host this call starts can honor; an already running one is refused.
  */
 export async function ensureSessionHost(
 	sessionFile: string | undefined,
 	launch: HostLaunch,
-	options: { launchFlagsMustApply?: boolean; restore?: boolean } = {},
+	options: { launchFlagsMustApply?: boolean; restore?: boolean; requireNewHost?: string } = {},
 ): Promise<SessionHostEntry> {
 	const registryDir = path.resolve(launch.registryDir ?? sessionHostsDir());
 	if (sessionFile === undefined) {
@@ -285,6 +287,11 @@ export async function ensureSessionHost(
 		async () => {
 			const running = await findHostForSession(file, registryDir);
 			if (running) {
+				if (options.requireNewHost) {
+					throw new CliUsageError(
+						`Session host ${running.hostId} already runs this session, and ${options.requireNewHost} needs a new one; run without it, or attach with: omp attach ${running.hostId}`,
+					);
+				}
 				if (options.launchFlagsMustApply && launch.args.length > 0) {
 					throw new CliUsageError(
 						`Session host ${running.hostId} already runs this session, so this launch's host options cannot apply; run without them, or attach with: omp attach ${running.hostId}`,
@@ -318,11 +325,11 @@ export async function ensureSessionHost(
 export async function ensureHostForResolvedSession(
 	sessionManager: SessionManager | undefined,
 	launch: HostLaunch,
-	options: { restore?: boolean } = {},
+	options: { restore?: boolean; requireNewHost?: string } = {},
 ): Promise<SessionHostEntry> {
 	const sessionFile = sessionManager?.isSessionOnDisk() ? sessionManager.getSessionFile() : undefined;
 	await sessionManager?.close();
-	return ensureSessionHost(sessionFile, launch, { launchFlagsMustApply: true, restore: options.restore });
+	return ensureSessionHost(sessionFile, launch, { launchFlagsMustApply: true, ...options });
 }
 
 async function resolveSessionFile(name: string, launch: HostLaunch): Promise<string | undefined> {

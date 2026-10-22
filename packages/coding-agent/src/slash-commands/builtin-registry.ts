@@ -133,9 +133,9 @@ export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = 
 
 /**
  * Builtins that keep running in this process while the UI is a client of a session host: they read or move only
- * what is on this screen or this machine (hotkeys, clipboard, links) or end this client. `bare`: only without
- * arguments, where the command sends the host its own RPC command (`/new`, `/fork`, `/tree`, `/branch`; `/fork pane`
- * stays refused).
+ * what is on this screen or this machine (hotkeys, clipboard, links) or end this client, or they send the host
+ * their own RPC command (`/goal`, `/guided-goal`). `bare`: only without arguments, where the command sends the host
+ * its own RPC command (`/new`, `/fork`, `/tree`, `/branch`; `/fork pane` stays refused).
  */
 const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true | "bare">> = {
 	hotkeys: true,
@@ -145,6 +145,8 @@ const HOSTED_LOCAL_COMMANDS: Readonly<Record<string, true | "bare">> = {
 	attach: true,
 	exit: true,
 	quit: true,
+	goal: true,
+	"guided-goal": true,
 	new: "bare",
 	fork: "bare",
 	tree: "bare",

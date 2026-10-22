@@ -149,33 +149,6 @@ describe("submitInteractiveInput", () => {
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
-	it("routes hidden custom submissions through promptCustomMessage with followUp queueing", async () => {
-		const mode = createMode();
-		const session = {
-			prompt: vi.fn(async () => true),
-			promptCustomMessage: vi.fn(async () => true),
-			isStreaming: false,
-		};
-		const input = createInput({ text: "continue goal", customType: "goal-continuation" });
-
-		await submitInteractiveInput(mode, session, input);
-
-		expect(session.prompt).not.toHaveBeenCalled();
-		// Even when idle, followUp is passed so a background turn that starts in the
-		// read-vs-dispatch gap queues the message instead of throwing AgentBusyError.
-		expect(session.promptCustomMessage).toHaveBeenCalledWith(
-			{
-				customType: "goal-continuation",
-				content: "continue goal",
-				display: false,
-				attribution: "agent",
-			},
-			{ streamingBehavior: "followUp" },
-		);
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.showError).not.toHaveBeenCalled();
-	});
-
 	it("passes followUp on a plain idle submission so a racing turn queues instead of erroring", async () => {
 		const mode = createMode();
 		const session = {

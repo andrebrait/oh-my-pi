@@ -227,6 +227,9 @@ export async function runSessionHost(session: AgentSession, options: SessionHost
 	const server = new RpcServer(session, {
 		...serverOptions,
 		hostId,
+		// A host stands in for the in-process TUI: default settings continue goals here, with or without clients.
+		// No `isBlocked`: this stack has no client-composing (idle-activity) gate yet.
+		goalContinuationMode: "interactive",
 		// `pi.shutdown()`: the server already disposed the session and wrote every owed response.
 		onShutdown: async () => lifetime.resolve(stop()),
 	});

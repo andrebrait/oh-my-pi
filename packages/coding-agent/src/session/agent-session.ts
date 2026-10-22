@@ -383,6 +383,7 @@ import {
 	type ToolExecutionStartData,
 } from "./exit-diagnostics";
 import { IdleMaintenance, type IdleMaintenanceOptions } from "./idle-maintenance";
+import { GoalModeController, type GoalModeOptions } from "./goal-mode";
 import { IrcBridge, type IrcBridgeHost } from "./irc-bridge";
 import {
 	buildLaunchCompletionBatchMessage,
@@ -3609,6 +3610,14 @@ export class AgentSession implements SettingsScope {
 				});
 			}
 		}
+		// After every subscriber: a completed goal's journal entries follow its terminal agent_end.
+		try {
+			this.#goalMode?.observeAfterListeners(event);
+		} catch (err) {
+			logger.warn("Goal mode failed to journal a completed goal", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 	}
 
 	#emitRunState(state: "running" | "idle"): void {
@@ -6045,6 +6054,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#goalMode?.dispose();
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
@@ -7465,6 +7475,51 @@ export class AgentSession implements SettingsScope {
 
 	get goalRuntime(): GoalRuntime {
 		return this.#goalRuntime;
+	}
+
+	#goalMode: GoalModeController | undefined;
+
+	/** The session's goal mode controller, once an owner enabled it ({@link enableGoalMode}). */
+	get goalMode(): GoalModeController | undefined {
+		return this.#goalMode;
+	}
+
+	/**
+	 * Run goal mode in this session: one controller decides continuations whatever the number of
+	 * clients. Idempotent for the same `mode`/`delayMs`; a second owner asking for others throws, as
+	 * does a passive replica, whose owner already runs it. The controller sees every event before
+	 * any subscriber, is stopped by an interrupting {@link abort}, and holds/reattaches the goal
+	 * across session changes.
+	 */
+	enableGoalMode(options: GoalModeOptions): GoalModeController {
+		if (this.passiveReplica) throw new Error("A passive replica does not run goal mode");
+		const running = this.#goalMode;
+		if (running) {
+			if (running.options.mode !== options.mode || running.options.delayMs !== options.delayMs) {
+				throw new Error(
+					`Goal mode already runs with mode ${running.options.mode} and ${running.options.delayMs} ms delay`,
+				);
+			}
+			return running;
+		}
+		const goalMode = new GoalModeController(this, options);
+		this.#goalMode = goalMode;
+		this.#eventListeners = [event => goalMode.observe(event), ...this.#eventListeners];
+		return goalMode;
+	}
+
+	/** Hold goal mode across a session change, then reattach it. `detachedRun` reads `change`'s result (`undefined`: it threw). */
+	async #goalSessionChange<T>(change: () => Promise<T>, detachedRun: (result: T | undefined) => boolean): Promise<T> {
+		const goalMode = this.#goalMode;
+		if (!goalMode) return change();
+		await goalMode.beginSessionChange();
+		let result: T | undefined;
+		try {
+			result = await change();
+			return result;
+		} finally {
+			await goalMode.endSessionChange({ detachedRun: detachedRun(result) });
+		}
 	}
 
 	markPlanReferenceSent(): void {
@@ -8907,14 +8962,8 @@ export class AgentSession implements SettingsScope {
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
-				const success = await this.newSession({ parentSession: options?.parentSession });
-				if (!success) {
-					return { cancelled: true };
-				}
-				if (options?.setup) {
-					await options.setup(this.sessionManager);
-				}
-				return { cancelled: false };
+				const success = await this.newSession({ parentSession: options?.parentSession, setup: options?.setup });
+				return { cancelled: !success };
 			},
 			branch: async entryId => {
 				const result = await this.branch(entryId);
@@ -10949,6 +10998,8 @@ export class AgentSession implements SettingsScope {
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
+		// Before anything unwinds, so the aborted run's agent_end cannot schedule another goal turn.
+		if (userInterrupt) this.#goalMode?.stopForAbort();
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
 		// Pull advisor concerns out of the steer/follow-up queues before any await so
@@ -11051,7 +11102,14 @@ export class AgentSession implements SettingsScope {
 	 * @param options - Optional initial messages and parent session path
 	 * @returns true if completed, false if cancelled by hook
 	 */
-	async newSession(options?: NewSessionOptions): Promise<boolean> {
+	newSession(options?: NewSessionOptions): Promise<boolean> {
+		return this.#goalSessionChange(
+			() => this.#newSession(options),
+			started => started !== false,
+		);
+	}
+
+	async #newSession(options?: NewSessionOptions): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
@@ -11166,6 +11224,8 @@ export class AgentSession implements SettingsScope {
 				});
 			}
 
+			// Inside the goal hold (see `newSession`), so the reattach sees what setup journals.
+			await options?.setup?.(this.sessionManager);
 			return true;
 		} finally {
 			if (advisorRecordersDetached) {
@@ -11204,7 +11264,14 @@ export class AgentSession implements SettingsScope {
 	 * Either refusal throws {@link SessionBusyError} before any session state is discarded.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
+	fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
+		return this.#goalSessionChange(
+			() => this.#fork(entryId, options),
+			() => false,
+		);
+	}
+
+	async #fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const requireIdleFor = entryId !== undefined || options?.requireIdle ? "fork the session" : undefined;
@@ -12663,7 +12730,11 @@ export class AgentSession implements SettingsScope {
 			throw new Error(`No API key for ${explicitModel.provider}/${explicitModel.id}`);
 		}
 		const guard = this.passiveReplica ? undefined : this.#sessionSwitchGuard;
-		const proceed = () => this.#switchSession(sessionPath, options);
+		const proceed = () =>
+			this.#goalSessionChange(
+				() => this.#switchSession(sessionPath, options),
+				switched => switched !== false,
+			);
 		return guard ? guard(sessionPath, proceed) : proceed();
 	}
 
@@ -13090,7 +13161,18 @@ export class AgentSession implements SettingsScope {
 	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
-	async branch(entryId: string): Promise<{
+	branch(entryId: string): Promise<{
+		selectedText: string;
+		selectedImages: ImageContent[];
+		cancelled: boolean;
+	}> {
+		return this.#goalSessionChange(
+			() => this.#branch(entryId),
+			() => false,
+		);
+	}
+
+	async #branch(entryId: string): Promise<{
 		selectedText: string;
 		selectedImages: ImageContent[];
 		cancelled: boolean;
@@ -13226,7 +13308,19 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Promotes a completed /btw answer from the explicitly authorized session and leaf. */
-	async branchFromBtw(
+	branchFromBtw(
+		question: string,
+		assistantMessage: AssistantMessage,
+		leafId: string,
+		sessionId: string,
+	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
+		return this.#goalSessionChange(
+			() => this.#branchFromBtw(question, assistantMessage, leafId, sessionId),
+			() => false,
+		);
+	}
+
+	async #branchFromBtw(
 		question: string,
 		assistantMessage: AssistantMessage,
 		leafId: string,
@@ -13355,7 +13449,7 @@ export class AgentSession implements SettingsScope {
 	 * @param options.customInstructions Custom instructions for summarizer
 	 * @returns Result with editorText/editorImages (if user message) and cancelled status
 	 */
-	async navigateTree(
+	navigateTree(
 		targetId: string,
 		options: {
 			summarize?: boolean;
@@ -13381,6 +13475,16 @@ export class AgentSession implements SettingsScope {
 			 */
 			reanswerAskResult?: AgentToolResult<AskToolDetails>;
 		} = {},
+	): Promise<NavigateTreeResult> {
+		return this.#goalSessionChange(
+			() => this.#navigateTree(targetId, options),
+			() => false,
+		);
+	}
+
+	async #navigateTree(
+		targetId: string,
+		options: NonNullable<Parameters<AgentSession["navigateTree"]>[1]>,
 	): Promise<NavigateTreeResult> {
 		using _transition = this.#beginSessionTransition();
 		await this.#bash.flushPending();

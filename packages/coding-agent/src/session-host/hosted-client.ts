@@ -54,6 +54,7 @@ import type {
 } from "../modes/rpc/rpc-types";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSessionEvent } from "../session/agent-session";
+import type { RpcGoalCommand, RpcGoalResult } from "../session/goal-mode";
 import { isTranscriptEntry } from "../session/session-context";
 import {
 	applyReplicaEvent,
@@ -490,6 +491,23 @@ export class HostedClientLink {
 		await this.#chain;
 	}
 
+	/** Run a goal op on the host; resolves once this view has applied the goal events it caused. */
+	async goal(command: RpcGoalCommand): Promise<RpcGoalResult> {
+		const result = await this.#client.goal(
+			command.op,
+			{
+				objective: command.objective,
+				tokenBudget: command.token_budget,
+				submitObjective: command.submitObjective,
+				images: command.images,
+				rough: command.rough,
+			},
+			this.#guard(),
+		);
+		await this.#chain;
+		return result;
+	}
+
 	/** Leave the session running and close this client; a reconnect in progress stops without sending anything. */
 	async detach(): Promise<void> {
 		await this.#leave(() => this.#client.detach());
@@ -687,9 +705,6 @@ export class HostedClientLink {
 			case "agent_start":
 				this.#isStreaming = true;
 				break;
-			case "agent_end":
-				this.#isStreaming = false;
-				break;
 			case "auto_compaction_start":
 				this.#isCompacting = true;
 				break;
@@ -707,6 +722,22 @@ export class HostedClientLink {
 				// Before the handler runs: it restyles the editor and thinking blocks from the session's level,
 				// and this event outruns the host's `config_update` for the same change.
 				this.#ctx.session.setReplicaThinkingLevel(event.thinkingLevel);
+				break;
+			case "goal_updated":
+				// Mirror the host's goal into the replica, so goal flags, menus and the status line read it.
+				// A dropped goal is gone on the host (it journals no further state), so it is gone here too.
+				this.#ctx.session.setGoalModeState(
+					event.state?.goal.status === "dropped" ? undefined : (event.state ?? undefined),
+				);
+				this.#ctx.handleGoalSessionEvent(event);
+				break;
+			case "agent_end":
+				this.#isStreaming = false;
+				// The host journals a completed goal after this event and sends no update for it.
+				if (event.isTerminal !== false && this.#ctx.session.getGoalModeState()?.mode === "exiting") {
+					this.#ctx.session.setGoalModeState(undefined);
+				}
+				this.#ctx.handleGoalSessionEvent(event);
 				break;
 		}
 		await applyReplicaEvent(this.#ctx, event);
@@ -768,6 +799,8 @@ export class HostedClientLink {
 		this.#queued = { steering: [...state.queuedMessages.steering], followUp: [...state.queuedMessages.followUp] };
 		this.#queuedAttachments = readQueueAttachments(snapshot.queueAttachments, this.#queued);
 		applyReplicaHostState(ctx.session, { model: state.model, thinkingLevel: state.thinkingLevel });
+		ctx.session.setGoalModeState(state.goal ?? undefined);
+		ctx.updateGoalModeStatus();
 		setSessionTerminalTitle(state.sessionName ?? header.title, ctx.sessionManager.getCwd());
 		this.#clientCount = snapshot.clients.length;
 		this.#publishStatus();

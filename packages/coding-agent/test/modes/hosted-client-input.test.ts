@@ -21,7 +21,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
@@ -1577,24 +1576,28 @@ describe("a hosted client's automation", () => {
 				expect(shown(mode, WORKER_RECAP)).toBe(1);
 			}, 30_000);
 
-			it("recaps the stretch once a goal continuation is cancelled before it starts, with no other turn to restart the clock", async () => {
-				const { mode, session, models } = await openRecapMode(false);
-				await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
+			/** A turn ends, then a goal set while idle schedules a continuation, due 800 ms later, that holds the recap back. */
+			async function openWithPendingContinuation() {
+				const opened = await openRecapMode(false);
+				const goalMode = opened.session.goalMode;
+				if (!goalMode) throw new Error("the terminal did not enable goal mode");
 				vi.useFakeTimers();
-				// The main loop waits for input, so the end of the turn schedules the goal's next continuation.
-				const input = mode.getUserInput();
-				await runTurn(session);
-				expect(models.main.calls).toHaveLength(1);
+				// The main loop waits for input: only then does the terminal let a goal continue.
+				void opened.mode.getUserInput();
+				await runTurn(opened.session);
+				expect(opened.models.main.calls).toHaveLength(1);
+				await wait(goalMode.handle({ op: "create", objective: "Ship the login flow" }));
+				expect(goalMode.continuationPending).toBe(true);
+				return { ...opened, goalMode };
+			}
 
-				// The continuation is submitted 800 ms after the turn ended; until its turn starts it holds the recap back.
+			it("recaps the stretch once a waiting goal continuation is abandoned, with no other turn to restart the clock", async () => {
+				const { mode, session, models, goalMode } = await openWithPendingContinuation();
+				// Paused before it is due: at admission the continuation is dropped, and no `agent_end` follows.
+				await wait(goalMode.handle({ op: "pause" }));
 				await elapse(800);
-				expect((await wait(input)).customType).toBe("goal-continuation");
-				await elapse(3 * RECAP_DELAY_MS);
-				expect(models.side.calls).toHaveLength(0);
-
-				// Esc before the turn begins: no `agent_end` will ever follow to end this stretch.
-				expect(mode.cancelPendingSubmission()).toBe(true);
 				await flush();
+				expect(goalMode.continuationPending).toBe(false);
 				await elapse(RECAP_DELAY_MS);
 				await until(() => shown(mode, RECAP) > 0, "the recap on screen");
 				await elapse(3 * RECAP_DELAY_MS);
@@ -1610,18 +1613,10 @@ describe("a hosted client's automation", () => {
 			];
 			for (const [outcome, dispatch] of refusals) {
 				it(`recaps the stretch once the session ${outcome} a goal continuation, with no other turn to restart the clock`, async () => {
-					const { mode, session, models } = await openRecapMode(false);
-					await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
-					vi.useFakeTimers();
-					const input = mode.getUserInput();
-					await runTurn(session);
-					await elapse(800);
-					const continuation = await wait(input);
-					expect(continuation.customType).toBe("goal-continuation");
-
-					// The main loop submits it and the session refuses it before any turn starts: no `agent_end` follows.
+					const { mode, session, models } = await openWithPendingContinuation();
+					// The session refuses the continuation before any turn starts: no `agent_end` follows.
 					vi.spyOn(session, "promptCustomMessage").mockImplementationOnce(dispatch);
-					await wait(submitInteractiveInput(mode, session, continuation));
+					await elapse(800);
 					await flush();
 					await elapse(RECAP_DELAY_MS);
 					await until(() => shown(mode, RECAP) > 0, "the recap on screen");
@@ -1632,25 +1627,16 @@ describe("a hosted client's automation", () => {
 				}, 30_000);
 			}
 
-			it("holds the recap while a goal continuation the session took still owes its turn, and recaps once that turn ends", async () => {
-				const { mode, session, models } = await openRecapMode(false);
-				await session.goalRuntime.createGoal({ objective: "Ship the login flow" });
-				vi.useFakeTimers();
-				const input = mode.getUserInput();
-				await runTurn(session);
+			it("gives a stretch that a goal continuation extends one recap, after the continuation's turn ends", async () => {
+				const { mode, session, models } = await openWithPendingContinuation();
+				const continued = Promise.withResolvers<void>();
+				session.subscribe(event => {
+					if (event.type === "agent_end" && event.isTerminal !== false) continued.resolve();
+				});
+				// The continuation is admitted and runs a real turn; the stretch has not ended before it does.
 				await elapse(800);
-				const continuation = await wait(input);
-				expect(continuation.customType).toBe("goal-continuation");
-
-				// The session takes it, queued into a turn that has not ended yet: its `agent_end` is still to come.
-				vi.spyOn(session, "promptCustomMessage").mockImplementationOnce(() => Promise.resolve(true));
-				await wait(submitInteractiveInput(mode, session, continuation));
-				await flush();
-				await elapse(3 * RECAP_DELAY_MS);
-				expect(models.side.calls).toHaveLength(0);
-
-				// That turn ends, and the stretch it closes is recapped.
-				await runTurn(session);
+				await driveTurn(session, continued.promise);
+				await wait(session.waitForIdle());
 				await elapse(RECAP_DELAY_MS);
 				await until(() => shown(mode, RECAP) > 0, "the recap on screen");
 				await elapse(3 * RECAP_DELAY_MS);

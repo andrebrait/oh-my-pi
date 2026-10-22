@@ -2732,12 +2732,18 @@ pub enum GoalOp {
 	Get,
 	#[serde(rename = "create")]
 	Create,
+	#[serde(rename = "replace")]
+	Replace,
 	#[serde(rename = "resume")]
 	Resume,
 	#[serde(rename = "pause")]
 	Pause,
 	#[serde(rename = "drop")]
 	Drop,
+	#[serde(rename = "budget")]
+	Budget,
+	#[serde(rename = "guided")]
+	Guided,
 }
 
 impl GoalOp {
@@ -2746,9 +2752,12 @@ impl GoalOp {
 		match self {
 			Self::Get => "get",
 			Self::Create => "create",
+			Self::Replace => "replace",
 			Self::Resume => "resume",
 			Self::Pause => "pause",
 			Self::Drop => "drop",
+			Self::Budget => "budget",
+			Self::Guided => "guided",
 		}
 	}
 }
@@ -5735,10 +5744,21 @@ pub struct SetSlowModeResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalParams {
 	pub op: GoalOp,
+	/// `create`/`replace`: the objective.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub objective: Option<String>,
+	/// `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub token_budget: Option<i64>,
+	/// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.
+	#[serde(rename = "submitObjective", default, skip_serializing_if = "Option::is_none")]
+	pub submit_objective: Option<bool>,
+	/// Images submitted with the objective (`submitObjective`) or the `guided` kickoff.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub images: Option<Vec<ImageContent>>,
+	/// `guided`: the rough idea the interview starts from.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rough: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6975,10 +6995,21 @@ impl Command for SetSlowModeCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalCommand {
 	pub op: GoalOp,
+	/// `create`/`replace`: the objective.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub objective: Option<String>,
+	/// `create`/`replace`: optional positive budget. `budget`: the new budget; omitted clears it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub token_budget: Option<i64>,
+	/// `create`/`replace`: submit the objective as a user prompt (its first turn) instead of a hidden continuation.
+	#[serde(rename = "submitObjective", default, skip_serializing_if = "Option::is_none")]
+	pub submit_objective: Option<bool>,
+	/// Images submitted with the objective (`submitObjective`) or the `guided` kickoff.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub images: Option<Vec<ImageContent>>,
+	/// `guided`: the rough idea the interview starts from.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rough: Option<String>,
 }
 
 impl Command for GoalCommand {

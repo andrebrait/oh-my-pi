@@ -20,7 +20,7 @@ export const stateDefs = {
 		"`message_update` projection (`set_event_filter`, or a socket hello's capabilities): `delta` replaces the accumulated snapshots with the block a start/end event touches.",
 	),
 	TodoStatus: "'pending' | 'in_progress' | 'completed' | 'abandoned' | 'blocked'",
-	GoalOp: "'get' | 'create' | 'resume' | 'pause' | 'drop'",
+	GoalOp: "'get' | 'create' | 'replace' | 'resume' | 'pause' | 'drop' | 'budget' | 'guided'",
 	GoalStatus: "'active' | 'paused' | 'budget-limited' | 'complete' | 'dropped'",
 	SlashCommandSource: "'builtin' | 'skill' | 'extension' | 'custom' | 'mcp_prompt' | 'file'",
 	SubagentSubscriptionLevel: doc(

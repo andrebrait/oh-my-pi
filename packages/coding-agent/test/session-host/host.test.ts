@@ -1128,22 +1128,24 @@ describe("session host idle recap", () => {
 		const settled = Promise.withResolvers<void>();
 		client.onSessionSettled(() => settled.resolve());
 		try {
-			// Goal mode is on, but the host does not yet continue goals: creating one runs no turn.
+			// A session host continues goals as an "interactive" owner. With that mode off, creating a goal runs no turn.
+			cfgGoalContinuationModes.set(host.session.settings, []);
 			await client.goal("create", { objective: "Ship the login flow" });
-			cfgGoalContinuationModes.set(host.session.settings, ["rpc"]);
+			cfgGoalContinuationModes.set(host.session.settings, ["interactive"]);
 			// The host's prompt re-arms the goal, so the end of its turn schedules a continuation turn. The gate that
 			// continuation re-reads when it is due closes while it waits, so it never runs and only the host's
 			// "settled" report is left to say the stretch is over.
 			host.session.subscribe(event => {
 				if (event.type === "agent_end" && event.isTerminal !== false) {
-					cfgGoalContinuationModes.set(host.session.settings, ["interactive"]);
+					cfgGoalContinuationModes.set(host.session.settings, []);
 				}
 			});
 
 			const recapped = nextIdleRecap(host.session);
 			vi.useFakeTimers();
 			await driveTurn(host.session, client.promptToCompletion("Wire the token refresh test"));
-			await wait(settled.promise);
+			// The continuation is due 800 ms after the turn: the clock runs until it is dropped and the host reports settled.
+			await drive(settled.promise);
 			await drive(recapped);
 			await until(() => told.recaps.length > 0, "the recap to reach the client after the abandoned continuation");
 
@@ -1241,4 +1243,77 @@ describe("session host idle recap", () => {
 			await finish(host, [viewer]);
 		}
 	}, 60_000);
+});
+
+describe("session host goal mode", () => {
+	const continuations = (session: AgentSession): number =>
+		session.messages.filter(message => message.role === "custom" && message.customType === "goal-continuation")
+			.length;
+	/** The host decided nothing more: no goal turn waiting, none running. */
+	const quiet = (session: AgentSession): boolean =>
+		session.goalMode?.continuationPending === false && !session.isStreaming && !session.hasAdmittedSubmission;
+
+	it("a session host continues an active goal with default settings and no client attached", async () => {
+		const host = await startHost();
+		// Attaching waits for the host's startup reattach, which would otherwise clear a goal set before it.
+		await (await attachClient(host)).detach();
+		await waitFor(async () => (await onlyEntry()).clients === 0);
+		const goalMode = host.session.goalMode;
+		if (!goalMode) throw new Error("the host did not enable goal mode");
+		await goalMode.handle({ op: "create", objective: "keep going" });
+		await waitFor(() => continuations(host.session) === 1 && quiet(host.session));
+		// The continuation made no progress, so the loop stopped after it.
+		expect(continuations(host.session)).toBe(1);
+		expect(host.session.getGoalModeState()?.goal.status).toBe("active");
+		await host.stop();
+	});
+
+	it("a session host admits a decided continuation after 800 ms, not before", async () => {
+		const host = await startHost();
+		await (await attachClient(host)).detach();
+		await waitFor(async () => (await onlyEntry()).clients === 0);
+		const goalMode = host.session.goalMode;
+		if (!goalMode) throw new Error("the host did not enable goal mode");
+		const admitted: string[] = [];
+		const prompt = spyOn(host.session, "promptCustomMessage").mockImplementation(async message => {
+			admitted.push(message.customType);
+			return true;
+		});
+		const nextMacrotask = () => new Promise<void>(resolve => setImmediate(resolve));
+		vi.useFakeTimers();
+		try {
+			await goalMode.handle({ op: "create", objective: "keep going" });
+			vi.advanceTimersByTime(799);
+			await nextMacrotask();
+			expect(admitted).toEqual([]);
+			vi.advanceTimersByTime(1);
+			await nextMacrotask();
+			expect(admitted).toEqual(["goal-continuation"]);
+		} finally {
+			vi.useRealTimers();
+			prompt.mockRestore();
+		}
+		await host.stop();
+	});
+
+	it("two clients see one continuation per idle", async () => {
+		const host = await startHost();
+		const a = await attachClient(host);
+		const b = await attachClient(host);
+		await a.goal("create", { objective: "keep going" });
+		await waitFor(() => continuations(host.session) === 1 && quiet(host.session));
+		// Input from either client re-arms the goal; its idle continues once, not once per client.
+		await b.promptAndWait("go on");
+		await waitFor(() => continuations(host.session) === 2 && quiet(host.session));
+		expect(continuations(host.session)).toBe(2);
+		for (const client of [a, b]) {
+			const seen = (await client.getMessages()).filter(
+				message => message.role === "custom" && message.customType === "goal-continuation",
+			);
+			expect(seen).toHaveLength(2);
+		}
+		await a.detach();
+		await b.detach();
+		await host.stop();
+	});
 });

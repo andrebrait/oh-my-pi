@@ -10,6 +10,7 @@ import type {
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
+import type { SessionManager } from "./session-manager";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import type { RuntimeIdentity } from "./runtime-identity";
 
@@ -74,6 +75,8 @@ export interface NewSessionOptions {
 	additionalDirectories?: string[];
 	/** Directory for the new session file (and later `/new` sessions); defaults to the current session directory. */
 	sessionDir?: string;
+	/** Runs once the new session is ready, before goal mode reattaches (extension `ctx.newSession({ setup })`). */
+	setup?: (sessionManager: SessionManager) => Promise<void>;
 }
 
 export interface SessionEntryBase {
