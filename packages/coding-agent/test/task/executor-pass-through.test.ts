@@ -10,10 +10,12 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, ServiceTierByFamily } from "@oh-my-pi/pi-ai";
+import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
@@ -22,9 +24,11 @@ import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-
 import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -549,6 +553,147 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
 	});
+
+	it("installs the per-call dispatch check and stamps the revival contract", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const other = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!model || !other) throw new Error("Expected bundled models to exist");
+		const session = yieldEmittingSession();
+		const initSpy = vi.spyOn(session.sessionManager, "appendSessionInit");
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const registry = createModelRegistry([model, other]);
+		const settings = Settings.isolated({ modelRoles: { review: `${model.provider}/${model.id}` } });
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-per-call-dispatch",
+			modelOverride: [`${model.provider}/${model.id}`],
+			perCallModelGrants: { settings, agentName: baseAgent.name },
+			settings,
+			modelRegistry: registry,
+		});
+
+		expect(result.exitCode).toBe(0);
+		const assertDispatchModel = spy.mock.calls[0]?.[0]?.assertDispatchModel;
+		expect(assertDispatchModel).toBeDefined();
+		expect(() => assertDispatchModel?.(model)).not.toThrow();
+		expect(() => assertDispatchModel?.(other)).toThrow(/not an approved model/);
+		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ perCallModel: true }));
+	});
+
+	it("leaves ordinary spawns without a dispatch check", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const spy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-ordinary-dispatch",
+			modelOverride: [`${model.provider}/${model.id}`],
+			settings: Settings.isolated(),
+			modelRegistry: createModelRegistry(model),
+		});
+
+		expect(spy.mock.calls[0]?.[0]?.assertDispatchModel).toBeUndefined();
+	});
+
+	it("retries a per-call role on its inherited default chain under the runtime allowlist", async () => {
+		const cwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-per-call-default-chain-"));
+		const authStorage = await AuthStorage.create(":memory:");
+		const id = "subagent-per-call-default-chain";
+		const sourceId = "executor-per-call-default-chain";
+		try {
+			authStorage.keys.setRuntime("mock", "test-key");
+			registerMockApi(sourceId);
+			const primary = createMockModel({
+				id: "per-call-default-chain-primary",
+				responses: [{ throw: "rate limit exceeded retry-after-ms=60000" }],
+				handler: () => ({ content: ["Unexpected primary retry."] }),
+			});
+			const fallback = createMockModel({
+				id: "per-call-default-chain-fallback",
+				handler: () => ({ content: ["Completed on default fallback."] }),
+			});
+			const models = [primary, fallback];
+			const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+			const find = modelRegistry.find.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "find").mockImplementation(
+				(provider, modelId) =>
+					models.find(model => model.provider === provider && model.id === modelId) ?? find(provider, modelId),
+			);
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
+			const primarySelector = `${primary.provider}/${primary.id}`;
+			const settings = Settings.isolated({
+				"task.perCallModel": "on",
+				"task.perCallModelAllow": ["@review"],
+				"task.perCallModelFallbacks": "runtime",
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 1_000,
+				modelRoles: { review: primarySelector },
+				// An absent review chain inherits default; only @review is allowed.
+				"retry.fallbackChains": { default: [`${fallback.provider}/${fallback.id}`] },
+			});
+
+			const result = await runSubprocess({
+				...baseOptions,
+				cwd,
+				id,
+				agent: { ...baseAgent, tools: ["read"] },
+				modelOverride: [primarySelector],
+				modelRole: "review",
+				perCallModelGrants: { settings, agentName: baseAgent.name },
+				settings,
+				modelRegistry,
+				restrictToolNames: true,
+				enableMCP: false,
+				enableIrc: false,
+				structured: false,
+				keepAlive: false,
+			});
+
+			expect(primary.calls).toHaveLength(1);
+			expect(fallback.calls).toHaveLength(1);
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toBe("Completed on default fallback.");
+		} finally {
+			await AgentRegistry.global().get(id)?.session?.dispose();
+			AgentRegistry.global().unregister(id);
+			unregisterCustomApis(sourceId);
+			authStorage.close();
+			await fs.promises.rm(cwd, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("starts a per-call worker on its first candidate with working credentials, a plain spawn on its first", async () => {
+		const unauthed = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const authed = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!unauthed || !authed) throw new Error("Expected bundled models to exist");
+		const spy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockImplementation(async () => createSessionResult(yieldEmittingSession()));
+		const registry = createModelRegistry([unauthed, authed], async model =>
+			model.provider === authed.provider ? "test-key" : undefined,
+		);
+		const settings = Settings.isolated();
+		const modelOverride = [`${unauthed.provider}/${unauthed.id}`, `${authed.provider}/${authed.id}`];
+
+		for (const perCallModelGrants of [{ settings, agentName: baseAgent.name }, undefined]) {
+			await runSubprocess({
+				...baseOptions,
+				id: `subagent-candidate-walk-${perCallModelGrants ? "per-call" : "plain"}`,
+				modelOverride,
+				perCallModelGrants,
+				settings,
+				modelRegistry: registry,
+			});
+		}
+
+		expect(spy.mock.calls.map(call => call[0]?.model?.id)).toEqual([authed.id, unauthed.id]);
+	});
+
 	it("persists an explicit role from a caller model override", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
