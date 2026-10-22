@@ -1,11 +1,12 @@
 import { PassThrough } from "node:stream";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, MockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { RpcConnection, RpcConnectionOptions } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-connection";
 import { RpcServer } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-server";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -57,21 +58,30 @@ function holdAfterFirstDelta(inner: StreamFn, gate: Promise<void>): StreamFn {
 	};
 }
 
+export interface TestSessionOptions {
+	passiveReplica?: boolean;
+	/** No session file: the host keeps the transcript in memory, so it has no artifacts directory. */
+	inMemory?: boolean;
+	/** A real extension `input` handler (through `ExtensionRunner`): runs for every user input, text as sent. */
+	inputHook?: (text: string) => Promise<void>;
+	/** A real extension (through `ExtensionRunner`), loaded beside any `inputHook`. */
+	extensionFactory?: ExtensionFactory;
+	/** Settings over the harness default (`compaction.enabled: false`). */
+	settings?: Readonly<Record<string, unknown>>;
+	/** Serves side-channel requests (the idle recap), which would otherwise reach for the network. */
+	sideStreamFn?: StreamFn;
+}
+
+/** A session over `mock`: options for a fresh scripted model, or a {@link MockModel} the test inspects. */
 export async function createTestSession(
 	dir: string,
-	mock: MockModelOptions,
+	mock: MockModelOptions | MockModel,
 	gate?: Promise<void>,
-	options: {
-		passiveReplica?: boolean;
-		/** No session file: the host keeps the transcript in memory, so it has no artifacts directory. */
-		inMemory?: boolean;
-		/** A real extension `input` handler (through `ExtensionRunner`): runs for every user input, text as sent. */
-		inputHook?: (text: string) => Promise<void>;
-	} = {},
+	options: TestSessionOptions = {},
 ): Promise<AgentSession> {
 	const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
 	authStorage.keys.setRuntime("anthropic", "test-key");
-	const model = createMockModel(mock);
+	const model = mock instanceof MockModel ? mock : createMockModel(mock);
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
@@ -81,12 +91,14 @@ export async function createTestSession(
 		? SessionManager.inMemory(dir)
 		: SessionManager.create(dir, path.join(dir, "sessions"));
 	const modelRegistry = new ModelRegistry(authStorage, path.join(dir, "models.yml"));
-	const { inputHook } = options;
+	const { inputHook, extensionFactory } = options;
 	let extensionRunner: ExtensionRunner | undefined;
-	if (inputHook) {
+	if (inputHook || extensionFactory) {
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
-			pi => {
+			async pi => {
+				await extensionFactory?.(pi);
+				if (!inputHook) return;
 				pi.on("input", async event => {
 					await inputHook(event.text);
 					return undefined;
@@ -95,18 +107,21 @@ export async function createTestSession(
 			dir,
 			new EventBus(),
 			runtime,
-			"input-hook",
+			"test-extension",
 		);
 		extensionRunner = new ExtensionRunner([extension], runtime, dir, sessionManager, modelRegistry);
 	}
-	return new AgentSession({
+	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated({ "compaction.enabled": false }),
+		settings: Settings.isolated({ "compaction.enabled": false, ...options.settings }),
 		modelRegistry,
 		extensionRunner,
 		passiveReplica: options.passiveReplica,
+		sideStreamFn: options.sideStreamFn,
 	});
+	session.addDisposer(() => authStorage.close());
+	return session;
 }
 
 /** In-process client: writes commands into the server and collects parsed frames. */

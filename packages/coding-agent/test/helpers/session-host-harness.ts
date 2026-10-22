@@ -2,13 +2,14 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { MockModel, MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { connectSessionHost } from "@oh-my-pi/pi-coding-agent/session-host/client";
 import { runSessionHost, type SessionHostOptions } from "@oh-my-pi/pi-coding-agent/session-host/host";
 import { listSessionHosts, newHostId, type SessionHostEntry } from "@oh-my-pi/pi-coding-agent/session-host/registry";
 import { isEnoent, removeWithRetries } from "@oh-my-pi/pi-utils";
-import { createTestSession, isolateAgentDir } from "./rpc-server-harness";
+import { createTestSession, isolateAgentDir, type TestSessionOptions } from "./rpc-server-harness";
 
 /** Polls a condition, not a guessed delay: the registry file is the host's only observable readiness and presence signal. */
 export async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
@@ -59,16 +60,22 @@ export class SessionHostFixture {
 
 	/**
 	 * A host serving a fresh session whose mock model answers `ok`; `gate` holds each reply after its first delta until
-	 * it resolves; `inMemory` keeps the transcript in memory, with no session file or artifacts directory.
+	 * it resolves. `sessionOptions` shapes the session: `mock` swaps the scripted model (pass a {@link MockModel} to
+	 * inspect its requests), and the rest is {@link TestSessionOptions} (`inMemory`, `settings`, `sideStreamFn`, ...).
 	 */
 	async startHost(
 		options: Partial<SessionHostOptions> = {},
 		gate?: Promise<void>,
-		sessionOptions: { inMemory?: boolean } = {},
+		sessionOptions: TestSessionOptions & { mock?: MockModelOptions | MockModel } = {},
 	): Promise<TestSessionHost> {
 		const sessionDir = path.join(this.dir, `host-${++this.#hostCount}`);
 		await fs.mkdir(sessionDir, { recursive: true });
-		const session = await createTestSession(sessionDir, { handler: { content: ["ok"] } }, gate, sessionOptions);
+		const session = await createTestSession(
+			sessionDir,
+			sessionOptions.mock ?? { handler: { content: ["ok"] } },
+			gate,
+			sessionOptions,
+		);
 		const hostId = newHostId();
 		const done = Promise.withResolvers<void>();
 		const host: TestSessionHost = {
