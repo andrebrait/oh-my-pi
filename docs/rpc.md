@@ -250,11 +250,21 @@ The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messa
 
 - `{ id?, type: "get_login_providers" }`
 - `{ id?, type: "login", providerId: string }`
+- `{ id?, type: "get_logout_accounts", providerId: string }` → `data: { accounts: LogoutAccount[] }`
+- `{ id?, type: "logout", providerId: string, credentialId: number }` → `data: { remainingSource?: string }`
 
 Login forwards ordinary OAuth input prompts only after the provider emits an
 authorization URL. Prompts marked `secret: true` are always rejected with a
 failed `login` response directing the user to the terminal UI; no ordinary
 `input` request is emitted. RPC does not negotiate secret-input support.
+
+Logout works per stored credential, as `/logout` does in the TUI, because one
+provider can hold several accounts. `get_logout_accounts` lists them (`credentialId`,
+`provider`, `label`, `detail`, `type`, and `active` for credentials the session may
+be using), active first. `logout` removes one and refreshes that provider's models;
+it fails when the credential is no longer stored. `remainingSource` names the source
+that still authenticates the provider: another stored credential, an environment
+variable, or a config key.
 
 ### Word prediction
 
@@ -692,7 +702,7 @@ fallback when enabling fails.
 
 ### `set_todos` payload
 
-Replaces the in-memory todo state for the current session and returns `{ todoPhases }`.
+Replaces the todo state for the current session and returns `{ todoPhases }`. The list is recorded on the current session branch and restored when that branch is reloaded, compacted, or resumed, like an interactive `/todo` edit.
 Phases use `{ name, tasks }`; tasks retain `{ content, status, blocker? }`. There
 are no phase or task IDs. Status is `"pending"`, `"in_progress"`, `"completed"`,
 `"abandoned"`, or `"blocked"`. Snapshot cloning drops extra fields, including
@@ -1008,7 +1018,9 @@ reports `reset: true`.
 (foreground or background, at any nesting depth) without aborting the parent
 turn. It uses the same path as the Agent Hub kill: the subagent's live turn is
 aborted and its registry entry becomes an `aborted` tombstone, so the owning
-`task` call settles with an aborted result and the subagent cannot be revived.
+`task` call settles with an aborted result. The kill stops the subagent without
+discarding it: a later `write agent://<id>` message or Agent Hub revive brings it
+back from its transcript.
 When `set_subagent_subscription` is `"progress"` or `"events"`, a
 `subagent_lifecycle` frame with `status: "aborted"` follows.
 
@@ -1615,7 +1627,7 @@ Current helper characteristics:
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Drives live voice sessions with `liveStart()`, `liveStop()`, `liveMute()`, and delivers live frames through `onLive()`
 - `promptAndWait()` waits for that prompt's result (or synchronous local completion); `waitForSettled()` also waits for session quiescence. `waitForIdle()` and `collectEvents()` stop at the next `agent_end`, including a non-terminal one, and are not settle barriers.
-- Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
+- Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)` and `getLogoutAccounts(...)` / `logout(...)`; use raw protocol frames for unwrapped surfaces such as host-URI registration or delta-only message updates.
 
 ### Python package
 

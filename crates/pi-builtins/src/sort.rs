@@ -2568,11 +2568,9 @@ use ext_sort::ext_sort;
 use foldhash::{HashMap, SharedSeed, fast::FoldHasher};
 use icu_collator::{
 	CollatorBorrowed,
-	options::{AlternateHandling, CollatorOptions},
+	options::{AlternateHandling, CollatorOptions, Strength},
 };
-use icu_decimal::provider::{Baked, DecimalSymbolsV1};
 use icu_locale_core::Locale;
-use icu_provider::{DataIdentifierBorrowed, DataLocale, DataProvider, DataRequest};
 use numeric_str_cmp::{NumInfo, NumInfoParseSettings, human_numeric_str_cmp, numeric_str_cmp};
 use parking_lot::Mutex;
 use pi_vfs::{BlockingFs, File, OpenOptions};
@@ -2594,8 +2592,11 @@ use uucore::{
 	version_cmp::version_cmp,
 };
 
+#[cfg(unix)]
+use crate::locale::locale_loadable;
 use crate::{
 	host::{Host, Utility, format_usage, rayon_global_pool_available, util},
+	locale::{numeric_symbols, parse_locale_name, shell_locale},
 	sort::{
 		buffer_hint::automatic_buffer_size,
 		tmp_dir::{TmpDirWrapper, TmpFile},
@@ -3934,34 +3935,6 @@ impl FieldSelector {
 	}
 }
 
-/// The shell's value for locale category `category`: LC_ALL, then the
-/// category, then LANG, with empty values treated as unset (POSIX). Read per
-/// invocation from the shell environment because uucore's getters read the
-/// process environment once and cache it, ignoring `LC_ALL=C sort`.
-fn shell_locale<'h>(host: &'h Host, category: &str) -> Option<&'h str> {
-	["LC_ALL", category, "LANG"]
-		.into_iter()
-		.find_map(|key| host.var(key).filter(|value| !value.is_empty()))
-}
-
-/// Parses a shell locale name the way uucore parses the process one:
-/// `language_TERRITORY[.codeset][@modifier]` becomes a BCP 47 locale plus
-/// whether the codeset is UTF-8. `None` means the C locale: C/POSIX, or a name
-/// ICU cannot read.
-fn parse_locale_name(name: &str) -> Option<(Locale, bool)> {
-	let mut parts = name.split(['.', '@']);
-	let language = parts
-		.next()
-		.filter(|language| !matches!(*language, "C" | "POSIX"))?;
-	let locale = Locale::try_from_str(&language.replace('_', "-"))
-		.ok()
-		.filter(|locale| *locale != Locale::UNKNOWN)?;
-	let utf8 = parts.next().is_some_and(|codeset| {
-		codeset.eq_ignore_ascii_case("utf-8") || codeset.eq_ignore_ascii_case("utf8")
-	});
-	Some((locale, utf8))
-}
-
 /// Collators built so far, by locale. Building one resolves the locale's
 /// tailoring through ICU's fallback chain, which repeated calls skip. `None`
 /// records a locale ICU could not build a collator for.
@@ -3980,10 +3953,11 @@ fn shell_collator(host: &Host) -> Option<Arc<CollatorBorrowed<'static>>> {
 		.lock()
 		.entry(locale)
 		.or_insert_with_key(|locale| {
-			// Shifted alternate handling makes spaces and punctuation matter only
-			// on ties, like glibc's collation (uucore's setting).
+			// Shift punctuation behind letters, but retain its quaternary
+			// distinctions for `-u` and `-c` instead of treating paths as equal.
 			let mut options = CollatorOptions::default();
 			options.alternate_handling = Some(AlternateHandling::Shifted);
+			options.strength = Some(Strength::Quaternary);
 			CollatorBorrowed::try_new(locale.into(), options)
 				.ok()
 				.map(Arc::new)
@@ -3991,45 +3965,12 @@ fn shell_collator(host: &Host) -> Option<Arc<CollatorBorrowed<'static>>> {
 		.clone()
 }
 
-/// Decimal point and thousands separator for the shell's LC_NUMERIC, from
-/// ICU's CLDR data for that locale (the data uucore reads for the process
-/// locale). C rules apply when it names C, or on Unix a locale the system
-/// cannot load (GNU's fallback); Windows has no system locale to probe, so any
-/// locale ICU parses uses its CLDR rules.
+/// Decimal point and thousands separator for the shell's LC_NUMERIC.
 fn detect_numeric_locale(host: &Host) -> NumericLocaleSettings {
-	let Some(name) = shell_locale(host, "LC_NUMERIC") else {
-		return NumericLocaleSettings::default();
-	};
-	let Some((locale, utf8)) = parse_locale_name(name) else {
-		return NumericLocaleSettings::default();
-	};
-	#[cfg(unix)]
-	if !locale_loadable(name, nix::libc::LC_NUMERIC_MASK) {
-		return NumericLocaleSettings::default();
-	}
-	let data_locale = DataLocale::from(&locale);
-	let request = DataRequest {
-		id:       DataIdentifierBorrowed::for_locale(&data_locale),
-		metadata: Default::default(),
-	};
-	let Ok(response) = DataProvider::<DecimalSymbolsV1>::load(&Baked, request) else {
-		return NumericLocaleSettings::default();
-	};
-	let symbols = response.payload.get();
+	let symbols = numeric_symbols(host);
 	NumericLocaleSettings {
-		decimal_pt:    match symbols.decimal_separator().as_bytes().first() {
-			Some(b',') => Some(b','),
-			_ => Some(DECIMAL_PT),
-		},
-		// Upstream GNU coreutils ignore multibyte thousands separators
-		// (FIXME in C source). We keep the same single-byte behavior.
-		thousands_sep: match symbols.grouping_separator().as_bytes() {
-			[b] => Some(*b),
-			// ICU returns NBSP as UTF-8 (0xC2 0xA0). In non-UTF8 locales like ISO-8859-1,
-			// the input byte is 0xA0, so map it to a single-byte separator.
-			[0xc2, 0xa0] if !utf8 => Some(0xa0),
-			_ => None,
-		},
+		decimal_pt:    Some(symbols.decimal_point),
+		thousands_sep: symbols.thousands_sep,
 	}
 }
 
@@ -4449,27 +4390,6 @@ fn locale_failed_to_set(host: &Host) -> bool {
 fn locale_failed_to_set(host: &Host) -> bool {
 	shell_locale(host, "LC_COLLATE")
 		.is_some_and(|locale| !locale_loadable(locale, nix::libc::LC_COLLATE_MASK))
-}
-
-/// Whether the system can load `locale` for the categories in `mask`, probed
-/// with `newlocale` rather than `setlocale`, which would change the C locale
-/// of the whole host process.
-#[cfg(unix)]
-fn locale_loadable(locale: &str, mask: nix::libc::c_int) -> bool {
-	use nix::libc;
-	let Ok(locale) = std::ffi::CString::new(locale) else {
-		return false;
-	};
-	// SAFETY: `locale` is a valid NUL-terminated string; a non-null result is
-	// a fresh locale object owned here and freed immediately.
-	unsafe {
-		let handle = libc::newlocale(mask, locale.as_ptr(), std::ptr::null_mut());
-		if handle.is_null() {
-			return false;
-		}
-		libc::freelocale(handle);
-	}
-	true
 }
 
 fn key_zero_width(selector: &FieldSelector) -> bool {
@@ -6182,6 +6102,37 @@ mod tests {
 			let rules = format!("text ordering performed using ‘{locale}’ sorting rules");
 			assert!(err.contains(&rules), "{err}");
 		}
+	}
+
+	// Failure mode: shifted collation at tertiary strength treated distinct
+	// punctuation-bearing paths as equal, so `sort -u` discarded records.
+	#[test]
+	fn locale_unique_preserves_punctuation_unless_the_key_ignores_it() {
+		if !locale_installed("en_US.UTF-8") {
+			eprintln!("skipping: en_US.UTF-8 not installed");
+			return;
+		}
+		let input = "src/a-b.ts\nsrc/ab.ts\nsrc/a_b.ts\nsrc/a.b.ts\n";
+		for args in [&["-u"][..], &["-u", "-k1,1"]] {
+			for _ in 0..2 {
+				let (code, out, err) = sort_in_locale("LANG", "en_US.UTF-8", args, input);
+				assert_eq!(code, 0, "{err}");
+				let mut lines: Vec<_> = out.lines().collect();
+				lines.sort_unstable();
+				assert_eq!(lines, ["src/a-b.ts", "src/a.b.ts", "src/a_b.ts", "src/ab.ts"], "{args:?}");
+			}
+		}
+		let (code, out, err) = sort_in_locale(
+			"LANG",
+			"en_US.UTF-8",
+			&["-u", "-k1,1"],
+			"group src/a-b.ts\ngroup src/ab.ts\n",
+		);
+		assert_eq!(code, 0, "{err}");
+		assert_eq!(out, "group src/a-b.ts\n");
+		let (code, out, err) = sort_in_locale("LANG", "en_US.UTF-8", &["-d", "-u"], input);
+		assert_eq!(code, 0, "{err}");
+		assert_eq!(out, "src/a-b.ts\n");
 	}
 
 	// Failure mode: the decimal point and grouping came from the process

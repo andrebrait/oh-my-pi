@@ -1,9 +1,15 @@
-import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { type ImageContent, toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
+import {
+	type AgentTool,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	validateAgentToolArguments,
+} from "@oh-my-pi/pi-agent-core";
+import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
+import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
@@ -31,6 +37,9 @@ import { getActiveEvalShadowCell } from "../speculation/runtime-context";
 import { EVAL_WORKPOOL_BRIDGE_NAME, type EvalWorkpoolResult, runEvalWorkpool } from "../workpool-bridge";
 import type { RuntimeCallIdentity } from "./shared/runtime";
 import type { JsStatusEvent } from "./shared/types";
+
+/** These tools await delegated subagents/jobs, not the cell runtime's own work. */
+const DELEGATED_WORK_TOOLS = new Set(["task", "wait"]);
 
 export type { JsStatusEvent } from "./shared/types";
 
@@ -273,28 +282,18 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	if (isRecord(validationArgs) && !intentIsDeclared) delete validationArgs[INTENT_FIELD];
 	let validatedArgs: unknown;
 	try {
-		validatedArgs = validateToolArguments(tool, {
-			type: "toolCall",
-			id: toolCallId,
-			name,
-			arguments: validationArgs as Record<string, unknown>,
-		});
+		// Script-written args: `__parseError`/`__rawJson` keys are forged, so lenience strips them.
+		validatedArgs = validateAgentToolArguments(
+			tool,
+			{ type: "toolCall", id: toolCallId, name, arguments: validationArgs as Record<string, unknown> },
+			"payload",
+		);
 	} catch (error) {
-		if (!tool.lenientArgValidation) {
-			options.emitStatus?.({
-				op: name,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			throw error;
-		}
-		if (isRecord(validationArgs)) {
-			const fallback = { ...validationArgs };
-			delete fallback.__parseError;
-			delete fallback.__rawJson;
-			validatedArgs = fallback;
-		} else {
-			validatedArgs = validationArgs;
-		}
+		options.emitStatus?.({
+			op: name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw error;
 	}
 	const shadowCell = options.shadowCell ?? getActiveEvalShadowCell();
 	if (shadowCell && options.identity) {
@@ -305,13 +304,33 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		options.signal?.throwIfAborted();
 		if (claimed) return bridgeValueFromToolResult(name, validatedArgs, claimed, options.emitStatus);
 	}
+	let settled = false;
+	const onUpdate: AgentToolUpdateCallback | undefined =
+		options.emitStatus && "mcpServerName" in tool && typeof tool.mcpServerName === "string"
+			? partial => {
+					if (settled || !isRecord(partial.details)) return;
+					const progress = parseMCPProgress(partial.details.progress);
+					if (progress) options.emitStatus?.({ op: "mcp_progress", id: toolCallId, tool: name, ...progress });
+				}
+			: undefined;
 	try {
-		const result = await tool.execute(
-			toolCallId,
-			validatedArgs,
-			options.signal,
-			undefined,
-			options.session.getToolContext?.(),
+		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
+		// signal still reaches it. Without a status sink the pause wrapper is a no-op.
+		const result = await withBridgeTimeoutPause(
+			DELEGATED_WORK_TOOLS.has(name) ? options.emitStatus : undefined,
+			async () => {
+				try {
+					return await tool.execute(
+						toolCallId,
+						validatedArgs,
+						options.signal,
+						onUpdate,
+						options.session.getToolContext?.(),
+					);
+				} finally {
+					settled = true;
+				}
+			},
 		);
 		if (name === "todo") {
 			// A bridged call emits no `todo` toolResult entry, the only thing branch

@@ -28,7 +28,7 @@ unsafe extern "system" fn observe(code: i32, message: WPARAM, data: LPARAM) -> L
 		if key.vkCode == u32::from(VK_ESCAPE) && key.flags & LLKHF_INJECTED == 0 {
 			STOP.with_borrow(|stop| {
 				if let Some(stop) = stop {
-					stop.cancel();
+					stop.escape();
 				}
 			});
 		}
@@ -49,7 +49,8 @@ impl EscapeMonitor {
 			.name("desktop-escape".into())
 			.spawn(move || {
 				STOP.with_borrow_mut(|slot| *slot = Some(stop));
-				// SAFETY: this hook callback is process-lived and uses no DLL state.
+				// SAFETY: this hook callback is process-lived and uses no DLL
+				// state.
 				let hook =
 					unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(observe), std::ptr::null_mut(), 0) };
 				if hook.is_null() {

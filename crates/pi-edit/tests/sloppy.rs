@@ -309,6 +309,26 @@ async fn overlapping_desired_matches_are_rejected_without_collapsing_source() {
 	assert_eq!(workspace.read("a.txt").unwrap(), before);
 }
 
+#[tokio::test]
+async fn a_staged_insertion_is_not_dropped_by_a_later_replace_on_the_same_find() {
+	let workspace = Workspace::new(EditMode::Sloppy);
+	let before = "old\nkeep\n";
+	workspace.write("a.txt", before);
+	let writer = DiskWriter::default();
+	let error = workspace
+		.apply_raw(
+			"*** Edit File: a.txt\n*** Find\nold\n*** Insert Before\nstaged\n*** Replace\nnew\n",
+			&writer,
+		)
+		.await
+		.expect_err("two operators on one *** Find cannot both apply");
+	assert!(matches!(error, EditError::Parse { .. }));
+	assert!(error.to_string().contains("*** Insert Before"), "{error}");
+	assert!(error.to_string().contains("*** Replace"), "{error}");
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("a.txt").unwrap(), before);
+}
+
 #[test]
 fn correctly_maps_source_spans_across_multi_byte_astral_characters_emoji() {
 	let source = "😀 const oldValue = 1;";
@@ -497,11 +517,11 @@ async fn miss_with_cjk_content_returns_match_error_without_panicking() {
 
 #[tokio::test]
 async fn overlapping_selection_spans_report_a_miss_without_panicking() {
-	// Garbled ⟪…⟫ marker glyphs can resolve overlapping selection spans. Splicing
-	// a multibyte (CJK) replacement into the mutated `content[start..end]` rewrite
-	// buffer then re-indexes it on a mid-char edge and panicked the worker instead
-	// of reporting the miss. The unmappable selection must surface as a match
-	// error. (#12529)
+	// Garbled ⟪…⟫ marker glyphs can resolve overlapping selection spans.
+	// Splicing a multibyte (CJK) replacement into the mutated
+	// `content[start..end]` rewrite buffer then re-indexes it on a mid-char
+	// edge and panicked the worker instead of reporting the miss. The
+	// unmappable selection must surface as a match error. (#12529)
 	let workspace = Workspace::new(EditMode::Sloppy);
 	workspace.write("a.txt", "d");
 	let writer = DiskWriter::default();
