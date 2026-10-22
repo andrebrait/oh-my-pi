@@ -208,6 +208,73 @@ export function parseArrayOrCSV(value: unknown): string[] | undefined {
 	return undefined;
 }
 
+/**
+ * Split a comma-separated glob list on top-level commas only: commas inside
+ * `{...}` or `[...]` groups are kept, so a brace expansion like
+ * `{alpha,beta}` survives the string form as one pattern. Parts are trimmed
+ * and empties dropped. An unclosed group suppresses further splitting, so a
+ * malformed pattern stays whole instead of splitting into fragments.
+ */
+export function splitGlobCSV(value: string): string[] {
+	const parts: string[] = [];
+	let depth = 0;
+	let current = "";
+	for (const char of value) {
+		if (char === "{" || char === "[") depth++;
+		else if (char === "}" || char === "]") depth = Math.max(0, depth - 1);
+		if (char === "," && depth === 0) {
+			const trimmed = current.trim();
+			if (trimmed) parts.push(trimmed);
+			current = "";
+		} else {
+			current += char;
+		}
+	}
+	const trimmed = current.trim();
+	if (trimmed) parts.push(trimmed);
+	return parts;
+}
+
+/**
+ * Parse a value that may be an array of glob strings or a comma-separated
+ * glob string. Like {@link parseArrayOrCSV}, but the string form splits on
+ * top-level commas only (see {@link splitGlobCSV}). Blank array items are
+ * dropped; callers trim the survivors. Returns undefined if the result would
+ * be empty.
+ */
+export function parseGlobArrayOrCSV(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) {
+		const filtered = value.filter((item): item is string => typeof item === "string" && item.trim() !== "");
+		return filtered.length > 0 ? filtered : undefined;
+	}
+	if (typeof value === "string") {
+		const parsed = splitGlobCSV(value);
+		return parsed.length > 0 ? parsed : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Parse one skill-visibility field (`skills`, `hideSkills`, `unhideSkills`).
+ * Wrong-typed values (numbers, objects, arrays without strings) warn and read
+ * as absent, mirroring the `tools` no-names warning; deliberate blanks (empty
+ * string, whitespace, arrays of blanks) stay silent.
+ */
+function parseVisibilityField(field: string, value: unknown, agent: string): string[] | undefined {
+	const parsed = parseGlobArrayOrCSV(value);
+	if (parsed !== undefined || value == null) return parsed;
+	const isBlank =
+		(typeof value === "string" && value.trim() === "") ||
+		(Array.isArray(value) && value.every(item => typeof item === "string" && item.trim() === ""));
+	if (!isBlank) {
+		logger.warn(`Agent ${field} declaration is not a string or string array; ignoring it`, {
+			agent,
+			valueType: Array.isArray(value) ? "array" : typeof value,
+		});
+	}
+	return undefined;
+}
+
 interface RuleMarkdownOptions {
 	ruleName?: string;
 	stripNamePattern?: RegExp;
@@ -298,6 +365,12 @@ export interface ParsedAgentFields {
 	output?: unknown;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	autoloadSkills?: string[];
+	/** Skill-name globs listed in the child's `<skills>` block. Absent = unrestricted; `[]`/`"none"` = none listed. */
+	skills?: string[];
+	/** Skill-name globs excluded from the child's `<skills>` block. Takes precedence over `skills` and `unhideSkills`. */
+	hideSkills?: string[];
+	/** Skill-name globs whose source `hide: true` is overridden for the child's `<skills>` block. */
+	unhideSkills?: string[];
 	readSummarize?: boolean;
 	blocking?: boolean;
 	/** `true` = keep `yield` and the output schema when `task.structured` is off. */
@@ -390,6 +463,31 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
+	// `skills: "none"` (case-insensitive, surrounding whitespace ignored) is
+	// sugar for the explicitly empty allowlist (`[]`): zero skills listed. An
+	// absent field stays `undefined` (unrestricted), and so does a malformed
+	// one that resolves to no usable name (a blank CSV, an array of blanks) —
+	// silently listing nothing is the one reading nobody asks for. The CSV
+	// form of all three fields splits on top-level commas only (see
+	// `splitGlobCSV`), so a brace expansion like `{alpha,beta}` survives as a
+	// single pattern; the YAML list form `["{alpha,beta}"]` works too.
+	const rawSkillsValue =
+		typeof frontmatter.skills === "string" && frontmatter.skills.trim().toLowerCase() === "none"
+			? []
+			: parseVisibilityField("skills", frontmatter.skills, name);
+	// Only the `[]` literal counts as explicit: `parseGlobArrayOrCSV` drops
+	// blank items, so distinguish a present-but-empty allowlist (`skills: []`
+	// lists nothing) from a malformed blank (`skills: [""]` = absent).
+	const skills =
+		Array.isArray(frontmatter.skills) && frontmatter.skills.length === 0
+			? []
+			: rawSkillsValue?.map(s => s.trim()).filter(Boolean);
+	const hideSkills = parseVisibilityField("hideSkills", frontmatter.hideSkills, name)
+		?.map(s => s.trim())
+		.filter(Boolean);
+	const unhideSkills = parseVisibilityField("unhideSkills", frontmatter.unhideSkills, name)
+		?.map(s => s.trim())
+		.filter(Boolean);
 	return {
 		name,
 		description,
@@ -401,6 +499,9 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		blocking,
 		structured,
 		autoloadSkills,
+		skills,
+		hideSkills,
+		unhideSkills,
 		readSummarize,
 		prewalk,
 		advisor,

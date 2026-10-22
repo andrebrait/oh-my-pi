@@ -33,6 +33,7 @@ import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
+import { resolveAgentAutoloadSkills, resolveAgentSkills } from "./agents";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
 import {
@@ -569,11 +570,12 @@ async function refreshSkillsForAutoload(session: ToolSession, agent: AgentDefini
 	await session.refreshSkills();
 }
 
-function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
-	const skills = [...(session.skills ?? [])];
-	const autoloadSkills = agent.autoloadSkills?.length
-		? agent.autoloadSkills.map(name => skills.find(skill => skill.name === name)).filter(skill => skill !== undefined)
-		: [];
+function resolveAgentSkillsForExecutor(session: ToolSession, agent: AgentDefinition) {
+	const fullSkills = session.skills ?? [];
+	const skills = resolveAgentSkills(fullSkills, agent);
+	// Autoload resolves against the full unfiltered list: a skill hidden from
+	// the `<skills>` listing can still be preloaded into the child's context.
+	const autoloadSkills = resolveAgentAutoloadSkills(fullSkills, agent.autoloadSkills);
 	return { skills, autoloadSkills };
 }
 
@@ -585,7 +587,7 @@ function buildExecutorOptions(
 ): ExecutorOptions {
 	const { session } = request;
 	const preparedSession = policy.preparedSession;
-	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
+	const { skills, autoloadSkills } = resolveAgentSkillsForExecutor(session, policy.agent);
 	const localProtocolOptions = sessionLocalProtocolOptions(session);
 	const restrictToolNames = preparedSession !== undefined || policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
