@@ -1,6 +1,4 @@
 import type { InteractiveModeContext } from "../modes/types";
-import { Text } from "@oh-my-pi/pi-tui";
-import { formatSkillDiagnostics } from "../modes/utils/skill-diagnostics";
 import { SkillshareClient } from "../skillshare/client";
 import {
 	formatInstalledSkills,
@@ -15,6 +13,7 @@ import {
 } from "../skillshare/installer";
 import { clearSubmittedText } from "./helpers/draft";
 import { errorMessage, parseSubcommand } from "./helpers/parse";
+import { runSkillDiagnosticsPanel } from "./skill-diagnostics-panel";
 import type { SlashCommandSpec } from "./types";
 
 const USAGE = [
@@ -22,7 +21,7 @@ const USAGE = [
 	"  /skills search <query>                        Search the registry",
 	"  /skills install <@scope/name[@range]>… [-g]   Install into this project (-g: user-global)",
 	"  /skills installed                             List installed registry skills",
-	"  /skills diagnostics                           Inspect conflicts and deduplicated copies",
+	"  /skills diagnostics                           Browse skill issues; Enter on a skill requests AI analysis",
 	"  /skills update [@scope/name…] [-g]            Update within the ranges in skills.json",
 ].join("\n");
 
@@ -73,7 +72,10 @@ export const BUILTIN_SKILLS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "search", description: "Search the skill registry", usage: "<query>" },
 			{ name: "install", description: "Install registry skills", usage: "<@scope/name[@range]>… [--global]" },
 			{ name: "installed", description: "List installed registry skills" },
-			{ name: "diagnostics", description: "Inspect skill conflicts and deduplicated installations" },
+			{
+				name: "diagnostics",
+				description: "Browse skill issues and request AI analysis of a selected skill",
+			},
 			{
 				name: "update",
 				description: "Update registry skills within their ranges",
@@ -90,13 +92,12 @@ export const BUILTIN_SKILLS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				switch (verb) {
 					case "diagnostics": {
 						if (rest) {
-							ctx.showError("Usage: /skills diagnostics");
+							ctx.showError(
+								"Usage: /skills diagnostics (no arguments; select a skill in the panel and press Enter)",
+							);
 							return;
 						}
-						ctx.showCommandReport({
-							title: "Skill Discovery Details",
-							body: new Text(formatSkillDiagnostics(ctx.session.skillDiagnostics), 0, 0),
-						});
+						await runSkillDiagnosticsPanel(ctx);
 						return;
 					}
 					case "search": {
