@@ -54,6 +54,13 @@ export interface PlanModeOptions {
 	onWarning?: (text: string) => void;
 }
 
+/** What {@link PlanModeController.approve} did: whether the approved prompt was sent, and the autosaved copy. */
+export interface PlanApprovalResult {
+	dispatched: boolean;
+	/** Where `plan.autosave` copied the plan; undefined when autosave is off or failed. */
+	savedPlanPath: string | undefined;
+}
+
 export type PlanModeSession = Pick<
 	AgentSession,
 	| "settings"
@@ -329,8 +336,9 @@ export class PlanModeController {
 	/**
 	 * Apply an approved plan review: leave plan mode, then start a new session (`execute`), compact
 	 * the planning transcript (`compact`) or keep it (`keep`), restore the execution tools, move onto
-	 * the picked tier and send the plan-approved prompt. Returns false when nothing was sent: the
-	 * owner declined the new session, or compaction was cancelled (the next turn still gets the plan).
+	 * the picked tier and send the plan-approved prompt. Nothing is sent when compaction was cancelled
+	 * (the next turn still gets the plan). An owner that does not start the new session leaves the
+	 * prompt to run in the current one, as the TUI's `/new` refusal always did.
 	 * `compact` runs `beforeFlush` before dispatching input queued during compaction, so that input
 	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued.
 	 */
@@ -339,14 +347,14 @@ export class PlanModeController {
 		choice: PlanApprovalChoice;
 		tierIndex?: number;
 		hooks: {
-			newSession(): Promise<boolean>;
+			newSession(): Promise<void>;
 			compact(
 				instructions: string,
 				beforeFlush: (outcome: CompactionOutcome) => Promise<void>,
 			): Promise<CompactionOutcome>;
 			beforeDispatch?(): void;
 		};
-	}): Promise<boolean> {
+	}): Promise<PlanApprovalResult> {
 		const { review, choice, hooks } = input;
 		const session = this.#session;
 		const sessionManager = session.sessionManager;
@@ -376,7 +384,7 @@ export class PlanModeController {
 			await this.exit({ paused: false, deferModelRestore: compact });
 			if (choice === "execute") {
 				const oldLocalRoot = path.resolve(resolveLocalRoot(files.localProtocolOptions));
-				if (!(await hooks.newSession())) return false;
+				await hooks.newSession();
 				await copyLocalArtifacts(oldLocalRoot, path.resolve(resolveLocalRoot(files.localProtocolOptions)));
 				await Bun.write(resolvePlanFilePath(planFilePath, files), planContent);
 			} else if (compact) {
@@ -399,8 +407,15 @@ export class PlanModeController {
 			: [...previousPresentation.enabled, "read"];
 		await session.restoreNonMCPToolPresentation(executionTools, previousPresentation.mounted);
 		session.setPlanReferencePath(planFilePath);
+		let savedPlanPath: string | undefined;
 		try {
-			await autosaveApprovedPlan({ settings: session.settings, cwd: sessionManager.getCwd(), title, planContent });
+			savedPlanPath =
+				(await autosaveApprovedPlan({
+					settings: session.settings,
+					cwd: sessionManager.getCwd(),
+					title,
+					planContent,
+				})) ?? undefined;
 		} catch (error) {
 			const detail = truncateToWidth(
 				shortenEmbeddedPaths(
@@ -425,7 +440,7 @@ export class PlanModeController {
 			this.#warn(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
-			return false;
+			return { dispatched: false, savedPlanPath };
 		}
 
 		// The approved prompt bypasses title generation; `auto` never replaces a name the user chose.
@@ -449,7 +464,7 @@ export class PlanModeController {
 				await session.followUp(approvedPrompt, undefined, { synthetic: true });
 			}
 		}
-		return true;
+		return { dispatched: true, savedPlanPath };
 	}
 
 	#planFileOptions(): { localProtocolOptions: LocalProtocolOptions; cwd: string } {

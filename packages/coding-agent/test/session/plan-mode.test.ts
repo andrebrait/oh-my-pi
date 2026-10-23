@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import { type AgentTool, AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
@@ -159,6 +159,7 @@ async function withApprovalSession(
 
 const DETAILS = { planFilePath: PLAN_URL, title: "ship-it", planExists: true };
 const noCompaction = (): Promise<never> => Promise.reject(new Error("unexpected compaction"));
+const noNewSession = (): Promise<never> => Promise.reject(new Error("unexpected new session"));
 
 describe("session-owned plan mode", () => {
 	test("enter switches to the plan role model and plan tools, and journals plan", async () => {
@@ -892,11 +893,13 @@ describe("session-owned plan mode", () => {
 				let messagesAtDispatch: number | undefined;
 				await Bun.write(planPath(session, "local://notes.md"), "notes");
 
-				const dispatched = await planMode.approve({
+				const result = await planMode.approve({
 					review,
 					choice: "execute",
 					hooks: {
-						newSession: () => session.newSession(),
+						newSession: async () => {
+							await session.newSession();
+						},
 						compact: noCompaction,
 						beforeDispatch: () => {
 							messagesAtDispatch = session.messages.length;
@@ -904,7 +907,7 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(dispatched).toBe(true);
+				expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
 				expect(session.sessionManager.getSessionId()).not.toBe(firstSession);
 				expect(planMode.view).toEqual({ enabled: false, paused: false, planFilePath: undefined });
 				expect(session.getPlanModeState()).toBeUndefined();
@@ -928,13 +931,18 @@ describe("session-owned plan mode", () => {
 			await withApprovalSession(
 				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } },
 				async (session, planMode) => {
-					const dispatched = await planMode.approve({
+					const result = await planMode.approve({
 						review: buildPlanReview(session, DETAILS),
 						choice: "execute",
-						hooks: { newSession: () => session.newSession(), compact: noCompaction },
+						hooks: {
+							newSession: async () => {
+								await session.newSession();
+							},
+							compact: noCompaction,
+						},
 					});
 
-					expect(dispatched).toBe(true);
+					expect(result.dispatched).toBe(true);
 					expect(planMode.view.enabled).toBe(false);
 					expect(session.getPlanModeState()).toBeUndefined();
 					expect(modeChanges(session, "plan")).toBe(0);
@@ -943,18 +951,22 @@ describe("session-owned plan mode", () => {
 			);
 		});
 
-		test("approve execute sends nothing when the owner declines the new session", async () => {
+		test("approve execute runs the plan in the current session when the owner starts no new one", async () => {
 			await withApprovalSession(readWriteTools(), async (session, planMode) => {
 				const firstSession = session.sessionManager.getSessionId();
-				const dispatched = await planMode.approve({
+				const result = await planMode.approve({
 					review: buildPlanReview(session, DETAILS),
 					choice: "execute",
-					hooks: { newSession: async () => false, compact: noCompaction },
+					hooks: { newSession: async () => {}, compact: noCompaction },
 				});
 
-				expect(dispatched).toBe(false);
+				expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
 				expect(session.sessionManager.getSessionId()).toBe(firstSession);
-				expect(approvedPrompts(session)).toEqual([]);
+				expect(await Bun.file(planPath(session, PLAN_URL)).text()).toBe(PLAN_TEXT);
+				expect(session.getPlanReferencePath()).toBe(PLAN_URL);
+				const [approved, ...rest] = approvedPrompts(session);
+				expect(rest).toEqual([]);
+				expect(approved).not.toContain("History usable");
 			});
 		});
 
@@ -966,13 +978,11 @@ describe("session-owned plan mode", () => {
 				const reviewed = "local://reviewed-plan.md";
 				await Bun.write(planPath(session, reviewed), PLAN_TEXT);
 
-				const dispatched = await planMode.approve({
+				const result = await planMode.approve({
 					review: buildPlanReview(session, { ...DETAILS, planFilePath: reviewed }),
 					choice: "compact",
 					hooks: {
-						newSession: async () => {
-							throw new Error("unexpected new session");
-						},
+						newSession: noNewSession,
 						compact: async (instructions, beforeFlush) => {
 							seen.instructions = instructions;
 							seen.reference = session.getPlanReferencePath();
@@ -984,7 +994,7 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(dispatched).toBe(true);
+				expect(result.dispatched).toBe(true);
 				expect(seen.instructions).toContain("Prepare to execute approved plan");
 				expect(seen.instructions).toContain(reviewed);
 				// The reference is pinned before compaction, so input queued meanwhile sees the plan.
@@ -999,16 +1009,53 @@ describe("session-owned plan mode", () => {
 			});
 		});
 
+		test("approve compact silences the internal abort through the compaction and clears it after", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const mark = vi.spyOn(session, "markPlanInternalAbortPending");
+				const clear = vi.spyOn(session, "clearPlanInternalAbortPending");
+				const during: number[] = [];
+
+				const approval = planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "compact",
+					hooks: {
+						newSession: noNewSession,
+						compact: async () => {
+							during.push(mark.mock.calls.length, clear.mock.calls.length);
+							throw new Error("compaction blew up");
+						},
+					},
+				});
+
+				await expect(approval).rejects.toThrow("compaction blew up");
+				expect(during).toEqual([1, 0]);
+				expect(clear).toHaveBeenCalledTimes(1);
+				expect(approvedPrompts(session)).toEqual([]);
+			});
+		});
+
+		test("approve keep does not mark an internal abort", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const mark = vi.spyOn(session, "markPlanInternalAbortPending");
+				await planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "keep",
+					hooks: { newSession: noNewSession, compact: noCompaction },
+				});
+				expect(mark).not.toHaveBeenCalled();
+			});
+		});
+
 		test("approve with a cancelled compaction leaves plan mode, sends nothing and warns", async () => {
 			const warnings: string[] = [];
 			await withApprovalSession(
 				readWriteTools(),
 				async (session, planMode) => {
-					const dispatched = await planMode.approve({
+					const result = await planMode.approve({
 						review: buildPlanReview(session, DETAILS),
 						choice: "compact",
 						hooks: {
-							newSession: async () => false,
+							newSession: noNewSession,
 							compact: async (_instructions, beforeFlush) => {
 								await beforeFlush("cancelled");
 								return "cancelled";
@@ -1016,7 +1063,7 @@ describe("session-owned plan mode", () => {
 						},
 					});
 
-					expect(dispatched).toBe(false);
+					expect(result).toEqual({ dispatched: false, savedPlanPath: undefined });
 					expect(approvedPrompts(session)).toEqual([]);
 					expect(warnings).toEqual([
 						"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
@@ -1033,11 +1080,11 @@ describe("session-owned plan mode", () => {
 
 		test("approve with a failed compaction stays on the plan model and still dispatches", async () => {
 			await withApprovalSession(readWriteTools(), async (session, planMode) => {
-				const dispatched = await planMode.approve({
+				const result = await planMode.approve({
 					review: buildPlanReview(session, DETAILS),
 					choice: "compact",
 					hooks: {
-						newSession: async () => false,
+						newSession: noNewSession,
 						compact: async (_instructions, beforeFlush) => {
 							await beforeFlush("failed");
 							return "failed";
@@ -1045,10 +1092,117 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(dispatched).toBe(true);
+				expect(result.dispatched).toBe(true);
 				expect(session.model?.id).toBe("claude-haiku-4-5");
 				expect(approvedPrompts(session)).toHaveLength(1);
 			});
+		});
+
+		test("approve queues the approved prompt behind a turn that is already running", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const prompt = vi.spyOn(session, "prompt");
+				const followUp = vi.spyOn(session, "followUp").mockResolvedValue();
+				try {
+					const result = await planMode.approve({
+						review: buildPlanReview(session, DETAILS),
+						choice: "keep",
+						hooks: {
+							newSession: noNewSession,
+							compact: noCompaction,
+							// Input queued during compaction started a turn right before dispatch.
+							beforeDispatch: () => {
+								Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+							},
+						},
+					});
+
+					expect(result.dispatched).toBe(true);
+					expect(prompt).not.toHaveBeenCalled();
+					expect(followUp).toHaveBeenCalledTimes(1);
+					expect(followUp.mock.calls[0]?.[0]).toContain("Plan approved.");
+					expect(followUp.mock.calls[0]?.slice(1)).toEqual([undefined, { synthetic: true }]);
+				} finally {
+					Reflect.deleteProperty(session, "isStreaming");
+				}
+			});
+		});
+
+		test("approve falls back to a follow-up when the prompt finds the agent busy", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const prompt = vi.spyOn(session, "prompt").mockRejectedValueOnce(new AgentBusyError());
+				const followUp = vi.spyOn(session, "followUp").mockResolvedValue();
+
+				const result = await planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "keep",
+					hooks: { newSession: noNewSession, compact: noCompaction },
+				});
+
+				expect(result.dispatched).toBe(true);
+				expect(prompt).toHaveBeenCalledTimes(1);
+				expect(followUp).toHaveBeenCalledTimes(1);
+				expect(followUp.mock.calls[0]?.[0]).toBe(prompt.mock.calls[0]?.[0]);
+				expect(followUp.mock.calls[0]?.slice(1)).toEqual([undefined, { synthetic: true }]);
+			});
+		});
+
+		test("approve keep turns read back on, keeps an existing name and reports the autosaved copy", async () => {
+			const bash = makeTool("bash");
+			const read = makeTool("read");
+			const write = makeTool("write");
+			const options: TestSessionOptions = {
+				settings: { ...PLAN_ROLE, "plan.autosave": true, "plan.autosaveDir": "saved-plans" },
+				tools: [bash],
+				config: {
+					toolRegistry: new Map([
+						[bash.name, bash],
+						[read.name, read],
+						[write.name, write],
+					]),
+					builtInToolNames: ["bash", "read", "write"],
+				},
+			};
+			await withApprovalSession(options, async (session, planMode) => {
+				await session.sessionManager.setSessionName("Mine", "auto");
+
+				const result = await planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "keep",
+					hooks: { newSession: noNewSession, compact: noCompaction },
+				});
+
+				expect(result.dispatched).toBe(true);
+				// The durable plan copy must stay readable even though planning started without `read`.
+				expect(session.getActiveToolNames()).toEqual(["bash", "read"]);
+				expect(session.sessionManager.getSessionName()).toBe("Mine");
+				const saved = result.savedPlanPath;
+				if (!saved) throw new Error("the plan was not autosaved");
+				expect(path.dirname(saved)).toBe(path.join(session.sessionManager.getCwd(), "saved-plans"));
+				expect(await Bun.file(saved).text()).toBe(PLAN_TEXT);
+			});
+		});
+
+		test("a failed autosave warns and the plan still runs", async () => {
+			const warnings: string[] = [];
+			await withApprovalSession(
+				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.autosave": true, "plan.autosaveDir": "blocker" } },
+				async (session, planMode) => {
+					// A file where the autosave directory should be.
+					await Bun.write(path.join(session.sessionManager.getCwd(), "blocker"), "");
+
+					const result = await planMode.approve({
+						review: buildPlanReview(session, DETAILS),
+						choice: "keep",
+						hooks: { newSession: noNewSession, compact: noCompaction },
+					});
+
+					expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
+					expect(warnings).toHaveLength(1);
+					expect(warnings[0]).toStartWith("Failed to autosave plan: ");
+					expect(approvedPrompts(session)).toHaveLength(1);
+				},
+				{ onWarning: text => warnings.push(text) },
+			);
 		});
 
 		test("approve keep runs on the selected tier, and the restored tier keeps the pre-plan model", async () => {
@@ -1070,14 +1224,14 @@ describe("session-owned plan mode", () => {
 					const review = buildPlanReview(session, DETAILS);
 					expect(review.restoredTierIndex).toBe(2);
 
-					const dispatched = await planMode.approve({
+					const result = await planMode.approve({
 						review,
 						choice: "keep",
 						tierIndex,
-						hooks: { newSession: async () => false, compact: noCompaction },
+						hooks: { newSession: noNewSession, compact: noCompaction },
 					});
 
-					expect(dispatched).toBe(true);
+					expect(result.dispatched).toBe(true);
 					expect(session.sessionManager.getSessionId()).toBe(firstSession);
 					expect(session.model?.id).toBe(model);
 					// The restored tier is not applied again: exit's temporary restore is the last switch.
@@ -1096,7 +1250,7 @@ describe("session-owned plan mode", () => {
 					planMode.approve({
 						review,
 						choice: "keep",
-						hooks: { newSession: async () => false, compact: noCompaction },
+						hooks: { newSession: noNewSession, compact: noCompaction },
 					}),
 				).rejects.toThrow("Plan mode is not active.");
 				expect(approvedPrompts(session)).toEqual([]);
