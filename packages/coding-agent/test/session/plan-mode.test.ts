@@ -613,58 +613,191 @@ describe("session-owned plan mode", () => {
 			});
 		});
 
-		test("new session re-enters plan mode when plan.defaultOnStartup is set", async () => {
+		test("new session leaves plan mode; the owner's applyStartupDefault enters it again", async () => {
 			await withPlanSession(
 				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } },
 				async (session, planMode) => {
-					await planMode.reconcile();
+					await planMode.applyStartupDefault();
 					expect(planMode.view.enabled).toBe(true);
 					const firstSession = session.sessionManager.getSessionId();
 
 					expect(await session.newSession()).toBe(true);
 
 					expect(session.sessionManager.getSessionId()).not.toBe(firstSession);
-					expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://PLAN.md" });
-					expect(lastModeChange(session)?.mode).toBe("plan");
-					expect(session.getActiveToolNames()).toContain("write");
-					expect(session.model?.id).toBe("claude-haiku-4-5");
-				},
-				{ applyStartupDefault: true },
-			);
-		});
-
-		test("new session does not re-enter plan mode after suppressNextStartupDefault", async () => {
-			await withPlanSession(
-				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } },
-				async (session, planMode) => {
-					await planMode.reconcile();
-					expect(planMode.view.enabled).toBe(true);
-
-					planMode.suppressNextStartupDefault();
-					expect(await session.newSession()).toBe(true);
-
 					expect(planMode.view).toEqual({ enabled: false, paused: false, planFilePath: undefined });
 					expect(session.getPlanModeState()).toBeUndefined();
 					expect(session.getActiveToolNames()).toEqual(["read"]);
 					// The new session records no model, so the pre-plan model comes back.
 					expect(session.model?.id).toBe("claude-sonnet-4-5");
-					// One new session only: the next one honors the default again.
-					expect(await session.newSession()).toBe(true);
-					expect(planMode.view.enabled).toBe(true);
+
+					await planMode.applyStartupDefault();
+					expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://PLAN.md" });
+					expect(lastModeChange(session)?.mode).toBe("plan");
+					expect(session.getActiveToolNames()).toContain("write");
+					expect(session.model?.id).toBe("claude-haiku-4-5");
 				},
-				{ applyStartupDefault: true },
 			);
 		});
 
-		test("plan.defaultOnStartup is left to the owner without applyStartupDefault", async () => {
+		test("branching at the first message does not apply plan.defaultOnStartup", async () => {
 			await withPlanSession(
 				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } },
-				async (session, planMode) => {
-					await planMode.reconcile();
-					expect(await session.newSession()).toBe(true);
+				async (session, planMode, streamTurn) => {
+					await (
+						await streamTurn()
+					)();
+					const first = session.sessionManager.getEntries().find(entry => entry.type === "message");
+					if (!first) throw new Error("no message to branch at");
+
+					expect((await session.branch(first.id)).cancelled).toBe(false);
+
+					expect(session.sessionManager.buildSessionContext().messages).toHaveLength(0);
 					expect(planMode.view.enabled).toBe(false);
+					expect(session.getPlanModeState()).toBeUndefined();
 				},
 			);
+		});
+
+		test("applyStartupDefault does nothing when plan.defaultOnStartup or plan.enabled is off", async () => {
+			for (const settings of [
+				{ ...PLAN_ROLE, "plan.defaultOnStartup": false },
+				{ ...PLAN_ROLE, "plan.defaultOnStartup": true, "plan.enabled": false },
+			]) {
+				await withPlanSession({ ...readWriteTools(), settings }, async (session, planMode) => {
+					await planMode.applyStartupDefault();
+					expect(planMode.view.enabled).toBe(false);
+					expect(session.getPlanModeState()).toBeUndefined();
+				});
+			}
+		});
+
+		test("applyStartupDefault leaves a session with conversation context or an explicit mode", async () => {
+			const options = { ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } };
+			await withPlanSession(options, async (_session, planMode, streamTurn) => {
+				await (
+					await streamTurn()
+				)();
+				await planMode.applyStartupDefault();
+				expect(planMode.view.enabled).toBe(false);
+			});
+			await withPlanSession(options, async (session, planMode) => {
+				session.sessionManager.appendModeChange("none");
+				await planMode.applyStartupDefault();
+				expect(planMode.view.enabled).toBe(false);
+			});
+		});
+
+		test("a goal live in the previous session leaves before the target's plan mode is restored", async () => {
+			const options = readWriteTools({ allowSessionModelFallback: true });
+			await withPlanSession(options, async (session, planMode, streamTurn) => {
+				const goalMode = session.enableGoalMode({ mode: "interactive", delayMs: 0 });
+				await (
+					await streamTurn()
+				)();
+				session.sessionManager.appendModeChange("plan", { planFilePath: "local://b.md" });
+				const planSession = session.sessionFile;
+				if (!planSession) throw new Error("the plan session has no file");
+				expect(await session.newSession()).toBe(true);
+				await goalMode.handle({ op: "create", objective: "live goal" });
+
+				expect(await session.switchSession(planSession)).toBe(true);
+
+				expect(session.getGoalModeState()?.goal).toBeUndefined();
+				expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://b.md" });
+			});
+		});
+
+		test("switching to a session that records a model keeps that model, not the pre-plan one", async () => {
+			const options = readWriteTools({ allowSessionModelFallback: true });
+			await withPlanSession(options, async (session, planMode, streamTurn) => {
+				await (
+					await streamTurn()
+				)();
+				await session.setModel(getBundledModel("anthropic", "claude-sonnet-4-6")!);
+				const recorded = session.sessionFile;
+				if (!recorded) throw new Error("the recorded session has no file");
+				expect(await session.newSession()).toBe(true);
+				await session.setModelTemporary(getBundledModel("anthropic", "claude-sonnet-4-5")!);
+				await planMode.handle({ op: "enter" });
+				expect(session.model?.id).toBe("claude-haiku-4-5");
+
+				expect(await session.switchSession(recorded)).toBe(true);
+
+				expect(planMode.view.enabled).toBe(false);
+				expect(session.model?.id).toBe("claude-sonnet-4-6");
+			});
+		});
+
+		test("a cancelled session change leaves plan mode as it was", async () => {
+			const views: unknown[] = [];
+			await withPlanSession(
+				{
+					...readWriteTools(),
+					extensionFactory: pi => {
+						pi.on("session_before_switch", async () => ({ cancel: true }));
+					},
+				},
+				async (session, planMode) => {
+					await planMode.handle({ op: "enter" });
+					const changes = views.length;
+
+					expect(await session.newSession()).toBe(false);
+
+					expect(views.length).toBe(changes);
+					expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://PLAN.md" });
+					expect(session.model?.id).toBe("claude-haiku-4-5");
+					// The pre-plan model is still recorded: exit restores it.
+					await planMode.handle({ op: "exit" });
+					expect(session.model?.id).toBe("claude-sonnet-4-5");
+				},
+				{ onChanged: view => views.push(view) },
+			);
+		});
+
+		test("a switch that rolls back restores plan mode in the session it stays in", async () => {
+			await withPlanSession(readWriteTools(), async (session, planMode, streamTurn) => {
+				// The replied turn journals the mock model, which the registry cannot restore.
+				await (
+					await streamTurn()
+				)();
+				const unrestorable = session.sessionFile;
+				if (!unrestorable) throw new Error("the target session has no file");
+				expect(await session.newSession()).toBe(true);
+				await planMode.handle({ op: "enter", planFilePath: "local://kept.md" });
+
+				await expect(session.switchSession(unrestorable)).rejects.toThrow("Could not restore model");
+
+				expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://kept.md" });
+				expect(session.getPlanModeState()?.enabled).toBe(true);
+				expect(session.getActiveToolNames()).toContain("write");
+			});
+		});
+
+		test("a session change that fails to restore plan mode warns instead of throwing", async () => {
+			const warnings: string[] = [];
+			await withPlanSession(
+				readWriteTools(),
+				async (session, planMode) => {
+					const started = await session.newSession({
+						setup: async sessionManager => {
+							sessionManager.appendModeChange("plan", { planFilePath: "local://blocked.md" });
+						},
+					});
+
+					expect(started).toBe(true);
+					expect(planMode.view.enabled).toBe(false);
+					expect(warnings).toEqual(["Failed to restore plan mode: Exit vibe mode first."]);
+				},
+				{ entryBlocked: () => "Exit vibe mode first.", onWarning: text => warnings.push(text) },
+			);
+		});
+
+		test("a journaled plan path that is not a string falls back to the default", async () => {
+			await withPlanSession(readWriteTools(), async (session, planMode) => {
+				session.sessionManager.appendModeChange("plan", { planFilePath: 42 });
+				await planMode.reconcile();
+				expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://PLAN.md" });
+			});
 		});
 
 		test("switching to a session whose journal holds a goal tears plan down and does not re-enter", async () => {

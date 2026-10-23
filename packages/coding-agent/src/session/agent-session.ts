@@ -7517,12 +7517,11 @@ export class AgentSession implements SettingsScope {
 		if (this.passiveReplica) throw new Error("A passive replica does not run plan mode");
 		const running = this.#planMode;
 		if (running) {
-			const { onChanged, entryBlocked, onWarning, applyStartupDefault } = running.options;
+			const { onChanged, entryBlocked, onWarning } = running.options;
 			if (
 				onChanged !== options.onChanged ||
 				entryBlocked !== options.entryBlocked ||
-				onWarning !== options.onWarning ||
-				applyStartupDefault !== options.applyStartupDefault
+				onWarning !== options.onWarning
 			) {
 				throw new Error("Plan mode already runs with other options");
 			}

@@ -34,8 +34,6 @@ export interface PlanModeOptions {
 	entryBlocked?: () => string | undefined;
 	/** Shows a warning the user should see (the TUI's `showWarning`); it is logged as well. */
 	onWarning?: (text: string) => void;
-	/** Enter plan mode on a fresh session when `plan.defaultOnStartup` says so (TUI and, in part 2, hosts). */
-	applyStartupDefault?: boolean;
 }
 
 export type PlanModeSession = Pick<
@@ -94,7 +92,6 @@ export class PlanModeController {
 	#sessionBeforeChange: string | undefined;
 	/** {@link leavePreviousSession} ran inside the change: its end restores plan mode even for the same transcript. */
 	#leftDuringChange = false;
-	#suppressStartupDefault = false;
 
 	constructor(session: PlanModeSession, options: PlanModeOptions) {
 		this.#session = session;
@@ -312,11 +309,31 @@ export class PlanModeController {
 	/**
 	 * Restore plan mode from the session journal (startup, resume): the previous session's plan
 	 * state goes first, then `plan` re-enters keeping the restored model and `plan_paused` reports
-	 * paused. Otherwise a fresh session gets the startup default.
+	 * paused.
 	 */
 	reconcile(): Promise<void> {
-		const suppressDefault = this.#takeStartupDefaultSuppression();
-		return this.#serialize(() => this.#reconcile(suppressDefault));
+		return this.#serialize(() => this.#reconcile());
+	}
+
+	/**
+	 * Enter plan mode when `plan.defaultOnStartup` applies: plan mode is enabled and the session is
+	 * fresh, with no conversation context and no explicit mode (a journaled goal or vibe has one).
+	 * The owner calls it at launch and after a user `/new`, never after an internal new session
+	 * (approval, loop reset), which must not be dragged back into plan mode.
+	 */
+	applyStartupDefault(): Promise<void> {
+		return this.#serialize(async () => {
+			const settings = this.#session.settings;
+			const sessionManager = this.#session.sessionManager;
+			if (
+				cfgPlanDefaultOnStartup.get(settings) &&
+				cfgPlanEnabled.get(settings) &&
+				sessionManager.buildSessionContext().messages.length === 0 &&
+				!sessionManager.getEntries().some(entry => entry.type === "mode_change")
+			) {
+				await this.#enter();
+			}
+		});
 	}
 
 	/** The session calls it before any session change or tree navigation, whoever started it. */
@@ -346,28 +363,15 @@ export class PlanModeController {
 			this.#leftDuringChange || this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
 		this.#leftDuringChange = false;
 		this.#sessionBeforeChange = undefined;
-		// Consumed by any change, so a cancelled one cannot suppress a later `/new`.
-		const suppressDefault = this.#takeStartupDefaultSuppression();
 		if (!switched) return;
 		try {
-			await this.#serialize(() => this.#reconcile(suppressDefault));
+			await this.#serialize(() => this.#reconcile());
 		} catch (error) {
 			this.#warn(`Failed to restore plan mode: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
-	/** Suppress the startup default for the next new session (approval's own "new session"). */
-	suppressNextStartupDefault(): void {
-		this.#suppressStartupDefault = true;
-	}
-
-	#takeStartupDefaultSuppression(): boolean {
-		const suppressed = this.#suppressStartupDefault;
-		this.#suppressStartupDefault = false;
-		return suppressed;
-	}
-
-	async #reconcile(suppressDefault: boolean): Promise<void> {
+	async #reconcile(): Promise<void> {
 		await this.#leave();
 		const sessionManager = this.#session.sessionManager;
 		const context = sessionManager.buildSessionContext();
@@ -389,17 +393,6 @@ export class PlanModeController {
 			this.#hasEntered = true;
 			this.#changed();
 			return;
-		}
-		// "Fresh": no conversation context and no explicit mode (a journaled goal or vibe has one).
-		if (
-			this.#options.applyStartupDefault &&
-			!suppressDefault &&
-			context.messages.length === 0 &&
-			!sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
-			cfgPlanDefaultOnStartup.get(this.#session.settings) &&
-			cfgPlanEnabled.get(this.#session.settings)
-		) {
-			await this.#enter();
 		}
 	}
 
