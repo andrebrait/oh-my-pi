@@ -121,6 +121,7 @@ export async function createTestSession(
 		extensionRunner = new ExtensionRunner([extension], runtime, dir, sessionManager, modelRegistry);
 	}
 	const session = new AgentSession({
+		...options.config,
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, ...options.settings }),
@@ -128,7 +129,6 @@ export async function createTestSession(
 		extensionRunner,
 		passiveReplica: options.passiveReplica,
 		sideStreamFn: options.sideStreamFn,
-		...options.config,
 	});
 	session.addDisposer(() => authStorage.close());
 	return session;

@@ -16,6 +16,7 @@ import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import { cfgPlanEnabled } from "../plan-mode/settings";
 import { isMCPToolName } from "../tools/builtin-names";
 import type { AgentSession } from "./agent-session";
+import type { ResolvedRoleModel } from "./agent-session-types";
 import { USER_INTERRUPT_LABEL } from "./messages";
 
 export type RpcPlanOp = "get" | "enter" | "exit" | "clear";
@@ -31,6 +32,8 @@ export interface PlanModeOptions {
 	onChanged?: (view: PlanModeView) => void;
 	/** True while the owner wants entry refused (e.g. vibe mode in the TUI). Returns the refusal text. */
 	entryBlocked?: () => string | undefined;
+	/** Shows a warning the user should see (the TUI's `showWarning`); it is logged as well. */
+	onWarning?: (text: string) => void;
 }
 
 export type PlanModeSession = Pick<
@@ -43,6 +46,7 @@ export type PlanModeSession = Pick<
 	| "resolveRoleModelWithThinking"
 	| "setModelTemporary"
 	| "setThinkingLevel"
+	| "applyRoleModel"
 	| "getGoalModeState"
 	| "getPlanModeState"
 	| "setPlanModeState"
@@ -81,6 +85,8 @@ export class PlanModeController {
 	#pendingPlanModelSwitch = false;
 	/** Entered since the last full exit; becomes `reentry` in the plan state. */
 	#hasEntered = false;
+	/** Tail of the transition queue: enter, exit, clear and role reapply run one at a time. */
+	#transitions: Promise<void> = Promise.resolve();
 
 	constructor(session: PlanModeSession, options: PlanModeOptions) {
 		this.#session = session;
@@ -99,6 +105,7 @@ export class PlanModeController {
 	async handle(command: { op: RpcPlanOp; planFilePath?: string }): Promise<PlanModeView> {
 		switch (command.op) {
 			case "get":
+				await this.#transitions;
 				break;
 			case "enter":
 				await this.enter({ planFilePath: command.planFilePath });
@@ -107,7 +114,7 @@ export class PlanModeController {
 				await this.exit({ paused: true, interruptActiveTurn: true });
 				break;
 			case "clear":
-				this.clearPaused();
+				await this.clearPaused();
 				break;
 			default: {
 				const op: never = command.op;
@@ -117,8 +124,19 @@ export class PlanModeController {
 		return this.view;
 	}
 
+	/** Run `transition` after every queued one, so concurrent callers see each other's result. */
+	#serialize(transition: () => Promise<void>): Promise<void> {
+		const run = this.#transitions.then(transition);
+		this.#transitions = run.catch(() => {});
+		return run;
+	}
+
 	/** Enter plan mode; a no-op while it is on. Throws the refusal when goal mode or the owner blocks it. */
-	async enter(options?: { planFilePath?: string; preserveRestoredModel?: boolean }): Promise<void> {
+	enter(options?: { planFilePath?: string; preserveRestoredModel?: boolean }): Promise<void> {
+		return this.#serialize(() => this.#enter(options));
+	}
+
+	async #enter(options?: { planFilePath?: string; preserveRestoredModel?: boolean }): Promise<void> {
 		if (this.#enabled) return;
 		const goal = this.#session.getGoalModeState();
 		if (goal?.enabled || goal?.goal?.status === "paused") throw new Error("Exit goal mode first.");
@@ -128,8 +146,7 @@ export class PlanModeController {
 			throw new Error("Plan mode is disabled. Enable it in settings (plan.enabled).");
 		}
 
-		this.#paused = false;
-		const planFilePath = options?.planFilePath ?? (this.#session.getPlanReferencePath() || "local://PLAN.md");
+		const planFilePath = options?.planFilePath || this.#session.getPlanReferencePath() || "local://PLAN.md";
 		const previousTools = this.#session.getEnabledToolNames();
 		const previousMountedTools = this.#session.getMountedXdevToolNames();
 		// `plan-mode-active.md` drafts the plan with `write`/`edit`, and approval is a `write` to
@@ -140,18 +157,11 @@ export class PlanModeController {
 		if (this.#session.hasBuiltInTool("write")) {
 			planAugmentations.push("write");
 		} else if (previousTools.includes("write")) {
-			logger.warn(
+			this.#warn(
 				"Plan mode: the `write` tool is provided by an extension and cannot submit plans. Disable it to use plan mode.",
 			);
 		}
 		const uniquePlanTools = [...new Set([...previousTools.filter(name => name !== "write"), ...planAugmentations])];
-
-		this.#previousToolPresentation = {
-			enabled: previousTools.filter(name => !isMCPToolName(name)),
-			mounted: previousMountedTools.filter(name => !isMCPToolName(name)),
-		};
-		this.#planFilePath = planFilePath;
-		this.#enabled = true;
 
 		// Plan state must land before the tool partition: it keeps `write` active as the staging transport.
 		const previousPlanModeState = this.#session.getPlanModeState();
@@ -165,9 +175,16 @@ export class PlanModeController {
 			await this.#session.setActiveToolsByName(uniquePlanTools);
 		} catch (error) {
 			this.#session.setPlanModeState(previousPlanModeState);
-			this.#enabled = false;
 			throw error;
 		}
+		// Committed only now: a failed entry leaves the view (paused included) as it was.
+		this.#previousToolPresentation = {
+			enabled: previousTools.filter(name => !isMCPToolName(name)),
+			mounted: previousMountedTools.filter(name => !isMCPToolName(name)),
+		};
+		this.#planFilePath = planFilePath;
+		this.#enabled = true;
+		this.#paused = false;
 		this.#session.setPlanProposalHandler(title => this.#session.preparePlanForReview(title));
 		if (this.#session.isStreaming) {
 			await this.#session.sendPlanModeContext({ deliverAs: "steer" });
@@ -185,27 +202,31 @@ export class PlanModeController {
 	/**
 	 * Leave plan mode (a no-op while it is off), to paused or fully off. `interruptActiveTurn`
 	 * aborts a streaming turn first: the plan prompt keeps it planning until `xd://propose`.
-	 * `deferModelRestore` leaves the pre-plan model recorded for the approval path to apply.
+	 * `deferModelRestore` leaves the pre-plan model for {@link applyDeferredModelTransition}.
 	 */
-	async exit(options: { paused: boolean; deferModelRestore?: boolean; interruptActiveTurn?: boolean }): Promise<void> {
-		if (!this.#enabled) return;
-		if (options.interruptActiveTurn && this.#session.isStreaming) {
-			await this.#session.runModeExitTeardown(async () => {
-				await this.#session.abort({ reason: USER_INTERRUPT_LABEL });
-				await this.#tearDown(options);
-			});
-			return;
-		}
-		await this.#tearDown(options);
+	exit(options: { paused: boolean; deferModelRestore?: boolean; interruptActiveTurn?: boolean }): Promise<void> {
+		return this.#serialize(async () => {
+			if (!this.#enabled) return;
+			if (options.interruptActiveTurn && this.#session.isStreaming) {
+				await this.#session.runModeExitTeardown(async () => {
+					await this.#session.abort({ reason: USER_INTERRUPT_LABEL });
+					await this.#tearDown(options);
+				});
+				return;
+			}
+			await this.#tearDown(options);
+		});
 	}
 
 	/** Paused → off: tools, model and plan state were already restored; only the marker and journal remain. */
-	clearPaused(): void {
-		if (!this.#paused) return;
-		this.#paused = false;
-		this.#hasEntered = false;
-		this.#session.sessionManager.appendModeChange("none");
-		this.#changed();
+	clearPaused(): Promise<void> {
+		return this.#serialize(async () => {
+			if (!this.#paused) return;
+			this.#paused = false;
+			this.#hasEntered = false;
+			this.#session.sessionManager.appendModeChange("none");
+			this.#changed();
+		});
 	}
 
 	/**
@@ -213,17 +234,22 @@ export class PlanModeController {
 	 * model IS the plan model there, so a settings-only change would leave the turn on the
 	 * model plan mode was entered with (issue #5657).
 	 */
-	async reapplyModelOnRoleChange(): Promise<void> {
-		if (!this.#enabled) return;
-		const resolved = this.#session.resolveRoleModelWithThinking("plan");
-		if (!resolved.model) {
-			this.#clearPendingPlanModelSwitch();
-			return;
-		}
-		await this.#applyPlanModelTransition(this.#session.model, resolved);
+	reapplyModelOnRoleChange(): Promise<void> {
+		return this.#serialize(async () => {
+			if (!this.#enabled) return;
+			const resolved = this.#session.resolveRoleModelWithThinking("plan");
+			if (!resolved.model) {
+				this.#clearPendingPlanModelSwitch();
+				return;
+			}
+			await this.#applyPlanModelTransition(this.#session.model, resolved);
+		});
 	}
 
-	/** Apply a model switch deferred while streaming; the owner calls it once the turn ends. */
+	/**
+	 * Apply a model switch deferred while streaming; the owner calls it once the turn ends.
+	 * Not queued: an interrupting exit waits for the aborted turn's end, which flushes.
+	 */
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
 		this.#pendingModelSwitch = undefined;
@@ -232,7 +258,32 @@ export class PlanModeController {
 		try {
 			await this.#session.setModelTemporary(pending.model, pending.thinkingLevel);
 		} catch (error) {
-			logger.warn("Failed to switch model after streaming", { error: String(error) });
+			this.#warn(
+				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * After `exit({ deferModelRestore: true })` (the compact-approval path): move onto
+	 * `executionModel`, or else back to the pre-plan model. Consumes the recorded pre-plan
+	 * model, so a second call is a no-op. The caller skips it when compaction failed: the
+	 * context is intact and the plan model stays.
+	 */
+	async applyDeferredModelTransition(executionModel?: ResolvedRoleModel): Promise<void> {
+		const deferredPrev = this.#previousModelState;
+		if (deferredPrev === undefined) return;
+		this.#previousModelState = undefined;
+		if (!executionModel) {
+			await this.#restorePreviousModel(deferredPrev);
+			return;
+		}
+		try {
+			await this.#session.applyRoleModel(executionModel);
+		} catch (error) {
+			this.#warn(
+				`Could not switch to the ${executionModel.role} model: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
@@ -244,6 +295,11 @@ export class PlanModeController {
 
 	#changed(): void {
 		this.#options.onChanged?.(this.view);
+	}
+
+	#warn(text: string): void {
+		logger.warn(text);
+		this.#options.onWarning?.(text);
 	}
 
 	async #applyPlanModeModel(): Promise<void> {
@@ -286,7 +342,9 @@ export class PlanModeController {
 				try {
 					await this.#session.setModelTemporary(transition.model, transition.thinkingLevel);
 				} catch (error) {
-					logger.warn("Failed to switch to plan model for plan mode", { error: String(error) });
+					this.#warn(
+						`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
+					);
 				}
 				return;
 		}

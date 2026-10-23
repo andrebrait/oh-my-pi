@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Effort } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { PlanModeController } from "@oh-my-pi/pi-coding-agent/session/plan-mode";
+import type { PlanModeController, PlanModeOptions } from "@oh-my-pi/pi-coding-agent/session/plan-mode";
 import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 import { createTestSession, isolateAgentDir, type TestSessionOptions } from "../helpers/rpc-server-harness";
@@ -58,34 +60,19 @@ function readWriteTools(extra: TestSessionOptions["config"] = {}): TestSessionOp
 	};
 }
 
+/** Starts a turn whose reply holds mid-stream; resolves once it streams, with a release that waits for idle. */
+type StreamTurn = () => Promise<() => Promise<void>>;
+
 async function withPlanSession(
 	options: TestSessionOptions,
-	run: (session: AgentSession, planMode: PlanModeController) => Promise<void>,
-): Promise<void> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plan-mode-"));
-	const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
-	const session = await createTestSession(dir, { handler: { content: ["ok"] } }, undefined, options);
-	try {
-		await run(session, session.enablePlanMode({}));
-	} finally {
-		await session.dispose();
-		restoreAgentDir();
-		await removeWithRetries(dir);
-	}
-}
-
-/** A session whose first reply holds mid-stream until `gate` resolves. */
-async function withStreamingPlanSession(
-	run: (session: AgentSession, planMode: PlanModeController, release: () => Promise<void>) => Promise<void>,
+	run: (session: AgentSession, planMode: PlanModeController, streamTurn: StreamTurn) => Promise<void>,
+	planOptions: PlanModeOptions = {},
 ): Promise<void> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plan-mode-"));
 	const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
 	const gate = Promise.withResolvers<void>();
-	const session = await createTestSession(dir, { handler: { content: ["ok"] } }, gate.promise, {
-		settings: PLAN_ROLE,
-	});
-	try {
-		const planMode = session.enablePlanMode({});
+	const session = await createTestSession(dir, { handler: { content: ["ok"] } }, gate.promise, options);
+	const streamTurn: StreamTurn = async () => {
 		const streaming = Promise.withResolvers<void>();
 		const unsubscribe = session.subscribe(event => {
 			if (event.type === "message_update") streaming.resolve();
@@ -94,11 +81,14 @@ async function withStreamingPlanSession(
 		await withTimeout(streaming.promise, 10_000, "the reply never started streaming");
 		unsubscribe();
 		expect(session.isStreaming).toBe(true);
-		await run(session, planMode, async () => {
+		return async () => {
 			gate.resolve();
 			await turn;
 			await session.waitForIdle();
-		});
+		};
+	};
+	try {
+		await run(session, session.enablePlanMode(planOptions), streamTurn);
 	} finally {
 		gate.resolve();
 		await session.dispose();
@@ -106,6 +96,18 @@ async function withStreamingPlanSession(
 		await removeWithRetries(dir);
 	}
 }
+
+/** A plan session over a turn that is streaming, held until `release`. */
+function withStreamingPlanSession(
+	run: (session: AgentSession, planMode: PlanModeController, release: () => Promise<void>) => Promise<void>,
+): Promise<void> {
+	return withPlanSession({ settings: PLAN_ROLE }, async (session, planMode, streamTurn) =>
+		run(session, planMode, await streamTurn()),
+	);
+}
+
+const modeChanges = (session: AgentSession, mode: string): number =>
+	session.sessionManager.getEntries().filter(entry => entry.type === "mode_change" && entry.mode === mode).length;
 
 function lastModeChange(session: AgentSession): { mode: string; data?: Record<string, unknown> } | undefined {
 	return session.sessionManager
@@ -179,13 +181,14 @@ describe("session-owned plan mode", () => {
 		}
 	});
 
-	test("entering while a turn streams defers the model switch to the turn end", async () => {
+	test("entering while a turn streams steers the plan context and defers the model switch until the owner flushes", async () => {
 		await withStreamingPlanSession(async (session, planMode, release) => {
 			await planMode.handle({ op: "enter" });
 			expect(session.getPlanModeState()?.enabled).toBe(true);
 			expect(session.model?.id).toBe("claude-sonnet-4-5");
 
 			await release();
+			expect(session.messages.some(m => m.role === "custom" && m.customType === "plan-mode-context")).toBe(true);
 			expect(session.model?.id).toBe("claude-sonnet-4-5");
 			// The owner flushes at the turn's end (the TUI on agent_end).
 			await planMode.flushPendingModelSwitch();
@@ -279,18 +282,277 @@ describe("session-owned plan mode", () => {
 	});
 
 	test("enter is refused while the owner blocks it", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plan-mode-"));
-		const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
-		const session = await createTestSession(dir, { handler: { content: ["ok"] } }, undefined, readWriteTools());
-		try {
-			const planMode = session.enablePlanMode({ entryBlocked: () => "Exit vibe mode first." });
-			await expect(planMode.handle({ op: "enter" })).rejects.toThrow("Exit vibe mode first.");
+		await withPlanSession(
+			readWriteTools(),
+			async (session, planMode) => {
+				await expect(planMode.handle({ op: "enter" })).rejects.toThrow("Exit vibe mode first.");
+				expect(session.getPlanModeState()).toBeUndefined();
+			},
+			{ entryBlocked: () => "Exit vibe mode first." },
+		);
+	});
+
+	test("enter is refused while plan.enabled is off", async () => {
+		await withPlanSession({ settings: { "plan.enabled": false } }, async (session, planMode) => {
+			await expect(planMode.handle({ op: "enter" })).rejects.toThrow(
+				"Plan mode is disabled. Enable it in settings (plan.enabled).",
+			);
 			expect(session.getPlanModeState()).toBeUndefined();
-		} finally {
-			await session.dispose();
-			restoreAgentDir();
-			await removeWithRetries(dir);
-		}
+		});
+	});
+
+	test("a second entry after a paused exit is a re-entry", async () => {
+		await withPlanSession(readWriteTools(), async (session, planMode) => {
+			await planMode.handle({ op: "enter" });
+			expect(session.getPlanModeState()?.reentry).toBe(false);
+			await planMode.handle({ op: "exit" });
+			await planMode.handle({ op: "enter" });
+			expect(session.getPlanModeState()?.reentry).toBe(true);
+		});
+	});
+
+	test("exit mid-turn interrupts the streaming turn", async () => {
+		await withStreamingPlanSession(async (session, planMode, release) => {
+			await planMode.handle({ op: "enter" });
+			await planMode.handle({ op: "exit" });
+			expect(planMode.view).toEqual({ enabled: false, paused: true, planFilePath: undefined });
+			await release();
+			const reply = session.messages.find(message => message.role === "assistant");
+			expect(reply && "stopReason" in reply ? reply.stopReason : undefined).toBe("aborted");
+		});
+	});
+
+	test("exit while a turn streams defers the model restore until the owner flushes", async () => {
+		await withPlanSession({ settings: PLAN_ROLE }, async (session, planMode, streamTurn) => {
+			await planMode.handle({ op: "enter" });
+			expect(session.model?.id).toBe("claude-haiku-4-5");
+			const release = await streamTurn();
+
+			await planMode.exit({ paused: true });
+			expect(session.model?.id).toBe("claude-haiku-4-5");
+
+			await release();
+			await planMode.flushPendingModelSwitch();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		});
+	});
+
+	test("exit with deferModelRestore keeps the plan model until applyDeferredModelTransition, which runs once", async () => {
+		await withPlanSession({ settings: PLAN_ROLE }, async (session, planMode) => {
+			await planMode.handle({ op: "enter" });
+			const haiku = session.model!;
+			await planMode.exit({ paused: false, deferModelRestore: true });
+			expect(session.model?.id).toBe("claude-haiku-4-5");
+			expect(lastModeChange(session)?.mode).toBe("none");
+
+			await planMode.applyDeferredModelTransition();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+			await session.setModelTemporary(haiku);
+			await planMode.applyDeferredModelTransition();
+			expect(session.model?.id).toBe("claude-haiku-4-5");
+		});
+	});
+
+	test("applyDeferredModelTransition moves onto the execution model", async () => {
+		await withPlanSession({ settings: PLAN_ROLE }, async (session, planMode) => {
+			await planMode.handle({ op: "enter" });
+			await planMode.exit({ paused: false, deferModelRestore: true });
+			const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;
+
+			await planMode.applyDeferredModelTransition({ role: "default", model, explicitThinkingLevel: false });
+			expect(session.model?.id).toBe("claude-sonnet-4-6");
+		});
+	});
+
+	test("reapplyModelOnRoleChange follows a reassigned plan role only while plan mode is on", async () => {
+		await withPlanSession({ settings: PLAN_ROLE }, async (session, planMode) => {
+			await planMode.handle({ op: "enter" });
+			session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-6");
+			await planMode.reapplyModelOnRoleChange();
+			expect(session.model?.id).toBe("claude-sonnet-4-6");
+
+			await planMode.handle({ op: "exit" });
+			session.settings.setModelRole("plan", "anthropic/claude-haiku-4-5");
+			await planMode.reapplyModelOnRoleChange();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		});
+	});
+
+	test("a plan role reassigned to the current model drops the stale deferred switch", async () => {
+		await withStreamingPlanSession(async (session, planMode, release) => {
+			await planMode.handle({ op: "enter" });
+			session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-5");
+			await planMode.reapplyModelOnRoleChange();
+
+			await release();
+			await planMode.flushPendingModelSwitch();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		});
+	});
+
+	test("enter with preserveRestoredModel keeps the current model", async () => {
+		await withPlanSession({ settings: PLAN_ROLE }, async (session, planMode) => {
+			await planMode.enter({ preserveRestoredModel: true });
+			expect(session.getPlanModeState()?.enabled).toBe(true);
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		});
+	});
+
+	test("a failed model restore rolls back the plan model and tool presentation", async () => {
+		const write = makeTool("write");
+		const planSelected = makeTool("plan_selected");
+		const read = makeTool("read");
+		const mountedTool = makeMcpTool();
+		let session: AgentSession | undefined;
+		const xdev: XdevState = {
+			tools: new Map([
+				[read.name, read],
+				[write.name, write],
+				[planSelected.name, planSelected],
+			]),
+			mountedNames: new Set(),
+			builtInNames: new Set(["read", "write"]),
+			isActive: name => session?.getActiveToolNames().includes(name) === true,
+		};
+		const options: TestSessionOptions = {
+			settings: { modelRoles: { plan: "anthropic/claude-haiku-4-5:high" } },
+			tools: [read],
+			config: { toolRegistry: xdev.tools, builtInToolNames: ["read", "write"], xdev },
+		};
+		await withPlanSession(options, async (created, planMode) => {
+			session = created;
+			await planMode.handle({ op: "enter" });
+			await created.refreshMCPTools([mountedTool]);
+			await created.setActiveToolsByName([...created.getEnabledToolNames(), planSelected.name]);
+			const planTools = created.getEnabledToolNames();
+			const planActiveTools = created.getActiveToolNames();
+			const planMountedTools = created.getMountedXdevToolNames();
+			expect(created.model?.id).toBe("claude-haiku-4-5");
+			expect(created.configuredThinkingLevel()).toBe(Effort.High);
+			expect(planActiveTools).toEqual(["read", "write", planSelected.name]);
+			expect(planMountedTools).toEqual([mountedTool.name]);
+
+			const setModelTemporary = created.setModelTemporary.bind(created);
+			const restoreModel = vi.spyOn(created, "setModelTemporary").mockImplementationOnce(async (...args) => {
+				await setModelTemporary(...args);
+				throw new Error("model restore failed after switch");
+			});
+			await expect(planMode.handle({ op: "exit" })).rejects.toThrow("model restore failed after switch");
+
+			expect(planMode.view).toEqual({ enabled: true, paused: false, planFilePath: "local://PLAN.md" });
+			expect(created.getPlanModeState()?.enabled).toBe(true);
+			expect(created.peekPlanProposalHandler()).toBeDefined();
+			expect(created.model?.id).toBe("claude-haiku-4-5");
+			expect(created.configuredThinkingLevel()).toBe(Effort.High);
+			expect(created.getEnabledToolNames()).toEqual(planTools);
+			expect(created.getActiveToolNames()).toEqual(planActiveTools);
+			expect(created.getMountedXdevToolNames()).toEqual(planMountedTools);
+
+			restoreModel.mockRestore();
+			await planMode.handle({ op: "exit" });
+			expect(created.getPlanModeState()).toBeUndefined();
+			expect(created.model?.id).toBe("claude-sonnet-4-5");
+			expect(created.getActiveToolNames()).toContain(mountedTool.name);
+			expect(created.getActiveToolNames()).not.toContain(planSelected.name);
+		});
+	});
+
+	test("enter drops a shadowing extension write and warns the owner", async () => {
+		const read = makeTool("read");
+		const shadowWrite = makeTool("write");
+		const warnings: string[] = [];
+		await withPlanSession(
+			{
+				settings: PLAN_ROLE,
+				tools: [read, shadowWrite],
+				config: {
+					toolRegistry: new Map([
+						[read.name, read],
+						[shadowWrite.name, shadowWrite],
+					]),
+					builtInToolNames: ["read"],
+				},
+			},
+			async (session, planMode) => {
+				expect(session.getActiveToolNames()).toContain("write");
+				await planMode.handle({ op: "enter" });
+				expect(session.getActiveToolNames()).not.toContain("write");
+				expect(warnings).toEqual([
+					"Plan mode: the `write` tool is provided by an extension and cannot submit plans. Disable it to use plan mode.",
+				]);
+			},
+			{ onWarning: text => warnings.push(text) },
+		);
+	});
+
+	test("dispose drops a deferred model switch", async () => {
+		await withStreamingPlanSession(async (session, planMode, release) => {
+			await planMode.handle({ op: "enter" });
+			planMode.dispose();
+
+			await release();
+			await planMode.flushPendingModelSwitch();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		});
+	});
+
+	test("a failed enter rolls back and leaves the view, journal and session as they were", async () => {
+		const rebuildGate = { fail: false };
+		const views: unknown[] = [];
+		const options = readWriteTools({
+			rebuildSystemPrompt: async () => {
+				if (rebuildGate.fail) throw new Error("rebuild failed");
+				return { systemPrompt: ["Test"] };
+			},
+		});
+		await withPlanSession(
+			options,
+			async (session, planMode) => {
+				await planMode.handle({ op: "enter" });
+				await planMode.handle({ op: "exit" });
+				const before = planMode.view;
+				const tools = session.getActiveToolNames();
+				const entries = session.sessionManager.getEntries().length;
+				const changes = views.length;
+				rebuildGate.fail = true;
+
+				await expect(planMode.handle({ op: "enter", planFilePath: "local://b.md" })).rejects.toThrow(
+					"rebuild failed",
+				);
+				expect(before).toEqual({ enabled: false, paused: true, planFilePath: undefined });
+				expect(planMode.view).toEqual(before);
+				expect(session.getPlanModeState()).toBeUndefined();
+				expect(session.peekPlanProposalHandler()).toBeUndefined();
+				expect(session.getActiveToolNames()).toEqual(tools);
+				expect(session.model?.id).toBe("claude-sonnet-4-5");
+				expect(session.sessionManager.getEntries().length).toBe(entries);
+				expect(views.length).toBe(changes);
+
+				rebuildGate.fail = false;
+				await planMode.handle({ op: "enter" });
+				expect(session.getPlanModeState()?.reentry).toBe(true);
+			},
+			{ onChanged: view => views.push(view) },
+		);
+	});
+
+	test("concurrent exits run one at a time and journal one plan_paused", async () => {
+		const views: unknown[] = [];
+		await withPlanSession(
+			readWriteTools(),
+			async (session, planMode) => {
+				await planMode.handle({ op: "enter" });
+				const [first, second] = await Promise.all([
+					planMode.handle({ op: "exit" }),
+					planMode.handle({ op: "exit" }),
+				]);
+				expect(first).toEqual({ enabled: false, paused: true, planFilePath: undefined });
+				expect(second).toEqual(first);
+				expect(modeChanges(session, "plan_paused")).toBe(1);
+				expect(views.length).toBe(2);
+			},
+			{ onChanged: view => views.push(view) },
+		);
 	});
 
 	test("enablePlanMode returns the running controller, refuses other options, and never runs on a passive replica", async () => {
