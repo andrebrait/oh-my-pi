@@ -1992,6 +1992,79 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(defaultApply?.[0]?.explicitThinkingLevel).toBe(true);
 	});
 
+	/**
+	 * Plan on opus from sonnet at high thinking, autosave on, then approve on the slider's start
+	 * tier, `default` (sonnet, thinking off): leaving plan mode puts the session back on sonnet, and
+	 * only `applyRoleModel` turns thinking off. Returns the statuses and warnings shown.
+	 */
+	async function approveOnDefaultTier(
+		choice: string,
+		compactOutcome: "ok" | "cancelled" = "ok",
+	): Promise<{ statuses: string[]; warnings: string[] }> {
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5:off");
+		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5");
+		session.settings.setModelRole("plan", "anthropic/claude-opus-4-5");
+		session.setThinkingLevel(ThinkingLevel.High);
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nRun on the default tier.",
+		);
+		await mode.handlePlanModeCommand();
+		cfgPlanAutosave.set(session.settings, true);
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		// As the real command does, the before-flush hook runs for every outcome.
+		vi.spyOn(mode, "handleCompactCommand").mockImplementation(async (_instructions, _mode, beforeFlush) => {
+			await beforeFlush?.(compactOutcome);
+			return compactOutcome;
+		});
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue(choice);
+		const status = vi.spyOn(mode, "showStatus");
+		const warning = vi.spyOn(mode, "showWarning");
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		return {
+			statuses: status.mock.calls.map(([text]) => String(text)),
+			warnings: warning.mock.calls.map(([text]) => String(text)),
+		};
+	}
+
+	it("announces the tier approval moved onto", async () => {
+		const { statuses, warnings } = await approveOnDefaultTier("Approve and keep context");
+
+		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.Off);
+		expect(statuses).toContain("Continuing with default: Claude Sonnet 4.5");
+		expect(warnings).toEqual([]);
+	});
+
+	it("shows only the failure when the tier switch fails, even though the session is on the tier's model", async () => {
+		vi.spyOn(session, "applyRoleModel").mockRejectedValue(new Error("boom"));
+
+		const { statuses, warnings } = await approveOnDefaultTier("Approve and keep context");
+
+		expect(session.model?.id).toBe("claude-sonnet-4-5");
+		expect(warnings).toEqual(["Could not switch to the default model: boom"]);
+		expect(statuses.filter(text => text.startsWith("Continuing with"))).toEqual([]);
+	});
+
+	it("a cancelled compaction still reports the saved plan and the tier it moved onto", async () => {
+		const { statuses, warnings } = await approveOnDefaultTier("Approve and compact context", "cancelled");
+
+		// Only the compaction was cancelled: the session moved onto the tier, and says so once.
+		expect(statuses.filter(text => text.startsWith("Saved plan to"))).toHaveLength(1);
+		expect(statuses.filter(text => text.startsWith("Continuing with"))).toEqual([
+			"Continuing with default: Claude Sonnet 4.5",
+		]);
+		expect(warnings).toEqual([
+			"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+		]);
+	});
+
 	it("preserves DEFAULT(auto) when plan approval restores the default tier", async () => {
 		const sonnet = session.modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		const opus = session.modelRegistry.find("anthropic", "claude-opus-4-5");
@@ -2359,6 +2432,33 @@ describe("InteractiveMode plan review rendering", () => {
 		const saved = path.join(tempDir.path(), ".omp", "plans", "AUTOSAVE_PLAN.md");
 		expect(await Bun.file(saved).text()).toBe("# Plan\n\nAutosave me.");
 		expect(savedBeforeRun).toBe(true);
+	});
+
+	it("still reports the autosaved copy when approval fails after saving it", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nAutosave me.");
+
+		await mode.handlePlanModeCommand();
+		cfgPlanAutosave.set(session.settings, true);
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and keep context");
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		// Seeding the session name runs after the autosave and before the approved prompt.
+		vi.spyOn(session.sessionManager, "setSessionName").mockRejectedValue(new Error("disk full"));
+		const status = vi.spyOn(mode, "showStatus");
+		const showError = vi.spyOn(mode, "showError");
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "AUTOSAVE" });
+
+		const saved = path.join(tempDir.path(), ".omp", "plans", "AUTOSAVE_PLAN.md");
+		expect(await Bun.file(saved).text()).toBe("# Plan\n\nAutosave me.");
+		expect(status.mock.calls.some(([text]) => String(text).startsWith("Saved plan to"))).toBe(true);
+		expect(showError).toHaveBeenCalledWith("Failed to finalize approved plan: disk full");
+		expect(prompt.mock.calls.some(isPlanApprovedCall)).toBe(false);
 	});
 
 	it("continues approval with a warning when autosave fails", async () => {

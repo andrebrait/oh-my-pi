@@ -239,6 +239,21 @@ describe("session-owned plan mode", () => {
 		});
 	});
 
+	test("a turn end that lands while a fresh turn streams leaves the deferred switch to that turn's end", async () => {
+		await withStreamingPlanSession(async (session, planMode, release) => {
+			await planMode.handle({ op: "enter" });
+			const setModel = vi.spyOn(session, "setModelTemporary");
+
+			// A superseded turn's end: the session already streams the fresh one.
+			planMode.observe({ type: "agent_end", messages: [], isTerminal: false });
+			expect(setModel).not.toHaveBeenCalled();
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+
+			await release();
+			expect(session.model?.id).toBe("claude-haiku-4-5");
+		});
+	});
+
 	test("exit drops a deferred plan model switch", async () => {
 		await withStreamingPlanSession(async (session, planMode, release) => {
 			await planMode.handle({ op: "enter" });
@@ -1165,10 +1180,15 @@ describe("session-owned plan mode", () => {
 			await withApprovalSession(options, async (session, planMode) => {
 				await session.sessionManager.setSessionName("Mine", "auto");
 
+				const announced: string[] = [];
 				const result = await planMode.approve({
 					review: buildPlanReview(session, DETAILS),
 					choice: "keep",
-					hooks: { newSession: noNewSession, compact: noCompaction },
+					hooks: {
+						newSession: noNewSession,
+						compact: noCompaction,
+						onPlanSaved: savedPlanPath => announced.push(savedPlanPath),
+					},
 				});
 
 				expect(result.dispatched).toBe(true);
@@ -1179,6 +1199,7 @@ describe("session-owned plan mode", () => {
 				if (!saved) throw new Error("the plan was not autosaved");
 				expect(path.dirname(saved)).toBe(path.join(session.sessionManager.getCwd(), "saved-plans"));
 				expect(await Bun.file(saved).text()).toBe(PLAN_TEXT);
+				expect(announced).toEqual([saved]);
 			});
 		});
 
@@ -1214,21 +1235,26 @@ describe("session-owned plan mode", () => {
 					slow: "anthropic/claude-sonnet-4-5",
 				},
 			};
-			for (const [tierIndex, model, role] of [
-				[undefined, "claude-opus-4-5", "default"],
-				[2, "claude-sonnet-4-5", "temporary"],
-				[0, "claude-haiku-4-5", "smol"],
+			for (const [tierIndex, model, role, announced] of [
+				[undefined, "claude-opus-4-5", "default", ["default"]],
+				[2, "claude-sonnet-4-5", "temporary", []],
+				[0, "claude-haiku-4-5", "smol", ["smol"]],
 			] as const) {
 				await withApprovalSession({ ...readWriteTools(), settings: roles }, async (session, planMode) => {
 					const firstSession = session.sessionManager.getSessionId();
 					const review = buildPlanReview(session, DETAILS);
 					expect(review.restoredTierIndex).toBe(2);
+					const applied: string[] = [];
 
 					const result = await planMode.approve({
 						review,
 						choice: "keep",
 						tierIndex,
-						hooks: { newSession: noNewSession, compact: noCompaction },
+						hooks: {
+							newSession: noNewSession,
+							compact: noCompaction,
+							onExecutionModel: executionModel => applied.push(executionModel.role),
+						},
 					});
 
 					expect(result.dispatched).toBe(true);
@@ -1236,9 +1262,52 @@ describe("session-owned plan mode", () => {
 					expect(session.model?.id).toBe(model);
 					// The restored tier is not applied again: exit's temporary restore is the last switch.
 					expect(session.sessionManager.getLastModelChangeRole()).toBe(role);
+					expect(applied).toEqual([...announced]);
 					expect(approvedPrompts(session)[0]).toContain("History usable");
 				});
 			}
+		});
+
+		test("a tier switch that fails is warned and not reported as the execution model", async () => {
+			const warnings: string[] = [];
+			// The review starts on `default` (opus); the pre-plan model is sonnet, so approval switches.
+			const settings = {
+				modelRoles: {
+					plan: "anthropic/claude-haiku-4-5",
+					default: "anthropic/claude-opus-4-5",
+					slow: "anthropic/claude-sonnet-4-5",
+				},
+			};
+			for (const choice of ["keep", "compact"] as const) {
+				await withApprovalSession(
+					{ ...readWriteTools(), settings },
+					async (session, planMode) => {
+						vi.spyOn(session, "applyRoleModel").mockRejectedValue(new Error("boom"));
+						const applied: string[] = [];
+
+						const result = await planMode.approve({
+							review: buildPlanReview(session, DETAILS),
+							choice,
+							hooks: {
+								newSession: noNewSession,
+								compact: async (_instructions, beforeFlush) => {
+									await beforeFlush("ok");
+									return "ok";
+								},
+								onExecutionModel: executionModel => applied.push(executionModel.role),
+							},
+						});
+
+						expect(result.dispatched).toBe(true);
+						expect(applied).toEqual([]);
+					},
+					{ onWarning: text => warnings.push(text) },
+				);
+			}
+			expect(warnings).toEqual([
+				"Could not switch to the default model: boom",
+				"Could not switch to the default model: boom",
+			]);
 		});
 
 		test("approve is refused outside plan mode", async () => {

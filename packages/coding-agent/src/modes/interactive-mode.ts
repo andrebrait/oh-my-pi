@@ -13,7 +13,6 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { execReplace } from "@oh-my-pi/pi-natives";
 import type {
 	AutocompleteProvider,
@@ -2631,13 +2630,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// plan-approval → execution handoff and loop resets also start sessions through
 		// handleClearCommand and must never be dragged back into plan mode; user-initiated /new
 		// re-applies the default through handleNewCommand instead.
+		// A failure is warned rather than ending startup, as a session change's restore is.
 		if (!this.hostedClientMode) {
 			const planMode = this.enablePlanMode();
 			try {
 				await planMode.reconcile();
+			} catch (error) {
+				this.showWarning(`Failed to restore plan mode: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			try {
 				await planMode.applyStartupDefault();
 			} catch (error) {
-				this.showWarning(error instanceof Error ? error.message : String(error));
+				this.showWarning(`Failed to enter plan mode: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
 
@@ -6172,23 +6176,6 @@ export class InteractiveMode implements InteractiveModeContext {
 					closePlanReview();
 					return;
 				}
-				// The tier approval moves onto; none when the slider is hidden or sits on the pre-plan model.
-				const executionModel =
-					slider && selectedTierIndex !== review.restoredTierIndex ? cycle?.models[selectedTierIndex] : undefined;
-				const announce = (savedPlanPath: string | undefined): void => {
-					if (savedPlanPath) {
-						this.showStatus(
-							`Saved plan to ${truncateToWidth(replaceTabs(shortenPath(savedPlanPath)), TRUNCATE_LENGTHS.CONTENT)}.`,
-						);
-					}
-					if (executionModel && modelsAreEqual(this.session.model, executionModel.model)) {
-						this.statusLine.invalidate();
-						this.updateEditorBorderColor();
-						this.showStatus(
-							`Continuing with ${executionModel.role}: ${executionModel.model.name || executionModel.model.id}`,
-						);
-					}
-				};
 				const result = await planMode.approve({
 					review,
 					choice: picked,
@@ -6200,15 +6187,24 @@ export class InteractiveMode implements InteractiveModeContext {
 						compact: (instructions, beforeFlush) =>
 							this.handleCompactCommand(undefined, undefined, beforeFlush, instructions),
 						// The approved prompt blocks for the whole run: leave the review now (issue #5688).
-						beforeDispatch: savedPlanPath => {
-							announce(savedPlanPath);
+						beforeDispatch: () => {
 							this.#hidePlanReview(pending);
 							this.ui.requestRender();
+						},
+						onPlanSaved: savedPlanPath =>
+							this.showStatus(
+								`Saved plan to ${truncateToWidth(replaceTabs(shortenPath(savedPlanPath)), TRUNCATE_LENGTHS.CONTENT)}.`,
+							),
+						onExecutionModel: executionModel => {
+							this.statusLine.invalidate();
+							this.updateEditorBorderColor();
+							this.showStatus(
+								`Continuing with ${executionModel.role}: ${executionModel.model.name || executionModel.model.id}`,
+							);
 						},
 					},
 				});
 				if (result.dispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
-				else announce(result.savedPlanPath);
 			} catch (error) {
 				this.showError(
 					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,

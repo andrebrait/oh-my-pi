@@ -23,7 +23,6 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { cfgCycleOrder } from "../config/model-settings";
-import type { Settings } from "../config/settings";
 import { copyLocalArtifacts, type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import { humanizePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
@@ -37,7 +36,6 @@ import { isMCPToolName } from "../tools/builtin-names";
 import type { AgentSession, AgentSessionEvent } from "./agent-session";
 import type { ResolvedRoleModel } from "./agent-session-types";
 import { USER_INTERRUPT_LABEL } from "./messages";
-import type { SessionManager } from "./session-manager";
 
 export type RpcPlanOp = "get" | "enter" | "exit" | "clear";
 
@@ -101,23 +99,6 @@ export type PlanModeSession = Pick<
 export interface ModelState {
 	model: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
-}
-
-/**
- * Whether `plan.defaultOnStartup` applies: plan mode is enabled and the session is fresh, with no
- * conversation context (messages, custom messages, branch and compaction summaries) and no
- * explicit `mode_change`. SDK startup metadata and extension `custom` state entries do not count.
- */
-export function shouldEnterPlanModeOnStartup(
-	sessionManager: Pick<SessionManager, "buildSessionContext" | "getEntries">,
-	settings: Settings,
-): boolean {
-	return (
-		cfgPlanDefaultOnStartup.get(settings) &&
-		cfgPlanEnabled.get(settings) &&
-		sessionManager.buildSessionContext().messages.length === 0 &&
-		!sessionManager.getEntries().some(entry => entry.type === "mode_change")
-	);
 }
 
 export class PlanModeController {
@@ -349,26 +330,27 @@ export class PlanModeController {
 	 * After `exit({ deferModelRestore: true })` (the compact-approval path): move onto
 	 * `executionModel`, or else back to the pre-plan model. Consumes the recorded pre-plan
 	 * model, so a second call is a no-op. The caller skips it when compaction failed: the
-	 * context is intact and the plan model stays.
+	 * context is intact and the plan model stays. True only when it moved onto `executionModel`.
 	 */
-	async applyDeferredModelTransition(executionModel?: ResolvedRoleModel): Promise<void> {
+	async applyDeferredModelTransition(executionModel?: ResolvedRoleModel): Promise<boolean> {
 		const deferredPrev = this.#previousModelState;
-		if (deferredPrev === undefined) return;
+		if (deferredPrev === undefined) return false;
 		this.#previousModelState = undefined;
-		if (executionModel) {
-			await this.#applyExecutionModel(executionModel);
-		} else {
-			await this.#restorePreviousModel(deferredPrev);
-		}
+		if (executionModel) return this.#applyExecutionModel(executionModel);
+		await this.#restorePreviousModel(deferredPrev);
+		return false;
 	}
 
-	async #applyExecutionModel(executionModel: ResolvedRoleModel): Promise<void> {
+	/** Move onto an approved tier's model; a failure is warned and reported as false. */
+	async #applyExecutionModel(executionModel: ResolvedRoleModel): Promise<boolean> {
 		try {
 			await this.#session.applyRoleModel(executionModel);
+			return true;
 		} catch (error) {
 			this.#warn(
 				`Could not switch to the ${executionModel.role} model: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			return false;
 		}
 	}
 
@@ -380,7 +362,8 @@ export class PlanModeController {
 	 * prompt to run in the current one, as the TUI's `/new` refusal always did.
 	 * `compact` runs `beforeFlush` before dispatching input queued during compaction, so that input
 	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued (the prompt
-	 * may run for the whole turn), with the autosaved copy's path.
+	 * may run for the whole turn). `onPlanSaved` reports the autosaved copy and `onExecutionModel` the
+	 * picked tier once the session runs on it, each as it happens, so a later failure keeps them.
 	 */
 	async approve(input: {
 		review: PlanReviewModel;
@@ -392,7 +375,9 @@ export class PlanModeController {
 				instructions: string,
 				beforeFlush: (outcome: CompactionOutcome) => Promise<void>,
 			): Promise<CompactionOutcome>;
-			beforeDispatch?(savedPlanPath: string | undefined): void;
+			beforeDispatch?(): void;
+			onPlanSaved?(savedPlanPath: string): void;
+			onExecutionModel?(executionModel: ResolvedRoleModel): void;
 		};
 	}): Promise<PlanApprovalResult> {
 		const { review, choice, hooks } = input;
@@ -411,6 +396,9 @@ export class PlanModeController {
 		const executionModel = tierRole
 			? session.getRoleModelCycle(cfgCycleOrder.get(session.settings))?.models.find(entry => entry.role === tierRole)
 			: undefined;
+		const moveOntoExecutionModel = async (apply: Promise<boolean>): Promise<void> => {
+			if ((await apply) && executionModel) hooks.onExecutionModel?.(executionModel);
+		};
 		const previousPresentation = this.#previousToolPresentation ?? {
 			enabled: session.getEnabledToolNames().filter(name => !isMCPToolName(name)),
 			mounted: session.getMountedXdevToolNames().filter(name => !isMCPToolName(name)),
@@ -433,7 +421,8 @@ export class PlanModeController {
 				outcome = await hooks.compact(
 					prompt.render(planModeCompactInstructionsPrompt, { planFilePath }),
 					async compactOutcome => {
-						if (compactOutcome !== "failed") await this.applyDeferredModelTransition(executionModel);
+						if (compactOutcome !== "failed")
+							await moveOntoExecutionModel(this.applyDeferredModelTransition(executionModel));
 					},
 				);
 			}
@@ -467,13 +456,14 @@ export class PlanModeController {
 			);
 			this.#warn(`Failed to autosave plan: ${detail}`);
 		}
+		if (savedPlanPath) hooks.onPlanSaved?.(savedPlanPath);
 
 		// Idempotent after `beforeFlush`; covers a compaction that never ran. A cancelled compaction
 		// still moves on (only the compaction was cancelled); a failed one keeps the plan model.
 		if (!compact) {
-			if (executionModel) await this.#applyExecutionModel(executionModel);
+			if (executionModel) await moveOntoExecutionModel(this.#applyExecutionModel(executionModel));
 		} else if (outcome !== "failed") {
-			await this.applyDeferredModelTransition(executionModel);
+			await moveOntoExecutionModel(this.applyDeferredModelTransition(executionModel));
 		}
 		if (outcome === "cancelled") {
 			// The plan reference stays unsent, so the next turn carries the plan.
@@ -492,7 +482,7 @@ export class PlanModeController {
 			planContent,
 			contextPreserved: choice !== "execute",
 		});
-		hooks.beforeDispatch?.(savedPlanPath);
+		hooks.beforeDispatch?.();
 		// Input queued during compaction may already be running: queue behind it rather than abort it.
 		if (session.isStreaming) {
 			await session.followUp(approvedPrompt, undefined, { synthetic: true });
@@ -526,10 +516,11 @@ export class PlanModeController {
 
 	/**
 	 * Fed every session event before any subscriber. A turn's end applies the model switch
-	 * deferred while it streamed, as the TUI did on each `agent_end`.
+	 * deferred while it streamed, as the TUI did on each `agent_end`; one that lands while a
+	 * fresh turn already streams belongs to a superseded turn, and that turn's own end flushes.
 	 */
 	observe(event: AgentSessionEvent): void {
-		if (event.type === "agent_end") void this.flushPendingModelSwitch();
+		if (event.type === "agent_end" && !this.#session.isStreaming) void this.flushPendingModelSwitch();
 	}
 
 	/**
@@ -543,13 +534,24 @@ export class PlanModeController {
 
 	/**
 	 * Enter plan mode when `plan.defaultOnStartup` applies: plan mode is enabled and the session is
-	 * fresh, with no conversation context and no explicit mode (a journaled goal or vibe has one).
-	 * The owner calls it at launch and after a user `/new`, never after an internal new session
-	 * (approval, loop reset), which must not be dragged back into plan mode.
+	 * fresh, with no conversation context (messages, custom messages, branch and compaction
+	 * summaries) and no explicit mode (a journaled goal or vibe has one). Startup metadata and
+	 * extension `custom` state entries do not count. The owner calls it at launch and after a user
+	 * `/new`, never after an internal new session (approval, loop reset), which must not be dragged
+	 * back into plan mode.
 	 */
 	applyStartupDefault(): Promise<void> {
 		return this.#serialize(async () => {
-			if (shouldEnterPlanModeOnStartup(this.#session.sessionManager, this.#session.settings)) await this.#enter();
+			const settings = this.#session.settings;
+			const sessionManager = this.#session.sessionManager;
+			if (
+				cfgPlanDefaultOnStartup.get(settings) &&
+				cfgPlanEnabled.get(settings) &&
+				sessionManager.buildSessionContext().messages.length === 0 &&
+				!sessionManager.getEntries().some(entry => entry.type === "mode_change")
+			) {
+				await this.#enter();
+			}
 		});
 	}
 
