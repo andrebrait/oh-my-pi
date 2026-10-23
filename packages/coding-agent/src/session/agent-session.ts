@@ -3137,13 +3137,19 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #reconcileModeAfterTransition(): Promise<void> {
 		try {
-			await this.#sessionSwitchReconciler?.();
+			await this.#reconcileSwitchedModes();
 		} catch (error) {
 			logger.warn("Failed to reconcile session mode after session transition", {
 				sessionFile: this.sessionFile,
 				error: String(error),
 			});
 		}
+	}
+
+	/** Leave the previous session's plan mode before the owner's reconciler (and goal mode) restore the target's modes. */
+	async #reconcileSwitchedModes(): Promise<void> {
+		await this.#planMode?.leavePreviousSession();
+		await this.#sessionSwitchReconciler?.();
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -7503,38 +7509,49 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Run plan mode in this session. Idempotent for the same callbacks; a second owner passing
-	 * others throws, as does a passive replica, whose owner already runs it.
+	 * Run plan mode in this session. Idempotent for the same options; a second owner passing
+	 * others throws, as does a passive replica, whose owner already runs it. The controller sees
+	 * every event before any subscriber, and restores plan mode across session changes.
 	 */
 	enablePlanMode(options: PlanModeOptions): PlanModeController {
 		if (this.passiveReplica) throw new Error("A passive replica does not run plan mode");
 		const running = this.#planMode;
 		if (running) {
-			const { onChanged, entryBlocked, onWarning } = running.options;
+			const { onChanged, entryBlocked, onWarning, applyStartupDefault } = running.options;
 			if (
 				onChanged !== options.onChanged ||
 				entryBlocked !== options.entryBlocked ||
-				onWarning !== options.onWarning
+				onWarning !== options.onWarning ||
+				applyStartupDefault !== options.applyStartupDefault
 			) {
 				throw new Error("Plan mode already runs with other options");
 			}
 			return running;
 		}
-		this.#planMode = new PlanModeController(this, options);
-		return this.#planMode;
+		const planMode = new PlanModeController(this, options);
+		this.#planMode = planMode;
+		this.#eventListeners = [event => planMode.observe(event), ...this.#eventListeners];
+		return planMode;
 	}
 
-	/** Hold goal mode across a session change, then reattach it. `detachedRun` reads `change`'s result (`undefined`: it threw). */
-	async #goalSessionChange<T>(change: () => Promise<T>, detachedRun: (result: T | undefined) => boolean): Promise<T> {
+	/**
+	 * Hold goal and plan mode across a session change, then restore them: plan's state is left inside
+	 * the change, goal's end runs before plan's, so a journal holding a goal wins. `detachedRun` reads
+	 * `change`'s result (`undefined`: it threw).
+	 */
+	async #modeSessionChange<T>(change: () => Promise<T>, detachedRun: (result: T | undefined) => boolean): Promise<T> {
 		const goalMode = this.#goalMode;
-		if (!goalMode) return change();
-		await goalMode.beginSessionChange();
+		const planMode = this.#planMode;
+		if (!goalMode && !planMode) return change();
+		planMode?.beginSessionChange();
+		await goalMode?.beginSessionChange();
 		let result: T | undefined;
 		try {
 			result = await change();
 			return result;
 		} finally {
-			await goalMode.endSessionChange({ detachedRun: detachedRun(result) });
+			await goalMode?.endSessionChange({ detachedRun: detachedRun(result) });
+			await planMode?.endSessionChange();
 		}
 	}
 
@@ -11046,7 +11063,7 @@ export class AgentSession implements SettingsScope {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
-		return this.#goalSessionChange(
+		return this.#modeSessionChange(
 			() => this.#newSession(options),
 			started => started !== false,
 		);
@@ -11208,7 +11225,7 @@ export class AgentSession implements SettingsScope {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
-		return this.#goalSessionChange(
+		return this.#modeSessionChange(
 			() => this.#fork(entryId, options),
 			() => false,
 		);
@@ -12674,7 +12691,7 @@ export class AgentSession implements SettingsScope {
 		}
 		const guard = this.passiveReplica ? undefined : this.#sessionSwitchGuard;
 		const proceed = () =>
-			this.#goalSessionChange(
+			this.#modeSessionChange(
 				() => this.#switchSession(sessionPath, options),
 				switched => switched !== false,
 			);
@@ -12942,7 +12959,7 @@ export class AgentSession implements SettingsScope {
 			}
 			this.#reconnectToAgent();
 			try {
-				await this.#sessionSwitchReconciler?.();
+				await this.#reconcileSwitchedModes();
 			} catch (error) {
 				logger.warn("Failed to reconcile session mode after switch", {
 					targetSessionFile: sessionPath,
@@ -13039,7 +13056,7 @@ export class AgentSession implements SettingsScope {
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
 			try {
-				await this.#sessionSwitchReconciler?.();
+				await this.#reconcileSwitchedModes();
 			} catch (reconcileError) {
 				logger.warn("Failed to reconcile session mode after switch rollback", {
 					targetSessionFile: sessionPath,
@@ -13109,7 +13126,7 @@ export class AgentSession implements SettingsScope {
 		selectedImages: ImageContent[];
 		cancelled: boolean;
 	}> {
-		return this.#goalSessionChange(
+		return this.#modeSessionChange(
 			() => this.#branch(entryId),
 			() => false,
 		);
@@ -13257,7 +13274,7 @@ export class AgentSession implements SettingsScope {
 		leafId: string,
 		sessionId: string,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
-		return this.#goalSessionChange(
+		return this.#modeSessionChange(
 			() => this.#branchFromBtw(question, assistantMessage, leafId, sessionId),
 			() => false,
 		);
@@ -13419,7 +13436,7 @@ export class AgentSession implements SettingsScope {
 			reanswerAskResult?: AgentToolResult<AskToolDetails>;
 		} = {},
 	): Promise<NavigateTreeResult> {
-		return this.#goalSessionChange(
+		return this.#modeSessionChange(
 			() => this.#navigateTree(targetId, options),
 			() => false,
 		);

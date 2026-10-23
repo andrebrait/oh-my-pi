@@ -13,9 +13,9 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
-import { cfgPlanEnabled } from "../plan-mode/settings";
+import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { isMCPToolName } from "../tools/builtin-names";
-import type { AgentSession } from "./agent-session";
+import type { AgentSession, AgentSessionEvent } from "./agent-session";
 import type { ResolvedRoleModel } from "./agent-session-types";
 import { USER_INTERRUPT_LABEL } from "./messages";
 
@@ -34,6 +34,8 @@ export interface PlanModeOptions {
 	entryBlocked?: () => string | undefined;
 	/** Shows a warning the user should see (the TUI's `showWarning`); it is logged as well. */
 	onWarning?: (text: string) => void;
+	/** Enter plan mode on a fresh session when `plan.defaultOnStartup` says so (TUI and, in part 2, hosts). */
+	applyStartupDefault?: boolean;
 }
 
 export type PlanModeSession = Pick<
@@ -87,6 +89,12 @@ export class PlanModeController {
 	#hasEntered = false;
 	/** Tail of the transition queue: enter, exit, clear and role reapply run one at a time. */
 	#transitions: Promise<void> = Promise.resolve();
+	/** Nesting depth of session changes between {@link beginSessionChange} and {@link endSessionChange}. */
+	#sessionChanges = 0;
+	#sessionBeforeChange: string | undefined;
+	/** {@link leavePreviousSession} ran inside the change: its end restores plan mode even for the same transcript. */
+	#leftDuringChange = false;
+	#suppressStartupDefault = false;
 
 	constructor(session: PlanModeSession, options: PlanModeOptions) {
 		this.#session = session;
@@ -291,6 +299,138 @@ export class PlanModeController {
 	dispose(): void {
 		this.#pendingModelSwitch = undefined;
 		this.#pendingPlanModelSwitch = false;
+	}
+
+	/**
+	 * Fed every session event before any subscriber. A turn's end applies the model switch
+	 * deferred while it streamed, as the TUI did on each `agent_end`.
+	 */
+	observe(event: AgentSessionEvent): void {
+		if (event.type === "agent_end") void this.flushPendingModelSwitch();
+	}
+
+	/**
+	 * Restore plan mode from the session journal (startup, resume): the previous session's plan
+	 * state goes first, then `plan` re-enters keeping the restored model and `plan_paused` reports
+	 * paused. Otherwise a fresh session gets the startup default.
+	 */
+	reconcile(): Promise<void> {
+		const suppressDefault = this.#takeStartupDefaultSuppression();
+		return this.#serialize(() => this.#reconcile(suppressDefault));
+	}
+
+	/** The session calls it before any session change or tree navigation, whoever started it. */
+	beginSessionChange(): void {
+		if (this.#sessionChanges++ === 0) this.#sessionBeforeChange = this.#session.sessionManager.getSessionId();
+	}
+
+	/**
+	 * For the change itself, once the target session is loaded: drop the previous session's plan
+	 * state and tools, so goal mode reconciles over the pre-plan tool set. The change's end then
+	 * restores the target's plan mode.
+	 */
+	leavePreviousSession(): Promise<void> {
+		if (this.#sessionChanges === 0) return this.reconcile();
+		this.#leftDuringChange = true;
+		return this.#serialize(() => this.#leave());
+	}
+
+	/**
+	 * Call after the change resolves, is cancelled, or throws, after goal mode's own end so a
+	 * journal holding a goal wins. Only a change that switched the transcript (or left it, see
+	 * {@link leavePreviousSession}) restores plan mode. Never throws: a failure is warned.
+	 */
+	async endSessionChange(): Promise<void> {
+		if (--this.#sessionChanges > 0) return;
+		const switched =
+			this.#leftDuringChange || this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
+		this.#leftDuringChange = false;
+		this.#sessionBeforeChange = undefined;
+		// Consumed by any change, so a cancelled one cannot suppress a later `/new`.
+		const suppressDefault = this.#takeStartupDefaultSuppression();
+		if (!switched) return;
+		try {
+			await this.#serialize(() => this.#reconcile(suppressDefault));
+		} catch (error) {
+			this.#warn(`Failed to restore plan mode: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/** Suppress the startup default for the next new session (approval's own "new session"). */
+	suppressNextStartupDefault(): void {
+		this.#suppressStartupDefault = true;
+	}
+
+	#takeStartupDefaultSuppression(): boolean {
+		const suppressed = this.#suppressStartupDefault;
+		this.#suppressStartupDefault = false;
+		return suppressed;
+	}
+
+	async #reconcile(suppressDefault: boolean): Promise<void> {
+		await this.#leave();
+		const sessionManager = this.#session.sessionManager;
+		const context = sessionManager.buildSessionContext();
+		if (context.mode === "plan" || context.mode === "plan_paused") {
+			if (!cfgPlanEnabled.get(this.#session.settings)) {
+				// Close the stale plan so re-enabling the setting later does not restore an old plan session.
+				sessionManager.appendModeChange("none");
+				return;
+			}
+			if (context.mode === "plan") {
+				const planFilePath = context.modeData?.planFilePath;
+				await this.#enter({
+					planFilePath: typeof planFilePath === "string" ? planFilePath : undefined,
+					preserveRestoredModel: true,
+				});
+				return;
+			}
+			this.#paused = true;
+			this.#hasEntered = true;
+			this.#changed();
+			return;
+		}
+		// "Fresh": no conversation context and no explicit mode (a journaled goal or vibe has one).
+		if (
+			this.#options.applyStartupDefault &&
+			!suppressDefault &&
+			context.messages.length === 0 &&
+			!sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
+			cfgPlanDefaultOnStartup.get(this.#session.settings) &&
+			cfgPlanEnabled.get(this.#session.settings)
+		) {
+			await this.#enter();
+		}
+	}
+
+	/** Drop plan mode without journaling: the state and tools belong to the session that set them. */
+	async #leave(): Promise<void> {
+		if (!this.#enabled && !this.#paused) return;
+		const session = this.#session;
+		const previousModel = this.#previousModelState;
+		const previousPresentation = this.#previousToolPresentation;
+		session.setPlanModeState(undefined);
+		try {
+			if (previousPresentation) {
+				await session.restoreNonMCPToolPresentation(previousPresentation.enabled, previousPresentation.mounted);
+			}
+		} finally {
+			session.setPlanProposalHandler(null);
+			this.#enabled = false;
+			this.#paused = false;
+			this.#planFilePath = undefined;
+			this.#previousToolPresentation = undefined;
+			this.#previousModelState = undefined;
+			this.#pendingModelSwitch = undefined;
+			this.#pendingPlanModelSwitch = false;
+			this.#hasEntered = false;
+			this.#changed();
+		}
+		// A session that records no model (a `/new` boundary) keeps the live model, which in plan
+		// mode is the plan-role model: hand it the pre-plan model. A switch restored a recorded one.
+		if (previousModel && Object.keys(session.sessionManager.buildSessionContext().models).length === 0) {
+			await this.#restorePreviousModel(previousModel);
+		}
 	}
 
 	#changed(): void {
