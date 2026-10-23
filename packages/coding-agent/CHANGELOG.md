@@ -7,6 +7,13 @@
 - Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
 - llama.cpp auto-discovery now also finds local servers on llama-server's new default port 9931 when nothing answers on 8080 ([#16675](https://github.com/can1357/oh-my-pi/pull/16675) by [@bartbroere](https://github.com/bartbroere))
 
+### Changed
+
+- Plan approval's "Continuing with …" notice now appears just before the approved run starts, after any approval-time compaction, instead of during compaction
+- Cancelling approval-time compaction on a plan now shows the cancellation warning before the "Saved plan to" and "Continuing with …" notices
+- A plan mode that cannot be restored or entered at startup now shows a warning and starts without plan mode, instead of aborting startup
+- Approving a plan after plan mode was already left now reports "Failed to finalize approved plan: Plan mode is not active." instead of continuing the approval
+
 ### Fixed
 ### Breaking Changes
 

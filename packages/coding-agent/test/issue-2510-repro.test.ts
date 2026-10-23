@@ -92,7 +92,7 @@ describe("issue #2510 — /plan toggles plan → plan_paused → none", () => {
 
 		await mode.handlePlanModeCommand();
 		expect(mode.planModeEnabled).toBe(true);
-		// `reentry` mirrors `#planModeHasEntered`. The fresh /plan after a full
+		// `reentry` is false: the fresh /plan after a full
 		// exit should look like a first entry, not a resume, so plan-mode prompts
 		// don't read "you're back in plan mode" on what is logically a new run.
 		expect(session.getPlanModeState()?.reentry).toBe(false);

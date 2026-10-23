@@ -2246,7 +2246,7 @@ export class AcpAgent implements Agent {
 				workflow: previous?.workflow ?? "parallel",
 				reentry: previous !== undefined,
 			});
-			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
+			// Mirror `PlanModeController.enter`: register the plan-proposal
 			// handler that consumes `xd://propose` writes from plan mode. Without
 			// this, proposal dispatch falls through and plan mode has no approval
 			// path (issue #1869).
@@ -2265,7 +2265,7 @@ export class AcpAgent implements Agent {
 	 * when supported), and on approval keeps the chosen plan path, exits plan
 	 * mode, and notifies the client so the agent regains full tools.
 	 *
-	 * Mirrors `InteractiveMode.#handlePlanProposal` for the parts the agent sees
+	 * Mirrors `PlanModeController`'s proposal handling for the parts the agent sees
 	 * (same `PlanApprovalDetails` shape). Clients without form-mode elicitation
 	 * get an auto-approve so plan mode is never stranded — the agent always has
 	 * a way out.

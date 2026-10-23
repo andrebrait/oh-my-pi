@@ -2,8 +2,8 @@
  * Contract: exiting plan mode while a model turn is streaming interrupts that
  * turn immediately, rather than only affecting the next turn.
  *
- * Regression for #9699: `#enterPlanMode` steers a fresh plan context into a live
- * turn, but `#exitPlanMode` used to clear state without touching the in-flight
+ * Regression for #9699: `PlanModeController.enter` steers a fresh plan context into a live
+ * turn, but `PlanModeController.exit` used to clear state without touching the in-flight
  * turn. The turn-start `plan-mode-active.md` block orders the model to keep
  * planning until it writes a plan, so a mid-turn user exit appeared to do nothing
  * — the agent kept acting in plan mode until it produced a plan. Exit must now

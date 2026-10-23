@@ -2205,7 +2205,7 @@ export class EventController {
 				typeof details.planExists === "boolean"
 			) {
 				// Dispatch the approval WITHOUT blocking the serialized event
-				// dispatch chain. `handlePlanApproval` -> `#approvePlan` awaits
+				// dispatch chain. `handlePlanApproval` -> `PlanModeController.approve` awaits
 				// `session.prompt` for the ENTIRE approved-execution turn; awaiting
 				// it here (this handler runs inside `#runSerialized`) would hold the
 				// single dispatch link for the whole run, so the run's own

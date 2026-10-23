@@ -4,7 +4,7 @@
  * Bug: When entering plan mode, the thinking level configured on the plan role
  * (e.g., "anthropic/claude-sonnet-4-5:xhigh") is discarded. resolveRoleModel()
  * calls resolveModelRoleValue() but only returns .model, dropping the thinking level.
- * #applyPlanModeModel() therefore has no thinking level to apply.
+ * `PlanModeController.applyStartupDefault` has no thinking level to apply.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";

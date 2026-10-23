@@ -64,7 +64,7 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		const planModel = modelRegistry.find("anthropic", "claude-haiku-4-5");
 		if (!planModel) throw new Error("Expected claude-haiku-4-5 in registry");
 
-		// Stream is active throughout entry: #applyPlanModeModel snapshots the
+		// Stream is active throughout entry: the controller snapshots the
 		// previous (default) model and queues a pending switch to the plan model
 		// instead of applying it immediately.
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });

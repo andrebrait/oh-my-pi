@@ -36,7 +36,7 @@ import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
 import { cfgPlanAutosave, cfgPlanAutosaveDir } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 
 /**
- * Matches the plan-approved synthetic-prompt dispatch. `#approvePlan` calls
+ * Matches the plan-approved synthetic-prompt dispatch. `PlanModeController.approve` calls
  * `session.prompt(rendered, { synthetic: true })` exclusively for that case,
  * so the `synthetic: true` option flag is the unique discriminator.
  */
@@ -1611,7 +1611,7 @@ describe("InteractiveMode plan review rendering", () => {
 	it("hides the review overlay before the blocking execution turn resolves", async () => {
 		// Regression (issue #5688): the flicker fix moved #hidePlanReview out of the
 		// picker's `finish` and into a `closePlanReview()` reached only AFTER
-		// #approvePlan returns. #approvePlan awaits `session.prompt(planApproved)`,
+		// `approve` returns. `approve` awaits `session.prompt(planApproved)`,
 		// which blocks for the whole execution turn — so the operator stayed stuck on
 		// the plan-review screen until work finished. The overlay must be hidden once
 		// execution BEGINS (after the async transcript rebuild), not when it ends.
@@ -1840,10 +1840,10 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 	});
 
-	it("executes on the slider-selected tier, surviving #exitPlanMode's model restore", async () => {
+	it("executes on the slider-selected tier, surviving the plan-mode exit's model restore", async () => {
 		// Regression: the model-tier slider's choice used to be applied BEFORE
-		// #approvePlan ran. #approvePlan → #exitPlanMode restores the model that
-		// was active before plan mode (#planModePreviousModelState), which silently
+		// `approve` ran. `approve` → `exit` restores the model that
+		// was active before plan mode (the controller's previous-model state), which silently
 		// reverted the operator's pick — sliding to "slow" still executed on the
 		// default model. The fix defers application until after the plan-mode exit.
 		authStorage.keys.setRuntime("anthropic", "test-key");
@@ -1852,7 +1852,7 @@ describe("InteractiveMode plan review rendering", () => {
 		if (!slow || !def) throw new Error("Expected sonnet + opus to exist in registry");
 
 		// plan === default === the session model: this is what makes plan-mode entry
-		// record a previous-model state for #exitPlanMode to restore. slow differs,
+		// record a previous-model state for `exit` to restore. slow differs,
 		// so an early application would be clobbered by that restore.
 		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
 		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5");
@@ -1949,7 +1949,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		// default tier explicitly turns thinking off on sonnet; the session enters
 		// plan mode with thinking already bumped to high. A model-only match check
-		// treats the slider's "stay on default" pick as implicit, so #exitPlanMode
+		// treats the slider's "stay on default" pick as implicit, so `exit`
 		// restores thinking=high instead of the configured off override. The fix
 		// must compare thinking levels too and pass the default entry through
 		// applyRoleModel.
@@ -2278,7 +2278,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 	it("cancelled compaction restores the pre-plan model before exiting", async () => {
 		// Regression: under defer-restore the cancel path returned without restoring
-		// #planModePreviousModelState, so an aborted "Approve and compact context"
+		// the controller's previous-model state, so an aborted "Approve and compact context"
 		// left the next turn stranded on the plan model. The transition now runs
 		// for "cancelled" too (the operator aborted only compaction, not approval).
 		const planModel = session.modelRegistry.find("anthropic", "claude-opus-4-5");
@@ -2534,7 +2534,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 	it("Approve and compact context: cancelled outcome skips plan-approved dispatch", async () => {
 		// Mock `handleCompactCommand` to surface the "cancelled" outcome directly.
-		// (Testing the consumer — `#approvePlan`'s outcome handling — at the
+		// (Testing the consumer — `PlanModeController.approve`'s outcome handling — at the
 		// CompactionOutcome boundary; the underlying executeCompaction → sentinel
 		// classification path is producer-layer and not under T3's contract.)
 		const planFilePath = "local://PLAN.md";
@@ -2678,11 +2678,11 @@ describe("InteractiveMode plan review rendering", () => {
 	});
 
 	// ==========================================================================
-	// Phase 6 — B layer: #approvePlan flag lifecycle via try/finally.
+	// Phase 6 — B layer: `approve` flag lifecycle via try/finally.
 	//
-	// asserts `session.isPlanInternalAbortPending === false` after `#approvePlan`
+	// asserts `session.isPlanInternalAbortPending === false` after `approve`
 	// resolves/rejects. The flag is the only state that can leak into later
-	// unrelated aborts; the `try/finally` in `#approvePlan` is what protects it.
+	// unrelated aborts; the `try/finally` in `approve` is what protects it.
 	// ==========================================================================
 
 	/**
@@ -2719,7 +2719,7 @@ describe("InteractiveMode plan review rendering", () => {
 	}
 
 	// B1-B3: every terminal compaction outcome must leave the flag cleared by
-	// `#approvePlan`'s `finally`. No aborted message_end is required to consume it,
+	// `approve`'s `finally`. No aborted message_end is required to consume it,
 	// so a stranded flag could otherwise silence the next unrelated abort. One
 	// parametrized case per outcome keeps ok/cancelled/failed each covered.
 	it.each(["ok", "cancelled", "failed"] as const)(
@@ -2731,10 +2731,10 @@ describe("InteractiveMode plan review rendering", () => {
 	);
 
 	it("B4: Approve and compact context + handleCompactCommand throws → showError surfaces the failure AND flag cleared by finally before the outer catch", async () => {
-		// `handlePlanApproval` wraps `#approvePlan` in a try/catch
+		// `handlePlanApproval` wraps `PlanModeController.approve` in a try/catch
 		// in `InteractiveMode` that consumes the throw and reports via
 		// `showError`. The contract under test is:
-		//   1. `#approvePlan`'s own `try/finally` clears the flag BEFORE the
+		//   1. `approve`'s own `try/finally` clears the flag BEFORE the
 		//      throw bubbles up to that outer catch.
 		//   2. The outer catch surfaces the failure via `showError` (not
 		//      silenced).

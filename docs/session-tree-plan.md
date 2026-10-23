@@ -193,11 +193,11 @@ Adjacent but related lifecycle hooks:
 
 ## Plan approval session naming
 
-When a user approves a plan from plan mode (`InteractiveMode.#approvePlan`), the dispatch path seeds the session name from the plan's title so the resulting fresh, preserved, or compacted session does not stay unnamed.
+When a user approves a plan from plan mode (`PlanModeController.approve`), the dispatch path seeds the session name from the plan's title so the resulting fresh, preserved, or compacted session does not stay unnamed.
 
 Trigger:
 
-- Plan approval reaches `#approvePlan(...)` with `options.title` populated from the plan-approval details.
+- Plan approval reaches `approve(...)` with `options.title` populated from the plan-approval details.
 - This applies to each approval choice that reaches execution dispatch. If approval-time compaction is explicitly cancelled, execution is not dispatched and the naming block is not reached; the next operator turn continues from the preserved plan reference.
 
 Naming source:

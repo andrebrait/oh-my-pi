@@ -40,7 +40,7 @@ describe("EventController plan-approval dispatch", () => {
 
 	it("keeps dispatching session events while the approved plan's execution turn runs (issue #7684)", async () => {
 		// Contract: the fullscreen Plan Review closes and the approved plan begins
-		// executing, but `handlePlanApproval` -> `#approvePlan` awaits
+		// executing, but `PlanModeController.approve` awaits
 		// `session.prompt` for the WHOLE run. The propose write's
 		// `tool_execution_end` handler runs inside `EventController`'s serialized
 		// dispatch chain (`#runSerialized`), so awaiting the approval there froze
