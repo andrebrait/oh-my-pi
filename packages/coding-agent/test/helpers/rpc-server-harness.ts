@@ -13,7 +13,8 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as path from "node:path";
-import type { StreamFn } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, StreamFn } from "@oh-my-pi/pi-agent-core";
+import type { AgentSessionConfig } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { __resetDirsFromEnvForTests, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -70,6 +71,10 @@ export interface TestSessionOptions {
 	settings?: Readonly<Record<string, unknown>>;
 	/** Serves side-channel requests (the idle recap, branch summaries), which would otherwise reach for the network. */
 	sideStreamFn?: StreamFn;
+	/** Agent tools active from the first turn. */
+	tools?: AgentTool[];
+	/** Further session dependencies (tool registry, built-in names, prompt rebuild, `xd://` state). */
+	config?: Partial<AgentSessionConfig>;
 }
 
 /** A session over `mock`: options for a fresh scripted model, or a {@link MockModel} the test inspects. */
@@ -84,7 +89,11 @@ export async function createTestSession(
 	const model = mock instanceof MockModel ? mock : createMockModel(mock);
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: ["Test"], tools: [] },
+		initialState: {
+			model: getBundledModel("anthropic", "claude-sonnet-4-5")!,
+			systemPrompt: ["Test"],
+			tools: options.tools ?? [],
+		},
 		streamFn: gate ? holdAfterFirstDelta(model.stream, gate) : model.stream,
 	});
 	const sessionManager = options.inMemory
@@ -119,6 +128,7 @@ export async function createTestSession(
 		extensionRunner,
 		passiveReplica: options.passiveReplica,
 		sideStreamFn: options.sideStreamFn,
+		...options.config,
 	});
 	session.addDisposer(() => authStorage.close());
 	return session;

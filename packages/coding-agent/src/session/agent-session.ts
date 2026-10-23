@@ -371,6 +371,7 @@ import {
 } from "./exit-diagnostics";
 import { IdleMaintenance, type IdleMaintenanceOptions } from "./idle-maintenance";
 import { GoalModeController, type GoalModeOptions } from "./goal-mode";
+import { PlanModeController, type PlanModeOptions } from "./plan-mode";
 import { IrcBridge, type IrcBridgeHost } from "./irc-bridge";
 import {
 	buildLaunchCompletionBatchMessage,
@@ -6042,6 +6043,7 @@ export class AgentSession implements SettingsScope {
 	beginDispose(): void {
 		this.#isDisposed = true;
 		this.#goalMode?.dispose();
+		this.#planMode?.dispose();
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
@@ -7491,6 +7493,30 @@ export class AgentSession implements SettingsScope {
 		this.#goalMode = goalMode;
 		this.#eventListeners = [event => goalMode.observe(event), ...this.#eventListeners];
 		return goalMode;
+	}
+
+	#planMode: PlanModeController | undefined;
+
+	/** The session's plan mode controller, once an owner enabled it ({@link enablePlanMode}). */
+	get planMode(): PlanModeController | undefined {
+		return this.#planMode;
+	}
+
+	/**
+	 * Run plan mode in this session. Idempotent for the same callbacks; a second owner passing
+	 * others throws, as does a passive replica, whose owner already runs it.
+	 */
+	enablePlanMode(options: PlanModeOptions): PlanModeController {
+		if (this.passiveReplica) throw new Error("A passive replica does not run plan mode");
+		const running = this.#planMode;
+		if (running) {
+			if (running.options.onChanged !== options.onChanged || running.options.entryBlocked !== options.entryBlocked) {
+				throw new Error("Plan mode already runs with other options");
+			}
+			return running;
+		}
+		this.#planMode = new PlanModeController(this, options);
+		return this.#planMode;
 	}
 
 	/** Hold goal mode across a session change, then reattach it. `detachedRun` reads `change`'s result (`undefined`: it threw). */
