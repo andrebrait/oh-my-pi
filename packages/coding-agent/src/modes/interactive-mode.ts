@@ -571,7 +571,6 @@ function formatHudNoteMarker(count: number): string {
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
-const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
 
 const CFG_APPROVE_SESSION = "Always for this session";
@@ -6026,7 +6025,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		const review = buildPlanReview(this.session, { ...details, planFilePath });
 		const reviewOptions = review.options;
-		const keepContextDisabled = reviewOptions[PLAN_KEEP_CONTEXT_OPTION_INDEX]?.disabled === true;
+		const keepContextIndex = reviewOptions.findIndex(option => option.id === "keep");
+		const keepContextDisabled = reviewOptions[keepContextIndex]?.disabled === true;
 
 		// Model-tier slider: let the operator pick which configured role model
 		// (smol/default/slow/…) executes the approved plan. It starts on the `default`
@@ -6111,7 +6111,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					if (state.annotations.length > 0) this.#planReviewAnnotationState.set(annotationStateKey, state);
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
-				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
+				disabledIndices: keepContextDisabled ? [keepContextIndex] : undefined,
 				onClose: closedWith => {
 					if (!extensionRunner) return;
 					const resolved = {
@@ -6176,7 +6176,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					closePlanReview();
 					return;
 				}
-				const result = await planMode.approve({
+				const dispatched = await planMode.approve({
 					review,
 					choice: picked,
 					tierIndex: selectedTierIndex,
@@ -6204,7 +6204,7 @@ export class InteractiveMode implements InteractiveModeContext {
 						},
 					},
 				});
-				if (result.dispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
+				if (dispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
 				this.showError(
 					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,

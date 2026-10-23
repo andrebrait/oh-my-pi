@@ -54,13 +54,6 @@ export interface PlanModeOptions {
 	onWarning?: (text: string) => void;
 }
 
-/** What {@link PlanModeController.approve} did: whether the approved prompt was sent, and the autosaved copy. */
-export interface PlanApprovalResult {
-	dispatched: boolean;
-	/** Where `plan.autosave` copied the plan; undefined when autosave is off or failed. */
-	savedPlanPath: string | undefined;
-}
-
 export type PlanModeSession = Pick<
 	AgentSession,
 	| "settings"
@@ -357,9 +350,10 @@ export class PlanModeController {
 	/**
 	 * Apply an approved plan review: leave plan mode, then start a new session (`execute`), compact
 	 * the planning transcript (`compact`) or keep it (`keep`), restore the execution tools, move onto
-	 * the picked tier and send the plan-approved prompt. Nothing is sent when compaction was cancelled
-	 * (the next turn still gets the plan). An owner that does not start the new session leaves the
-	 * prompt to run in the current one, as the TUI's `/new` refusal always did.
+	 * the picked tier and send the plan-approved prompt. Resolves whether the prompt was sent: nothing
+	 * is sent when compaction was cancelled (the next turn still gets the plan). An owner that does
+	 * not start the new session leaves the prompt to run in the current one, as the TUI's `/new`
+	 * refusal always did.
 	 * `compact` runs `beforeFlush` before dispatching input queued during compaction, so that input
 	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued (the prompt
 	 * may run for the whole turn). `onPlanSaved` reports the autosaved copy and `onExecutionModel` the
@@ -379,7 +373,7 @@ export class PlanModeController {
 			onPlanSaved?(savedPlanPath: string): void;
 			onExecutionModel?(executionModel: ResolvedRoleModel): void;
 		};
-	}): Promise<PlanApprovalResult> {
+	}): Promise<boolean> {
 		const { review, choice, hooks } = input;
 		const session = this.#session;
 		const sessionManager = session.sessionManager;
@@ -470,7 +464,7 @@ export class PlanModeController {
 			this.#warn(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
-			return { dispatched: false, savedPlanPath };
+			return false;
 		}
 
 		// The approved prompt bypasses title generation; `auto` never replaces a name the user chose.
@@ -494,7 +488,7 @@ export class PlanModeController {
 				await session.followUp(approvedPrompt, undefined, { synthetic: true });
 			}
 		}
-		return { dispatched: true, savedPlanPath };
+		return true;
 	}
 
 	#planFileOptions(): { localProtocolOptions: LocalProtocolOptions; cwd: string } {

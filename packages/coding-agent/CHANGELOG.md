@@ -9,8 +9,6 @@
 
 ### Changed
 
-- Plan approval's "Continuing with …" notice now appears just before the approved run starts, after any approval-time compaction, instead of during compaction
-- Cancelling approval-time compaction on a plan now shows the cancellation warning before the "Saved plan to" and "Continuing with …" notices
 - A plan mode that cannot be restored or entered at startup now shows a warning and starts without plan mode, instead of aborting startup
 - Approving a plan after plan mode was already left now reports "Failed to finalize approved plan: Plan mode is not active." instead of continuing the approval
 
@@ -20,6 +18,7 @@
 - SDK: removed `SessionManager.onEntryAppended`; use `SessionManager.subscribeEntryAppended(listener)`, which supports several listeners and returns an unsubscribe function ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait))
 - SDK: `RpcClient.getAvailableModels()` now returns `Promise<Model[]>` (complete `Model` records, as the host has always sent them) instead of the reduced `ModelInfo[]`; the `ModelInfo` type is no longer exported from the RPC client module ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait))
 - SDK deep imports: replaced `ACP_BUILTIN_RESERVED_NAMES` with `acpBuiltinReservedNames()` and removed the unused `ACP_BUILTIN_SLASH_COMMANDS` export from `slash-commands/acp-builtins` ([#14166](https://github.com/can1357/oh-my-pi/pull/14166) by [@andrebrait](https://github.com/andrebrait)).
+- SDK deep imports: removed `shouldEnterPlanModeOnStartup` from `modes/interactive-mode`; use `session.planMode.applyStartupDefault()` instead
 
 ### Added
 - Added `computer.backgroundFallback` (`takeover` by default, or `refuse`): when a `computer` window input call has no background route, the tool reruns that one call in takeover, hands focus back to your app and says so in its result; `refuse` fails the call instead and also refuses the agent's own foreground requests (`takeover: true`, `raise()`, an activating `apps.open`, desktop input, and on macOS menus and `AXOpen`) ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))

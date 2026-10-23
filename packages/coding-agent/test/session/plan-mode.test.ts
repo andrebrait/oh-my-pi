@@ -612,6 +612,30 @@ describe("session-owned plan mode", () => {
 		);
 	});
 
+	test("retarget journals the new plan path, so a resume targets it; same path and plan off are no-ops", async () => {
+		await withPlanSession(readWriteTools(), async (session, planMode) => {
+			await planMode.handle({ op: "enter", planFilePath: "local://a.md" });
+
+			planMode.retarget("local://b.md");
+
+			const retargeted = { enabled: true, paused: false, planFilePath: "local://b.md" };
+			expect(planMode.view).toEqual(retargeted);
+			expect(session.getPlanModeState()?.planFilePath).toBe("local://b.md");
+			expect(lastModeChange(session)).toMatchObject({ mode: "plan", data: { planFilePath: "local://b.md" } });
+			const entries = modeChanges(session, "plan");
+			planMode.retarget("local://b.md");
+			expect(modeChanges(session, "plan")).toBe(entries);
+
+			await planMode.reconcile();
+			expect(planMode.view).toEqual(retargeted);
+
+			await planMode.handle({ op: "exit" });
+			planMode.retarget("local://c.md");
+			expect(planMode.view.planFilePath).toBeUndefined();
+			expect(lastModeChange(session)?.mode).toBe("plan_paused");
+		});
+	});
+
 	test("enablePlanMode returns the running controller, refuses other options, and never runs on a passive replica", async () => {
 		await withPlanSession(readWriteTools(), async (session, planMode) => {
 			expect(session.planMode).toBe(planMode);
@@ -907,6 +931,7 @@ describe("session-owned plan mode", () => {
 				const review = buildPlanReview(session, DETAILS);
 				let messagesAtDispatch: number | undefined;
 				await Bun.write(planPath(session, "local://notes.md"), "notes");
+				const saved: string[] = [];
 
 				const result = await planMode.approve({
 					review,
@@ -919,10 +944,12 @@ describe("session-owned plan mode", () => {
 						beforeDispatch: () => {
 							messagesAtDispatch = session.messages.length;
 						},
+						onPlanSaved: savedPlanPath => saved.push(savedPlanPath),
 					},
 				});
 
-				expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
+				expect(result).toBe(true);
+				expect(saved).toEqual([]);
 				expect(session.sessionManager.getSessionId()).not.toBe(firstSession);
 				expect(planMode.view).toEqual({ enabled: false, paused: false, planFilePath: undefined });
 				expect(session.getPlanModeState()).toBeUndefined();
@@ -957,7 +984,7 @@ describe("session-owned plan mode", () => {
 						},
 					});
 
-					expect(result.dispatched).toBe(true);
+					expect(result).toBe(true);
 					expect(planMode.view.enabled).toBe(false);
 					expect(session.getPlanModeState()).toBeUndefined();
 					expect(modeChanges(session, "plan")).toBe(0);
@@ -969,13 +996,19 @@ describe("session-owned plan mode", () => {
 		test("approve execute runs the plan in the current session when the owner starts no new one", async () => {
 			await withApprovalSession(readWriteTools(), async (session, planMode) => {
 				const firstSession = session.sessionManager.getSessionId();
+				const saved: string[] = [];
 				const result = await planMode.approve({
 					review: buildPlanReview(session, DETAILS),
 					choice: "execute",
-					hooks: { newSession: async () => {}, compact: noCompaction },
+					hooks: {
+						newSession: async () => {},
+						compact: noCompaction,
+						onPlanSaved: savedPlanPath => saved.push(savedPlanPath),
+					},
 				});
 
-				expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
+				expect(result).toBe(true);
+				expect(saved).toEqual([]);
 				expect(session.sessionManager.getSessionId()).toBe(firstSession);
 				expect(await Bun.file(planPath(session, PLAN_URL)).text()).toBe(PLAN_TEXT);
 				expect(session.getPlanReferencePath()).toBe(PLAN_URL);
@@ -1009,7 +1042,7 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(result.dispatched).toBe(true);
+				expect(result).toBe(true);
 				expect(seen.instructions).toContain("Prepare to execute approved plan");
 				expect(seen.instructions).toContain(reviewed);
 				// The reference is pinned before compaction, so input queued meanwhile sees the plan.
@@ -1066,6 +1099,7 @@ describe("session-owned plan mode", () => {
 			await withApprovalSession(
 				readWriteTools(),
 				async (session, planMode) => {
+					const saved: string[] = [];
 					const result = await planMode.approve({
 						review: buildPlanReview(session, DETAILS),
 						choice: "compact",
@@ -1075,10 +1109,12 @@ describe("session-owned plan mode", () => {
 								await beforeFlush("cancelled");
 								return "cancelled";
 							},
+							onPlanSaved: savedPlanPath => saved.push(savedPlanPath),
 						},
 					});
 
-					expect(result).toEqual({ dispatched: false, savedPlanPath: undefined });
+					expect(result).toBe(false);
+					expect(saved).toEqual([]);
 					expect(approvedPrompts(session)).toEqual([]);
 					expect(warnings).toEqual([
 						"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
@@ -1107,7 +1143,7 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(result.dispatched).toBe(true);
+				expect(result).toBe(true);
 				expect(session.model?.id).toBe("claude-haiku-4-5");
 				expect(approvedPrompts(session)).toHaveLength(1);
 			});
@@ -1131,7 +1167,7 @@ describe("session-owned plan mode", () => {
 						},
 					});
 
-					expect(result.dispatched).toBe(true);
+					expect(result).toBe(true);
 					expect(prompt).not.toHaveBeenCalled();
 					expect(followUp).toHaveBeenCalledTimes(1);
 					expect(followUp.mock.calls[0]?.[0]).toContain("Plan approved.");
@@ -1153,7 +1189,7 @@ describe("session-owned plan mode", () => {
 					hooks: { newSession: noNewSession, compact: noCompaction },
 				});
 
-				expect(result.dispatched).toBe(true);
+				expect(result).toBe(true);
 				expect(prompt).toHaveBeenCalledTimes(1);
 				expect(followUp).toHaveBeenCalledTimes(1);
 				expect(followUp.mock.calls[0]?.[0]).toBe(prompt.mock.calls[0]?.[0]);
@@ -1191,11 +1227,11 @@ describe("session-owned plan mode", () => {
 					},
 				});
 
-				expect(result.dispatched).toBe(true);
+				expect(result).toBe(true);
 				// The durable plan copy must stay readable even though planning started without `read`.
 				expect(session.getActiveToolNames()).toEqual(["bash", "read"]);
 				expect(session.sessionManager.getSessionName()).toBe("Mine");
-				const saved = result.savedPlanPath;
+				const saved = announced[0];
 				if (!saved) throw new Error("the plan was not autosaved");
 				expect(path.dirname(saved)).toBe(path.join(session.sessionManager.getCwd(), "saved-plans"));
 				expect(await Bun.file(saved).text()).toBe(PLAN_TEXT);
@@ -1211,13 +1247,19 @@ describe("session-owned plan mode", () => {
 					// A file where the autosave directory should be.
 					await Bun.write(path.join(session.sessionManager.getCwd(), "blocker"), "");
 
+					const saved: string[] = [];
 					const result = await planMode.approve({
 						review: buildPlanReview(session, DETAILS),
 						choice: "keep",
-						hooks: { newSession: noNewSession, compact: noCompaction },
+						hooks: {
+							newSession: noNewSession,
+							compact: noCompaction,
+							onPlanSaved: savedPlanPath => saved.push(savedPlanPath),
+						},
 					});
 
-					expect(result).toEqual({ dispatched: true, savedPlanPath: undefined });
+					expect(result).toBe(true);
+					expect(saved).toEqual([]);
 					expect(warnings).toHaveLength(1);
 					expect(warnings[0]).toStartWith("Failed to autosave plan: ");
 					expect(approvedPrompts(session)).toHaveLength(1);
@@ -1257,7 +1299,7 @@ describe("session-owned plan mode", () => {
 						},
 					});
 
-					expect(result.dispatched).toBe(true);
+					expect(result).toBe(true);
 					expect(session.sessionManager.getSessionId()).toBe(firstSession);
 					expect(session.model?.id).toBe(model);
 					// The restored tier is not applied again: exit's temporary restore is the last switch.
@@ -1298,7 +1340,7 @@ describe("session-owned plan mode", () => {
 							},
 						});
 
-						expect(result.dispatched).toBe(true);
+						expect(result).toBe(true);
 						expect(applied).toEqual([]);
 					},
 					{ onWarning: text => warnings.push(text) },

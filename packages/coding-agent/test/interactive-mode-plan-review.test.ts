@@ -1088,6 +1088,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await Bun.write(resolve(oldPlanPath), "# Old\n\nold body");
 		await Bun.write(resolve(newPlanPath), "# New\n\nnew body");
 
+		const showStatus = vi.spyOn(mode, "showStatus");
 		await mode.enablePlanMode().enter({ planFilePath: oldPlanPath });
 		// State still points at the previously reviewed (older) plan.
 		session.setPlanModeState({ enabled: true, planFilePath: oldPlanPath, workflow: "parallel", reentry: true });
@@ -1104,6 +1105,9 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.getPlanModeState()?.planFilePath).toBe(newPlanPath);
 		// `/plan` autocomplete and the exit draft check read the plan mode view.
 		expect(mode.planModePlanFilePath).toBe(newPlanPath);
+		// Retargeting keeps plan mode on: the entry is announced once, not again for the new path.
+		const announced = showStatus.mock.calls.filter(([text]) => text.startsWith("Plan mode enabled"));
+		expect(announced).toHaveLength(1);
 	});
 
 	it("opens the annotation external editor from the real plan review overlay", async () => {
