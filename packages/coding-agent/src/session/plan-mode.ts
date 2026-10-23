@@ -23,6 +23,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { cfgCycleOrder } from "../config/model-settings";
+import type { Settings } from "../config/settings";
 import { copyLocalArtifacts, type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import { humanizePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
@@ -36,6 +37,7 @@ import { isMCPToolName } from "../tools/builtin-names";
 import type { AgentSession, AgentSessionEvent } from "./agent-session";
 import type { ResolvedRoleModel } from "./agent-session-types";
 import { USER_INTERRUPT_LABEL } from "./messages";
+import type { SessionManager } from "./session-manager";
 
 export type RpcPlanOp = "get" | "enter" | "exit" | "clear";
 
@@ -101,6 +103,23 @@ export interface ModelState {
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
+/**
+ * Whether `plan.defaultOnStartup` applies: plan mode is enabled and the session is fresh, with no
+ * conversation context (messages, custom messages, branch and compaction summaries) and no
+ * explicit `mode_change`. SDK startup metadata and extension `custom` state entries do not count.
+ */
+export function shouldEnterPlanModeOnStartup(
+	sessionManager: Pick<SessionManager, "buildSessionContext" | "getEntries">,
+	settings: Settings,
+): boolean {
+	return (
+		cfgPlanDefaultOnStartup.get(settings) &&
+		cfgPlanEnabled.get(settings) &&
+		sessionManager.buildSessionContext().messages.length === 0 &&
+		!sessionManager.getEntries().some(entry => entry.type === "mode_change")
+	);
+}
+
 export class PlanModeController {
 	readonly #session: PlanModeSession;
 	readonly #options: PlanModeOptions;
@@ -119,6 +138,8 @@ export class PlanModeController {
 	#hasEntered = false;
 	/** Tail of the transition queue: enter, exit, clear and role reapply run one at a time. */
 	#transitions: Promise<void> = Promise.resolve();
+	/** Transitions queued or running: with none, the next starts synchronously, as an owner's direct call did. */
+	#pendingTransitions = 0;
 	/** Nesting depth of session changes between {@link beginSessionChange} and {@link endSessionChange}. */
 	#sessionChanges = 0;
 	#sessionBeforeChange: string | undefined;
@@ -168,8 +189,12 @@ export class PlanModeController {
 
 	/** Run `transition` after every queued one, so concurrent callers see each other's result. */
 	#serialize(transition: () => Promise<void>): Promise<void> {
-		const run = this.#transitions.then(transition);
-		this.#transitions = run.catch(() => {});
+		const run = this.#pendingTransitions++ === 0 ? transition() : this.#transitions.then(transition);
+		this.#transitions = run
+			.catch(() => {})
+			.finally(() => {
+				this.#pendingTransitions--;
+			});
 		return run;
 	}
 
@@ -272,6 +297,20 @@ export class PlanModeController {
 	}
 
 	/**
+	 * Point plan mode at a plan under review that is newer than the one it targets, so the next
+	 * planning turn (a refine, or after a dismissed review) works on it. Not queued: the owner
+	 * calls it synchronously while it mounts the review.
+	 */
+	retarget(planFilePath: string): void {
+		const state = this.#session.getPlanModeState();
+		if (!this.#enabled || !state?.enabled || state.planFilePath === planFilePath) return;
+		this.#session.setPlanModeState({ ...state, planFilePath });
+		this.#planFilePath = planFilePath;
+		this.#session.sessionManager.appendModeChange("plan", { planFilePath });
+		this.#changed();
+	}
+
+	/**
 	 * Move the active model onto a reassigned `plan` role while plan mode is on: the active
 	 * model IS the plan model there, so a settings-only change would leave the turn on the
 	 * model plan mode was entered with (issue #5657).
@@ -340,7 +379,8 @@ export class PlanModeController {
 	 * (the next turn still gets the plan). An owner that does not start the new session leaves the
 	 * prompt to run in the current one, as the TUI's `/new` refusal always did.
 	 * `compact` runs `beforeFlush` before dispatching input queued during compaction, so that input
-	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued.
+	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued (the prompt
+	 * may run for the whole turn), with the autosaved copy's path.
 	 */
 	async approve(input: {
 		review: PlanReviewModel;
@@ -352,7 +392,7 @@ export class PlanModeController {
 				instructions: string,
 				beforeFlush: (outcome: CompactionOutcome) => Promise<void>,
 			): Promise<CompactionOutcome>;
-			beforeDispatch?(): void;
+			beforeDispatch?(savedPlanPath: string | undefined): void;
 		};
 	}): Promise<PlanApprovalResult> {
 		const { review, choice, hooks } = input;
@@ -452,7 +492,7 @@ export class PlanModeController {
 			planContent,
 			contextPreserved: choice !== "execute",
 		});
-		hooks.beforeDispatch?.();
+		hooks.beforeDispatch?.(savedPlanPath);
 		// Input queued during compaction may already be running: queue behind it rather than abort it.
 		if (session.isStreaming) {
 			await session.followUp(approvedPrompt, undefined, { synthetic: true });
@@ -509,16 +549,7 @@ export class PlanModeController {
 	 */
 	applyStartupDefault(): Promise<void> {
 		return this.#serialize(async () => {
-			const settings = this.#session.settings;
-			const sessionManager = this.#session.sessionManager;
-			if (
-				cfgPlanDefaultOnStartup.get(settings) &&
-				cfgPlanEnabled.get(settings) &&
-				sessionManager.buildSessionContext().messages.length === 0 &&
-				!sessionManager.getEntries().some(entry => entry.type === "mode_change")
-			) {
-				await this.#enter();
-			}
+			if (shouldEnterPlanModeOnStartup(this.#session.sessionManager, this.#session.settings)) await this.#enter();
 		});
 	}
 

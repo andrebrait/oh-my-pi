@@ -252,7 +252,8 @@ export interface InteractiveModeContext {
 	toolOutputExpanded: boolean;
 	hideToolActivity: boolean;
 	todoExpanded: boolean;
-	planModeEnabled: boolean;
+	/** Reads of the session's plan mode controller view. */
+	readonly planModeEnabled: boolean;
 	vibeModeEnabled: boolean;
 	readonly goalModeEnabled: boolean;
 	readonly goalModePaused: boolean;
@@ -261,7 +262,7 @@ export interface InteractiveModeContext {
 	loopPrompt?: string;
 	loopLimit?: LoopLimitRuntime;
 	loopCondition?: LoopConditionConfig;
-	planModePlanFilePath?: string;
+	readonly planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	/**
 	 * Effective thinking-block visibility: true when hidden by user setting OR

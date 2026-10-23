@@ -6,7 +6,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	type Agent,
-	AgentBusyError,
 	type AgentMessage,
 	agentPauseGate,
 	EventLoopKeepalive,
@@ -66,7 +65,6 @@ import {
 	$env,
 	adjustHsv,
 	formatDuration,
-	formatNumber,
 	getActiveProfile,
 	getProjectDir,
 	isEnoent,
@@ -84,7 +82,7 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
-import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelString } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
@@ -102,7 +100,6 @@ import type {
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
 	PlanReviewChoice,
-	PlanReviewOption,
 	PlanReviewRequestedEvent,
 } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
@@ -110,7 +107,6 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { GoalModeState } from "../goals/state";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
-import { copyLocalArtifacts, resolveLocalRoot } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
 import {
@@ -120,7 +116,7 @@ import {
 	type McpConnectionFailure,
 	type McpConnectionStatusEvent,
 } from "../mcp/startup-events";
-import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
+import { type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import {
 	isJudgmentBatchProgress,
 	JUDGMENT_BATCH_PROGRESS_EVENT_CHANNEL,
@@ -128,11 +124,9 @@ import {
 } from "../eval/judgment-batch-events";
 import { onDownloadActivity } from "../downloads/activity";
 import { DownloadActivityHud, JudgmentBatchProgressHud } from "./progress-hud";
-import { autosaveApprovedPlan, planSaveFileName } from "../plan-mode/plan-autosave";
-import { resolvePlanModelTransition } from "../plan-mode/model-transition";
+import { planSaveFileName } from "../plan-mode/plan-autosave";
+import { buildPlanReview } from "../plan-mode/review";
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
-import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
-import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents } from "../registry/persisted-agents";
@@ -142,7 +136,6 @@ import {
 	type AgentSession,
 	type AgentSessionEvent,
 	type DroppedPrompt,
-	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
@@ -150,7 +143,6 @@ import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
 import { syncTextPrediction, textPredictionBackend } from "../predict/client";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
-import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
@@ -165,6 +157,7 @@ import {
 	type WorktreeExitPlan,
 } from "../session/session-worktree";
 import type { RpcGoalCommand } from "../session/goal-mode";
+import type { PlanModeController, PlanModeOptions } from "../session/plan-mode";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import type { HostedClientLink } from "../session-host/hosted-client";
@@ -178,7 +171,6 @@ import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-pro
 import { labelEchoesHandle } from "../task/label";
 import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { isMCPToolName } from "../tools/builtin-names";
 import type { LspStartupServerInfo } from "../tools";
 import { resolvePlanFilePath } from "../plan-mode/plan-files";
 import { resolveToCwd } from "../tools/path-utils";
@@ -417,7 +409,7 @@ import { cfgExpandThinkingBlocks, cfgProseOnlyThinking } from "../session/settin
 import { cfgHideThinkingBlock } from "../session/settings";
 import { cfgCycleOrder, cfgModelRoles } from "../config/model-settings";
 import { cfgGoalEnabled } from "../goals/settings";
-import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
+import { cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
 import { cfgSttEnabled } from "../stt/settings";
 import { combine, type SettingValueOf } from "../config/registry";
@@ -581,8 +573,6 @@ type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
 const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
-const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
-const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
 
 const CFG_APPROVE_SESSION = "Always for this session";
@@ -615,10 +605,6 @@ function parseGoalSubcommand(args: string): {
 	return { sub: undefined, rest: trimmed };
 }
 
-function formatContextTokenCount(value: number): string {
-	return formatNumber(Math.max(0, Math.round(value))).toLowerCase();
-}
-
 function hasAssistantToolCall(message: AgentMessage): boolean {
 	return message.role === "assistant" && message.content.some(block => block.type === "toolCall");
 }
@@ -632,20 +618,6 @@ function readPersistedToolNames(value: unknown): string[] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	if (!value.every(name => typeof name === "string")) return undefined;
 	return value as string[];
-}
-
-export function shouldEnterPlanModeOnStartup(
-	sessionManager: Pick<SessionManager, "buildSessionContext" | "getEntries">,
-	sessionSettings: Settings,
-): boolean {
-	const hasConversationContext = sessionManager.buildSessionContext().messages.length > 0;
-	const hasExplicitMode = sessionManager.getEntries().some(entry => entry.type === "mode_change");
-	return (
-		!hasConversationContext &&
-		!hasExplicitMode &&
-		cfgPlanDefaultOnStartup.get(sessionSettings) &&
-		cfgPlanEnabled.get(sessionSettings)
-	);
 }
 
 /** Options for creating an InteractiveMode instance (for future API use) */
@@ -1325,8 +1297,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	toolOutputExpanded = false;
 	hideToolActivity = false;
 	todoExpanded = false;
-	planModeEnabled = false;
-	planModePaused = false;
+	get planModeEnabled(): boolean {
+		return this.session.planMode?.view.enabled === true;
+	}
+	get planModePaused(): boolean {
+		return this.session.planMode?.view.paused === true;
+	}
+	get planModePlanFilePath(): string | undefined {
+		return this.session.planMode?.view.planFilePath;
+	}
 	get goalModeEnabled(): boolean {
 		return this.session.getGoalModeState()?.enabled === true;
 	}
@@ -1334,7 +1313,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#getPausedGoalState() !== undefined;
 	}
 	vibeModeEnabled = false;
-	planModePlanFilePath: string | undefined = undefined;
 	loopModeEnabled = false;
 	loopModePaused = false;
 	loopPrompt: string | undefined = undefined;
@@ -1654,7 +1632,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
 	#headerAfter: readonly Component[] = [];
-	#planModePreviousToolPresentation: { enabled: string[]; mounted: string[] } | undefined;
 	// True from `/guided-goal` kickoff until the interview ends: a goal record
 	// appears, a turn makes tool calls (the interview itself is tool-free, so
 	// tool use means it was abandoned for real work), the kickoff fails, or the
@@ -1677,11 +1654,25 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeSkillTail: Promise<void> = Promise.resolve();
 	#vibeSkillInFlight = 0;
 	#vibeScopeSuspendedForSwitch = false;
-	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
-	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
-	#pendingPlanModelSwitch = false;
-	#planModeHasEntered = false;
+	/** Stable across calls, so {@link enablePlanMode} returns the running controller. */
+	readonly #planModeOptions: PlanModeOptions = {
+		onChanged: view => {
+			// Entering or leaving changes the system prompt, which predictably invalidates the cache: no cache-miss marker.
+			this.lastAssistantUsage = undefined;
+			this.statusLine.setPlanModeStatus(
+				view.enabled || view.paused ? { enabled: view.enabled, paused: view.paused } : undefined,
+			);
+			this.ui.requestRender();
+			if (view.enabled && !this.#planModeStatusEnabled) {
+				this.showStatus(`Plan mode enabled. Plan file: ${view.planFilePath}`);
+			}
+			this.#planModeStatusEnabled = view.enabled;
+		},
+		onWarning: text => this.showWarning(text),
+		entryBlocked: () => (this.vibeModeEnabled ? "Exit vibe mode first." : undefined),
+	};
+	/** The status line shows plan mode on: a view that turns enabled announces the entry once. */
+	#planModeStatusEnabled = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
 	#sessionInfoOverlayHandle: OverlayHandle | undefined;
@@ -2534,7 +2525,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Single side-effect point for title changes: every setSessionName caller
 		// (first-input titling, /rename, extension renames, plan seeding, replan
 		// refresh) gets the terminal title + accent updates from here. Registered
-		// before initHooksAndCustomTools/#reconcileModeFromSession/#enterPlanMode —
+		// before initHooksAndCustomTools/#reconcileModeFromSession/plan mode's entry —
 		// all of which can reach setSessionName during init.
 		this.#eventBusUnsubscribers.push(
 			this.sessionManager.onPersistenceError(error => {
@@ -2634,20 +2625,21 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
 		await logger.time("InteractiveMode.init:reconcileMode", () => this.#reconcileModeFromSession());
 
-		// Brand-new sessions optionally start in plan mode when the user has made it
-		// the startup default. "Brand-new" means the resolved branch carries no
-		// conversation context (buildSessionContext().messages — covers messages,
-		// custom messages, branch summaries, and compaction summaries) and the user
-		// set no explicit `mode_change` (which #reconcileModeFromSession just
-		// restored). SDK startup metadata and extension `custom` state entries are
-		// ignored. This way `omp --continue` (or auto-resume) that finds no recent
-		// session and creates a fresh one still honors the default, while a session
-		// with restored context or an explicit mode keeps its reconciled mode. Not
-		// part of the switch reconciler above: the plan-approval → execution handoff
-		// and loop resets also start sessions through handleClearCommand and must
-		// never be dragged back into plan mode; user-initiated /new re-applies the
-		// default through handleNewCommand instead.
-		if (!this.hostedClientMode) await this.#applyPlanModeDefault();
+		// Plan mode restores the journaled plan state, then brand-new sessions optionally start
+		// in plan mode when the user made it the startup default (see
+		// `PlanModeController.applyStartupDefault`). Not part of the switch reconciler above: the
+		// plan-approval → execution handoff and loop resets also start sessions through
+		// handleClearCommand and must never be dragged back into plan mode; user-initiated /new
+		// re-applies the default through handleNewCommand instead.
+		if (!this.hostedClientMode) {
+			const planMode = this.enablePlanMode();
+			try {
+				await planMode.reconcile();
+				await planMode.applyStartupDefault();
+			} catch (error) {
+				this.showWarning(error instanceof Error ? error.message : String(error));
+			}
+		}
 
 		// Restore unsent editor draft from previous session shutdown (Ctrl+D).
 		// One-shot: consumeDraft removes the sidecar after read so the next
@@ -2690,7 +2682,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			cfgLiveUiSettings.listen(this.settings, (next, previous) => this.#applyUiSettingChanges(next, previous)),
 		);
 		// Cache the live model for the next status-bar prepaint: init-time
-		// reconciliations (#reconcileModeFromSession, #enterPlanMode for
+		// reconciliations (#reconcileModeFromSession, plan mode's reconcile and
 		// plan.defaultOnStartup) can change the model before this subscription
 		// exists, so the model_changed events they emit are never observed above.
 		this.#scheduleComposerStatusPersist();
@@ -2698,7 +2690,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// event is not replayed, so rebuild from the live array once here too.
 		this.#syncConfigWarningHeader();
 		this.#eventBusUnsubscribers.push(
-			cfgModelRoles.listen(this.settings, () => this.#reapplyPlanModeModelOnRoleChange()),
+			cfgModelRoles.listen(this.settings, () => this.session.planMode?.reapplyModelOnRoleChange()),
 		);
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribeCommandMetadataChanged(() => {
@@ -3089,6 +3081,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.loopModeEnabled ||
 				this.planModePaused,
 		});
+	}
+
+	/**
+	 * Opt this session into session-owned plan mode with the terminal as its owner and return the
+	 * controller (`init` does; a hosted terminal never does: the host owns plan mode). Idempotent,
+	 * so `/plan` and the plan shortcut reach the running controller through it.
+	 */
+	enablePlanMode(): PlanModeController {
+		return this.session.enablePlanMode(this.#planModeOptions);
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
@@ -4721,18 +4722,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 	}
 
-	#updatePlanModeStatus(): void {
-		const status =
-			this.planModeEnabled || this.planModePaused
-				? {
-						enabled: this.planModeEnabled,
-						paused: this.planModePaused,
-					}
-				: undefined;
-		this.statusLine.setPlanModeStatus(status);
-		this.ui.requestRender();
-	}
-
 	#updateVibeModeStatus(): void {
 		this.statusLine.setVibeModeStatus(this.vibeModeEnabled ? { enabled: true } : undefined);
 		this.ui.requestRender();
@@ -4875,135 +4864,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #applyPlanModeModel(): Promise<void> {
-		const resolved = this.session.resolveRoleModelWithThinking("plan");
-		if (!resolved.model) return;
-
-		const currentModel = this.session.model;
-		// Capture the pre-plan model so #exitPlanMode can restore it. Only the
-		// entry path records this — a mid-planning role change (below) leaves the
-		// active model on the plan role, so overwriting here would restore the old
-		// plan model instead of the user's real pre-plan model.
-		this.#planModePreviousModelState = currentModel
-			? {
-					model: currentModel,
-					thinkingLevel: this.session.configuredThinkingLevel(),
-				}
-			: undefined;
-
-		await this.#applyPlanModelTransition(currentModel, resolved);
-	}
-
 	/**
-	 * Re-resolve the `plan` role and move the active model onto it. Fires when
-	 * the plan role is reassigned while plan mode is active: the active model IS
-	 * the plan model there, so a settings-only change would otherwise leave the
-	 * current turn on the model plan mode was entered with (issue #5657). No-op
-	 * outside plan mode — role reassignment for an inactive role only touches
-	 * settings.
+	 * Apply the plan model switch deferred while a turn streamed. Plan mode also applies it on its
+	 * own at each turn end; this is idempotent. A hosted terminal runs no plan mode: the host owns the model.
 	 */
-	async #reapplyPlanModeModelOnRoleChange(): Promise<void> {
-		if (this.hostedClientMode || !this.planModeEnabled) return;
-		const resolved = this.session.resolveRoleModelWithThinking("plan");
-		if (!resolved.model) {
-			this.#clearPendingPlanModelSwitch();
-			return;
-		}
-		await this.#applyPlanModelTransition(this.session.model, resolved);
-	}
-
-	/**
-	 * Drop a stale deferred switch that was queued for a previous plan-role
-	 * assignment. Other deferred switches (such as restoring the pre-plan
-	 * model) remain intact.
-	 */
-	#clearPendingPlanModelSwitch(): void {
-		if (!this.#pendingPlanModelSwitch) return;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
-	}
-
-	/** Apply (or defer) the model/thinking change implied by the resolved plan role. */
-	async #applyPlanModelTransition(currentModel: Model | undefined, resolved: ResolvedModelRoleValue): Promise<void> {
-		const transition = resolvePlanModelTransition(currentModel, resolved, this.session.isStreaming);
-		if (transition.kind !== "apply" || !transition.deferred) {
-			this.#clearPendingPlanModelSwitch();
-		}
-		switch (transition.kind) {
-			case "none":
-				return;
-			case "thinking":
-				this.session.setThinkingLevel(transition.thinkingLevel);
-				return;
-			case "apply":
-				if (transition.deferred) {
-					this.#pendingModelSwitch = {
-						model: transition.model,
-						thinkingLevel: transition.thinkingLevel,
-					};
-					this.#pendingPlanModelSwitch = true;
-					return;
-				}
-				try {
-					await this.session.setModelTemporary(transition.model, transition.thinkingLevel);
-				} catch (error) {
-					this.showWarning(
-						`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
-					);
-				}
-				return;
-		}
-	}
-
-	/** Apply any deferred model switch after the current stream ends. */
 	async flushPendingModelSwitch(): Promise<void> {
-		const pending = this.#pendingModelSwitch;
-		this.#pendingModelSwitch = undefined;
-		this.#pendingPlanModelSwitch = false;
-		// The host owns the model: a switch queued by local mode machinery must not touch the replica.
-		if (!pending || this.hostedClientMode) return;
-		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
-		} catch (error) {
-			this.showWarning(
-				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
+		await this.session.planMode?.flushPendingModelSwitch();
 	}
 
 	async #clearTransientModeState(options?: {
 		preserveVibe?: boolean;
 		vibeScopeAlreadySuspended?: boolean;
-		restorePlanModel?: boolean;
 	}): Promise<void> {
-		if (this.planModeEnabled || this.planModePaused) {
-			const previousModel = this.#planModePreviousModelState;
-			this.session.setPlanModeState(undefined);
-			try {
-				const previousPresentation = this.#planModePreviousToolPresentation;
-				if (previousPresentation) {
-					await this.session.restoreNonMCPToolPresentation(
-						previousPresentation.enabled,
-						previousPresentation.mounted,
-					);
-				}
-			} finally {
-				this.session.setPlanProposalHandler?.(null);
-				this.planModeEnabled = false;
-				this.planModePaused = false;
-				this.planModePlanFilePath = undefined;
-				this.#planModePreviousToolPresentation = undefined;
-				this.#planModePreviousModelState = undefined;
-				this.#pendingModelSwitch = undefined;
-				this.#pendingPlanModelSwitch = false;
-				this.#planModeHasEntered = false;
-				this.#updatePlanModeStatus();
-			}
-			if (options?.restorePlanModel && previousModel) {
-				await this.#restorePlanPreviousModel(previousModel);
-			}
-		}
-
 		if (this.vibeModeEnabled && !options?.preserveVibe) {
 			const ownerScope = this.#vibeModeOwnerScope;
 			// This runs only from #reconcileModeFromSession, i.e. after switchSession
@@ -5047,293 +4919,25 @@ export class InteractiveMode implements InteractiveModeContext {
 		// flags and settings, and that set — not a historical one — is what exiting
 		// vibe must restore.
 		const vibeToolsetLostToTeardown = this.vibeModeEnabled && !preserveVibe;
-		// A session that records no model (a `/new` boundary) keeps the live model,
-		// which during plan mode is the transient plan-role model; hand it the
-		// pre-plan model instead. A recorded model was already restored by switchSession.
 		await this.#clearTransientModeState({
 			preserveVibe,
 			vibeScopeAlreadySuspended,
-			restorePlanModel: Object.keys(sessionContext.models).length === 0,
 		});
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalMode = this.session.goalMode;
-		// A switch leaves the previous goal now, before the target's plan/vibe mode is restored;
+		// A switch leaves the previous goal now, before the target's vibe mode is restored;
 		// the session adopts the target's goal when the change ends.
 		if (options?.preserveActiveGoal) await goalMode?.leavePreviousGoal();
 		else await goalMode?.reconcile();
 		this.updateGoalModeStatus();
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") return;
-		if (sessionContext.mode === "vibe") {
-			if (!preserveVibe) {
-				await this.#enterVibeMode({
-					persistModeChange: false,
-					previousTools: vibeToolsetLostToTeardown
-						? readPersistedToolNames(sessionContext.modeData?.previousTools)
-						: undefined,
-				});
-			}
-			return;
-		}
-		if (!cfgPlanEnabled.get(this.session.settings)) {
-			// Clear stale plan/plan_paused mode so re-enabling the setting
-			// later doesn't unexpectedly restore an old plan session.
-			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused") {
-				this.sessionManager.appendModeChange("none");
-			}
-			return;
-		}
-		if (sessionContext.mode === "plan") {
-			const planFilePath = sessionContext.modeData?.planFilePath as string | undefined;
-			await this.#enterPlanMode({ planFilePath, preserveRestoredModel: true });
-		} else if (sessionContext.mode === "plan_paused") {
-			this.planModePaused = true;
-			this.#planModeHasEntered = true;
-			this.#updatePlanModeStatus();
-		}
-	}
-
-	/**
-	 * Enters plan mode when `plan.defaultOnStartup` applies to the current session
-	 * (see {@link shouldEnterPlanModeOnStartup}). Called at launch and after `/new`.
-	 * #enterPlanMode is idempotent and self-guards against an active plan/goal/vibe
-	 * mode; plan.enabled is checked by shouldEnterPlanModeOnStartup.
-	 */
-	async #applyPlanModeDefault(): Promise<void> {
-		if (shouldEnterPlanModeOnStartup(this.sessionManager, this.session.settings)) {
-			await this.#enterPlanMode();
-		}
-	}
-
-	async #enterPlanMode(options?: {
-		planFilePath?: string;
-		workflow?: "parallel" | "iterative";
-		preserveRestoredModel?: boolean;
-	}): Promise<void> {
-		if (this.planModeEnabled) {
-			return;
-		}
-		if (this.goalModeEnabled || this.goalModePaused) {
-			this.showWarning("Exit goal mode first.");
-			return;
-		}
-		if (this.vibeModeEnabled) {
-			this.showWarning("Exit vibe mode first.");
-			return;
-		}
-
-		this.planModePaused = false;
-
-		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
-		const previousTools = this.session.getEnabledToolNames();
-		const previousMountedTools = this.session.getMountedXdevToolNames();
-		// `plan-mode-active.md` instructs the agent to draft the plan file with
-		// `write` and refine it with `edit`, and plan approval itself is a `write`
-		// to `xd://propose`. Both must be in the active set or the agent falls
-		// back to `edit` on a non-existent file and stalls — and cannot submit the plan.
-		// `edit` is an essential built-in and always ships top-level; re-activate
-		// `write` here only when the current registry entry is the built-in write
-		// tool (issue #3165). A shadowing extension tool named `write` must stay
-		// inactive because plan mode's read-only guarantee relies on the built-in
-		// write/edit guard. The standing handler below consumes plan-approval
-		// dispatches.
-		const planAugmentations: string[] = [];
-		// A shadowing extension tool named `write` has no `xd://` transport, so plan
-		// approval would never dispatch and the turn would loop on propose writes
-		// forever (issue #14030). Drop it from the active set rather than carrying it
-		// over: keeping it active breaks both the read-only guarantee and approval.
-		if (this.session.hasBuiltInTool("write")) {
-			planAugmentations.push("write");
-		} else if (previousTools.includes("write")) {
-			this.showWarning(
-				"Plan mode: the `write` tool is provided by an extension and cannot submit plans. Disable it to use plan mode.",
-			);
-		}
-		const uniquePlanTools = [...new Set([...previousTools.filter(name => name !== "write"), ...planAugmentations])];
-
-		this.#planModePreviousToolPresentation = {
-			enabled: previousTools.filter(name => !isMCPToolName(name)),
-			mounted: previousMountedTools.filter(name => !isMCPToolName(name)),
-		};
-		this.planModePlanFilePath = planFilePath;
-		this.planModeEnabled = true;
-		// Suppress cache-miss marker on the next turn: plan mode changes the system
-		// prompt, which predictably invalidates the cache.
-		this.lastAssistantUsage = undefined;
-
-		// Plan mode state must land before the tool partition: it keeps `write`
-		// active as the staging transport, and plan approval is a top-level
-		// `write` to `xd://propose`.
-		const previousPlanModeState = this.session.getPlanModeState();
-		this.session.setPlanModeState({
-			enabled: true,
-			planFilePath,
-			workflow: options?.workflow ?? "parallel",
-			reentry: this.#planModeHasEntered,
-		});
-		try {
-			await this.session.setActiveToolsByName(uniquePlanTools);
-		} catch (error) {
-			this.session.setPlanModeState(previousPlanModeState);
-			this.planModeEnabled = false;
-			throw error;
-		}
-		this.session.setPlanProposalHandler?.(title => this.session.preparePlanForReview(title));
-		if (this.session.isStreaming) {
-			await this.session.sendPlanModeContext({ deliverAs: "steer" });
-		}
-		this.#planModeHasEntered = true;
-		// Session loading already restored the model recorded in the journal.
-		// Reapplying today's plan role here would replace a CLI/session-specific
-		// selection with current config during --resume or an in-process switch.
-		if (!options?.preserveRestoredModel) {
-			await this.#applyPlanModeModel();
-		}
-		this.#updatePlanModeStatus();
-		this.sessionManager.appendModeChange("plan", { planFilePath });
-		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
-	}
-
-	async #restorePlanPreviousModel(prev: { model: Model; thinkingLevel?: ConfiguredThinkingLevel }): Promise<void> {
-		if (modelsAreEqual(this.session.model, prev.model)) {
-			// Same model — only thinking level may differ. Avoid setModelTemporary()
-			// which would reset provider-side sessions and break continuity.
-			this.session.setThinkingLevel(prev.thinkingLevel);
-		} else if (this.session.isStreaming) {
-			this.#pendingModelSwitch = {
-				model: prev.model,
-				thinkingLevel: prev.thinkingLevel,
-			};
-			this.#pendingPlanModelSwitch = false;
-		} else {
-			await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
-		}
-	}
-
-	/**
-	 * Idempotent post-compaction model transition for the plan-approval compact
-	 * path. The deferred pre-plan state is consumed on first application, so a
-	 * second call (the before-flush hook vs. the short-circuit fallback) is a
-	 * no-op. "failed" intentionally stays on the plan model — the context is
-	 * intact and we dispatch best-effort.
-	 */
-	async #applyDeferredPlanModelTransition(
-		outcome: CompactionOutcome | undefined,
-		executionModel: ResolvedRoleModel | undefined,
-	): Promise<void> {
-		const deferredPrev = this.#planModePreviousModelState;
-		if (deferredPrev === undefined || outcome === "failed") return;
-		this.#planModePreviousModelState = undefined;
-		if (executionModel) {
-			await this.#applyPlanExecutionModel(executionModel);
-		} else {
-			await this.#restorePlanPreviousModel(deferredPrev);
-		}
-	}
-
-	async #exitPlanMode(options?: {
-		silent?: boolean;
-		paused?: boolean;
-		deferModelRestore?: boolean;
-		interruptActiveTurn?: boolean;
-	}): Promise<void> {
-		if (!this.planModeEnabled) {
-			return;
-		}
-		// A mid-turn exit must interrupt the currently streaming turn.
-		// The plan-mode prompt instructs the model to keep planning until it
-		// writes to `xd://propose`, so the live turn must be aborted inside
-		// `runModeExitTeardown` to avoid restarting on the stale toolset.
-		if (options?.interruptActiveTurn && this.session.isStreaming) {
-			await this.session.runModeExitTeardown(async () => {
-				await this.session.abort({ reason: USER_INTERRUPT_LABEL });
-				await this.#tearDownPlanMode(options);
+		if (sessionContext.mode === "vibe" && !preserveVibe) {
+			await this.#enterVibeMode({
+				persistModeChange: false,
+				previousTools: vibeToolsetLostToTeardown
+					? readPersistedToolNames(sessionContext.modeData?.previousTools)
+					: undefined,
 			});
-			return;
-		}
-		await this.#tearDownPlanMode(options);
-	}
-
-	async #tearDownPlanMode(options?: {
-		silent?: boolean;
-		paused?: boolean;
-		deferModelRestore?: boolean;
-	}): Promise<void> {
-		const planModeState = this.session.getPlanModeState();
-		const planModeTools = this.session.getEnabledToolNames();
-		const planModeMountedTools = this.session.getMountedXdevToolNames();
-		const planModeModelState = this.session.model
-			? {
-					model: this.session.model,
-					thinkingLevel: this.session.configuredThinkingLevel(),
-				}
-			: undefined;
-		this.session.setPlanModeState(undefined);
-		try {
-			const previousPresentation = this.#planModePreviousToolPresentation;
-			if (previousPresentation) {
-				await this.session.restoreNonMCPToolPresentation(
-					previousPresentation.enabled,
-					previousPresentation.mounted,
-				);
-			}
-			if (this.#planModePreviousModelState && !options?.deferModelRestore) {
-				await this.#restorePlanPreviousModel(this.#planModePreviousModelState);
-			}
-			// If #applyPlanModeModel queued a deferred switch to the plan-role model
-			// (because the session was streaming on entry), drop it now: we are
-			// leaving plan mode, so flushing it on the next agent_end would land the
-			// session on the plan-role model after the user has exited plan mode
-			// (issue #816). This runs even when deferModelRestore is set
-			// (compact-approval path): otherwise the stale plan switch survives and
-			// flushPendingModelSwitch() later clobbers the restored/execution model.
-			if (this.#planModePreviousModelState) this.#clearPendingPlanModelSwitch();
-		} catch (error) {
-			this.session.setPlanModeState(planModeState);
-			if (
-				planModeModelState &&
-				(!modelsAreEqual(this.session.model, planModeModelState.model) ||
-					this.session.configuredThinkingLevel() !== planModeModelState.thinkingLevel)
-			) {
-				try {
-					await this.#restorePlanPreviousModel(planModeModelState);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan model after plan exit failure", {
-						error: String(rollbackError),
-					});
-				}
-			}
-			const enabledTools = this.session.getEnabledToolNames();
-			const mountedTools = this.session.getMountedXdevToolNames();
-			if (
-				enabledTools.length !== planModeTools.length ||
-				enabledTools.some((name, index) => name !== planModeTools[index]) ||
-				mountedTools.length !== planModeMountedTools.length ||
-				mountedTools.some((name, index) => name !== planModeMountedTools[index])
-			) {
-				try {
-					await this.session.setActiveToolPresentation(planModeTools, planModeMountedTools);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan tools after plan exit failure", {
-						error: String(rollbackError),
-					});
-				}
-			}
-			throw error;
-		}
-		this.session.setPlanProposalHandler?.(null);
-		this.planModeEnabled = false;
-		// Suppress cache-miss marker on the next turn: plan exit changes the system
-		// prompt, which predictably invalidates the cache.
-		this.lastAssistantUsage = undefined;
-		this.planModePaused = options?.paused ?? false;
-		this.planModePlanFilePath = undefined;
-		this.#planModePreviousToolPresentation = undefined;
-		if (!options?.deferModelRestore) this.#planModePreviousModelState = undefined;
-		this.#updatePlanModeStatus();
-		const paused = options?.paused ?? false;
-		this.sessionManager.appendModeChange(paused ? "plan_paused" : "none");
-		if (!options?.silent) {
-			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
 		}
 	}
 
@@ -5516,28 +5120,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		return false;
 	}
 
-	#getPlanApprovalContextUsage(): ContextUsage | undefined {
-		const executionModel = this.#planModePreviousModelState?.model ?? this.session.model;
-		const contextWindow = executionModel?.contextWindow;
-		if (typeof contextWindow === "number") {
-			return this.session.getContextUsage({ contextWindow });
-		}
-		return this.session.getContextUsage();
-	}
-
-	#formatKeepContextLabel(contextUsage: ContextUsage | undefined): string {
-		if (!contextUsage) {
-			return "Approve and keep context";
-		}
-		const tokens = formatContextTokenCount(contextUsage.tokens);
-		const contextWindow = formatContextTokenCount(contextUsage.contextWindow);
-		return `Approve and keep context (~${tokens} / ${contextWindow})`;
-	}
-
-	#isKeepContextDisabled(contextUsage: ContextUsage | undefined): boolean {
-		return contextUsage !== undefined && contextUsage.percent > PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT;
-	}
-
 	/** Apply the `tui.vimMode` setting to an editor and route Visual-mode yanks to the clipboard. */
 	#applyVimMode(editor: CustomEditor): void {
 		editor.setVimMode(cfgTuiVimMode.get(settings));
@@ -5668,7 +5250,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		try {
-			await this.#exitPlanMode({ silent: true });
+			await this.session.planMode?.exit({ paused: false });
 		} catch (error) {
 			this.showError(
 				`Saved plan to ${shortenPath(destination)}, but could not exit plan mode: ${
@@ -5751,220 +5333,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #applyPlanExecutionModel(entry: ResolvedRoleModel | undefined): Promise<void> {
-		if (!entry) return;
-		try {
-			await this.session.applyRoleModel(entry);
-			this.statusLine.invalidate();
-			this.updateEditorBorderColor();
-			this.showStatus(`Continuing with ${entry.role}: ${entry.model.name || entry.model.id}`);
-		} catch (error) {
-			this.showWarning(
-				`Could not switch to the ${entry.role} model: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-	}
-
-	#resolveLocalRoot(): string {
-		return path.resolve(
-			resolveLocalRoot({
-				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-				getSessionId: () => this.sessionManager.getSessionId(),
-			}),
-		);
-	}
-
-	async #approvePlan(
-		planContent: string,
-		options: {
-			planFilePath: string;
-			title: string;
-			preserveContext?: boolean;
-			compactBeforeExecute?: boolean;
-			executionModel?: ResolvedRoleModel;
-			reviewOwner: object;
-		},
-	): Promise<boolean> {
-		const previousPresentation = this.#planModePreviousToolPresentation ?? {
-			enabled: this.session.getEnabledToolNames().filter(name => !isMCPToolName(name)),
-			mounted: this.session.getMountedXdevToolNames().filter(name => !isMCPToolName(name)),
-		};
-
-		// Mark the pending abort caused by the plan-mode → compaction transition as
-		// silent BEFORE #exitPlanMode raises it. The `finally` below clears the
-		// flag on every terminal compaction outcome (ok / cancelled / failed /
-		// throw) so a leaked flag cannot silence a later unrelated abort.
-		// Branchless mark+clear when !compactBeforeExecute: mark is gated; clear
-		// is unconditional and idempotent.
-		if (options.compactBeforeExecute) {
-			this.session.markPlanInternalAbortPending();
-		}
-		let compactOutcome: CompactionOutcome | undefined;
-		try {
-			await this.#exitPlanMode({
-				silent: true,
-				paused: false,
-				deferModelRestore: options.compactBeforeExecute === true,
-			});
-
-			if (!options.preserveContext) {
-				const oldLocalRoot = this.#resolveLocalRoot();
-				await this.handleClearCommand();
-				const newLocalRoot = this.#resolveLocalRoot();
-				await copyLocalArtifacts(oldLocalRoot, newLocalRoot);
-				const newLocalPath = this.#resolvePlanFilePath(options.planFilePath);
-				await fs.mkdir(path.dirname(newLocalPath), { recursive: true });
-				await fs.writeFile(newLocalPath, planContent);
-			} else if (options.compactBeforeExecute) {
-				// Distill the plan-mode transcript before the execution turn is queued so
-				// the plan-approved synthetic prompt lands as a fresh cache anchor.
-				// Outcome is consumed after tool-restoration and plan-reference-path
-				// bookkeeping below; `markPlanReferenceSent` is intentionally deferred
-				// past the cancel guard — see the comment at the cancel branch.
-				// Cancellation skips the synthetic-prompt dispatch (operator's explicit
-				// abort is honored); failure proceeds best-effort — approval intent stands.
-				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
-					planFilePath: options.planFilePath,
-				});
-				// Pin the plan reference path BEFORE compaction so any user messages
-				// queued during the compaction await (which `handleCompactCommand`
-				// flushes via `flushCompactionQueue` before returning) see the
-				// approved plan in `#buildPlanReferenceMessage`. Reassignment after
-				// the try/finally is idempotent and kept for the !compactBeforeExecute
-				// branch.
-				this.session.setPlanReferencePath(options.planFilePath);
-				// Ride the plan-mode distillation prompt through as `internalGuidance`
-				// so it reaches native summarization without leaking into the public
-				// `customInstructions` channel on `session_before_compact` — extensions
-				// there treat that field as user focus and would query-bias the
-				// summary toward the plan boilerplate (issue #4359).
-				compactOutcome = await this.handleCompactCommand(
-					undefined,
-					undefined,
-					outcome => this.#applyDeferredPlanModelTransition(outcome, options.executionModel),
-					compactionPrompt,
-				);
-			}
-		} finally {
-			// Unconditional clear. Idempotent: a no-op when the flag was never set
-			// (i.e., the !compactBeforeExecute branch), and a no-op when the flag
-			// was already consumed by AgentSession.#handleAgentEvent's aborted
-			// message_end stamping. Guarantees the flag is dead at every exit.
-			this.session.clearPlanInternalAbortPending();
-		}
-
-		// Restore the execution tool set, but force-enable `read` so the durable
-		// local:// plan remains available if the inline copy becomes unrecoverable.
-		const executionTools = previousPresentation.enabled.includes("read")
-			? previousPresentation.enabled
-			: [...previousPresentation.enabled, "read"];
-		await this.session.restoreNonMCPToolPresentation(executionTools, previousPresentation.mounted);
-		this.session.setPlanReferencePath(options.planFilePath);
-		try {
-			const autosaved = await autosaveApprovedPlan({
-				settings: this.session.settings,
-				cwd: this.sessionManager.getCwd(),
-				title: options.title,
-				planContent,
-			});
-			if (autosaved) {
-				const displayPath = truncateToWidth(replaceTabs(shortenPath(autosaved)), TRUNCATE_LENGTHS.CONTENT);
-				this.showStatus(`Saved plan to ${displayPath}.`);
-			}
-		} catch (error) {
-			const detail = truncateToWidth(
-				shortenEmbeddedPaths(
-					replaceTabs(error instanceof Error ? error.message : String(error))
-						.replace(/[\r\n]+/g, " ")
-						.trim(),
-				),
-				TRUNCATE_LENGTHS.CONTENT,
-			);
-			this.showWarning(`Failed to autosave plan: ${detail}`);
-		}
-
-		// Resolve the deferred plan-approval model transition. On the compact path
-		// the before-flush hook passed to handleCompactCommand already ran this (so
-		// any input queued during compaction executed on the post-compaction
-		// model); the re-run here is idempotent and covers the short-circuit where
-		// compaction never executed. It runs for "cancelled" too — the operator
-		// aborted only the compaction, not the approval — so the next turn no longer
-		// lands on the plan model. "failed" stays on the plan model (context
-		// intact) and dispatches best-effort.
-		if (options.compactBeforeExecute) {
-			await this.#applyDeferredPlanModelTransition(compactOutcome, options.executionModel);
-		} else {
-			await this.#applyPlanExecutionModel(options.executionModel);
-		}
-
-		if (compactOutcome === "cancelled") {
-			// Explicit abort: honor it. `executeCompaction` already surfaced
-			// `showError("Compaction cancelled")`; we add the deferred-dispatch
-			// warning and exit without dispatching the synthetic plan-approved
-			// prompt. `markPlanReferenceSent` stays unset so
-			// `AgentSession.#buildPlanReferenceMessage` injects the plan reference
-			// on the operator's next `prompt()` call.
-			this.showWarning(
-				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
-			);
-			return false;
-		}
-
-		// Approved plans land in a fresh (or compacted) session whose first user-visible
-		// turn is the synthetic plan-approved prompt — that path bypasses the
-		// input-controller's title generation. Seed an auto-name from the plan title
-		// so the session is not left unnamed. `setSessionName("auto")` is a no-op
-		// when the user has already chosen a name (preserveContext paths).
-		const seededName = humanizePlanTitle(options.title);
-		if (seededName && !this.sessionManager.getSessionName()) {
-			await this.sessionManager.setSessionName(seededName, "auto");
-		}
-
-		// markPlanReferenceSent fires only on the dispatch path so the synthetic
-		// plan-approved prompt is the source of the reference injection.
-		this.session.markPlanReferenceSent();
-		const planModePrompt = prompt.render(planModeApprovedPrompt, {
-			planFilePath: options.planFilePath,
-			planContent,
-			contextPreserved: options.preserveContext === true,
-		});
-		// Close the review overlay only now — after the async title write and plan
-		// prompt are prepared, immediately before the execution turn is queued. The
-		// synthetic prompt below blocks in `session.prompt` for the whole run, so
-		// hiding here (rather than after #approvePlan returns) keeps the operator off
-		// the stale plan-review screen (issue #5688) while #5319's stale-buffer guard
-		// stays intact. Deferring the hide past the awaited `setSessionName` also
-		// prevents restored editor focus from letting operator keystrokes submit a
-		// normal turn ahead of the approved execution turn (PR #5689 review).
-		// The ownership-bound hide is idempotent, so the caller's trailing
-		// `closePlanReview()` — and a stale continuation after a replacement review
-		// opened — stay safe no-ops.
-		this.#hidePlanReview(options.reviewOwner);
-		this.ui.requestRender();
-		// A user turn queued during compaction was already fired by
-		// `flushCompactionQueue` before we returned from `handleCompactCommand`; the
-		// old abort-then-prompt path would have discarded that operator turn AND
-		// still surfaced `AgentBusyError` when the queued turn kicked off in the
-		// synchronous gap. Preserve the in-flight work and queue the hidden
-		// execution directive behind it as a synthetic follow-up. If `isStreaming`
-		// flips true between the check and dispatch (the same fire-and-forget race
-		// noted below), catch `AgentBusyError` and fall back to the same queue.
-		if (this.session.isStreaming) {
-			await this.session.followUp(planModePrompt, undefined, {
-				synthetic: true,
-			});
-		} else {
-			try {
-				await this.session.prompt(planModePrompt, { synthetic: true });
-			} catch (error) {
-				if (!(error instanceof AgentBusyError)) throw error;
-				await this.session.followUp(planModePrompt, undefined, {
-					synthetic: true,
-				});
-			}
-		}
-		return true;
-	}
 	async #abortPlanApprovalTurnSilently(): Promise<void> {
 		this.session.markPlanInternalAbortPending();
 		try {
@@ -5986,8 +5354,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Exit vibe mode first.");
 			return false;
 		}
-		if (this.planModeEnabled) {
-			const planFilePath = this.planModePlanFilePath ?? (await this.#getPlanFilePath());
+		const planMode = this.enablePlanMode();
+		if (planMode.view.enabled) {
+			const planFilePath = planMode.view.planFilePath ?? (await this.#getPlanFilePath());
 			if (await this.#hasPlanModeDraftContent(planFilePath)) {
 				const confirmed = await this.showHookConfirm(
 					"Exit plan mode?",
@@ -5995,19 +5364,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				);
 				if (!confirmed) return false;
 			}
-			await this.#exitPlanMode({ paused: true, interruptActiveTurn: true });
+			await planMode.handle({ op: "exit" });
+			this.showStatus("Plan mode paused.");
 			return false;
 		}
-		if (this.planModePaused && !initialPrompt) {
-			// No-arg third toggle: paused → off. Tools, model, and plan state were
-			// already restored by the prior #exitPlanMode({ paused: true }); only the
-			// paused flag, the reentry marker, and the session mode entry remain.
-			// Prompted /plan invocations fall through to #enterPlanMode below so the
-			// supplied prompt is still submitted as the first plan-mode turn.
-			this.planModePaused = false;
-			this.#planModeHasEntered = false;
-			this.#updatePlanModeStatus();
-			this.sessionManager.appendModeChange("none");
+		if (planMode.view.paused && !initialPrompt) {
+			// No-arg third toggle: paused → off. Prompted /plan invocations fall through to
+			// the entry below so the supplied prompt is still submitted as the first plan-mode turn.
+			await planMode.handle({ op: "clear" });
 			this.showStatus("Plan mode disabled.");
 			return false;
 		}
@@ -6015,7 +5379,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
 			return false;
 		}
-		await this.#enterPlanMode();
+		await planMode.handle({ op: "enter" });
 		if (!initialPrompt) return false;
 		if (isKnownSkillCommand(this, initialPrompt)) {
 			await invokeSkillCommandFromText(this, initialPrompt, "steer", {
@@ -6622,7 +5986,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		details: PlanApprovalDetails,
 		options?: { abortTurn?: boolean; onOpened?: () => void },
 	): Promise<void> {
-		if (!this.planModeEnabled) {
+		const planMode = this.session.planMode;
+		if (!planMode?.view.enabled) {
 			this.showWarning("Plan mode is not active.");
 			return;
 		}
@@ -6637,7 +6002,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (abortTurn) await this.#abortPlanApprovalTurnSilently();
 
 		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
-		this.planModePlanFilePath = planFilePath;
 		const planContent = await this.#readPlanFile(planFilePath);
 		if (!planContent) {
 			this.showError(`Plan file not found at ${planFilePath}`);
@@ -6652,52 +6016,35 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		// resolveApprovedPlan may return a newer draft than the path recorded in
-		// plan-mode state. `AgentSession.#buildPlanModeMessage()` reads that state,
-		// so if the operator refines (or dismisses and keeps planning) the next
-		// planning turn must target the plan just reviewed — promote the reviewed
-		// path into plan-mode state now, mirroring the print-mode approval handler.
-		const planState = this.session.getPlanModeState();
-		if (planState?.enabled && planState.planFilePath !== planFilePath) {
-			this.session.setPlanModeState({ ...planState, planFilePath });
-			this.sessionManager.appendModeChange("plan", { planFilePath });
-		}
+		// resolveApprovedPlan may return a newer draft than the path plan mode entered with. The next
+		// planning turn (after a refine, or a dismissed review) must target the plan just reviewed.
+		planMode.retarget(planFilePath);
 
-		const contextUsage = this.#getPlanApprovalContextUsage();
-		const keepContextLabel = this.#formatKeepContextLabel(contextUsage);
-		const keepContextDisabled = this.#isKeepContextDisabled(contextUsage);
-		const reviewOptions: PlanReviewOption[] = [
-			{ id: "execute", label: "Approve and execute", disabled: false },
-			{ id: "compact", label: "Approve and compact context", disabled: false },
-			{ id: "keep", label: keepContextLabel, disabled: keepContextDisabled },
-			{ id: "refine", label: "Refine plan", disabled: false },
-			{ id: "save", label: PLAN_SAVE_AND_QUIT_OPTION, disabled: false },
-		];
+		const review = buildPlanReview(this.session, { ...details, planFilePath });
+		const reviewOptions = review.options;
+		const keepContextDisabled = reviewOptions[PLAN_KEEP_CONTEXT_OPTION_INDEX]?.disabled === true;
 
 		// Model-tier slider: let the operator pick which configured role model
-		// (smol/default/slow/…) executes the approved plan. The slider always starts
-		// on the `default` tier so execution defaults to the default model no matter
-		// which model drove the planning conversation. Left/right move it from there;
-		// hidden when fewer than two role models resolve — a lone tier is no choice.
+		// (smol/default/slow/…) executes the approved plan. It starts on the `default`
+		// tier so execution defaults to the default model no matter which model drove the
+		// planning conversation; hidden when fewer than two role models resolve.
 		// `selectedTierIndex` tracks the live slider position.
-		const cycle = this.session.getRoleModelCycle(cfgCycleOrder.get(this.session.settings));
-		const defaultTierIndex = cycle ? cycle.models.findIndex(entry => entry.role === "default") : -1;
-		const startTierIndex = defaultTierIndex >= 0 ? defaultTierIndex : (cycle?.currentIndex ?? 0);
-		let selectedTierIndex = startTierIndex;
-		const slider: HookSelectorSlider | undefined =
-			cycle && cycle.models.length > 1
-				? {
-						caption: "continue with",
-						index: startTierIndex,
-						segments: cycle.models.map(entry => ({
-							label: entry.role,
-							detail: entry.model.name || entry.model.id,
-						})),
-						onChange: index => {
-							selectedTierIndex = index;
-						},
-					}
-				: undefined;
+		const cycle =
+			review.tiers.length > 0 ? this.session.getRoleModelCycle(cfgCycleOrder.get(this.session.settings)) : undefined;
+		let selectedTierIndex = review.startTierIndex;
+		const slider: HookSelectorSlider | undefined = cycle
+			? {
+					caption: "continue with",
+					index: review.startTierIndex,
+					segments: cycle.models.map(entry => ({
+						label: entry.role,
+						detail: entry.model.name || entry.model.id,
+					})),
+					onChange: index => {
+						selectedTierIndex = index;
+					},
+				}
+			: undefined;
 		// The overlay now owns the dynamic, focus-aware help line; the caller only
 		// supplies the trailing cancel hint.
 		const helpText = `${editorKey("tui.select.cancel")} cancel`;
@@ -6717,14 +6064,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			planFilePath,
 			planContent,
 			options: reviewOptions,
-			tiers: slider
-				? cycle!.models.map(entry => ({
-						role: entry.role,
-						provider: entry.model.provider,
-						model: entry.model.id,
-						...(entry.explicitThinkingLevel && entry.thinkingLevel ? { thinkingLevel: entry.thinkingLevel } : {}),
-					}))
-				: undefined,
+			tiers: slider ? review.tiers : undefined,
 		};
 		const reviewId = request.reviewId;
 		this.#pendingPlanReview = {
@@ -6735,7 +6075,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// it would switch the session back to the plan model.
 			selectTier: slider
 				? role => {
-						const index = cycle!.models.findIndex(entry => entry.role === role);
+						const index = review.tiers.findIndex(tier => tier.role === role);
 						if (index < 0) return false;
 						this.#planReviewOverlay?.setSliderIndex(index);
 						return true;
@@ -6796,8 +6136,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#hidePlanReview(pending);
 			this.ui.requestRender();
 		};
+		const picked = reviewOptions.find(option => option.label === choice)?.id;
 
-		if (choice === PLAN_SAVE_AND_QUIT_OPTION) {
+		if (picked === "save") {
 			closePlanReview();
 			try {
 				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
@@ -6817,7 +6158,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
+		if (picked === "execute" || picked === "compact" || picked === "keep") {
 			try {
 				// Prefer in-overlay edits (already in memory) over a disk re-read. The
 				// overlay mirrors edits as they happen, and approval awaits one final
@@ -6831,43 +6172,43 @@ export class InteractiveMode implements InteractiveModeContext {
 					closePlanReview();
 					return;
 				}
-				// Capture the operator's tier choice and hand it to #approvePlan, which
-				// applies it AFTER #exitPlanMode. #exitPlanMode normally restores
-				// #planModePreviousModelState (the model from before plan mode), so
-				// applying the slider choice any earlier would be silently reverted.
-				// Pass executionModel only when the slider was actually shown — a
-				// singleton cycle (e.g. only modelRoles.plan is configured, so
-				// getRoleModelCycle synthesizes a lone `default` entry from the
-				// currently active plan model) hides the slider, the operator made
-				// no selection, and the pre-plan model is not in the cycle. Pinning
-				// that singleton would silently switch the session back to the plan
-				// model after #exitPlanMode restored the pre-plan model.
-				// Treat the choice as implicit only when applying the selected role
-				// would land on the same end state as the restore — same model AND
-				// the same effective thinking level. A role with an explicit thinking
-				// suffix that differs from the restored thinking level must still go
-				// through applyRoleModel, otherwise approving on the same model with a
-				// different configured thinking level silently keeps the pre-plan level.
-				const restoredState = this.#planModePreviousModelState;
-				const restoredIndex =
-					cycle && restoredState
-						? cycle.models.findIndex(entry => {
-								if (!modelsAreEqual(entry.model, restoredState.model)) return false;
-								if (!entry.explicitThinkingLevel) return true;
-								return entry.thinkingLevel === restoredState.thinkingLevel;
-							})
-						: -1;
+				// The tier approval moves onto; none when the slider is hidden or sits on the pre-plan model.
 				const executionModel =
-					slider && cycle && selectedTierIndex !== restoredIndex ? cycle.models[selectedTierIndex] : undefined;
-				const executionDispatched = await this.#approvePlan(latestPlanContent, {
-					planFilePath,
-					title: details.title,
-					preserveContext: choice !== "Approve and execute",
-					compactBeforeExecute: choice === "Approve and compact context",
-					executionModel,
-					reviewOwner: pending,
+					slider && selectedTierIndex !== review.restoredTierIndex ? cycle?.models[selectedTierIndex] : undefined;
+				const announce = (savedPlanPath: string | undefined): void => {
+					if (savedPlanPath) {
+						this.showStatus(
+							`Saved plan to ${truncateToWidth(replaceTabs(shortenPath(savedPlanPath)), TRUNCATE_LENGTHS.CONTENT)}.`,
+						);
+					}
+					if (executionModel && modelsAreEqual(this.session.model, executionModel.model)) {
+						this.statusLine.invalidate();
+						this.updateEditorBorderColor();
+						this.showStatus(
+							`Continuing with ${executionModel.role}: ${executionModel.model.name || executionModel.model.id}`,
+						);
+					}
+				};
+				const result = await planMode.approve({
+					review,
+					choice: picked,
+					tierIndex: selectedTierIndex,
+					hooks: {
+						newSession: () => this.handleClearCommand(),
+						// The plan-compact prompt rides as `internalGuidance`: extensions read
+						// `customInstructions` as user focus (issue #4359).
+						compact: (instructions, beforeFlush) =>
+							this.handleCompactCommand(undefined, undefined, beforeFlush, instructions),
+						// The approved prompt blocks for the whole run: leave the review now (issue #5688).
+						beforeDispatch: savedPlanPath => {
+							announce(savedPlanPath);
+							this.#hidePlanReview(pending);
+							this.ui.requestRender();
+						},
+					},
 				});
-				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
+				if (result.dispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
+				else announce(result.savedPlanPath);
 			} catch (error) {
 				this.showError(
 					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
@@ -6877,7 +6218,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (choice === "Refine plan") {
+		if (picked === "refine") {
 			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
 			try {
 				if (refinement.trim()) {
@@ -8035,7 +7376,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const previousSessionId = this.sessionManager.getSessionId();
 		await this.handleClearCommand();
 		if (this.sessionManager.getSessionId() === previousSessionId) return;
-		await this.#applyPlanModeDefault();
+		await this.session.planMode?.applyStartupDefault();
 	}
 
 	handleFreshCommand(): Promise<void> {

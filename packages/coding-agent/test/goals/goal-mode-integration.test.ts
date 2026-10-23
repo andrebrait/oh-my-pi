@@ -264,7 +264,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("never submits a startup objective when plan mode blocks goal activation", async () => {
-		harness.mode.planModeEnabled = true;
+		await harness.mode.enablePlanMode().enter();
 		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
 
 		await harness.mode.startGoalAtStartup("Inspect the importer");
@@ -640,9 +640,14 @@ describe("InteractiveMode goal mode integration", () => {
 		{
 			name: "paused plan mode",
 			hold: mode => {
-				mode.planModePaused = true;
+				// A goal is active, so plan mode cannot really pause here: pin the controller's view.
+				const planMode = mode.enablePlanMode();
+				Object.defineProperty(planMode, "view", {
+					configurable: true,
+					value: { enabled: false, paused: true, planFilePath: undefined },
+				});
 				return () => {
-					mode.planModePaused = false;
+					Reflect.deleteProperty(planMode, "view");
 				};
 			},
 		},
@@ -866,7 +871,7 @@ describe("InteractiveMode goal mode integration", () => {
 
 	it("refuses /goal while plan mode is active", async () => {
 		const showWarning = vi.spyOn(harness.mode, "showWarning");
-		harness.mode.planModeEnabled = true;
+		await harness.mode.enablePlanMode().enter();
 
 		await harness.mode.handleGoalModeCommand("Ship the release");
 
