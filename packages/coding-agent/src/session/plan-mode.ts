@@ -5,15 +5,33 @@
  * It enters and leaves plan mode: the read-only tool set plus `write` for `xd://propose`,
  * the `plan` role model (deferred while a turn streams), the proposal handler and the
  * `plan` / `plan_paused` / `none` journal entries. Exit restores the pre-plan tools and
- * model, and rolls back to plan mode when the restore fails.
+ * model, and rolls back to plan mode when the restore fails. {@link PlanModeController.approve}
+ * applies an approved plan review.
  */
+import * as path from "node:path";
+import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import {
+	replaceTabs,
+	shortenEmbeddedPaths,
+	TRUNCATE_LENGTHS,
+	truncateToWidth,
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { cfgCycleOrder } from "../config/model-settings";
+import { copyLocalArtifacts, type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
+import { humanizePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
+import { autosaveApprovedPlan } from "../plan-mode/plan-autosave";
+import { readPlanFile, resolvePlanFilePath } from "../plan-mode/plan-files";
+import type { PlanApprovalChoice, PlanReviewModel } from "../plan-mode/review";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
+import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import { isMCPToolName } from "../tools/builtin-names";
 import type { AgentSession, AgentSessionEvent } from "./agent-session";
 import type { ResolvedRoleModel } from "./agent-session-types";
@@ -47,10 +65,17 @@ export type PlanModeSession = Pick<
 	| "setModelTemporary"
 	| "setThinkingLevel"
 	| "applyRoleModel"
+	| "getRoleModelCycle"
 	| "getGoalModeState"
 	| "getPlanModeState"
 	| "setPlanModeState"
 	| "getPlanReferencePath"
+	| "setPlanReferencePath"
+	| "markPlanReferenceSent"
+	| "markPlanInternalAbortPending"
+	| "clearPlanInternalAbortPending"
+	| "prompt"
+	| "followUp"
 	| "getEnabledToolNames"
 	| "getMountedXdevToolNames"
 	| "hasBuiltInTool"
@@ -64,7 +89,7 @@ export type PlanModeSession = Pick<
 	| "abort"
 >;
 
-interface ModelState {
+export interface ModelState {
 	model: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
@@ -105,6 +130,11 @@ export class PlanModeController {
 
 	get view(): PlanModeView {
 		return { enabled: this.#enabled, paused: this.#paused, planFilePath: this.#planFilePath };
+	}
+
+	/** The pre-plan model exit restores; kept past an exit that defers the restore until it is applied. */
+	get previousModel(): ModelState | undefined {
+		return this.#previousModelState;
 	}
 
 	async handle(command: { op: RpcPlanOp; planFilePath?: string }): Promise<PlanModeView> {
@@ -279,10 +309,14 @@ export class PlanModeController {
 		const deferredPrev = this.#previousModelState;
 		if (deferredPrev === undefined) return;
 		this.#previousModelState = undefined;
-		if (!executionModel) {
+		if (executionModel) {
+			await this.#applyExecutionModel(executionModel);
+		} else {
 			await this.#restorePreviousModel(deferredPrev);
-			return;
 		}
+	}
+
+	async #applyExecutionModel(executionModel: ResolvedRoleModel): Promise<void> {
 		try {
 			await this.#session.applyRoleModel(executionModel);
 		} catch (error) {
@@ -290,6 +324,143 @@ export class PlanModeController {
 				`Could not switch to the ${executionModel.role} model: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+	}
+
+	/**
+	 * Apply an approved plan review: leave plan mode, then start a new session (`execute`), compact
+	 * the planning transcript (`compact`) or keep it (`keep`), restore the execution tools, move onto
+	 * the picked tier and send the plan-approved prompt. Returns false when nothing was sent: the
+	 * owner declined the new session, or compaction was cancelled (the next turn still gets the plan).
+	 * `compact` runs `beforeFlush` before dispatching input queued during compaction, so that input
+	 * runs on the execution model; `beforeDispatch` runs right before the prompt is queued.
+	 */
+	async approve(input: {
+		review: PlanReviewModel;
+		choice: PlanApprovalChoice;
+		tierIndex?: number;
+		hooks: {
+			newSession(): Promise<boolean>;
+			compact(
+				instructions: string,
+				beforeFlush: (outcome: CompactionOutcome) => Promise<void>,
+			): Promise<CompactionOutcome>;
+			beforeDispatch?(): void;
+		};
+	}): Promise<boolean> {
+		const { review, choice, hooks } = input;
+		const session = this.#session;
+		const sessionManager = session.sessionManager;
+		const { planFilePath, title } = review.details;
+		if (!this.#enabled) throw new Error("Plan mode is not active.");
+		// Resolves `local://` against whichever transcript is current when it is used.
+		const files = this.#planFileOptions();
+		const planContent = await readPlanFile(planFilePath, files);
+		if (!planContent) throw new Error(`Plan file not found at ${planFilePath}`);
+		// Resolved while still in plan mode, as the review was: a role without its own model maps to the live one.
+		const tierIndex = input.tierIndex ?? review.startTierIndex;
+		const tierRole =
+			review.tiers.length > 1 && tierIndex !== review.restoredTierIndex ? review.tiers[tierIndex]?.role : undefined;
+		const executionModel = tierRole
+			? session.getRoleModelCycle(cfgCycleOrder.get(session.settings))?.models.find(entry => entry.role === tierRole)
+			: undefined;
+		const previousPresentation = this.#previousToolPresentation ?? {
+			enabled: session.getEnabledToolNames().filter(name => !isMCPToolName(name)),
+			mounted: session.getMountedXdevToolNames().filter(name => !isMCPToolName(name)),
+		};
+
+		const compact = choice === "compact";
+		// The exit's abort before compaction is internal: keep it silent. Cleared on every outcome.
+		if (compact) session.markPlanInternalAbortPending();
+		let outcome: CompactionOutcome | undefined;
+		try {
+			await this.exit({ paused: false, deferModelRestore: compact });
+			if (choice === "execute") {
+				const oldLocalRoot = path.resolve(resolveLocalRoot(files.localProtocolOptions));
+				if (!(await hooks.newSession())) return false;
+				await copyLocalArtifacts(oldLocalRoot, path.resolve(resolveLocalRoot(files.localProtocolOptions)));
+				await Bun.write(resolvePlanFilePath(planFilePath, files), planContent);
+			} else if (compact) {
+				// Pinned before compaction so input queued during it sees the approved plan.
+				session.setPlanReferencePath(planFilePath);
+				outcome = await hooks.compact(
+					prompt.render(planModeCompactInstructionsPrompt, { planFilePath }),
+					async compactOutcome => {
+						if (compactOutcome !== "failed") await this.applyDeferredModelTransition(executionModel);
+					},
+				);
+			}
+		} finally {
+			session.clearPlanInternalAbortPending();
+		}
+
+		// `read` stays on so the durable plan copy remains reachable if the inline one is lost.
+		const executionTools = previousPresentation.enabled.includes("read")
+			? previousPresentation.enabled
+			: [...previousPresentation.enabled, "read"];
+		await session.restoreNonMCPToolPresentation(executionTools, previousPresentation.mounted);
+		session.setPlanReferencePath(planFilePath);
+		try {
+			await autosaveApprovedPlan({ settings: session.settings, cwd: sessionManager.getCwd(), title, planContent });
+		} catch (error) {
+			const detail = truncateToWidth(
+				shortenEmbeddedPaths(
+					replaceTabs(error instanceof Error ? error.message : String(error))
+						.replace(/[\r\n]+/g, " ")
+						.trim(),
+				),
+				TRUNCATE_LENGTHS.CONTENT,
+			);
+			this.#warn(`Failed to autosave plan: ${detail}`);
+		}
+
+		// Idempotent after `beforeFlush`; covers a compaction that never ran. A cancelled compaction
+		// still moves on (only the compaction was cancelled); a failed one keeps the plan model.
+		if (!compact) {
+			if (executionModel) await this.#applyExecutionModel(executionModel);
+		} else if (outcome !== "failed") {
+			await this.applyDeferredModelTransition(executionModel);
+		}
+		if (outcome === "cancelled") {
+			// The plan reference stays unsent, so the next turn carries the plan.
+			this.#warn(
+				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+			);
+			return false;
+		}
+
+		// The approved prompt bypasses title generation; `auto` never replaces a name the user chose.
+		const seededName = humanizePlanTitle(title);
+		if (seededName && !sessionManager.getSessionName()) await sessionManager.setSessionName(seededName, "auto");
+		session.markPlanReferenceSent();
+		const approvedPrompt = prompt.render(planModeApprovedPrompt, {
+			planFilePath,
+			planContent,
+			contextPreserved: choice !== "execute",
+		});
+		hooks.beforeDispatch?.();
+		// Input queued during compaction may already be running: queue behind it rather than abort it.
+		if (session.isStreaming) {
+			await session.followUp(approvedPrompt, undefined, { synthetic: true });
+		} else {
+			try {
+				await session.prompt(approvedPrompt, { synthetic: true });
+			} catch (error) {
+				if (!(error instanceof AgentBusyError)) throw error;
+				await session.followUp(approvedPrompt, undefined, { synthetic: true });
+			}
+		}
+		return true;
+	}
+
+	#planFileOptions(): { localProtocolOptions: LocalProtocolOptions; cwd: string } {
+		const sessionManager = this.#session.sessionManager;
+		return {
+			localProtocolOptions: {
+				getArtifactsDir: () => sessionManager.getArtifactsDir(),
+				getSessionId: () => sessionManager.getSessionId(),
+			},
+			cwd: sessionManager.getCwd(),
+		};
 	}
 
 	/** The session is being disposed: a deferred switch must not land afterwards. */

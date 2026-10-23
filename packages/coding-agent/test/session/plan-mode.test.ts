@@ -7,6 +7,8 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import { buildPlanReview } from "@oh-my-pi/pi-coding-agent/plan-mode/review";
+import { resolvePlanFilePath } from "@oh-my-pi/pi-coding-agent/plan-mode/plan-files";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { PlanModeController, PlanModeOptions } from "@oh-my-pi/pi-coding-agent/session/plan-mode";
 import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
@@ -115,6 +117,48 @@ function lastModeChange(session: AgentSession): { mode: string; data?: Record<st
 		.filter(entry => entry.type === "mode_change")
 		.at(-1);
 }
+
+/** Where a plan URL lives on disk in the session's current transcript. */
+function planPath(session: AgentSession, planFilePath: string): string {
+	return resolvePlanFilePath(planFilePath, {
+		localProtocolOptions: {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		},
+		cwd: session.sessionManager.getCwd(),
+	});
+}
+
+/** The hidden plan-approved prompts the session has sent. */
+const approvedPrompts = (session: AgentSession): string[] =>
+	session.messages.map(message => JSON.stringify(message)).filter(text => text.includes("Plan approved."));
+
+const PLAN_URL = "local://ship-plan.md";
+const PLAN_TEXT = "# Ship it\n\nStep one.";
+
+/** A plan session whose replies complete at once, in plan mode with {@link PLAN_TEXT} written. */
+async function withApprovalSession(
+	options: TestSessionOptions,
+	run: (session: AgentSession, planMode: PlanModeController) => Promise<void>,
+	planOptions: PlanModeOptions = {},
+): Promise<void> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plan-approval-"));
+	const restoreAgentDir = isolateAgentDir(path.join(dir, "agent"));
+	const session = await createTestSession(dir, { handler: { content: ["ok"] } }, undefined, options);
+	try {
+		const planMode = session.enablePlanMode(planOptions);
+		await planMode.enter({ planFilePath: PLAN_URL });
+		await Bun.write(planPath(session, PLAN_URL), PLAN_TEXT);
+		await run(session, planMode);
+	} finally {
+		await session.dispose();
+		restoreAgentDir();
+		await removeWithRetries(dir);
+	}
+}
+
+const DETAILS = { planFilePath: PLAN_URL, title: "ship-it", planExists: true };
+const noCompaction = (): Promise<never> => Promise.reject(new Error("unexpected compaction"));
 
 describe("session-owned plan mode", () => {
 	test("enter switches to the plan role model and plan tools, and journals plan", async () => {
@@ -836,6 +880,226 @@ describe("session-owned plan mode", () => {
 				// Goal mode adopted the pre-plan tools: leaving the goal must not bring plan's `write` back.
 				await goalMode.handle({ op: "drop" });
 				expect(session.getActiveToolNames()).toEqual(["read"]);
+			});
+		});
+	});
+
+	describe("approval", () => {
+		test("approve execute starts a new session, sets the plan reference and sends the approved prompt", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const firstSession = session.sessionManager.getSessionId();
+				const review = buildPlanReview(session, DETAILS);
+				let messagesAtDispatch: number | undefined;
+				await Bun.write(planPath(session, "local://notes.md"), "notes");
+
+				const dispatched = await planMode.approve({
+					review,
+					choice: "execute",
+					hooks: {
+						newSession: () => session.newSession(),
+						compact: noCompaction,
+						beforeDispatch: () => {
+							messagesAtDispatch = session.messages.length;
+						},
+					},
+				});
+
+				expect(dispatched).toBe(true);
+				expect(session.sessionManager.getSessionId()).not.toBe(firstSession);
+				expect(planMode.view).toEqual({ enabled: false, paused: false, planFilePath: undefined });
+				expect(session.getPlanModeState()).toBeUndefined();
+				expect(session.getPlanReferencePath()).toBe(PLAN_URL);
+				// The plan travels to the new session's local root.
+				expect(await Bun.file(planPath(session, PLAN_URL)).text()).toBe(PLAN_TEXT);
+				// …with the other session-local artifacts.
+				expect(await Bun.file(planPath(session, "local://notes.md")).text()).toBe("notes");
+				expect(session.sessionManager.getSessionName()).toBe("Ship it");
+				expect(session.model?.id).toBe("claude-sonnet-4-5");
+				expect(session.getActiveToolNames()).toEqual(["read"]);
+				expect(messagesAtDispatch).toBe(0);
+				const [approved, ...rest] = approvedPrompts(session);
+				expect(rest).toEqual([]);
+				expect(approved).toContain("Step one.");
+				expect(approved).not.toContain("History usable");
+			});
+		});
+
+		test("approve execute does not re-enter plan mode on the new session", async () => {
+			await withApprovalSession(
+				{ ...readWriteTools(), settings: { ...PLAN_ROLE, "plan.defaultOnStartup": true } },
+				async (session, planMode) => {
+					const dispatched = await planMode.approve({
+						review: buildPlanReview(session, DETAILS),
+						choice: "execute",
+						hooks: { newSession: () => session.newSession(), compact: noCompaction },
+					});
+
+					expect(dispatched).toBe(true);
+					expect(planMode.view.enabled).toBe(false);
+					expect(session.getPlanModeState()).toBeUndefined();
+					expect(modeChanges(session, "plan")).toBe(0);
+					expect(session.getActiveToolNames()).not.toContain("write");
+				},
+			);
+		});
+
+		test("approve execute sends nothing when the owner declines the new session", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const firstSession = session.sessionManager.getSessionId();
+				const dispatched = await planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "execute",
+					hooks: { newSession: async () => false, compact: noCompaction },
+				});
+
+				expect(dispatched).toBe(false);
+				expect(session.sessionManager.getSessionId()).toBe(firstSession);
+				expect(approvedPrompts(session)).toEqual([]);
+			});
+		});
+
+		test("approve compact passes the plan-compact instructions and keeps the transcript", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const firstSession = session.sessionManager.getSessionId();
+				const seen: Record<string, string | undefined> = {};
+				// The reviewed plan can be a newer draft than the one plan mode was entered with.
+				const reviewed = "local://reviewed-plan.md";
+				await Bun.write(planPath(session, reviewed), PLAN_TEXT);
+
+				const dispatched = await planMode.approve({
+					review: buildPlanReview(session, { ...DETAILS, planFilePath: reviewed }),
+					choice: "compact",
+					hooks: {
+						newSession: async () => {
+							throw new Error("unexpected new session");
+						},
+						compact: async (instructions, beforeFlush) => {
+							seen.instructions = instructions;
+							seen.reference = session.getPlanReferencePath();
+							seen.compactingOn = session.model?.id;
+							await beforeFlush("ok");
+							seen.flushedOn = session.model?.id;
+							return "ok";
+						},
+					},
+				});
+
+				expect(dispatched).toBe(true);
+				expect(seen.instructions).toContain("Prepare to execute approved plan");
+				expect(seen.instructions).toContain(reviewed);
+				// The reference is pinned before compaction, so input queued meanwhile sees the plan.
+				expect(seen.reference).toBe(reviewed);
+				// Compaction runs on the plan model; queued input after it runs on the execution model.
+				expect(seen.compactingOn).toBe("claude-haiku-4-5");
+				expect(seen.flushedOn).toBe("claude-sonnet-4-5");
+				expect(session.sessionManager.getSessionId()).toBe(firstSession);
+				expect(planMode.view.enabled).toBe(false);
+				const [approved] = approvedPrompts(session);
+				expect(approved).toContain("History usable");
+			});
+		});
+
+		test("approve with a cancelled compaction leaves plan mode, sends nothing and warns", async () => {
+			const warnings: string[] = [];
+			await withApprovalSession(
+				readWriteTools(),
+				async (session, planMode) => {
+					const dispatched = await planMode.approve({
+						review: buildPlanReview(session, DETAILS),
+						choice: "compact",
+						hooks: {
+							newSession: async () => false,
+							compact: async (_instructions, beforeFlush) => {
+								await beforeFlush("cancelled");
+								return "cancelled";
+							},
+						},
+					});
+
+					expect(dispatched).toBe(false);
+					expect(approvedPrompts(session)).toEqual([]);
+					expect(warnings).toEqual([
+						"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+					]);
+					// Only the compaction was cancelled, not the approval: the next turn runs the plan.
+					expect(planMode.view.enabled).toBe(false);
+					expect(session.getPlanReferencePath()).toBe(PLAN_URL);
+					expect(session.model?.id).toBe("claude-sonnet-4-5");
+					expect(session.getActiveToolNames()).toEqual(["read"]);
+				},
+				{ onWarning: text => warnings.push(text) },
+			);
+		});
+
+		test("approve with a failed compaction stays on the plan model and still dispatches", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const dispatched = await planMode.approve({
+					review: buildPlanReview(session, DETAILS),
+					choice: "compact",
+					hooks: {
+						newSession: async () => false,
+						compact: async (_instructions, beforeFlush) => {
+							await beforeFlush("failed");
+							return "failed";
+						},
+					},
+				});
+
+				expect(dispatched).toBe(true);
+				expect(session.model?.id).toBe("claude-haiku-4-5");
+				expect(approvedPrompts(session)).toHaveLength(1);
+			});
+		});
+
+		test("approve keep runs on the selected tier, and the restored tier keeps the pre-plan model", async () => {
+			const roles = {
+				modelRoles: {
+					plan: "anthropic/claude-haiku-4-5",
+					smol: "anthropic/claude-haiku-4-5",
+					default: "anthropic/claude-opus-4-5",
+					slow: "anthropic/claude-sonnet-4-5",
+				},
+			};
+			for (const [tierIndex, model, role] of [
+				[undefined, "claude-opus-4-5", "default"],
+				[2, "claude-sonnet-4-5", "temporary"],
+				[0, "claude-haiku-4-5", "smol"],
+			] as const) {
+				await withApprovalSession({ ...readWriteTools(), settings: roles }, async (session, planMode) => {
+					const firstSession = session.sessionManager.getSessionId();
+					const review = buildPlanReview(session, DETAILS);
+					expect(review.restoredTierIndex).toBe(2);
+
+					const dispatched = await planMode.approve({
+						review,
+						choice: "keep",
+						tierIndex,
+						hooks: { newSession: async () => false, compact: noCompaction },
+					});
+
+					expect(dispatched).toBe(true);
+					expect(session.sessionManager.getSessionId()).toBe(firstSession);
+					expect(session.model?.id).toBe(model);
+					// The restored tier is not applied again: exit's temporary restore is the last switch.
+					expect(session.sessionManager.getLastModelChangeRole()).toBe(role);
+					expect(approvedPrompts(session)[0]).toContain("History usable");
+				});
+			}
+		});
+
+		test("approve is refused outside plan mode", async () => {
+			await withApprovalSession(readWriteTools(), async (session, planMode) => {
+				const review = buildPlanReview(session, DETAILS);
+				await planMode.exit({ paused: true });
+
+				await expect(
+					planMode.approve({
+						review,
+						choice: "keep",
+						hooks: { newSession: async () => false, compact: noCompaction },
+					}),
+				).rejects.toThrow("Plan mode is not active.");
+				expect(approvedPrompts(session)).toEqual([]);
 			});
 		});
 	});
