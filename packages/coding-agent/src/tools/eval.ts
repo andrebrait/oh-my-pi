@@ -62,7 +62,7 @@ import {
 	cfgEvalAutoProvision,
 	cfgEvalToolsEnabled,
 } from "../eval/settings";
-import { cfgTaskMaxRecursionDepth } from "../task/settings";
+import { cfgTaskMaxRecursionDepth, cfgTaskPerCallModel } from "../task/settings";
 import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./settings";
 
 /** Language tokens the eval tool accepts, in stable display order. */
@@ -196,6 +196,8 @@ export interface EvalToolDescriptionOptions {
 	toolNames?: readonly string[];
 	/** Configured global ceiling for nonzero cell deadlines. */
 	maxTimeout?: number;
+	/** `task.perCallModel` is not `off`: advertise `model` on `agent()`/`workpool()`. Default: false. */
+	perCallModel?: boolean;
 }
 
 function evalTemplateContext(options: EvalToolDescriptionOptions) {
@@ -215,6 +217,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		timeoutMax: TOOL_TIMEOUTS.eval.max,
 		configuredMaxTimeout: options.maxTimeout !== undefined && options.maxTimeout > 0 ? options.maxTimeout : undefined,
 		timeoutCeiling: clampTimeout("eval", TOOL_TIMEOUTS.eval.max, options.maxTimeout),
+		perCallModel: options.perCallModel ?? false,
 	};
 }
 
@@ -384,6 +387,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 			toolNames: session.getEvalBridgeToolNames?.(),
 			maxTimeout: cfgToolsMaxTimeout.get(session.settings),
+			perCallModel: cfgTaskPerCallModel.get(session.settings) !== "off",
 		};
 	}
 
