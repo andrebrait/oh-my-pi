@@ -12,6 +12,7 @@
  * frame is observable.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fsp from "node:fs/promises";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -32,6 +33,7 @@ import type {
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { instrumentRelay, waitFor } from "./helpers/throttled-host";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
 // ./helpers/in-memory-relay), same contract as the other collab tests.
@@ -241,7 +243,11 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 		},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
-		eventController: { handleEvent: () => Promise.resolve(), takeDisplaceableComponents: () => [] },
+		eventController: {
+			dispatchSessionEvent: () => Promise.resolve(),
+			takeDisplaceableComponents: () => [],
+			resetTranscriptAnchors: () => {},
+		},
 		syncRunningSubagentBadge: () => {},
 		showHookSelector: (
 			title: string,
@@ -278,16 +284,20 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 
 const harnessCleanups: (() => Promise<void>)[] = [];
 let writeSpy: { mockRestore(): void } | null = null;
+let renameSpy: { mockRestore(): void } | null = null;
 
 beforeEach(() => {
 	installInMemoryRelay();
 	writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+	renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
 	for (const cleanup of harnessCleanups.splice(0).reverse()) await cleanup();
 	writeSpy?.mockRestore();
+	renameSpy?.mockRestore();
 	writeSpy = null;
+	renameSpy = null;
 	uninstallInMemoryRelay();
 });
 
@@ -806,6 +816,54 @@ function makeAskHostContext(): InteractiveModeContext {
 	};
 	return stub as unknown as InteractiveModeContext;
 }
+
+describe("guest ask host reconnect", () => {
+	it.each(["guest", "host"])("lets a writer answer an open ask after a %s disconnect", async disconnect => {
+		const relay = installInMemoryRelay();
+		const probe = instrumentRelay(relay, { throttle: false });
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		const abort = new AbortController();
+		const firstGuest = await joinRawGuest(host.link, COLLAB_PROTO);
+		let rejoined: { socket: CollabSocket; nextFrame(): Promise<CollabFrame> } | undefined;
+		try {
+			expect((await firstGuest.nextFrame()).t).toBe("welcome");
+			const result = controller.showAskDialog(
+				[{ id: "lock", question: "How should it lock?", options: [{ label: "ACCESS EXCLUSIVE" }] }],
+				{ signal: abort.signal },
+			);
+			expect((await firstGuest.nextFrame()).t).toBe("ui-request");
+
+			if (disconnect === "host") {
+				const previousSocket = probe.hostSocket();
+				previousSocket.close();
+				await waitFor(() => probe.hostSocket() !== previousSocket && host.relayConnected, "host did not reconnect");
+			} else {
+				firstGuest.socket.close();
+			}
+			rejoined = await joinRawGuest(host.link, COLLAB_PROTO);
+			expect((await rejoined.nextFrame()).t).toBe("welcome");
+			// A directed error is a barrier: a retained ask must arrive before it.
+			rejoined.socket.send({ t: "agent-cmd", cmd: "chat", agentId: "barrier", text: "" });
+			const request = await rejoined.nextFrame();
+			expect(request.t).toBe("ui-request");
+			if (request.t !== "ui-request") throw new Error("pending ask was lost across the host reconnect");
+			rejoined.socket.send({ t: "ui-response", reqId: request.request.reqId, value: "ACCESS EXCLUSIVE" });
+			expect(await result).toMatchObject({
+				kind: "submit",
+				results: [{ id: "lock", selectedOptions: ["ACCESS EXCLUSIVE"] }],
+			});
+		} finally {
+			abort.abort();
+			firstGuest.socket.close();
+			rejoined?.socket.close();
+			await host.stop("test done");
+		}
+	});
+});
 
 describe("guest ask room ownership", () => {
 	it.each(["next question", "custom answer"])("does not mirror a %s to a successor room", async followup => {

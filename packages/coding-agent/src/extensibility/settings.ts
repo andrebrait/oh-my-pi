@@ -80,6 +80,12 @@ export const cfgSkillsIncludeSkills = register({
 	default: EMPTY_STRING_ARRAY,
 });
 
+export const cfgSkillsOptInSkills = register({
+	id: "skills.optInSkills",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
 /** Skill discovery options (`skills.*` except the `omp skill` registry URL). */
 export const cfgSkills = combine({
 	enabled: cfgSkillsEnabled,
@@ -94,6 +100,7 @@ export const cfgSkills = combine({
 	customDirectories: cfgSkillsCustomDirectories,
 	ignoredSkills: cfgSkillsIgnoredSkills,
 	includeSkills: cfgSkillsIncludeSkills,
+	optInSkills: cfgSkillsOptInSkills,
 });
 
 /** Skill discovery options ({@link cfgSkills}); omitted fields fall back to the setting defaults. */
@@ -158,5 +165,31 @@ export const cfgExtensionHandlersToolCallTimeoutMs = register({
 		label: "Tool Call Handler Timeout (ms)",
 		description:
 			"Positive finite active-work timeout for extension tool_call handlers; invalid values use 30000ms, and time awaiting OMP-owned dialogs does not count",
+	},
+});
+
+export const cfgExtensionHandlersModeControl = register({
+	id: "extensionHandlers.modeControl",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tools",
+		group: "Extensions",
+		label: "Extension Mode Control",
+		description:
+			"Let extensions enter and exit plan, vibe, goal, and loop modes via ctx.sessionModes.set(); reading mode state stays available",
+	},
+});
+
+export const cfgExtensionAssistantTextRenderers = register({
+	id: "extensionRenderers.assistantText",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tools",
+		group: "Extensions",
+		label: "Extension Reply Renderers",
+		description:
+			"Let extensions change how assistant replies are drawn, redraw a reply in place, and receive clicks on their own links; the session, exports and model context keep the reply as written",
 	},
 });
