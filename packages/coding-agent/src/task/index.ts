@@ -65,6 +65,7 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
+	invalidModelSelectorReason,
 	renderSubagentUserPrompt,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
@@ -89,6 +90,7 @@ import {
 	cfgTaskMaxConcurrency,
 	cfgTaskMaxRecursionDepth,
 	cfgTaskMaxRuntimeMs,
+	cfgTaskPerCallModel,
 	cfgTaskSpeculativeLaunch,
 	cfgTaskStructured,
 } from "./settings";
@@ -156,6 +158,7 @@ interface TaskDescriptionOptions {
 	disabledAgents: string[];
 	batchEnabled: boolean;
 	effortEnabled: boolean;
+	perCallModel: "off" | "unpinned" | "on";
 	evalToolsEnabled: boolean;
 	structured: boolean;
 	file: boolean;
@@ -207,6 +210,8 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		applyIsolatedChanges: options.applyIsolatedChanges,
 		batchEnabled: options.batchEnabled,
 		effortEnabled: options.effortEnabled,
+		perCallModelEnabled: options.perCallModel !== "off",
+		perCallModelUnpinnedOnly: options.perCallModel === "unpinned",
 		evalToolsEnabled: options.evalToolsEnabled,
 		structured: options.structured,
 		file: options.file,
@@ -291,7 +296,16 @@ function validateTaskInput(item: TaskItem | undefined, label: string, fileEnable
 	return undefined;
 }
 
-function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnabled: boolean): string | undefined {
+/**
+ * `isSeanceItem` marks items for the advertised bundled seance, whose own
+ * `model` is checked by {@link validateSeanceParams}, not the per-call rules.
+ */
+function validateSpawnParams(
+	params: TaskParams,
+	batchEnabled: boolean,
+	fileEnabled: boolean,
+	isSeanceItem: (agent: string | undefined) => boolean,
+): string | undefined {
 	const tasks = params.tasks;
 	if (
 		!fileEnabled &&
@@ -308,14 +322,13 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 		}
 		for (let i = 0; i < tasks.length; i++) {
 			const item = tasks[i];
-			const inputError = validateTaskInput(
-				item,
-				`Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`,
-				fileEnabled,
-			);
+			const label = `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`;
+			const inputError = validateTaskInput(item, label, fileEnabled);
 			if (inputError) return inputError;
-			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			const effortError = validateEffort(item.effort, label);
 			if (effortError) return effortError;
+			const modelError = isSeanceItem(item.agent) ? undefined : invalidModelSelectorReason(item.model, label);
+			if (modelError) return modelError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -336,7 +349,11 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean, fileEnab
 	if (batchEnabled && params.task === undefined && params.taskFile === undefined) {
 		return "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`.";
 	}
-	return validateTaskInput(params, "The call", fileEnabled) ?? validateEffort(params.effort, "The call");
+	return (
+		validateTaskInput(params, "The call", fileEnabled) ??
+		validateEffort(params.effort, "The call") ??
+		(isSeanceItem(params.agent) ? undefined : invalidModelSelectorReason(params.model, "The call"))
+	);
 }
 
 /**
@@ -460,7 +477,12 @@ function planSpawns(
 	const params = repairTaskParams(rawParams as TaskParams);
 	const error =
 		validateShapeParams(batchEnabled, params) ??
-		validateSpawnParams(params, batchEnabled, fileEnabled) ??
+		validateSpawnParams(
+			params,
+			batchEnabled,
+			fileEnabled,
+			agent => seanceAdvertised && (agent?.trim() || defaultAgent) === SEANCE_AGENT_NAME,
+		) ??
 		validateSeanceParams({ params, batchEnabled, defaultAgent, seanceAdvertised });
 	if (error) return error;
 	const items = resolveSpawnItems(params);
@@ -825,6 +847,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			file: cfgTaskFile.get(this.session.settings),
 			defaultAgent: this.#defaultAgent(),
 			seanceFields: this.#seanceSchemaFields(),
+			perCallModel: cfgTaskPerCallModel.get(this.session.settings) !== "off",
 		});
 	}
 
@@ -858,6 +881,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			disabledAgents,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
+			perCallModel: cfgTaskPerCallModel.get(this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			structured: this.#isStructured(),
 			file: cfgTaskFile.get(this.session.settings),
