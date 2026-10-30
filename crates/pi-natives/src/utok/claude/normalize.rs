@@ -111,7 +111,7 @@ fn lowers_to_self(c: char) -> bool {
 /// Append one character's UTF-8 bytes.
 #[inline]
 fn push_char(c: char, out: &mut Vec<u8>) {
-	let mut buf = [0u8; 4];
+	let mut buf = [0u8; char::MAX_LEN_UTF8];
 	out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
@@ -654,7 +654,8 @@ fn case_form(span: &str, allcaps_min: Option<usize>, head_mark: bool) -> CaseFor
 			|| matches!(
 				c.general_category_group(),
 				GeneralCategoryGroup::Letter | GeneralCategoryGroup::Mark
-			)) && !is_lower_x(c)
+			))
+			&& !is_lower_x(c)
 			&& (!is_upper_x(c) || lowers_to_self(c))
 	});
 	if let Some(min) = allcaps_min

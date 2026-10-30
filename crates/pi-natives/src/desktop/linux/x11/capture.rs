@@ -130,7 +130,7 @@ impl X11Capture {
 				.and_then(|cookie| cookie.reply().ok())
 				.map_or_else(
 					|| format!("Monitor {}", monitor.name),
-					|atom| String::from_utf8_lossy(&atom.name).into_owned(),
+					|atom| String::from_utf8_lossy_owned(atom.name),
 				);
 			displays.push(DesktopDisplay {
 				id: monitor.name.to_string(),
@@ -249,12 +249,10 @@ impl X11Capture {
 			let title = self
 				.property(id, name_atom, utf8_atom, 1024)
 				.or_else(|| self.property(id, AtomEnum::WM_NAME.into(), AtomEnum::ANY, 1024))
-				.map(|reply| String::from_utf8_lossy(&reply.value).into_owned())
-				.unwrap_or_default();
+				.map_or_default(|reply| String::from_utf8_lossy_owned(reply.value));
 			let app = self
 				.property(id, AtomEnum::WM_CLASS.into(), AtomEnum::STRING, 1024)
-				.map(|reply| parse_wm_class(&reply.value))
-				.unwrap_or_default();
+				.map_or_default(|reply| parse_wm_class(&reply.value));
 			let pid = self
 				.property(id, pid_atom, AtomEnum::CARDINAL, 1)
 				.and_then(|reply| reply.value32()?.next());
@@ -466,8 +464,7 @@ fn parse_wm_class(value: &[u8]) -> String {
 	parts
 		.next()
 		.or(instance)
-		.map(|part| String::from_utf8_lossy(part).into_owned())
-		.unwrap_or_default()
+		.map_or_default(|part| String::from_utf8_lossy(part).into_owned())
 }
 
 fn zpixmap_to_rgba(

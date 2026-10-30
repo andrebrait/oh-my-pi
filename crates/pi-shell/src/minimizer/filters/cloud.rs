@@ -525,11 +525,14 @@ fn generic_columns(rows: &[Map<String, Value>]) -> Vec<String> {
 			if (matches!(
 				lower.as_str(),
 				"id"
-					| "name" | "arn"
-					| "status" | "state"
+					| "name"
+					| "arn"
+					| "status"
+					| "state"
 					| "created"
 					| "modified"
-					| "type" | "engine"
+					| "type"
+					| "engine"
 					| "version"
 			) || lower.ends_with("id")
 				|| lower.ends_with("name")
@@ -1284,7 +1287,7 @@ fn is_important_line(line: &str) -> bool {
 			.is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 	}) || line
 		.as_bytes()
-		.windows(b"EXCEPTION".len())
+		.array_windows::<{ b"EXCEPTION".len() }>()
 		.any(|window| window.eq_ignore_ascii_case(b"EXCEPTION"))
 }
 

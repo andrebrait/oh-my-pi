@@ -227,6 +227,8 @@ impl Backend for WaylandBackend {
 				"unavailable".to_string()
 			},
 			display_count: self.displays.len() as u32,
+			screen_locked: false,
+			display_asleep: false,
 		}
 	}
 
@@ -246,7 +248,8 @@ impl Backend for WaylandBackend {
 		#[cfg(feature = "wayland-pipewire")]
 		{
 			// ScreenCast exposes geometry only when opening a stream. Enumeration
-			// can use the last snapshot, but coordinate delivery needs fresh bounds.
+			// can use the last snapshot, but coordinate delivery needs fresh
+			// bounds.
 			let geometry = capture::geometry();
 			control::check()?;
 			let geometry = geometry.map_err(|error| {
