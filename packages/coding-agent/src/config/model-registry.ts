@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
-import { type AuthApiKeyOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
+import { type AuthApiKeyOptions, type AuthPeekOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
@@ -8,7 +8,6 @@ import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-co
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
 import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
-import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-ai/stream";
 import type {
 	Api,
 	Context,
@@ -19,7 +18,7 @@ import type {
 	ThinkingConfig,
 } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import { buildDiscoveredModel, buildModel } from "@oh-my-pi/pi-catalog/build";
+import { buildDiscoveredModel, buildModel, nextBuildPriceChange } from "@oh-my-pi/pi-catalog/build";
 import { collapseBuiltVariants } from "@oh-my-pi/pi-catalog/compat/collapse";
 import {
 	clampCodexContextWindow,
@@ -27,7 +26,7 @@ import {
 	resolveMaxContextWindow,
 } from "@oh-my-pi/pi-catalog/compat/context-window";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "@oh-my-pi/pi-catalog/identity/metrics";
-import { getModelCacheWriteStats, readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { getModelCacheWriteStats, readModelCache, retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
 	fingerprintStaticModels,
@@ -48,9 +47,11 @@ import {
 } from "@oh-my-pi/pi-catalog/provider-models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { apiServesKind, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
 import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
+import { redactUrlForLog } from "../mcp/json-rpc";
 import type { AuthStorage } from "../session/auth-storage";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
 import type { ConfigError, ConfigFile } from "./config-file";
@@ -82,6 +83,7 @@ import {
 	getImplicitOllamaBaseUrl,
 	getOllamaContextLengthOverride,
 	isDiscoveryAuthRejection,
+	LLAMA_CPP_DEFAULT_BASE_URLS,
 	normalizeBareDiscoveryBaseUrl,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
@@ -151,6 +153,8 @@ setCodexAttestationProvider(generateCodexAttestation);
 
 /** One built-in discovery pass rewriting more payload rows than this is debug-logged. */
 const MODEL_CACHE_REWRITE_LOG_THRESHOLD = 5;
+/** `scheme://user:pass@` in free text (e.g. a fetch error echoing the request URL). */
+const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
 const BUILT_IN_MODEL_MANAGER_PROVIDER_IDS: Readonly<Record<string, true>> = Object.freeze(
 	Object.fromEntries(
 		[...PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId), ...SPECIAL_MODEL_MANAGER_PROVIDER_IDS].map(
@@ -323,8 +327,35 @@ export class ModelRegistry {
 	#commandConfigsByProvider: Map<string, Set<string>> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
+	/**
+	 * Local providers registered without a models.yml entry (ollama, llama.cpp,
+	 * lm-studio, apple). Their models sort after every other provider's, so a
+	 * bare id the user also defined in models.yml resolves to the configured one.
+	 */
+	#implicitLocalProviders: Set<string> = new Set();
+	/** Implicit local provider → env var that set its discovery endpoint. */
+	#implicitProviderEndpointEnv: Map<string, string> = new Map();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
+	/**
+	 * Last `mergeDiscoveredModel` result per discovered row. Every refresh
+	 * re-resolves each built-in provider, and offline (or unchanged online)
+	 * passes hand back the same bundled/cached row objects against the same
+	 * references, so re-running the full model build for thousands of rows is
+	 * pure repetition. A changed reference or provider override misses, and so
+	 * does reaching the next dated price card the build would select. Held per
+	 * registry (not tagged onto the rows): bundled rows outlive every registry,
+	 * so their merges must be collected with the registry.
+	 */
+	#discoveredMergeMemo = new WeakMap<
+		Model<Api>,
+		{
+			reference: Model<Api> | undefined;
+			override: ProviderOverride | undefined;
+			merged: Model<Api>;
+			validUntil: number;
+		}
+	>();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
@@ -392,8 +423,32 @@ export class ModelRegistry {
 		this.#catalogMetrics.add(models);
 	}
 
-	#withCatalogMetrics(models: Model<Api>[]): Model<Api>[] {
-		return applyCatalogMetrics(models, this.#catalogMetrics);
+	/** Final pass over every published model list: catalog metrics, then implicit local providers last. */
+	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
+		return this.#orderImplicitProvidersLast(applyCatalogMetrics(models, this.#catalogMetrics));
+	}
+
+	/**
+	 * Stable-partition implicit local provider models after all others. Model
+	 * resolution breaks ties between equally ranked candidates by list order, so
+	 * this keeps an auto-discovered endpoint (e.g. `OLLAMA_BASE_URL`) from
+	 * shadowing a same-named model the user configured explicitly.
+	 */
+	#orderImplicitProvidersLast(models: Model<Api>[]): Model<Api>[] {
+		const implicit = this.#implicitLocalProviders;
+		if (implicit.size === 0) return models;
+		let sawImplicit = false;
+		for (const model of models) {
+			if (implicit.has(model.provider)) {
+				sawImplicit = true;
+			} else if (sawImplicit) {
+				const explicit: Model<Api>[] = [];
+				const deferred: Model<Api>[] = [];
+				for (const candidate of models) (implicit.has(candidate.provider) ? deferred : explicit).push(candidate);
+				return explicit.concat(deferred);
+			}
+		}
+		return models;
 	}
 
 	/**
@@ -580,7 +635,11 @@ export class ModelRegistry {
 		if (this.#backgroundRefresh) {
 			return;
 		}
-		const refreshPromise = this.refresh(strategy)
+		// `refresh()` synchronously reloads static config, which can reset startup
+		// discovery states. Start it on a microtask so a caller can validate
+		// against the hydrated startup catalog right after kicking the refresh off.
+		const refreshPromise = Promise.resolve()
+			.then(() => this.refresh(strategy))
 			.catch(error => {
 				logger.warn("background model refresh failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -825,7 +884,7 @@ export class ModelRegistry {
 					candidate.provider === base.provider && candidate.id === base.id ? patchedResolved : candidate,
 				);
 			}
-			this.#models = this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+			this.#models = this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
 			return resolveProviderModelReference(current.provider, current.id, this.#models) ?? patchedBase;
 		}
 		const patched = applyModelPatch(current, patch, "merge");
@@ -952,7 +1011,11 @@ export class ModelRegistry {
 		return this.#configError;
 	}
 
-	/** Drain non-fatal file diagnostics, reporting each key path once per registry. */
+	/**
+	 * Drain non-fatal diagnostics: models.yml key problems (once per key path)
+	 * and discovery failures of env-redirected built-in providers (once per
+	 * distinct error).
+	 */
 	drainConfigWarnings(): string[] {
 		const warnings = this.#configWarnings;
 		this.#configWarnings = [];
@@ -1182,7 +1245,7 @@ export class ModelRegistry {
 		const projectFullCatalog = providerFilter !== undefined && this.#runtimeModelModifiers.size > 0;
 		const compositionFilter = projectFullCatalog ? undefined : providerFilter;
 		const unprojected = this.#projectBaseModels(this.#composeBaseModels(compositionFilter), compositionFilter);
-		const projected = this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(unprojected));
+		const projected = this.#finalizeModels(this.#applyRuntimeModelModifiers(unprojected));
 		const selected = projectFullCatalog ? projected.filter(model => providerFilter.has(model.provider)) : projected;
 		return this.#internStaticModels(selected);
 	}
@@ -1192,7 +1255,7 @@ export class ModelRegistry {
 			this.#baseModels = this.#composeBaseModels();
 			this.#unprojectedModels = this.#projectBaseModels(this.#baseModels);
 			this.#models = this.#internStaticModels(
-				this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(this.#unprojectedModels)),
+				this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels)),
 			);
 			this.#hasFullSnapshot = true;
 			this.#providerLookupSnapshots.clear();
@@ -1290,6 +1353,11 @@ export class ModelRegistry {
 		);
 	}
 
+	/**
+	 * Credential-less cache namespace. Wrong for credential-scoped providers
+	 * (`isCredentialScopedModelCacheProvider`), whose discovery writes hash the
+	 * credential in; those load only through their model manager.
+	 */
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
@@ -1304,6 +1372,7 @@ export class ModelRegistry {
 	} {
 		const modelsByProvider = new Map<string, Model<Api>[]>();
 		const authoritativeFreshProviders = new Set<string>();
+		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
 		for (const providerId of providerIds) {
 			const cacheProviderId = this.#resolveStartupModelCacheProviderId(providerId);
 			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
@@ -1473,6 +1542,7 @@ export class ModelRegistry {
 
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
+		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
 		for (const providerConfig of this.#discoverableProviders) {
 			const cacheProviderId = this.#configuredDiscoveryCacheProviderId(providerConfig);
 			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
@@ -1556,6 +1626,9 @@ export class ModelRegistry {
 				)
 			: withDecoderMetadata;
 
+		// User config plumbing, not catalog policy: an ollama provider configured
+		// for Responses moves its completions-discovered rows onto that API.
+		// KDL `api-routes` key on model ids and cannot see the provider config.
 		if (providerConfig.provider !== "ollama" || providerConfig.api !== "openai-responses") {
 			return withRemoteCompaction;
 		}
@@ -1583,32 +1656,43 @@ export class ModelRegistry {
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		this.#implicitLocalProviders.clear();
+		this.#implicitProviderEndpointEnv.clear();
 		for (const provider of ["local", "web"]) {
 			if (!disabledProviders.has(provider)) this.#keylessProviders.add(provider);
 		}
-		const hasOllamaEndpointOverride = Boolean(Bun.env.OLLAMA_BASE_URL?.trim() || Bun.env.OLLAMA_HOST?.trim());
+		const ollamaEndpointEnv = Bun.env.OLLAMA_BASE_URL?.trim()
+			? "OLLAMA_BASE_URL"
+			: Bun.env.OLLAMA_HOST?.trim()
+				? "OLLAMA_HOST"
+				: undefined;
 		if (!configuredProviders.has("ollama") && !disabledProviders.has("ollama")) {
 			this.#discoverableProviders.push({
 				provider: "ollama",
 				api: "openai-responses",
 				baseUrl: getImplicitOllamaBaseUrl(),
 				discovery: { type: "ollama" },
-				optional: !hasOllamaEndpointOverride,
+				optional: ollamaEndpointEnv === undefined,
 			});
 			this.#keylessProviders.add("ollama");
+			this.#implicitLocalProviders.add("ollama");
+			if (ollamaEndpointEnv) this.#implicitProviderEndpointEnv.set("ollama", ollamaEndpointEnv);
 		}
 		if (!configuredProviders.has("llama.cpp") && !disabledProviders.has("llama.cpp")) {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
 				api: "openai-responses",
-				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
+				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || LLAMA_CPP_DEFAULT_BASE_URLS[0],
 				discovery: { type: "llama.cpp" },
 				optional: !Bun.env.LLAMA_CPP_BASE_URL,
+				fallbackBaseUrls: Bun.env.LLAMA_CPP_BASE_URL ? undefined : LLAMA_CPP_DEFAULT_BASE_URLS.slice(1),
 			});
 			// Only mark as keyless if no API key is configured
 			if (this.authStorage.keys.source("llama.cpp") === undefined) {
 				this.#keylessProviders.add("llama.cpp");
 			}
+			this.#implicitLocalProviders.add("llama.cpp");
+			if (Bun.env.LLAMA_CPP_BASE_URL) this.#implicitProviderEndpointEnv.set("llama.cpp", "LLAMA_CPP_BASE_URL");
 		}
 		if (
 			process.platform === "darwin" &&
@@ -1624,6 +1708,7 @@ export class ModelRegistry {
 				optional: true,
 			});
 			this.#keylessProviders.add("apple");
+			this.#implicitLocalProviders.add("apple");
 		}
 		if (!configuredProviders.has("lm-studio") && !disabledProviders.has("lm-studio")) {
 			this.#discoverableProviders.push({
@@ -1634,6 +1719,8 @@ export class ModelRegistry {
 				optional: !Bun.env.LM_STUDIO_BASE_URL,
 			});
 			this.#keylessProviders.add("lm-studio");
+			this.#implicitLocalProviders.add("lm-studio");
+			if (Bun.env.LM_STUDIO_BASE_URL) this.#implicitProviderEndpointEnv.set("lm-studio", "LM_STUDIO_BASE_URL");
 		}
 	}
 
@@ -1808,6 +1895,9 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
 	): Promise<void> {
+		// One cache connection for the whole pass: every provider manager reads
+		// (and may write) its row, which would otherwise reopen the database each time.
+		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
 			providerFilter
@@ -1852,7 +1942,7 @@ export class ModelRegistry {
 		const referenceModels = this.#composeDiscoveryReferenceModels(touchedProviders);
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
-				mergeDiscoveredModel(
+				this.#mergeDiscoveredModelMemoized(
 					model,
 					resolveProviderModelReference(model.provider, model.id, referenceModels),
 					this.#providerOverrides.get(model.provider),
@@ -1902,7 +1992,24 @@ export class ModelRegistry {
 		}
 		this.#baseModels = this.#mergeResolvedModels(baseModels, discoveredModels);
 		this.#unprojectedModels = this.#projectBaseModels(this.#baseModels);
-		this.#models = this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+		this.#models = this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+	}
+
+	#mergeDiscoveredModelMemoized(
+		model: Model<Api>,
+		reference: Model<Api> | undefined,
+		override: ProviderOverride | undefined,
+	): Model<Api> {
+		const now = Date.now();
+		const memo = this.#discoveredMergeMemo.get(model);
+		if (memo && memo.reference === reference && memo.override === override && now < memo.validUntil) {
+			return memo.merged;
+		}
+		const merged = mergeDiscoveredModel(model, reference, override);
+		// Measured before the build: a card falling due mid-build expires the memo at once.
+		const validUntil = nextBuildPriceChange(model.cost, now);
+		this.#discoveredMergeMemo.set(model, { reference, override, merged, validUntil });
+		return merged;
 	}
 
 	/**
@@ -1931,6 +2038,15 @@ export class ModelRegistry {
 		return discovery;
 	}
 
+	/**
+	 * Namespace suffix for the `discovery.advertisedReasoning` opt-out. Rows built
+	 * under one mode must never satisfy the other's cache read: under the
+	 * `offline` strategy nothing else refetches them.
+	 */
+	advertisedReasoningCacheSuffix(providerConfig: DiscoveryProviderConfig): string {
+		return providerConfig.discovery.advertisedReasoning === false ? "advertised-off-context-v5" : "context-v5";
+	}
+
 	#configuredDiscoveryCacheProviderId(providerConfig: DiscoveryProviderConfig): string {
 		if (providerConfig.discovery.type === "ollama") {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
@@ -1939,18 +2055,36 @@ export class ModelRegistry {
 			// context-v3 invalidates rows cached before server-advertised input
 			// modalities were parsed from `/v1/models`; warm v2 rows pinned
 			// vision-capable ids at `input: ["text"]` until a forced refresh.
+			// context-v4 invalidates rows cached before
+			// `top_provider.max_completion_tokens` was read; warm v3 rows kept
+			// the bundled reference's larger output limit and the provider
+			// rejected every request.
+			// context-v5 invalidates rows cached before a row's advertised
+			// reasoning ladder outranked the bundled reference; warm v4 rows kept
+			// `reasoning: false` (ids absent from the catalog) or an inherited
+			// `omitReasoningEffort`, so no effort dial appeared until a refresh.
 			// `injectV1: false` additionally splits off its own namespace: rows
 			// cached from the `/v1`-injected URL can hold a different (smaller)
 			// model set and must never satisfy a bare provider's cache read.
 			return providerConfig.discovery.injectV1 === false
-				? `${providerConfig.provider}:openai-models-list-bare-context-v3`
-				: `${providerConfig.provider}:openai-models-list-context-v3`;
+				? `${providerConfig.provider}:openai-models-list-bare-${this.advertisedReasoningCacheSuffix(providerConfig)}`
+				: `${providerConfig.provider}:openai-models-list-${this.advertisedReasoningCacheSuffix(providerConfig)}`;
+		}
+		if (providerConfig.discovery.type === "proxy") {
+			// proxy-v2 invalidates rows cached before a proxy row's advertised
+			// reasoning ladder was read; warm v1 rows (stored under the bare
+			// provider id) pinned gateway ids at `reasoning: false`. The opt-out
+			// gets its own namespace for the same reason it does above: under the
+			// `offline` strategy nothing else would refetch the other mode's rows.
+			return `${providerConfig.provider}:proxy-v2-${this.advertisedReasoningCacheSuffix(providerConfig)}`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
-			// rich-v5 invalidates rows written before discovery filtered known
-			// non-conversational modes. Keep this in lockstep with the catalog
-			// package's `litellm:rich-vN` namespace whenever mapping behavior changes.
-			return `${providerConfig.provider}:litellm-rich-v5`;
+			// rich-v7 invalidates incomplete /v2/model/info rosters cached before
+			// pagination. rich-v6 moved decisions-mode groups to the Decisions
+			// runner; rich-v5 filtered known non-conversational modes. Bump this
+			// namespace alongside the catalog package's `litellm:rich-vN` when
+			// discovery behavior changes.
+			return `${providerConfig.provider}:litellm-rich-v7`;
 		}
 		return providerConfig.provider;
 	}
@@ -2096,11 +2230,24 @@ export class ModelRegistry {
 			return;
 		}
 		this.#lastDiscoveryWarnings.set(providerConfig.provider, error);
+		const { baseUrl } = providerConfig;
+		const url = baseUrl && redactUrlForLog(baseUrl);
 		logger.warn("model discovery failed for provider", {
 			provider: providerConfig.provider,
-			url: providerConfig.baseUrl,
+			url,
 			error,
 		});
+		// An env var silently redirected a built-in provider the user never
+		// configured; a log line alone leaves its failures untraceable.
+		const endpointEnv = this.#implicitProviderEndpointEnv.get(providerConfig.provider);
+		if (endpointEnv && baseUrl && url) {
+			const provider = providerConfig.provider;
+			// The endpoint env var may embed `user:pass@`, and fetch errors can echo it.
+			const detail = error.replaceAll(baseUrl, url).replace(URL_USERINFO_RE, "$1").replace(/\s+/g, " ").trim();
+			this.#configWarnings.push(
+				`Built-in ${provider} provider: model discovery at ${url} (from ${endpointEnv}) failed. Fix or unset ${endpointEnv}, or add "${provider}" to disabledProviders. Error: ${detail}`,
+			);
+		}
 	}
 
 	async #discoverBuiltInProviderModels(
@@ -2149,15 +2296,28 @@ export class ModelRegistry {
 		return { models, authoritativeProviders, replaceRuntimeProviders };
 	}
 
+	/**
+	 * Resolve the key built-in discovery uses for `providerId`. `cacheProviderId`
+	 * is the namespace probed to skip an OAuth refresh while its cache is fresh;
+	 * `undefined` for a credential-scoped catalog, whose namespace only the
+	 * account's credential determines (the write side hashes it in).
+	 */
 	async #resolveBuiltInDiscoveryApiKey(
 		providerId: string,
 		strategy: ModelRefreshStrategy,
-		cacheProviderId: string,
+		cacheProviderId: string | undefined,
 		authoritative: boolean,
 	): Promise<string | undefined> {
 		const peekedKey = await this.#peekApiKeyForProvider(providerId);
-		if (isAuthenticated(peekedKey) || strategy === "offline") {
+		if (isAuthenticated(peekedKey)) {
 			return peekedKey;
+		}
+		if (strategy === "offline") {
+			// Offline discovery only reads the cache. An expired access token still
+			// names its account (Cursor scopes rows on the JWT subject), so it keys
+			// the same row the last online pass wrote with the then-live token.
+			if (cacheProviderId !== undefined) return peekedKey;
+			return (await this.#peekApiKeyForProvider(providerId, { includeExpired: true })) ?? peekedKey;
 		}
 		const oauthCredentials = getOAuthCredentialsForProvider(this.authStorage, providerId);
 		if (oauthCredentials.length === 0) {
@@ -2169,7 +2329,9 @@ export class ModelRegistry {
 		// undefined, the manager is never added, and stale bundled models survive the
 		// full cache TTL. So only take the no-refresh shortcut for non-authoritative
 		// providers, whose bundled models stay visible regardless.
-		if (strategy === "online-if-uncached" && !authoritative) {
+		// A credential-scoped catalog has no credential-less namespace to probe,
+		// and only its manager can load the account's rows, so it always refreshes.
+		if (strategy === "online-if-uncached" && !authoritative && cacheProviderId !== undefined) {
 			// Mirror shouldFetchRemoteSources: built-in managers use the catalog's
 			// default TTL, so only refresh when the manager will actually fetch.
 			const cache = readModelCache<Api>(
@@ -2233,6 +2395,7 @@ export class ModelRegistry {
 								accounts?.map(account => ({
 									accessToken: account.accessToken,
 									accountKey: oauthAccountKey(account),
+									projectId: account.projectId,
 								})) ?? null
 							);
 						},
@@ -2297,7 +2460,9 @@ export class ModelRegistry {
 		});
 		const standardProviderKeys = await Promise.all(
 			standardProviderDescriptors.map(descriptor => {
-				const cacheProviderId = this.#resolveStartupModelCacheProviderId(descriptor.providerId);
+				const cacheProviderId = isCredentialScopedModelCacheProvider(descriptor.providerId)
+					? undefined
+					: this.#resolveStartupModelCacheProviderId(descriptor.providerId);
 				return this.#resolveBuiltInDiscoveryApiKey(
 					descriptor.providerId,
 					strategy,
@@ -2485,6 +2650,9 @@ export class ModelRegistry {
 		const providers = new Map(this.#discoverableProviders.map(config => [config.provider, config.discovery.type]));
 		return models.map(model => {
 			const providerType = providers.get(model.provider);
+			if (providerType === "litellm" && model.providerType !== providerType) {
+				return buildDiscoveredModel(toModelSpec(model), providerType);
+			}
 			if (providerType !== "llama.cpp") return model;
 			const spec = toModelSpec(model);
 			if (!model.transport) {
@@ -2770,9 +2938,6 @@ export class ModelRegistry {
 			if (!model.contextWindowAuthoritative) {
 				({ model, tiers } = this.#applyContextWindowPolicies(model, extendedContext, compactionPoints));
 			}
-			if (model.provider === "ollama-cloud" && model.omitMaxOutputTokens !== true) {
-				model = applyModelOverride(model, { omitMaxOutputTokens: true });
-			}
 			if (tiers) this.#policyWindowTiers.set(model, tiers);
 			return model;
 		});
@@ -2827,29 +2992,18 @@ export class ModelRegistry {
 		// Extended context off: cap models with a premium long-context price
 		// tier (e.g. GPT-5.6 bills 2x input above 272K) at the standard-pricing
 		// threshold so compaction fires before a request crosses into the tier.
-		// xai-oauth carries public xAI prices only for API-equivalent stats;
-		// SuperGrok requests remain subscription-backed, so its estimated tier
-		// must not constrain the runtime context window. Explicit per-model
+		// Rows flagged `longContextWindowUncapped` (catalog
+		// `long-context-window-uncapped`, e.g. subscription-backed hosts whose
+		// tier prices are estimates) keep their full window. Explicit per-model
 		// `contextWindow` overrides reapply later in composition and win over
 		// this cap.
-		if (!extendedContext && model.provider !== "xai-oauth") {
+		if (!extendedContext && model.longContextWindowUncapped !== true) {
 			const threshold = model.cost.longContext?.inputThreshold;
 			if (threshold !== undefined && model.contextWindow !== null && model.contextWindow > threshold) {
 				model = applyModelOverride(model, { contextWindow: threshold });
 			}
 		}
-		if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
-			return model;
-		}
-		const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
-		if (!overrides) {
-			return applyModelOverride(model, { contextWindow: 1_000_000 });
-		}
-		this.#warnUnservedOverrideKind(model, overrides);
-		return applyModelOverride(model, {
-			contextWindow: overrides.contextWindow ?? 1_000_000,
-			...overrides,
-		});
+		return model;
 	}
 
 	#parseModels(config: ModelsConfig): CustomModelOverlay[] {
@@ -2969,6 +3123,15 @@ export class ModelRegistry {
 				provider => requested.has(provider.toLowerCase()) && isProviderAvailable(provider),
 			),
 		);
+		// Reuse the same provider snapshot as find()/getProviderModels(). The
+		// availability gate above stays live, while catalog invalidation remains
+		// owned by refresh, discovery and runtime provider registration. Whole-
+		// catalog modifiers can inspect live credentials, so keep reprojecting
+		// those rather than extending the lifetime of their output.
+		if (availableProviders.size === 1 && this.#runtimeModelModifiers.size === 0) {
+			const models = this.#modelsForProviderLookup(availableProviders.values().next().value!);
+			return kind === "all" ? models.slice() : models.filter(model => modelKind(model) === kind);
+		}
 		const models = this.#composeStaticModels(availableProviders);
 		return kind === "all" ? models : models.filter(model => modelKind(model) === kind);
 	}
@@ -3086,14 +3249,22 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Whether a config-declared discovery provider has not yet produced a
-	 * catalog in this process. A cold discovery cache (e.g. after `omp update`
-	 * bumps the cache namespace) leaves the provider in its initial `idle`
-	 * state with no models, so a selector the provider will supply looks
-	 * unknown until background discovery lands (#10048).
+	 * Whether an unresolved selector on `provider` may still be supplied by
+	 * discovery this process has not finished. Two states qualify:
+	 * - `idle`: a config-declared provider with a cold cache has no catalog yet
+	 *   (e.g. after `omp update` bumps the cache namespace, #10048).
+	 * - `cached`/`unavailable` while the initial background refresh is in
+	 *   flight: startup replayed a cache row or fell back to the bundled
+	 *   catalog, and that refresh may still add ids (a cold namespace after an
+	 *   upgrade, or a cache row keyed to another credential). With no refresh
+	 *   running (an embedder that manages discovery itself) these states are
+	 *   final, so unresolved selectors warn immediately.
 	 */
 	isProviderDiscoveryPending(provider: string): boolean {
-		return this.#providerDiscoveryStates.get(provider)?.status === "idle";
+		const status = this.#providerDiscoveryStates.get(provider)?.status;
+		if (status === "idle") return true;
+		if (status !== "cached" && status !== "unavailable") return false;
+		return this.#backgroundRefresh !== undefined && !this.#initialRefreshSettled;
 	}
 
 	/**
@@ -3249,6 +3420,7 @@ export class ModelRegistry {
 			accountIds: accountAccess && Object.keys(accountAccess),
 			forceRefresh: options?.forceRefresh,
 			refreshReason: options?.refreshReason,
+			rejectedAccessToken: options?.rejectedAccessToken,
 			signal: options?.signal,
 		});
 	}
@@ -3274,11 +3446,11 @@ export class ModelRegistry {
 		});
 	}
 
-	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
+	async #peekApiKeyForProvider(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
 		if (this.#keylessProviders.has(provider) && this.authStorage.keys.source(provider) === undefined) {
 			return kNoAuth;
 		}
-		return this.authStorage.keys.peek(provider);
+		return this.authStorage.keys.peek(provider, options);
 	}
 
 	/**
@@ -3316,25 +3488,32 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Remove custom API/OAuth registrations for a specific extension source.
+	 * Remove custom API/OAuth registrations for one or more extension sources.
+	 * The model catalog is rebuilt once, however many sources are cleared.
 	 */
-	clearSourceRegistrations(sourceId: string): void {
-		unregisterCustomApis(sourceId);
-		unregisterOAuthProviders(sourceId);
-		const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
-		if (!sourceProviders || sourceProviders.size === 0) {
-			return;
-		}
-		this.#ensureFullSnapshot();
-		this.#runtimeProvidersBySource.delete(sourceId);
-		for (const providerName of sourceProviders) {
-			if (this.#runtimeProviderSourceByName.get(providerName) !== sourceId) {
+	clearSourceRegistrations(sourceIds: string | Iterable<string>): void {
+		let cleared = false;
+		for (const sourceId of typeof sourceIds === "string" ? [sourceIds] : sourceIds) {
+			unregisterCustomApis(sourceId);
+			unregisterOAuthProviders(sourceId);
+			const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
+			if (!sourceProviders || sourceProviders.size === 0) {
 				continue;
 			}
-			this.#runtimeProviderSourceByName.delete(providerName);
-			this.#clearRuntimeProviderState(providerName);
+			this.#ensureFullSnapshot();
+			this.#runtimeProvidersBySource.delete(sourceId);
+			for (const providerName of sourceProviders) {
+				if (this.#runtimeProviderSourceByName.get(providerName) !== sourceId) {
+					continue;
+				}
+				this.#runtimeProviderSourceByName.delete(providerName);
+				this.#clearRuntimeProviderState(providerName);
+			}
+			cleared = true;
 		}
-		this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
+		if (cleared) {
+			this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
+		}
 	}
 
 	/**
@@ -3361,11 +3540,9 @@ export class ModelRegistry {
 	 */
 	syncExtensionSources(activeSourceIds: string[]): void {
 		const activeSources = new Set(activeSourceIds);
-		for (const sourceId of this.#registeredProviderSources) {
-			if (activeSources.has(sourceId)) {
-				continue;
-			}
-			this.clearSourceRegistrations(sourceId);
+		const inactiveSources = [...this.#registeredProviderSources].filter(sourceId => !activeSources.has(sourceId));
+		this.clearSourceRegistrations(inactiveSources);
+		for (const sourceId of inactiveSources) {
 			this.#registeredProviderSources.delete(sourceId);
 		}
 	}
@@ -3519,7 +3696,7 @@ export class ModelRegistry {
 				: nextModels;
 			this.#unprojectedModels = this.#applyProviderBedrockOverrides(nextModelsWithTransport);
 
-			this.#models = this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+			this.#models = this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
 			this.#invalidateProviderModelCache(providerName);
 			if (!config.fetchDynamicModels) return;
 		}
@@ -3610,7 +3787,7 @@ export class ModelRegistry {
 						return this.#applyProviderTransportOverrideToModel(model, transportOverride);
 					}),
 				);
-				this.#models = this.#withCatalogMetrics(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+				this.#models = this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
 			}
 			this.#invalidateProviderModelCache(providerName);
 		}

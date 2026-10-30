@@ -11,10 +11,11 @@ import {
 	fetchWithRetry,
 	getFastembedCacheDir,
 	logger,
+	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
-import { loadFastembed } from "./fastembed-runtime";
+import { loadFastembed, withEmbedSessionBudget } from "./fastembed-runtime";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
@@ -98,20 +99,27 @@ export async function quarantineCorruptModelFile(message: string, cacheDir?: str
  * retries once; fastembed re-downloads any file missing from the model's
  * cache directory. Also the initializer the embed worker uses in its
  * subprocess; the in-process seam stays {@link setLocalModelInitializer}.
+ *
+ * The ONNX sessions fastembed builds here from the model cache carry the
+ * embedding thread budget ({@link withEmbedSessionBudget}); it is off again by
+ * the time this returns, and never touches a session built from anywhere else,
+ * so a consumer sharing the same onnxruntime copy keeps its own defaults.
  */
 export async function defaultLocalModelInitializer(options: LocalModelInitOptions): Promise<LocalEmbeddingModel> {
 	const cacheDir = options.cacheDir ?? getFastembedCacheDir();
 	const initOptions = options.cacheDir === undefined ? { ...options, cacheDir } : options;
 	const { FlagEmbedding } = await loadFastembed();
-	try {
-		return await FlagEmbedding.init(initOptions);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "";
-		if (/Protobuf parsing failed/i.test(message) && (await quarantineCorruptModelFile(message, cacheDir))) {
-			return FlagEmbedding.init(initOptions);
+	return withEmbedSessionBudget(cacheDir, async () => {
+		try {
+			return await FlagEmbedding.init(initOptions);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "";
+			if (/Protobuf parsing failed/i.test(message) && (await quarantineCorruptModelFile(message, cacheDir))) {
+				return FlagEmbedding.init(initOptions);
+			}
+			throw error;
 		}
-		throw error;
-	}
+	});
 }
 
 function activeEmbeddingOptions() {
@@ -294,9 +302,11 @@ export function embeddingDimFor(modelName: string): number {
 async function collectMatrix(batches: EmbeddingOutput): Promise<EmbeddingMatrix> {
 	const rows: Vector[] = [];
 	for await (const batch of batches) {
-		for (const row of batch) {
-			rows.push(new Float32Array(row));
-		}
+		withLoopPhase("mnemopi.embed", () => {
+			for (const row of batch) {
+				rows.push(new Float32Array(row));
+			}
+		});
 	}
 	return rows;
 }
@@ -310,7 +320,8 @@ const KNOWN_MODEL_NAMES: Record<string, string> = {
 	"intfloat/multilingual-e5-large": "fast-multilingual-e5-large",
 	"sentence-transformers/all-MiniLM-L6-v2": "fast-all-MiniLM-L6-v2",
 };
-function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
+/** The bundled fastembed model id for a model name, or `null` when fastembed has no local model for it. */
+export function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 	// Fastembed `EmbeddingModel` enum string values, inlined so resolving a model name
 	// (and `available()`) never imports `fastembed` — its module eagerly loads the
 	// `onnxruntime-node` native addon, which segfaults in some runtimes.
@@ -388,12 +399,15 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 		if (!response.ok) {
 			return null;
 		}
-		const { data: rows } = (await response.json()) as { data?: Array<{ embedding: number[] }> };
-		if (rows === undefined) {
-			return null;
-		}
-		apiCallCount += 1;
-		return rows.map(row => new Float32Array(row.embedding));
+		const data = (await response.json()) as { data?: Array<{ embedding: number[] }> };
+		return withLoopPhase("mnemopi.embed", () => {
+			const { data: rows } = data;
+			if (rows === undefined) {
+				return null;
+			}
+			apiCallCount += 1;
+			return rows.map(row => new Float32Array(row.embedding));
+		});
 	} catch (error) {
 		logger.debug("mnemopi embedding request failed", { status: extractHttpStatusFromError(error) });
 		return null;
@@ -525,7 +539,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 		return null;
 	}
 	try {
-		const vectors = await collectMatrix(model.embed([...texts]));
+		const vectors = await withLoopPhase("mnemopi.embed", () => collectMatrix(model.embed([...texts])));
 		if (vectors.length === 1) {
 			const vector = vectors[0];
 			if (vector !== undefined) {
