@@ -11,7 +11,7 @@ import type {
 	Usage,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { isRecord, parseJsonlLenient } from "@oh-my-pi/pi-utils";
+import { isRecord, parseJsonlLenient, sanitizeText } from "@oh-my-pi/pi-utils";
 import { resolveClaudePaths } from "../config/claude-paths";
 import { collectForeignJsonRecords, type ForeignJsonRecord, readForeignJsonRecords } from "./foreign-session-jsonl";
 import type { ForeignSessionInfo, ForeignSessionStore } from "./foreign-session-store";
@@ -68,6 +68,18 @@ function cleanPreview(value: string): string | undefined {
 	return cleaned.length > 0 ? cleaned : undefined;
 }
 
+/** Claude stores the user's `/rename` title beside the transcript in <sessionId>/custom-title.json. */
+async function readTitleSidecar(transcript: string, sessionId: string): Promise<string | undefined> {
+	try {
+		const value: unknown = await Bun.file(path.join(path.dirname(transcript), sessionId, "custom-title.json")).json();
+		if (!isRecord(value)) return undefined;
+		const title = stringField(value, "customTitle");
+		return title ? cleanPreview(sanitizeText(title)) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function readHistoryIndex(file: string): Promise<Map<string, ClaudeHistoryMetadata>> {
 	const metadata = new Map<string, ClaudeHistoryMetadata>();
 	try {
@@ -114,8 +126,17 @@ async function readRegisteredProjects(root: string): Promise<string[]> {
 	}
 }
 
+/**
+ * Claude Code encodes a project cwd into its `projects/` directory name by
+ * replacing every non-alphanumeric character with `-`, on every platform
+ * (`/home/x/my_app.v2` → `-home-x-my-app-v2`, `C:\Users\x` → `C--Users-x`).
+ */
+function encodeProjectDir(project: string): string {
+	return project.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
 function projectCwd(encoded: string, registered: readonly string[]): string {
-	const exact = registered.find(project => project.replaceAll(path.sep, "-") === encoded);
+	const exact = registered.find(project => encodeProjectDir(project) === encoded);
 	if (exact) return exact;
 	if (!encoded.startsWith("-")) return encoded;
 	return encoded.replaceAll("-", path.sep);
@@ -370,6 +391,7 @@ export class ClaudeSessionStore implements ForeignSessionStore {
 					id,
 					path: item.file,
 					cwd: indexed?.cwd ?? (await recordedCwd(item.file)) ?? item.cwd,
+					title: await readTitleSidecar(item.file, id),
 					created: new Date(createdMs),
 					modified: new Date(modifiedMs),
 					firstMessage: indexed?.firstMessage,
@@ -436,7 +458,7 @@ export class ClaudeSessionStore implements ForeignSessionStore {
 			const timestamp = isoTimestamp(value.timestamp, stats.mtimeMs);
 			if (value.type === "assistant" && isRecord(value.message)) {
 				const model = stringField(value.message, "model");
-				if (model && model !== lastModel) {
+				if (model && model !== "<synthetic>" && model !== lastModel) {
 					const id = uniqueEntryId(`claude-${sourceUuid}-model`, usedIds);
 					const entry: ModelChangeEntry = {
 						type: "model_change",
@@ -460,8 +482,10 @@ export class ClaudeSessionStore implements ForeignSessionStore {
 			if (parentId) sourceTails.set(sourceUuid, parentId);
 		}
 
-		const title = sourceTitle ?? aiTitle ?? info.title;
-		if (title) await manager.setSessionName(title, sourceTitle ? "user" : "auto");
+		// The sidecar (info.title) is rewritten on every /rename, so it outranks older transcript titles.
+		const userTitle = info.title ?? sourceTitle;
+		const title = userTitle ?? aiTitle;
+		if (title) await manager.setSessionName(title, userTitle ? "user" : "auto");
 		return manager;
 	}
 }

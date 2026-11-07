@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RenderResultOptions } from "../src/tools/renderer";
@@ -139,6 +139,26 @@ describe("bashToolRenderer", () => {
 		expect(rendered).not.toContain("Wall time: 1.23 seconds");
 	});
 
+	it("strips only the generated subsecond footer from older results with identical stdout", () => {
+		const result = {
+			content: [{ type: "text", text: "Wall time: 0.02 seconds\n\nWall time: 0.02 seconds" }],
+			details: { wallTimeMs: 20 },
+		};
+		for (const expanded of [false, true]) {
+			const options = { expanded, isPartial: false };
+			const args = { command: "benchmark" };
+			const component = bashToolRenderer.renderResult(result, options, uiTheme, args);
+			const rendered = sanitizeText(component.render(120).join("\n"));
+			expect(rendered.match(/Wall time: 0\.02 seconds/gu)).toHaveLength(1);
+			expect(rendered).toContain("Wall: 0.02s");
+			const view = bashToolRenderer.describeResult(result, options, args);
+			const output = (view.body ?? [])
+				.flatMap(node => ("k" in node ? (node.c ?? []) : []))
+				.find(node => "k" in node && node.k === "ansi");
+			expect(output).toMatchObject({ p: { role: "omp.tool.bash.output", text: "Wall time: 0.02 seconds" } });
+		}
+	});
+
 	it("shows a supervised service's readiness and output without a command timeout", async () => {
 		const component = bashToolRenderer.renderResult(
 			{
@@ -159,29 +179,37 @@ describe("bashToolRenderer", () => {
 		expect(rendered).not.toContain("Timeout:");
 	});
 
-	it("renders a backgrounded job as a static footer notice", async () => {
-		const component = bashToolRenderer.renderResult(
-			{
-				content: [
-					{
-						type: "text",
-						text: `started\n\n${formatBackgroundNotice("bash-42")}`,
+	it("renders a backgrounded job as a static footer notice, with or without a stated deadline", async () => {
+		for (const [label, notice] of [
+			// Persisted by older versions, before the notice stated a deadline.
+			[
+				"no deadline stated",
+				"Backgrounded as job bash-42; its output is injected into the conversation as a follow-up the moment it finishes.",
+			],
+			["deadline", formatBackgroundNotice("bash-42", 300)],
+			["deadline disabled", formatBackgroundNotice("bash-42", undefined)],
+		] as const) {
+			const component = bashToolRenderer.renderResult(
+				{
+					content: [{ type: "text", text: `started\n\n${notice}` }],
+					details: {
+						timeoutSeconds: 300,
+						async: { state: "running", jobId: "bash-42", type: "bash" },
 					},
-				],
-				details: {
-					timeoutSeconds: 300,
-					async: { state: "running", jobId: "bash-42", type: "bash" },
+					isError: false,
 				},
-				isError: false,
-			},
-			{ expanded: false, isPartial: false },
-			uiTheme,
-			{ command: "sleep 30" },
-		);
-		const rendered = sanitizeText(component.render(120).join("\n"));
-		expect(rendered).toContain("started");
-		expect(rendered).toContain("Backgrounded: bash-42");
-		expect(rendered).not.toContain("Do NOT poll");
+				{ expanded: false, isPartial: false },
+				uiTheme,
+				{ command: "sleep 30" },
+			);
+			const rendered = sanitizeText(component.render(120).join("\n"));
+			expect(rendered, label).toContain("started");
+			expect(rendered, label).toContain("Backgrounded: bash-42");
+			// Shared by every notice form, so a row whose notice is not stripped fails here.
+			expect(rendered, label).not.toContain("injected into the conversation");
+			expect(rendered, label).not.toContain("Do NOT poll");
+			expect(rendered, label).not.toContain("deadline");
+		}
 	});
 
 	it("folds raw output artifact notices into the status footer", async () => {
@@ -393,5 +421,50 @@ describe("bashToolRenderer", () => {
 		const expandedFinal = render({ expanded: true, isPartial: false });
 		expect(expandedFinal).toContain("echo step_0");
 		expect(expandedFinal).not.toContain("earlier line");
+	});
+
+	it("shows a minimizer filter label as one sanitized, width-bounded footer fact", () => {
+		const filter = `\x1b[31mlint\x1b[0m\tun\x07safe\nfooter ${"界".repeat(30)}`;
+		const label = `lint unsafe footer ${"界".repeat(10)}…`;
+		const result = {
+			content: [{ type: "text" as const, text: "1 error\n[raw output: artifact://2]" }],
+			details: { meta: { minimized: { filter, inputBytes: 1960, outputBytes: 27, artifactId: "2" } } },
+		};
+		const args = { command: "pnpm lint" };
+		const options = { expanded: false, isPartial: false };
+		const rendered = bashToolRenderer.renderResult(result, options, uiTheme, args).render(200).join("\n");
+		expect(rendered).not.toContain("\x1b[31m");
+		expect(rendered).not.toContain("\x07");
+		const footer = Bun.stripANSI(rendered)
+			.split("\n")
+			.find(line => line.includes("Minimized:"));
+		expect(footer).toContain(`Minimized: ${label} 1.9KB → 27B`);
+		expect(footer).not.toContain("\t");
+		const view = JSON.stringify(bashToolRenderer.describeResult(result, options, args));
+		expect(view).toContain(`Minimized ${label} 1.9KB → 27B`);
+		expect(view).not.toContain("\\u001b[31m");
+	});
+
+	it("shows a home path in a minimizer filter label as ~", () => {
+		const home = spyOn(os, "homedir").mockReturnValue("/home/alice");
+		try {
+			const result = {
+				content: [{ type: "text" as const, text: "ok\n[raw output: artifact://3]" }],
+				details: {
+					meta: {
+						minimized: { filter: "/home/alice/bin/lint", inputBytes: 1960, outputBytes: 27, artifactId: "3" },
+					},
+				},
+			};
+			const options = { expanded: false, isPartial: false };
+			const rendered = bashToolRenderer
+				.renderResult(result, options, uiTheme, { command: "lint" })
+				.render(200)
+				.join("\n");
+			expect(Bun.stripANSI(rendered)).toContain("Minimized: ~/bin/lint 1.9KB → 27B");
+			expect(rendered).not.toContain("/home/alice");
+		} finally {
+			home.mockRestore();
+		}
 	});
 });

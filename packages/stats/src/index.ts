@@ -3,6 +3,7 @@
 import { parseArgs } from "node:util";
 import { formatDuration, formatNumber, formatPercent, normalizePremiumRequests } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { formatErrorRate } from "./client/data/formatters";
 import { getDashboardStats, getTotalMessageCount, syncAllSessions } from "./aggregator";
 import { closeDb } from "./db";
 import { refreshRollups } from "./rollup";
@@ -21,8 +22,17 @@ export { closeDb } from "./db";
 export { refreshRollups } from "./rollup";
 export type { StatsJudge, StatsJudgeProvider } from "./frustration";
 export { getGainDashboardStats } from "./gain-aggregator";
-export { formatStatsDashboardUrl, type StartServerOptions, startServer } from "./server";
-export type { GainDashboardStats, GainSource, GainSourceTotals, GainTimeSeriesPoint } from "./shared-types";
+export { formatStatsDashboardUrl, type StartServerOptions, setStatsCloseHandler, startServer } from "./server";
+export type {
+	GainDashboardStats,
+	GainSource,
+	GainSourceTotals,
+	GainTimeSeriesPoint,
+	SpotlightAgentScope,
+	SpotlightDashboardStats,
+	SpotlightSessionContext,
+} from "./shared-types";
+export { getSpotlightDashboardStats, getSpotlightSessionContext } from "./spotlight-aggregator";
 export type {
 	AggregatedStats,
 	DashboardStats,
@@ -58,7 +68,7 @@ export async function printStatsSummary(): Promise<void> {
 
 	console.log(chalk.bold("Overall:"));
 	console.log(`  Requests: ${formatNumber(overall.totalRequests)} (${formatNumber(overall.failedRequests)} errors)`);
-	console.log(`  Error Rate: ${formatPercent(overall.errorRate)}`);
+	console.log(`  Error Rate: ${formatErrorRate(overall.errorRate)}`);
 	console.log(`  Total Tokens: ${formatNumber(overall.totalInputTokens + overall.totalOutputTokens)}`);
 	console.log(`  Input Tokens: ${formatNumber(overall.totalInputTokens)}`);
 	console.log(`  Output Tokens: ${formatNumber(overall.totalOutputTokens)}`);

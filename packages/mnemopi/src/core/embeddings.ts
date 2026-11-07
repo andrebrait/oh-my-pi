@@ -11,17 +11,18 @@ import {
 	fetchWithRetry,
 	getFastembedCacheDir,
 	logger,
+	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
-import { ensureFastembedModelSidecars } from "./fastembed-model-cache";
-import { loadFastembed } from "./fastembed-runtime";
+import { loadFastembed, withEmbedSessionBudget } from "./fastembed-runtime";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
 	mnemopiDebugEnabled,
 	resolveEmbeddingProvider,
 } from "./runtime-options";
+import { clipToWindow, DEFAULT_INPUT_CHARS } from "./text-window";
 
 export type { EmbeddingOutput } from "./runtime-options";
 export { cosineSimilarity } from "./vector-math";
@@ -93,77 +94,32 @@ export async function quarantineCorruptModelFile(message: string, cacheDir?: str
 }
 
 /**
- * Recover from a partially-extracted fastembed model cache. An interrupted
- * archive download/extraction leaves `<cacheDir>/<model>/` populated with
- * sidecars and a truncated `model.onnx_data` but WITHOUT the graph file
- * (`model.onnx` / `model_optimized.onnx`), so `FlagEmbedding.init` throws
- * `Model file not found at .../model.onnx`. Upstream `retrieveModel`
- * short-circuits on the existing model dir and never re-downloads, and
- * `downloadFileFromGCS` reuses a leftover partial `<model>.tar.gz` as-is, so
- * the cache is stuck broken forever: recall silently dies and the rebuild
- * queue grows every session. Delete the incomplete model dir AND the leftover
- * partial archive so the retry re-downloads from scratch. The model path is
- * error-message CONTENT, so the dir is only removed when it is a direct child
- * of the fastembed cache root — never touch a directory a dependency merely
- * names. Returns true when a retry is worth attempting (the incomplete cache
- * was cleared, or already gone from a concurrent heal).
- * @internal exported for tests
- */
-export async function clearIncompleteModelCache(message: string, cacheDir?: string): Promise<boolean> {
-	const match = /Model file not found at (.+?\.onnx)\b/i.exec(message);
-	if (!match) return false;
-	const modelFile = nodePath.resolve(match[1]);
-	const modelDir = nodePath.dirname(modelFile);
-	const cacheRoot = nodePath.resolve(cacheDir ?? getFastembedCacheDir());
-	// Only a direct child of the cache root: `<cacheRoot>/<model>`.
-	if (nodePath.dirname(modelDir) !== cacheRoot) return false;
-	try {
-		await fsp.rm(modelDir, { recursive: true, force: true });
-		await fsp.rm(`${modelDir}.tar.gz`, { force: true });
-		logger.warn("mnemopi: cleared incomplete local embedding model cache; re-downloading", { modelDir });
-	} catch {
-		// Concurrent heal or vanished dir: the single retry stays safe.
-	}
-	return true;
-}
-
-const SIDECAR_ERROR_RE =
-	/(?:Config file not found at .*config|Tokenizer file not found at .*tokenizer|Tokens map file not found at .*special_tokens_map)/u;
-
-/**
- * Shared local-model initializer: FlagEmbedding.init with BOTH cache heals.
- * Missing sidecars (config/tokenizer/tokens map) re-fetch and retry; a
- * corrupt model blob (Protobuf parse failure) quarantines the file and
- * retries THROUGH the sidecar heal, so a cache that is broken in both ways
- * still recovers in one pass. Also the initializer the embed worker uses in
- * its subprocess; the in-process seam stays {@link setLocalModelInitializer}.
+ * Shared local-model initializer: FlagEmbedding.init with a corrupt-cache heal.
+ * A corrupt model blob (Protobuf parse failure) quarantines the file and
+ * retries once; fastembed re-downloads any file missing from the model's
+ * cache directory. Also the initializer the embed worker uses in its
+ * subprocess; the in-process seam stays {@link setLocalModelInitializer}.
+ *
+ * The ONNX sessions fastembed builds here from the model cache carry the
+ * embedding thread budget ({@link withEmbedSessionBudget}); it is off again by
+ * the time this returns, and never touches a session built from anywhere else,
+ * so a consumer sharing the same onnxruntime copy keeps its own defaults.
  */
 export async function defaultLocalModelInitializer(options: LocalModelInitOptions): Promise<LocalEmbeddingModel> {
 	const cacheDir = options.cacheDir ?? getFastembedCacheDir();
 	const initOptions = options.cacheDir === undefined ? { ...options, cacheDir } : options;
 	const { FlagEmbedding } = await loadFastembed();
-	const initWithSidecarHeal = async (): Promise<LocalEmbeddingModel> => {
+	return withEmbedSessionBudget(cacheDir, async () => {
 		try {
 			return await FlagEmbedding.init(initOptions);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "";
-			if (!SIDECAR_ERROR_RE.test(message)) throw error;
-			if (!(await ensureFastembedModelSidecars(options.model, cacheDir))) throw error;
-			return FlagEmbedding.init(initOptions);
+			if (/Protobuf parsing failed/i.test(message) && (await quarantineCorruptModelFile(message, cacheDir))) {
+				return FlagEmbedding.init(initOptions);
+			}
+			throw error;
 		}
-	};
-	try {
-		return await initWithSidecarHeal();
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "";
-		if (/Protobuf parsing failed/i.test(message) && (await quarantineCorruptModelFile(message, cacheDir))) {
-			return initWithSidecarHeal();
-		}
-		if (await clearIncompleteModelCache(message, cacheDir)) {
-			return initWithSidecarHeal();
-		}
-		throw error;
-	}
+	});
 }
 
 function activeEmbeddingOptions() {
@@ -219,29 +175,7 @@ function effectiveMaxInputChars(): number {
 	if (override !== undefined) return Math.max(0, Math.trunc(override));
 	const envValue = Number.parseInt($env.MNEMOPI_EMBEDDING_MAX_INPUT_CHARS ?? "", 10);
 	if (Number.isFinite(envValue) && envValue >= 0) return envValue;
-	return 8192;
-}
-
-/** Elision marker injected between the retained head and tail of an oversized input. */
-const EMBEDDING_ELISION_MARKER = "\n\n[...]\n\n";
-
-/**
- * Right-clip a single oversized input to {@link max} chars while preserving
- * both ends. Retention transcripts are chronological (oldest → newest), so a
- * naive `slice(0, max)` would drop the most recent — and most semantically
- * loaded — turns once a session passed the cap, leaving every later retained
- * episode with essentially the same prefix vector. Keeping a head/tail split
- * lets the embedding capture the topic setup at the start AND the latest
- * exchanges at the end. Falls back to a tail-only clip when `max` is too
- * small to fit the elision marker plus a useful slice on either side.
- */
-function clipToWindow(text: string, max: number): string {
-	if (text.length <= max) return text;
-	if (max <= EMBEDDING_ELISION_MARKER.length + 16) return text.slice(text.length - max);
-	const budget = max - EMBEDDING_ELISION_MARKER.length;
-	const headLen = budget >>> 1;
-	const tailLen = budget - headLen;
-	return text.slice(0, headLen) + EMBEDDING_ELISION_MARKER + text.slice(text.length - tailLen);
+	return DEFAULT_INPUT_CHARS;
 }
 
 /**
@@ -368,9 +302,11 @@ export function embeddingDimFor(modelName: string): number {
 async function collectMatrix(batches: EmbeddingOutput): Promise<EmbeddingMatrix> {
 	const rows: Vector[] = [];
 	for await (const batch of batches) {
-		for (const row of batch) {
-			rows.push(new Float32Array(row));
-		}
+		withLoopPhase("mnemopi.embed", () => {
+			for (const row of batch) {
+				rows.push(new Float32Array(row));
+			}
+		});
 	}
 	return rows;
 }
@@ -384,7 +320,8 @@ const KNOWN_MODEL_NAMES: Record<string, string> = {
 	"intfloat/multilingual-e5-large": "fast-multilingual-e5-large",
 	"sentence-transformers/all-MiniLM-L6-v2": "fast-all-MiniLM-L6-v2",
 };
-function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
+/** The bundled fastembed model id for a model name, or `null` when fastembed has no local model for it. */
+export function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 	// Fastembed `EmbeddingModel` enum string values, inlined so resolving a model name
 	// (and `available()`) never imports `fastembed` — its module eagerly loads the
 	// `onnxruntime-node` native addon, which segfaults in some runtimes.
@@ -424,7 +361,53 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 	}
 }
 
+const DEFAULT_EMBEDDING_BATCH_SIZE = 64;
+
+/**
+ * Max texts per `/embeddings` request. Some hosted providers cap the inputs per
+ * request (DashScope: 10), and a rejected request fails the whole call. Reads the
+ * runtime scope's `embeddings.batchSize`, then `MNEMOPI_EMBEDDING_BATCH_SIZE`, then 64.
+ */
+function embeddingBatchSize(): number {
+	return (
+		positiveBatchSize(activeEmbeddingOptions()?.batchSize) ??
+		positiveBatchSize(Number.parseInt($env.MNEMOPI_EMBEDDING_BATCH_SIZE ?? "", 10)) ??
+		DEFAULT_EMBEDDING_BATCH_SIZE
+	);
+}
+
+/** Floors a configured size to a whole request cap; undefined unless it is at least 1. */
+function positiveBatchSize(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isFinite(value)) return undefined;
+	const size = Math.floor(value);
+	return size >= 1 ? size : undefined;
+}
+
+// Same level policy as the local-model failures: debug, or warn when runtime debug is on.
+function logEmbeddingRejection(status: number, body: string): void {
+	logger[mnemopiDebugEnabled() ? "warn" : "debug"]("mnemopi embedding request rejected", {
+		status,
+		body: body.slice(0, 300),
+	});
+}
+
 async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
+	const size = embeddingBatchSize();
+	if (texts.length <= size) {
+		return embedApiBatch(texts);
+	}
+	const matrix: EmbeddingMatrix = [];
+	for (let offset = 0; offset < texts.length; offset += size) {
+		const part = await embedApiBatch(texts.slice(offset, offset + size));
+		if (part === null) {
+			return null;
+		}
+		matrix.push(...part);
+	}
+	return matrix;
+}
+
+async function embedApiBatch(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
 	const baseUrl = embeddingBaseUrl();
 	const isCustom = !hostMatchesUrl(baseUrl, "openrouter");
 	const apiKey = embeddingApiKey();
@@ -455,21 +438,35 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 				defaultDelayMs: attempt => 2 ** attempt * 1000,
 			});
 			if (res.status === 401) {
-				throw new ProviderHttpError("mnemopi embedding request unauthorized (401)", 401, { headers: res.headers });
+				// Keep the provider's denial text: the log can only show what the error carries.
+				const detail = (await res.text().catch(() => "")).trim();
+				throw new ProviderHttpError(detail || "mnemopi embedding request unauthorized (401)", 401, {
+					headers: res.headers,
+				});
 			}
 			return res;
 		});
 		if (!response.ok) {
+			logEmbeddingRejection(response.status, await response.text().catch(() => ""));
 			return null;
 		}
-		const { data: rows } = (await response.json()) as { data?: Array<{ embedding: number[] }> };
-		if (rows === undefined) {
-			return null;
-		}
-		apiCallCount += 1;
-		return rows.map(row => new Float32Array(row.embedding));
+		const data = (await response.json()) as { data?: Array<{ embedding: number[] }> };
+		return withLoopPhase("mnemopi.embed", () => {
+			const { data: rows } = data;
+			// A short or long matrix would stamp vectors onto the wrong memories.
+			if (rows === undefined || rows.length !== texts.length) {
+				return null;
+			}
+			apiCallCount += 1;
+			return rows.map(row => new Float32Array(row.embedding));
+		});
 	} catch (error) {
-		logger.debug("mnemopi embedding request failed", { status: extractHttpStatusFromError(error) });
+		const status = extractHttpStatusFromError(error);
+		if (status === undefined) {
+			logger.debug("mnemopi embedding request failed", { error: String(error) });
+		} else {
+			logEmbeddingRejection(status, error instanceof Error ? error.message : "");
+		}
 		return null;
 	}
 }
@@ -599,7 +596,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 		return null;
 	}
 	try {
-		const vectors = await collectMatrix(model.embed([...texts]));
+		const vectors = await withLoopPhase("mnemopi.embed", () => collectMatrix(model.embed([...texts])));
 		if (vectors.length === 1) {
 			const vector = vectors[0];
 			if (vector !== undefined) {

@@ -4,12 +4,12 @@
 
 use std::{
 	ffi::OsString,
+	fmt::NumBuffer,
 	io::{BufRead, BufReader, BufWriter, Write},
 	num::IntErrorKind,
 	path::PathBuf,
 };
 
-use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use pi_vfs::File;
 use uucore::{
@@ -18,7 +18,10 @@ use uucore::{
 	posix::{OBSOLETE, posix_version},
 };
 
-use crate::host::{Host, StreamWriter, Utility, format_usage, matches_parser, util};
+use crate::{
+	host::{Host, StreamWriter, Utility, format_usage, matches_parser, strip_errno},
+	locale::shell_locale,
+};
 
 mod options {
 	pub static ALL_REPEATED: &str = "all-repeated";
@@ -69,11 +72,7 @@ struct LineMeta {
 type PortResult<T> = Result<T, String>;
 
 fn io_error(context: &str, error: std::io::Error) -> String {
-	let mut message = error.to_string();
-	if let Some(pos) = message.find(" (os error ") {
-		message.truncate(pos);
-	}
-	format!("{context}: {message}")
+	format!("{context}: {}", strip_errno(&error))
 }
 
 macro_rules! write_line_terminator {
@@ -301,22 +300,8 @@ impl UniqState {
 	// Also remove needless explicit lifetimes to satisfy
 	// clippy::needless-lifetimes.
 	fn build_count_prefix(count: usize, buf: &mut [u8; Self::COUNT_PREFIX_BUF_SIZE]) -> &[u8] {
-		let mut digits_buf = [0u8; 20];
-		let mut value = count;
-		let mut idx = digits_buf.len();
-
-		if value == 0 {
-			idx -= 1;
-			digits_buf[idx] = b'0';
-		} else {
-			while value > 0 {
-				idx -= 1;
-				digits_buf[idx] = b'0' + (value % 10) as u8;
-				value /= 10;
-			}
-		}
-
-		let digits = &digits_buf[idx..];
+		let mut digits_buf = NumBuffer::new();
+		let digits = count.format_into(&mut digits_buf).as_bytes();
 		let width = Self::COUNT_PREFIX_WIDTH;
 
 		if digits.len() <= width {
@@ -788,8 +773,7 @@ fn run_uniq(matches: &ArgMatches, host: &mut Host) -> PortResult<()> {
 	let files = matches.get_many::<OsString>(ARG_FILES);
 	let (in_file_name, out_file_name) = files
 		.map(|fi| fi.map(AsRef::as_ref))
-		.map(|mut fi| (fi.next(), fi.next()))
-		.unwrap_or_default();
+		.map_or_default(|mut fi| (fi.next(), fi.next()));
 
 	let uniq = UniqState {
 		repeats_only:    matches.get_flag(options::REPEATED)
@@ -881,14 +865,7 @@ fn operand_path(host: &Host, operand: Option<&std::ffi::OsStr>) -> Option<PathBu
 }
 
 fn is_c_locale(host: &Host) -> bool {
-	for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
-		if let Some(value) = host.var(key)
-			&& !value.is_empty()
-		{
-			return value == "C" || value == "POSIX";
-		}
-	}
-	true
+	shell_locale(host, "LC_CTYPE").is_none_or(|locale| locale == "C" || locale == "POSIX")
 }
 
 fn app() -> Command {
@@ -1013,11 +990,6 @@ fn get_delimiter(matches: &ArgMatches) -> Delimiters {
 	} else {
 		Delimiters::None
 	}
-}
-
-/// Creates the `uniq` builtin registration.
-pub(crate) fn uniq_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Uniq, SE>()
 }
 
 

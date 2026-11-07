@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import { type AgentMessage, filterProviderReplayMessages } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
 import { inferCopilotInitiator } from "@oh-my-pi/pi-ai/providers/github-copilot-headers";
@@ -363,6 +364,22 @@ describe("wrapSteeringForModel", () => {
 		expect(wrappedText).not.toContain("&amp;");
 	});
 
+	it("reuses one wrapper per steering message until the owner invalidates it", () => {
+		const text: TextContent = { type: "text", text: "first draft" };
+		const message: AgentMessage = { role: "user", content: [text], steering: true, timestamp: 1 };
+
+		const wrapped = wrapSteeringForModel([message])[0];
+		expect(wrapSteeringForModel([message])[0]).toBe(wrapped);
+
+		text.text = "edited in place";
+		invalidateMessageCache(message);
+
+		const rewrapped = wrapSteeringForModel([message])[0];
+		expect(rewrapped).not.toBe(wrapped);
+		expect(getUserText(rewrapped)).toContain("edited in place");
+		expect(getUserText(rewrapped)).not.toContain("first draft");
+	});
+
 	it("presents user-attributed collab prompts as wrapped user turns on every conversion path", () => {
 		const message: AgentMessage = {
 			role: "custom",
@@ -415,16 +432,6 @@ describe("wrapSteeringForModel", () => {
 		// Non-steering trailing message is untouched, and the persisted steer is not mutated.
 		expect(wrapped[1]).toBe(later);
 		expect(buried.content).toBe("old steer");
-	});
-
-	it("leaves trailing user messages without the steering marker unchanged", () => {
-		const message: AgentMessage = { role: "user", content: "plain user", timestamp: 1 };
-		const messages = [message];
-
-		const wrapped = wrapSteeringForModel(messages);
-
-		expect(wrapped).toBe(messages);
-		expect(wrapped[0]).toBe(message);
 	});
 
 	it("preserves images after the wrapped steering text", () => {

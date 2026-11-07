@@ -8,12 +8,11 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use pi_vfs::{BlockingFs, CanonicalizeOptions, MissingHandling, ResolveMode};
 use uucore::{display::Quotable, libc::EINVAL, line_ending::LineEnding};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, util};
+use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes};
 
 const OPT_CANONICALIZE: &str = "canonicalize";
 const OPT_CANONICALIZE_MISSING: &str = "canonicalize-missing";
@@ -63,8 +62,7 @@ impl Utility for Readlink {
 		let files: Vec<PathBuf> = self
 			.matches
 			.get_many::<OsString>(ARG_FILES)
-			.map(|values| values.map(PathBuf::from).collect())
-			.unwrap_or_default();
+			.map_or_default(|values| values.map(PathBuf::from).collect());
 
 		if files.is_empty() {
 			host.error("missing operand", 1);
@@ -207,10 +205,12 @@ fn app() -> Command {
 /// The value plain `readlink` prints for `link`.
 ///
 /// A provider path that aliases a host file (`skill://name/SKILL.md`) prints
-/// that file's canonical host path; everything else reads one symlink hop.
+/// that file's canonical host path; everything else reads one symlink hop. The
+/// host path goes through the uucore-style resolver (as `realpath` does), not
+/// `std::fs::canonicalize`, which spells Windows paths with a `\\?\` prefix.
 fn read_link(filesystem: &BlockingFs, link: &Path) -> io::Result<PathBuf> {
 	match filesystem.backing_path(link)? {
-		Some(backing) => BlockingFs::native().canonicalize(backing),
+		Some(backing) => BlockingFs::native().canonicalize_with(backing, &CanonicalizeOptions::default()),
 		None => filesystem.read_link(link),
 	}
 }
@@ -239,11 +239,6 @@ fn show(out: &mut impl Write, path: &Path, line_ending: Option<LineEnding>) -> s
 		write!(out, "{line_ending}")?;
 	}
 	out.flush()
-}
-
-/// Creates the `readlink` builtin registration.
-pub(crate) fn readlink_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Readlink, SE>()
 }
 
 #[cfg(test)]

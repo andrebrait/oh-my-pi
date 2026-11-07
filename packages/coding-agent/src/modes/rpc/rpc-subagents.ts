@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
-import type { AgentSession } from "../../session/agent-session";
+import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -111,10 +111,13 @@ export class RpcSubagentRegistry {
 	#transcriptSessionFilesBySubagentId = new Map<string, string>();
 	#staleSubagentIds = new Set<string>();
 	#unsubscribers: Array<() => void> = [];
+	#eventUnsubscribe: (() => void) | undefined;
+	#observabilityBus: EventBus | undefined;
 	#output: RpcSubagentOutput;
 	#subscriptionLevel: RpcSubagentSubscriptionLevel = "off";
 
 	constructor(observabilityBus: EventBus, output: RpcSubagentOutput) {
+		this.#observabilityBus = observabilityBus;
 		this.#output = output;
 		this.#unsubscribers.push(
 			observabilityBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
@@ -123,15 +126,15 @@ export class RpcSubagentRegistry {
 			observabilityBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, data => {
 				this.handleProgress(data as SubagentProgressPayload);
 			}),
-			observabilityBus.on(TASK_SUBAGENT_EVENT_CHANNEL, data => {
-				this.handleEvent(data as SubagentEventPayload);
-			}),
 		);
 	}
 
 	dispose(): void {
+		this.#eventUnsubscribe?.();
+		this.#eventUnsubscribe = undefined;
 		for (const unsubscribe of this.#unsubscribers) unsubscribe();
 		this.#unsubscribers = [];
+		this.#observabilityBus = undefined;
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 		this.#staleSubagentIds.clear();
@@ -149,6 +152,15 @@ export class RpcSubagentRegistry {
 	}
 
 	setSubscriptionLevel(level: RpcSubagentSubscriptionLevel): void {
+		const observabilityBus = this.#observabilityBus;
+		if (level === "events" && !this.#eventUnsubscribe && observabilityBus) {
+			this.#eventUnsubscribe = observabilityBus.on(TASK_SUBAGENT_EVENT_CHANNEL, data => {
+				this.handleEvent(data as SubagentEventPayload);
+			});
+		} else if (level !== "events" && this.#eventUnsubscribe) {
+			this.#eventUnsubscribe();
+			this.#eventUnsubscribe = undefined;
+		}
 		this.#subscriptionLevel = level;
 	}
 
@@ -269,7 +281,7 @@ export class RpcSubagentRegistry {
 /** A running subagent from this session's roster, bound to its live registry ref. */
 export interface RpcOwnedSubagent {
 	ref: AgentRef;
-	session: AgentSession;
+	session: AgentSessionHandle;
 }
 
 /**

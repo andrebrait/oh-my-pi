@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,13 +7,18 @@ import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-cod
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { getWslWindowsHomeCandidate, runHostProbe } from "@oh-my-pi/pi-coding-agent/discovery/agents";
 import {
+	type LoadSkillsOptions,
 	type LoadSkillsResult,
 	loadSkills,
 	loadSkillsFromDir,
 	parseSkillInvocation,
 } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { getSessionSlashCommands } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/get-commands-handler";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
+import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/skill-protocol";
+import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { CombinedAutocompleteProvider } from "@oh-my-pi/pi-tui/autocomplete";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
@@ -445,6 +450,135 @@ enabled: false
 		});
 	});
 
+	describe("opt-in skills", () => {
+		let tempSkillsDir: string;
+
+		beforeEach(async () => {
+			tempSkillsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-opt-in-skills-"));
+			for (const [directoryName, skillName, body] of [
+				["visible-skill", "visible-skill", "Visible skill instructions."],
+				["explicit-only-directory", "manual-skill", "Manual skill instructions."],
+			] as const) {
+				await Bun.write(
+					path.join(tempSkillsDir, directoryName, "SKILL.md"),
+					[
+						"---",
+						`name: ${skillName}`,
+						`description: ${skillName} description.`,
+						"---",
+						"",
+						`# ${skillName}`,
+						"",
+						body,
+					].join("\n"),
+				);
+			}
+		});
+
+		afterEach(async () => {
+			await removeWithRetries(tempSkillsDir);
+		});
+
+		interface ObservedSkills {
+			prompt: string;
+			discoveredSkillNames: string[];
+			skillCommands: string[];
+			manualSkillContent: string;
+		}
+
+		async function observeSkills(optInSkills?: string[]): Promise<ObservedSkills> {
+			const skillsSettings: LoadSkillsOptions = {
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [tempSkillsDir],
+				enableSkillCommands: true,
+				...(optInSkills === undefined ? {} : { optInSkills }),
+			};
+			const { skills, warnings } = await loadSkills(skillsSettings);
+			expect(warnings).toHaveLength(0);
+
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: tempSkillsDir,
+				contextFiles: [],
+				skillsSettings,
+				toolNames: ["read"],
+				workspaceTree: {
+					rootPath: tempSkillsDir,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+				activeRepoContext: null,
+				includeModelInPrompt: false,
+				personality: "none",
+			});
+			const commands = getSessionSlashCommands({
+				customCommands: [],
+				skills,
+				skillsSettings,
+			});
+			const manualSkillResource = await InternalUrlRouter.instance().resolve("skill://manual-skill", { skills });
+
+			return {
+				prompt: systemPrompt.join("\n"),
+				discoveredSkillNames: skills.map(skill => skill.name),
+				skillCommands: commands.filter(command => command.source === "skill").map(command => command.name),
+				manualSkillContent: manualSkillResource.content,
+			};
+		}
+
+		async function expectManualSkillToBeOptInOnly(pattern: string) {
+			const observed = await observeSkills([pattern]);
+
+			expect(observed.discoveredSkillNames).toEqual(["manual-skill", "visible-skill"]);
+			expect(observed.prompt).toContain("visible-skill");
+			expect(observed.skillCommands).toContain("skill:manual-skill");
+			expect(observed.manualSkillContent).toContain("Manual skill instructions.");
+			expect(observed.prompt.includes("manual-skill")).toBe(false);
+		}
+
+		it("omits an exact opt-in skill from the prompt while keeping explicit access", async () => {
+			await expectManualSkillToBeOptInOnly("manual-skill");
+		});
+
+		it("omits a wildcard-matched opt-in skill from the prompt while keeping explicit access", async () => {
+			await expectManualSkillToBeOptInOnly("manual-*");
+		});
+
+		it("preserves current prompt and explicit access behavior for an empty opt-in array", async () => {
+			const withoutOptInSetting = await observeSkills();
+			const withEmptyOptInSetting = await observeSkills([]);
+			const summarize = (observed: ObservedSkills) => ({
+				visibleInPrompt: observed.prompt.includes("visible-skill"),
+				manualInPrompt: observed.prompt.includes("manual-skill"),
+				discoveredSkillNames: observed.discoveredSkillNames,
+				skillCommands: observed.skillCommands,
+				manualSkillContent: observed.manualSkillContent,
+			});
+
+			expect(summarize(withEmptyOptInSetting)).toEqual(summarize(withoutOptInSetting));
+			expect(summarize(withEmptyOptInSetting)).toMatchObject({
+				visibleInPrompt: true,
+				manualInPrompt: true,
+			});
+		});
+
+		it("does not name an opt-in skill in the unknown-skill error the model reads", async () => {
+			const { skills } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [tempSkillsDir],
+				optInSkills: ["manual-skill"],
+			});
+			const error = await InternalUrlRouter.instance()
+				.resolve("skill://typo", { skills })
+				.then(
+					() => undefined,
+					(e: Error) => e.message,
+				);
+			expect(error).toBe("Unknown skill: typo\nAvailable: visible-skill");
+		});
+	});
+
 	it("should expand ~ in customDirectories", async () => {
 		const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "pi-skills-home-"));
 		const homedirSpy = spyOn(os, "homedir").mockReturnValue(fakeHome);
@@ -526,6 +660,148 @@ description: Skill loaded from a tilde-expanded custom directory.
 			customDirectories: [fixturesDir],
 		});
 		expect(withEmpty.length).toBe(withoutOption.length);
+	});
+});
+
+describe("manual skill visibility", () => {
+	const first = path.join(collisionFixturesDir, "first");
+	const second = path.join(collisionFixturesDir, "second");
+
+	it("hides exact matches without removing them, while ignored matches are removed", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "manual-skills-"));
+		try {
+			for (const [name, description] of [
+				["valid-skill", "Valid"],
+				["other-skill", "Other"],
+			]) {
+				const dir = path.join(root, name);
+				await fs.mkdir(dir, { recursive: true });
+				await Bun.write(
+					path.join(dir, "SKILL.md"),
+					`---\nname: ${name}\ndescription: ${description}\n---\nContent\n`,
+				);
+			}
+			const { skills } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [root],
+				manualSkills: ["valid-skill"],
+			});
+			expect(skills.map(skill => [skill.name, skill.hide === true])).toEqual([
+				["other-skill", false],
+				["valid-skill", true],
+			]);
+			const ignored = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [root],
+				manualSkills: ["valid-skill"],
+				ignoredSkills: ["valid-skill"],
+			});
+			expect(ignored.skills.map(skill => skill.name)).toEqual(["other-skill"]);
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	it("only adds hiding on top of frontmatter visibility", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "manual-skills-frontmatter-"));
+		try {
+			for (const [name, fields] of [
+				["hidden", "description: Hidden\nhide: true"],
+				["explicit-false", "description: Explicitly visible\nhide: false"],
+			]) {
+				const dir = path.join(root, name);
+				await fs.mkdir(dir, { recursive: true });
+				await Bun.write(path.join(dir, "SKILL.md"), `---\nname: ${name}\n${fields}\n---\nContent\n`);
+			}
+			const { skills } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [root],
+				manualSkills: ["explicit-false"],
+			});
+			expect(skills.map(skill => [skill.name, skill.hide])).toEqual([
+				["explicit-false", true],
+				["hidden", true],
+			]);
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	it("matches raw names through namespaces and collision suffixes", async () => {
+		const pair = await loadSkills({
+			...DISABLE_ALL_BUILTIN_SKILLS,
+			customDirectories: [first, second],
+			manualSkills: ["calendar"],
+		});
+		expect(pair.skills).toHaveLength(2);
+		expect(pair.skills.every(skill => skill.hide === true)).toBe(true);
+		const nested = path.join(collisionFixturesDir, "nested", "second");
+		const triple = await loadSkills({
+			...DISABLE_ALL_BUILTIN_SKILLS,
+			customDirectories: [first, second, nested],
+			manualSkills: ["calend*"],
+		});
+		expect(triple.skills.map(skill => skill.name).sort()).toEqual([
+			"calendar",
+			"second/calendar",
+			"second/calendar~2",
+		]);
+		expect(triple.skills.every(skill => skill.hide === true)).toBe(true);
+	});
+
+	it("matches namespaced final names and drops matches from the system prompt", async () => {
+		const { skills } = await loadSkills({
+			...DISABLE_ALL_BUILTIN_SKILLS,
+			customDirectories: [first, second],
+			manualSkills: ["second/*"],
+		});
+		expect(skills.map(skill => [skill.name, skill.hide === true])).toEqual([
+			["calendar", false],
+			["second/calendar", true],
+		]);
+		const project = await fs.mkdtemp(path.join(os.tmpdir(), "manual-skills-prompt-"));
+		try {
+			const prompt = await buildSystemPrompt({
+				cwd: project,
+				contextFiles: [],
+				rules: [],
+				toolNames: ["read"],
+				skills,
+			});
+			const text = prompt.systemPrompt.join("\n");
+			expect(text).toContain("First calendar skill.");
+			expect(text).not.toContain("Second calendar skill.");
+		} finally {
+			await removeWithRetries(project);
+		}
+	});
+
+	it("matches the final name of a displaced provider skill", async () => {
+		const project = await fs.mkdtemp(path.join(os.tmpdir(), "skills-displaced-manual-"));
+		try {
+			const providerDir = path.join(project, ".claude", "skills", "calendar");
+			const claudeRoot = path.join(project, "x", "claude");
+			await fs.mkdir(providerDir, { recursive: true });
+			await fs.mkdir(path.join(claudeRoot, "calendar"), { recursive: true });
+			await fs.copyFile(path.join(first, "calendar", "SKILL.md"), path.join(providerDir, "SKILL.md"));
+			await fs.copyFile(
+				path.join(collisionFixturesDir, "nested", "second", "calendar", "SKILL.md"),
+				path.join(claudeRoot, "calendar", "SKILL.md"),
+			);
+			const { skills } = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				enableClaudeProject: true,
+				cwd: project,
+				customDirectories: [second, claudeRoot],
+				manualSkills: ["claude/calendar"],
+			});
+			const byName = new Map(skills.map(skill => [skill.name, skill]));
+			expect(byName.get("calendar")?.hide).not.toBe(true);
+			expect(byName.get("claude/calendar")?.hide).toBe(true);
+			expect(byName.get("claude/calendar~2")?.hide).not.toBe(true);
+		} finally {
+			await removeWithRetries(project);
+		}
 	});
 });
 
