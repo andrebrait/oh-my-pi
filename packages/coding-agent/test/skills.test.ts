@@ -15,7 +15,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { getSessionSlashCommands } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/get-commands-handler";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
-import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/skill-protocol";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
