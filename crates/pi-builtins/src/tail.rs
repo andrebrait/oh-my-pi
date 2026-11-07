@@ -686,9 +686,12 @@ mod chunks {
 	
 			// The chunk size is `BLOCK_SIZE` for all but the last chunk
 			// (that is, the chunk closest to the beginning of the file),
-			// which contains the remainder of the bytes.
-			let block_size = if self.block_idx == self.max_blocks_to_read - 1 {
-				self.size % BLOCK_SIZE
+			// which contains the remainder of the bytes. A file whose size is
+			// an exact multiple of `BLOCK_SIZE` has remainder zero, so the last
+			// chunk is a full block rather than an empty one.
+			let remainder = self.size % BLOCK_SIZE;
+			let block_size = if self.block_idx == self.max_blocks_to_read - 1 && remainder != 0 {
+				remainder
 			} else {
 				BLOCK_SIZE
 			};
@@ -905,9 +908,10 @@ mod chunks {
 				self.bytes += chunk.bytes as u64;
 				self.chunks.push_back(chunk.clone());
 	
-				let first = &self.chunks[0];
-				if self.bytes - first.bytes as u64 > self.num_print {
-					chunk = self.chunks.pop_front().unwrap();
+				if let Some(first) =
+					self.chunks.pop_front_if(|first| self.bytes - first.bytes as u64 > self.num_print)
+				{
+					chunk = first;
 					self.bytes -= chunk.bytes as u64;
 				} else {
 					*chunk = BytesChunk::new();
@@ -1178,9 +1182,10 @@ mod chunks {
 				self.lines += chunk.lines as u64;
 				self.chunks.push_back(chunk.clone());
 	
-				let first = &self.chunks[0];
-				if self.lines - first.lines as u64 > self.num_print {
-					chunk = self.chunks.pop_front().unwrap();
+				if let Some(first) =
+					self.chunks.pop_front_if(|first| self.lines - first.lines as u64 > self.num_print)
+				{
+					chunk = first;
 	
 					self.lines -= chunk.lines as u64;
 				} else {
@@ -1496,11 +1501,7 @@ mod follow {
 			/// printed
 			pub fn needs_header(&self, path: &Path, verbose: bool) -> bool {
 				if verbose {
-					if let Some(ref last) = self.last {
-						!last.eq(&path)
-					} else {
-						true
-					}
+					self.last.as_ref().is_none_or(|last| !last.eq(&path))
 				} else {
 					false
 				}
@@ -1564,7 +1565,7 @@ mod follow {
 		use notify::{RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 		use uucore::display::Quotable;
 		
-		use brush_core::openfiles::OpenFile;
+		use crate::openfile::OpenFile;
 		use pi_vfs::{BlockingFs, File, parent_path};
 		
 		use crate::{
@@ -2271,40 +2272,10 @@ mod follow {
 			}
 		}
 		
-		/// Whether the command's stdout is a pipe whose reader has exited, as GNU
-		/// tail checks while idle. Utilities run inside the host process, so this
-		/// must poll the command's fd 1, not the process-wide `std::io::stdout()`.
-		#[cfg(unix)]
-		fn stdout_reader_gone(stdout: &OpenFile) -> bool {
-			use nix::{
-				poll::{PollFd, PollFlags, PollTimeout, poll},
-				sys::stat::{SFlag, fstat},
-			};
-		
-			let Ok(fd) = stdout.try_borrow_as_fd() else {
-				return false;
-			};
-			let is_fifo = fstat(fd).is_ok_and(|stat| {
-				SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFIFO
-			});
-			if !is_fifo {
-				return false;
-			}
-			// POLLRDBAND like GNU tail/tee: never ready on a pipe's write end, so
-			// only POLLERR (no reader left) wakes it.
-			let mut fds = [PollFd::new(fd, PollFlags::POLLRDBAND)];
-			matches!(poll(&mut fds, PollTimeout::ZERO), Ok(n) if n > 0)
-				&& fds[0].revents().is_none_or(|revents| revents.contains(PollFlags::POLLERR))
-		}
-		
 		#[allow(clippy::cognitive_complexity, reason = "preserves upstream follow loop")]
 		pub fn follow(
 			mut observer: Observer,
 			settings: &Settings,
-			#[cfg_attr(
-				not(unix),
-				expect(unused_variables, reason = "only unix detects a closed stdout pipe while idle")
-			)]
 			stdout: &OpenFile,
 		) -> TailResult<()> {
 			if observer.files.no_files_remaining(settings) && !observer.files.only_stdin_remaining() {
@@ -2360,8 +2331,7 @@ mod follow {
 					// through the provider, sleeping only after an idle pass.
 					if !observer.poll_provider(settings)? {
 						// Stop once the reader of our stdout pipe has gone away.
-						#[cfg(unix)]
-						if stdout_reader_gone(stdout) {
+						if stdout.reader_gone() {
 							return Ok(());
 						}
 						if !sleep_interval(&observer.cancel, settings.sleep_sec) {
@@ -2440,8 +2410,7 @@ mod follow {
 					Err(mpsc::RecvTimeoutError::Timeout) => {
 						timeout_counter += 1;
 						// Stop once the reader of our stdout pipe has gone away.
-						#[cfg(unix)]
-						if stdout_reader_gone(stdout) {
+						if stdout.reader_gone() {
 							return Ok(());
 						}
 					},
@@ -2491,7 +2460,7 @@ mod follow {
 	mod wasi_stubs {
 		use std::{io::BufReader, path::Path};
 	
-		use brush_core::openfiles::OpenFile;
+		use crate::openfile::OpenFile;
 		use pi_vfs::File;
 	
 		use crate::tail::{TailError, TailResult, args::Settings};
@@ -2680,7 +2649,7 @@ mod paths {
 		path::{Path, PathBuf},
 	};
 	
-	use brush_core::openfiles::{DescriptorPath, OpenFiles};
+	use crate::openfile::{DescriptorPath, STDIN_FD};
 	use pi_vfs::{BlockingFs, File, Metadata};
 
 	use crate::{host::Host, tail::{TailResult, text}};
@@ -2742,7 +2711,7 @@ mod paths {
 				return;
 			};
 			let absolute = pi_vfs::absolute_path(host.cwd(), path);
-			*path = if DescriptorPath::parse(&absolute) == Some(DescriptorPath::Fd(OpenFiles::STDIN_FD)) {
+			*path = if DescriptorPath::parse(&absolute) == Some(DescriptorPath::Fd(STDIN_FD)) {
 				PathBuf::from(text::DEV_STDIN)
 			} else {
 				host.resolve(&*path)
@@ -3028,12 +2997,11 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use brush_core::{ShellExtensions, builtins::Registration};
 use clap::ArgMatches;
 use memchr::{memchr_iter, memrchr_iter};
 use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, matches_parser, util};
+use crate::host::{Host, Utility, matches_parser};
 
 use args::{FilterMode, Settings, Signum};
 use chunks::ReverseChunks;
@@ -3214,11 +3182,6 @@ impl Utility for Tail {
 			},
 		}
 	}
-}
-
-/// Creates the `tail` builtin registration.
-pub(crate) fn tail_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Tail, SE>()
 }
 
 /// BSD `tail -r`: print lines in reverse order. With `-n N` the count selects
@@ -3717,7 +3680,7 @@ fn backwards_thru_file(file: &mut (impl Read + Seek), num_delimiters: u64, delim
 				// cursor in the file is at the *beginning* of the
 				// block, so seeking forward by `i + 1` bytes puts
 				// us right after the found delimiter.
-				file.seek(SeekFrom::Current((i + 1) as i64)).unwrap();
+				file.seek_relative((i + 1) as i64).unwrap();
 				return;
 			}
 		}
@@ -3897,6 +3860,37 @@ mod tests {
 		assert_eq!(capture.err(), "");
 	}
 
+	// Failure mode: a file whose size is an exact multiple of the reverse-read
+	// block size (64 KiB) made the last `ReverseChunks` chunk come out empty,
+	// so that block was never searched — a single-block file printed nothing,
+	// and a larger file lost every line living in its first block.
+	#[test]
+	fn prints_last_lines_when_size_is_an_exact_block_multiple() {
+		let dir = tempfile::tempdir().unwrap();
+		// `L000000\n` … `L008191\n`: 8-byte lines, 8192 lines = 65536 bytes.
+		let content: String = (0..8192).map(|i| format!("L{i:06}\n")).collect();
+		assert_eq!(content.len(), 65536);
+		fs::write(dir.path().join("log"), content).unwrap();
+		let (code, capture) = run_util::<Tail>(&["-n", "2", "log"], "", dir.path());
+		assert_eq!(code, 0);
+		assert_eq!(capture.out(), "L008190\nL008191\n");
+		assert_eq!(capture.err(), "");
+	}
+
+	#[test]
+	fn searches_the_first_block_when_size_is_an_exact_block_multiple() {
+		let dir = tempfile::tempdir().unwrap();
+		// 16384 lines = 131072 bytes = two full blocks with no remainder.
+		let content: String = (0..16384).map(|i| format!("L{i:06}\n")).collect();
+		assert_eq!(content.len(), 131072);
+		fs::write(dir.path().join("log"), content).unwrap();
+		let (code, capture) = run_util::<Tail>(&["-n", "16384", "log"], "", dir.path());
+		assert_eq!(code, 0);
+		assert_eq!(capture.out().lines().count(), 16384);
+		assert!(capture.out().starts_with("L000000\n"), "first block was dropped");
+		assert_eq!(capture.err(), "");
+	}
+
 	#[test]
 	fn bsd_reverse_delegates_to_tac() {
 		let dir = tempfile::tempdir().unwrap();
@@ -4055,7 +4049,7 @@ mod tests {
 		let parsed = Tail::try_parse_from(["tail", "-f", path.to_str().unwrap()]).unwrap();
 		let (mut host, _) = Host::for_test("tail", "", dir.path());
 		let (mut reader, writer) = std::io::pipe().unwrap();
-		host.stdout = brush_core::openfiles::OpenFile::from(writer);
+		host.stdout = crate::openfile::OpenFile::from(writer);
 		let cancel = host.cancel_flag();
 		let tail = std::thread::spawn(move || parsed.run(&mut host));
 		// Consume the initial output like `grep -m1 line`, then go away.

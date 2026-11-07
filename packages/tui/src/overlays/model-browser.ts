@@ -10,8 +10,13 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getModelPricingStatus, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import type { ModelKind, ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
+import {
+	getEffectiveTokenCost,
+	getFactoryDroidCreditRate,
+	getModelPricingStatus,
+	modelsAreEqual,
+} from "@oh-my-pi/pi-catalog/models";
+import { modelKind, type ModelKind, type ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
 import type { Component } from "../tui";
 import { FuzzyCorpus, fuzzyRank } from "../fuzzy";
 import { Input } from "../components/input";
@@ -27,7 +32,7 @@ import {
 	parseConfiguredThinkingLevel,
 } from "../thinking";
 import { thinkingLevelGlyph } from "../render/render-utils";
-import { type ThemeColor, theme } from "../theme/theme";
+import { type Theme, type ThemeColor, theme } from "../theme/theme";
 import {
 	matchesSelectCancel,
 	matchesSelectDown,
@@ -37,7 +42,15 @@ import {
 } from "../keybinding-matchers";
 import { MenuSelection } from "../components/menu-selection";
 import { clampScrollOffset, scrollOffsetForRow } from "../components/scroll-viewport";
-import type { TspPickerColumn, TspPickerGroup, TspPickerItem, TspSpan, TspText } from "@oh-my-pi/pi-wire";
+import type {
+	TspPickerColumn,
+	TspPickerGroup,
+	TspPickerItem,
+	TspPickerMark,
+	TspPickerProps,
+	TspSpan,
+	TspText,
+} from "@oh-my-pi/pi-wire";
 import { col, md, node, row, span, text } from "../native/describe";
 import { pickerFuzzyHits } from "../native/picker";
 import type { NativeChild, NativeNode, NativeUiEvent } from "../native/node";
@@ -56,6 +69,7 @@ export type ModelRole =
 	| "memory"
 	| "task"
 	| "advisor"
+	| "widget"
 	| "image"
 	| "web"
 	| "speech"
@@ -72,6 +86,7 @@ export const MODEL_ROLE_IDS: ModelRole[] = [
 	"memory",
 	"task",
 	"advisor",
+	"widget",
 	"image",
 	"web",
 	"speech",
@@ -89,6 +104,7 @@ export const CHAT_MODEL_ROLE_IDS: ModelRole[] = [
 	"memory",
 	"task",
 	"advisor",
+	"widget",
 ];
 export const KIND_ROLE_IDS: ModelRole[] = ["image", "web", "speech", "dictation", "judge"];
 
@@ -122,6 +138,18 @@ export interface ResolvedModelRoleValue {
 	warning?: string;
 }
 
+/** Where auto-compaction triggers for one model, as the model hub's preview shows it (edited from the Roles view). */
+export interface ModelCompactionPoint {
+	/** Context tokens that trigger auto-compaction; undefined when auto-compaction is off or the window is unknown. */
+	tokens: number | undefined;
+	/** Why it triggers there, in a few words: `fixed`, `85% of 400K base`, `80% of window`. */
+	basis?: string;
+	/** What sets it: the matching `compaction.modelThresholds` key, `global`, or `default`. */
+	source: string;
+	/** The model's own exact entry as editable text (`90k`, `80%`); absent when it has none. */
+	draft?: string;
+}
+
 /** Host-provided preferences and model-role resolution for the browser. */
 export interface ModelBrowserSource extends ModelRoleLookup {
 	/**
@@ -143,6 +171,8 @@ export interface ModelBrowserSource extends ModelRoleLookup {
 	getRoleInfo(role: string): ModelBrowserRoleInfo;
 	defaultRoleChain(role: string): string[];
 	resolveRoleValue(value: string | undefined, models: Model[], roleLookup?: ModelRoleLookup): ResolvedModelRoleValue;
+	/** Auto-compaction point for `model`; absent hosts show no compaction row in the preview. */
+	compactionPointFor?(model: Model): ModelCompactionPoint | undefined;
 }
 
 /** Read-only catalog surface consumed by model browsers. */
@@ -247,6 +277,22 @@ export function resolveRoleAssignments(
 	}
 
 	return roles;
+}
+
+/**
+ * Role-resolution pool for a `--models`/`enabledModels` scope: the scoped
+ * models plus every available non-chat runner (judge, search, image, …). The
+ * scope only filters chat models (it feeds Ctrl+P cycling) and runtime role
+ * resolution ignores it for other kinds, so displayed role assignments must too.
+ * Shared by the /models hub and the session picker.
+ */
+export function scopedRolePool(scoped: ReadonlyArray<Model>, registry: ModelBrowserRegistry): Model[] {
+	const pool = [...scoped];
+	for (const model of registry.getAvailable("all")) {
+		if (modelKind(model) === "chat" || scoped.some(entry => modelsAreEqual(entry, model))) continue;
+		pool.push(model);
+	}
+	return pool;
 }
 
 /** Wrap raw models into browser items. */
@@ -373,8 +419,16 @@ export interface SessionModelScope {
 
 /** Catalog inputs a {@link SessionModelScope} is derived from. */
 interface SessionModelScopeInputs {
+	/** Chat models listed as picker rows. */
 	models: ReadonlyArray<Model>;
+	/** Catalog that configured role values resolve against. */
 	allModels: ReadonlyArray<Model>;
+	/**
+	 * Available models of every kind that unconfigured roles auto-select from,
+	 * as at runtime; a chat-only pool would pin `judge` on a chat model while
+	 * the session judges with an available native judge.
+	 */
+	roleModels: ReadonlyArray<Model>;
 	error: string | undefined;
 }
 
@@ -382,21 +436,32 @@ function readSessionModelScopeInputs(
 	registry: ModelBrowserRegistry,
 	scopedModels: ReadonlyArray<Model>,
 ): SessionModelScopeInputs {
-	if (scopedModels.length > 0) return { models: scopedModels, allModels: scopedModels, error: undefined };
+	if (scopedModels.length > 0) {
+		let roleModels: ReadonlyArray<Model>;
+		let error: string | undefined;
+		try {
+			roleModels = scopedRolePool(scopedModels, registry);
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : String(cause);
+			roleModels = scopedModels;
+		}
+		return { models: scopedModels, allModels: roleModels, roleModels, error };
+	}
 	const loadError = registry.getError();
 	let error = loadError ? String(loadError) : undefined;
-	let models: ReadonlyArray<Model>;
+	let roleModels: ReadonlyArray<Model>;
 	try {
-		models = registry.getAvailable();
+		roleModels = registry.getAvailable("all");
 	} catch (cause) {
 		error = cause instanceof Error ? cause.message : String(cause);
-		models = [];
+		roleModels = [];
 	}
-	return { models, allModels: registry.getAll("all"), error };
+	const models = roleModels.filter(model => modelKind(model) === "chat");
+	return { models, allModels: registry.getAll("all"), roleModels, error };
 }
 
 function scopeFromInputs(settings: ModelBrowserSource, inputs: SessionModelScopeInputs): SessionModelScope {
-	const roles = resolveRoleAssignments(settings, inputs.allModels, inputs.models);
+	const roles = resolveRoleAssignments(settings, inputs.allModels, inputs.roleModels);
 	const mruOrder = settings.mruOrder;
 	const items = buildBrowserItems(inputs.models);
 	sortModelItems(items, { roles, mruOrder });
@@ -441,6 +506,7 @@ export class SessionModelScopeCache {
 			inputs.error === cachedInputs.error &&
 			sameItems(inputs.models, cachedInputs.models) &&
 			sameItems(inputs.allModels, cachedInputs.allModels) &&
+			sameItems(inputs.roleModels, cachedInputs.roleModels) &&
 			sameItems(this.#settings.mruOrder, cached.mruOrder)
 		) {
 			return cached;
@@ -685,8 +751,8 @@ function declaredPricingStatus(model: Model): Exclude<ModelPricingStatus, "fixed
 function isFreeModel(model: Model): boolean {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return declared === "free";
-	const cost = model.cost;
-	const credits = model.factoryDroidCredits;
+	const cost = model.cost ? getEffectiveTokenCost(model.cost) : undefined;
+	const credits = getFactoryDroidCreditRate(model)?.rate;
 	return (!cost || (cost.input === 0 && cost.output === 0)) && (credits === undefined || credits === 0);
 }
 
@@ -700,16 +766,24 @@ function formatCostLeg(n: number): string {
 	return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
+/** `2× from 2026-11-22` when a dated Factory Droid credit card changes the rate in force now; undefined otherwise. */
+function nextCreditRateNote(model: Model): string | undefined {
+	const next = getFactoryDroidCreditRate(model)?.next;
+	return next ? `${formatCostLeg(next.rate)}× from ${new Date(next.at).toISOString().slice(0, 10)}` : undefined;
+}
+
 /**
- * Adds Factory Droid's `N×` base Standard Credits rate to a dollar price,
- * replacing the price when the model has no dollar reference. Neither the
- * reference price nor the base credit rate includes live promotions.
+ * Adds Factory Droid's `N×` Standard Credits rate in force now (its dated
+ * `credit-rates` card applied) to a dollar price, replacing the price when the
+ * model has no dollar reference. The dollar reference never includes vendor
+ * promotions; the preview and detail facts name the next rate (`nextCreditRateNote`).
  */
 function withCreditBadge(model: Model, price: string): string {
-	const credits = model.factoryDroidCredits;
+	const credits = getFactoryDroidCreditRate(model);
 	if (credits === undefined) return price;
-	const badge = `${formatCostLeg(credits)}×`;
-	return model.cost.input !== 0 || model.cost.output !== 0 ? `${price} ${badge}` : badge;
+	const badge = `${formatCostLeg(credits.rate)}×`;
+	const cost = getEffectiveTokenCost(model.cost);
+	return cost.input !== 0 || cost.output !== 0 ? `${price} ${badge}` : badge;
 }
 
 const PRICING_STATUS_LABELS: Record<Exclude<ModelPricingStatus, "fixed">, { short: string; detail: string }> = {
@@ -724,7 +798,8 @@ function formatCostPair(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`);
+	const cost = getEffectiveTokenCost(model.cost);
+	return withCreditBadge(model, `$${formatCostLeg(cost.input)}/${formatCostLeg(cost.output)}`);
 }
 
 /** Detail-pane price fact: `$3/15 per M`, or the declared pricing state in words. */
@@ -746,17 +821,34 @@ function pickerPrice(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`);
+	const cost = getEffectiveTokenCost(model.cost);
+	return withCreditBadge(model, `$${formatCostLeg(cost.input)}·${formatCostLeg(cost.output)}`);
 }
 
 /** `$2 in · $10 out · $0.2 cache` for a model preview. */
 function previewPrice(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].detail;
-	const cost = model.cost;
+	const cost = getEffectiveTokenCost(model.cost);
 	const parts = [`$${formatCostLeg(cost.input)} in`, `$${formatCostLeg(cost.output)} out`];
 	if (cost.cacheRead > 0) parts.push(`$${formatCostLeg(cost.cacheRead)} cache`);
-	return withCreditBadge(model, parts.join(" · "));
+	const priced = withCreditBadge(model, parts.join(" · "));
+	const note = nextCreditRateNote(model);
+	return note ? `${priced} (${note})` : priced;
+}
+
+/**
+ * A provider's picker mark: the terminal's logo for it, else its initials
+ * (`amazon-bedrock` → `AB`, `anthropic` → `An`) on its own gradient.
+ */
+export function providerMark(providerId: string): TspPickerMark {
+	const words = providerId.split(/[-_\s.]+/).filter(word => word.length > 0);
+	const word = words[0] ?? providerId;
+	const text =
+		words.length >= 2
+			? `${words[0]!.charAt(0)}${words[1]!.charAt(0)}`.toUpperCase()
+			: `${word.charAt(0).toUpperCase()}${word.charAt(1)}`;
+	return { text, seed: providerId, icon: `provider:${providerId}` };
 }
 
 /** The omp theme token of a thinking level's dot (`thinkingHigh`); none for inherit and auto. */
@@ -841,6 +933,22 @@ export interface ModelPickerCatalogue {
 	readonly itemsDel?: readonly string[];
 }
 
+/** The search, fact-column and row props every model `picker` sheet sends ({@link ModelBrowser.pickerRows}). */
+export type ModelPickerRows = Pick<
+	TspPickerProps,
+	| "query"
+	| "cursor"
+	| "columns"
+	| "items"
+	| "itemsAdd"
+	| "itemsDel"
+	| "order"
+	| "hits"
+	| "selected"
+	| "current"
+	| "total"
+>;
+
 /** How {@link ModelBrowser.pickerOrder} heads its rows. */
 export interface ModelPickerGrouping {
 	/** One group per provider after the Recent block (the unfiltered All models view). */
@@ -887,6 +995,24 @@ function metaColumnsWidth(widths: readonly number[]): number {
 /** What the per-row perf column shows at the current width. */
 type PerfMode = "off" | "tps" | "full";
 
+/** A measured perf aggregate and, when it came from one, its service tier. */
+interface MeasuredPerf {
+	perf: ModelBrowserPerf;
+	tier?: string;
+}
+
+/** Plain catalog metric cells of one row and their terminal widths, valid for one model and theme. */
+interface MetricCells {
+	model: Model;
+	theme: Theme;
+	intelligence: string;
+	intelligenceWidth: number;
+	ctx: string;
+	ctxWidth: number;
+	cost: string;
+	costWidth: number;
+}
+
 /**
  * The reusable browser component. Renders a fixed-height block
  * (`maxVisible + LIST_ROW_START + DETAIL_ROWS` rows) so host mouse geometry
@@ -907,6 +1033,16 @@ export class ModelBrowser implements Component {
 	/** Ranker for the menu's current item array; rebuilt when items or affinity change. */
 	#ranker?: { source: readonly ModelBrowserItem[]; ranker: ModelItemRanker };
 	#perf: ReadonlyMap<string, ModelBrowserPerf> = new Map();
+	/** Fastest tier aggregate per selector in {@link #perf}, built on the first lookup miss. */
+	#perfTiers:
+		| { perf: ReadonlyMap<string, ModelBrowserPerf>; size: number; best: Map<string, MeasuredPerf> }
+		| undefined;
+	/** Theme-formatted catalog metric cells per item; rebuilt when the item's model or the theme changes. */
+	#metricCells = new WeakMap<ModelBrowserItem, MetricCells>();
+	/** Earliest dated credit-rate change among models whose rows are memoized; passing it rebuilds them. */
+	#nextCreditChange = Number.POSITIVE_INFINITY;
+	/** Non-separator items of the last ranked visible list, for {@link queryMatches}. */
+	#queryMatches: { visible: readonly ModelBrowserItem[]; matches: readonly ModelBrowserItem[] } | undefined;
 	#hoveredIndex: number | null = null;
 	#maxVisible = 10;
 	#showProvider: boolean;
@@ -996,6 +1132,7 @@ export class ModelBrowser implements Component {
 
 	/** Replace the scope's base items; the live query re-applies and selection is pinned by selector. */
 	setItems(items: ModelBrowserItem[]): void {
+		for (const item of items) this.#noteCreditChange(item.model);
 		const selectedKey = this.getSelected()?.selector;
 		this.#menu.setItems(this.#insertSeparator(items), selectedKey);
 		this.onSelectionChange?.(this.getSelected());
@@ -1073,6 +1210,22 @@ export class ModelBrowser implements Component {
 
 	get visibleCount(): number {
 		return this.#menu.visibleItems.length;
+	}
+
+	/**
+	 * Base items matching the live query, best first, without the separator
+	 * row; undefined while the query is blank. Reuses the ranking the list
+	 * already ran, so hosts can derive match counts without ranking again.
+	 */
+	get queryMatches(): readonly ModelBrowserItem[] | undefined {
+		if (!this.query.trim()) return undefined;
+		const visible = this.#menu.visibleItems;
+		let cached = this.#queryMatches;
+		if (cached?.visible !== visible) {
+			cached = { visible, matches: visible.filter(item => !this.#isDisabled(item)) };
+			this.#queryMatches = cached;
+		}
+		return cached.matches;
 	}
 
 	/** Move selection to `selector`; false when it is not in the current view. */
@@ -1339,7 +1492,8 @@ export class ModelBrowser implements Component {
 	 * on a non-default tier still shows its real speed. `tier` is set whenever
 	 * the numbers come from a tier aggregate, for the caller to label.
 	 */
-	#perfFor(item: ModelBrowserItem): { perf: ModelBrowserPerf; tier?: string } | undefined {
+	#perfFor(item: ModelBrowserItem): MeasuredPerf | undefined {
+		if (this.#perf.size === 0) return undefined;
 		const tier = this.#settings.serviceTierFor?.(item.model);
 		if (tier) {
 			const tiered = this.#perf.get(`${item.selector}@${tier}`);
@@ -1347,13 +1501,49 @@ export class ModelBrowser implements Component {
 		}
 		const standard = this.#perf.get(item.selector);
 		if (standard) return { perf: standard };
-		const prefix = `${item.selector}@`;
-		let best: { perf: ModelBrowserPerf; tier: string } | undefined;
-		for (const [key, perf] of this.#perf) {
-			if (!key.startsWith(prefix)) continue;
-			if (!best || perf.tps > best.perf.tps) best = { perf, tier: key.slice(prefix.length) };
+		return this.#fastestTierPerf(item.selector);
+	}
+
+	/** Fastest `selector@tier` aggregate (first wins ties), from an index built once per perf map. */
+	#fastestTierPerf(selector: string): MeasuredPerf | undefined {
+		const perfMap = this.#perf;
+		let index = this.#perfTiers;
+		if (index?.perf !== perfMap || index.size !== perfMap.size) {
+			const best = new Map<string, MeasuredPerf>();
+			for (const [key, perf] of perfMap) {
+				// Every `@` may end the selector: `a@b@t` is tier `b@t` of `a` and tier `t` of `a@b`.
+				for (let at = key.indexOf("@"); at >= 0; at = key.indexOf("@", at + 1)) {
+					const owner = key.slice(0, at);
+					const current = best.get(owner);
+					if (!current || perf.tps > current.perf.tps) best.set(owner, { perf, tier: key.slice(at + 1) });
+				}
+			}
+			index = { perf: perfMap, size: perfMap.size, best };
+			this.#perfTiers = index;
 		}
-		return best;
+		return index.best.get(selector);
+	}
+
+	/** Catalog metric cells of a row, formatted once per model and theme. */
+	#metricCellsFor(item: ModelBrowserItem): MetricCells {
+		const cached = this.#metricCells.get(item);
+		if (cached?.model === item.model && cached.theme === theme) return cached;
+		this.#noteCreditChange(item.model);
+		const intelligence = formatIntelligence(item.model);
+		const ctx = formatContext(item.model);
+		const cost = formatCostPair(item.model);
+		const cells: MetricCells = {
+			model: item.model,
+			theme,
+			intelligence,
+			intelligenceWidth: visibleWidth(intelligence),
+			ctx,
+			ctxWidth: visibleWidth(ctx),
+			cost,
+			costWidth: visibleWidth(cost),
+		};
+		this.#metricCells.set(item, cells);
+		return cells;
 	}
 
 	/** Measured TPS/TTFT, falling back to the catalog TPS as an estimated `~118t/s`. */
@@ -1381,7 +1571,8 @@ export class ModelBrowser implements Component {
 		costWidth: number,
 		intelligenceWidth: number,
 		perfWidth: number,
-		perfMode: PerfMode,
+		metrics: MetricCells,
+		perfCell: string,
 	): string {
 		if (item.id === "separator") {
 			const dashCount = Math.max(0, width - 4);
@@ -1405,11 +1596,10 @@ export class ModelBrowser implements Component {
 
 		// Metric columns collapse when empty or when the row needs room for its name.
 		const cols: string[] = [];
-		if (intelligenceWidth > 0)
-			cols.push(theme.fg("dim", padLeftVisible(formatIntelligence(item.model), intelligenceWidth)));
-		if (perfWidth > 0) cols.push(theme.fg("dim", padLeftVisible(this.#perfCell(item, perfMode), perfWidth)));
-		if (ctxWidth > 0) cols.push(theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth)));
-		if (costWidth > 0) cols.push(theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth)));
+		if (intelligenceWidth > 0) cols.push(theme.fg("dim", padLeftVisible(metrics.intelligence, intelligenceWidth)));
+		if (perfWidth > 0) cols.push(theme.fg("dim", padLeftVisible(perfCell, perfWidth)));
+		if (ctxWidth > 0) cols.push(theme.fg("dim", padLeftVisible(metrics.ctx, ctxWidth)));
+		if (costWidth > 0) cols.push(theme.fg("dim", padLeftVisible(metrics.cost, costWidth)));
 		const metaWidth = metaColumnsWidth([intelligenceWidth, perfWidth, ctxWidth, costWidth]);
 		const available = Math.max(1, width - metaWidth - (cols.length > 0 ? 1 : 0));
 		left = truncateToWidth(left, available);
@@ -1455,6 +1645,9 @@ export class ModelBrowser implements Component {
 		} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 			facts.push(`~${formatTps(model.tps)}`);
 		}
+		// Last fact before prose, so narrow widths cut it before capability and perf facts.
+		const nextCredits = nextCreditRateNote(model);
+		if (nextCredits) facts.push(nextCredits);
 		if (model.description) {
 			const description = formatDescription(model.description);
 			if (description) facts.push(description);
@@ -1486,6 +1679,7 @@ export class ModelBrowser implements Component {
 	}
 
 	render(width: number): string[] {
+		this.#syncCreditClock();
 		const lines: string[] = [];
 
 		const searchIcon = theme.fg("accent", theme.symbol("icon.search"));
@@ -1515,15 +1709,22 @@ export class ModelBrowser implements Component {
 			const perfMode: PerfMode = width >= PERF_FULL_MIN_WIDTH ? "full" : width >= PERF_TPS_MIN_WIDTH ? "tps" : "off";
 			let intelligenceWidth = 0;
 			let perfWidth = 0;
+			const visible = this.#menu.visibleItems;
+			const windowMetrics: MetricCells[] = [];
+			const windowPerf: string[] = [];
 			for (let i = startIndex; i < endIndex; i++) {
-				const item = this.#menu.visibleItems[i];
+				const item = visible[i];
 				if (!item) continue;
-				ctxWidth = Math.max(ctxWidth, visibleWidth(formatContext(item.model)));
-				costWidth = Math.max(costWidth, visibleWidth(formatCostPair(item.model)));
+				const metrics = this.#metricCellsFor(item);
+				const perfCell = this.#perfCell(item, perfMode);
+				windowMetrics[i - startIndex] = metrics;
+				windowPerf[i - startIndex] = perfCell;
+				ctxWidth = Math.max(ctxWidth, metrics.ctxWidth);
+				costWidth = Math.max(costWidth, metrics.costWidth);
 				if (perfMode !== "off") {
-					intelligenceWidth = Math.max(intelligenceWidth, visibleWidth(formatIntelligence(item.model)));
+					intelligenceWidth = Math.max(intelligenceWidth, metrics.intelligenceWidth);
 				}
-				perfWidth = Math.max(perfWidth, visibleWidth(this.#perfCell(item, perfMode)));
+				perfWidth = Math.max(perfWidth, visibleWidth(perfCell));
 			}
 			// Preserve at least a readable name by dropping cost, then context.
 			let nameRoom = width - 2 - metaColumnsWidth([intelligenceWidth, perfWidth, ctxWidth, costWidth]);
@@ -1533,7 +1734,7 @@ export class ModelBrowser implements Component {
 
 			const rows: string[] = [];
 			for (let i = startIndex; i < endIndex; i++) {
-				const item = this.#menu.visibleItems[i];
+				const item = visible[i];
 				if (!item) continue;
 				rows.push(
 					this.#renderRow(
@@ -1545,7 +1746,8 @@ export class ModelBrowser implements Component {
 						costWidth,
 						intelligenceWidth,
 						perfWidth,
-						perfMode,
+						windowMetrics[i - startIndex]!,
+						windowPerf[i - startIndex]!,
 					),
 				);
 			}
@@ -1569,6 +1771,30 @@ export class ModelBrowser implements Component {
 
 	invalidate(): void {}
 
+	/** Called for every listed model and before a row is memoized: its credit rate changes at its next dated card. */
+	#noteCreditChange(model: Model): void {
+		const at = getFactoryDroidCreditRate(model)?.next?.at;
+		if (at !== undefined && at < this.#nextCreditChange) this.#nextCreditChange = at;
+	}
+
+	/**
+	 * A dated credit rate took effect since rows were memoized: rebuild every
+	 * memoized row, and re-rank the list, whose `free` search word follows the
+	 * rate too.
+	 */
+	#syncCreditClock(): void {
+		if (Date.now() < this.#nextCreditChange) return;
+		this.#nextCreditChange = Number.POSITIVE_INFINITY;
+		this.#metricCells = new WeakMap();
+		this.#pickerPreview = undefined;
+		this.#bumpPickerEpoch();
+		this.#ranker = undefined;
+		this.#menu.setItems(this.#menu.items);
+		for (const item of this.#menu.items) {
+			if (item.id !== "separator") this.#noteCreditChange(item.model);
+		}
+	}
+
 	#bumpNativeEpoch(): void {
 		this.#nativeEpoch++;
 		this.#itemNodes.clear();
@@ -1587,6 +1813,7 @@ export class ModelBrowser implements Component {
 	 * scrolls), and the selection's facts and role chips.
 	 */
 	describe(): NativeNode {
+		this.#syncCreditClock();
 		this.#nativeSearch ??= row([text([span(theme.symbol("icon.search"), "accent")]), this.#searchInput], {
 			gap: "sm",
 			align: "center",
@@ -1657,6 +1884,7 @@ export class ModelBrowser implements Component {
 		if (item.id === "separator") return node("rule", undefined, undefined, "separator");
 		const cached = this.#itemNodes.get(item.selector);
 		if (cached?.item === item) return cached.node;
+		this.#noteCreditChange(item.model);
 
 		const label: TspSpan[] = [];
 		if (this.#showProvider) label.push(span(`${item.provider}/`, "dim"));
@@ -1699,6 +1927,7 @@ export class ModelBrowser implements Component {
 			return prev.node;
 		}
 
+		if (selected) this.#noteCreditChange(selected.model);
 		const children: NativeChild[] = [];
 		if (selected) {
 			const model = selected.model;
@@ -1723,6 +1952,8 @@ export class ModelBrowser implements Component {
 			} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 				facts.push(`~${formatTps(model.tps)}`);
 			}
+			const nextCredits = nextCreditRateNote(model);
+			if (nextCredits) facts.push(nextCredits);
 			children.push(text([span(facts.join(" · "), "muted")], { wrap: "word" }));
 			const description = model.description ? formatDescription(model.description) : "";
 			if (description) children.push(text([span(description, "dim")], { wrap: "word", lines: 2 }));
@@ -1771,12 +2002,33 @@ export class ModelBrowser implements Component {
 	}
 
 	/**
+	 * A model picker's search field, fact columns and rows: `catalogue` (from
+	 * {@link pickerItems}) in `view` order (from {@link pickerOrder}), the
+	 * selection, and `current` checked. Memoize hosts on its inputs plus
+	 * {@link query}, {@link cursor} and {@link pickerSelected}.
+	 */
+	pickerRows(catalogue: ModelPickerCatalogue, view: ModelPickerOrder, current: string | undefined): ModelPickerRows {
+		return {
+			query: this.query,
+			cursor: this.cursor,
+			columns: MODEL_PICKER_COLUMNS,
+			...catalogue,
+			order: view.order,
+			...(view.hits ? { hits: view.hits } : {}),
+			selected: this.pickerSelected,
+			...(current ? { current: [current] } : {}),
+			total: this.baseCount,
+		};
+	}
+
+	/**
 	 * Picker rows for `catalogue`: the same object while the catalogue, roles
 	 * and row inputs are unchanged, so typing and scope hops never resend it.
 	 * A rebuilt catalogue that differs in a few rows (a provider refresh, a
 	 * role moving) keeps the last whole `items` and patches it.
 	 */
 	pickerItems(catalogue: readonly ModelBrowserItem[]): ModelPickerCatalogue {
+		this.#syncCreditClock();
 		const memo = this.#pickerItems;
 		if (memo?.catalogue === catalogue && memo.epoch === this.#pickerEpoch && memo.roles === this.#roles) {
 			return memo.value;
@@ -1828,6 +2080,7 @@ export class ModelBrowser implements Component {
 		) {
 			return cached.value;
 		}
+		this.#noteCreditChange(model);
 		const facts: Record<string, TspText | number> = {};
 		const int = model.int != null && Number.isFinite(model.int) ? model.int : undefined;
 		if (int !== undefined) facts.int = String(Math.round(int));
@@ -1863,6 +2116,7 @@ export class ModelBrowser implements Component {
 		const value: TspPickerItem = {
 			id: item.selector,
 			label: quickRole ? item.id : item.selector,
+			mark: providerMark(item.model.provider),
 			mono: true,
 			...(quickRole ? { detail: `${item.model.provider}/${item.model.id}` } : {}),
 			facts,
@@ -1973,9 +2227,10 @@ export class ModelBrowser implements Component {
 	 * below the list): one inline fact line and the held-role chips.
 	 */
 	pickerPreview(mode: "full" | "compact", current?: string): readonly NativeChild[] {
+		this.#syncCreditClock();
 		const selected = this.getSelected();
 		const item = selected && !this.#isDisabled(selected) ? selected : undefined;
-		const key = `${mode}\0${current ?? ""}`;
+		const key = `${mode}\0${current ?? ""}\0${this.#settings.revision}`;
 		const memo = this.#pickerPreview;
 		if (
 			memo !== undefined &&
@@ -1986,6 +2241,7 @@ export class ModelBrowser implements Component {
 		) {
 			return memo.children;
 		}
+		if (item) this.#noteCreditChange(item.model);
 		const children = item ? this.modelPreview(item, mode, current) : [];
 		this.#pickerPreview = { item, epoch: this.#pickerEpoch, roles: this.#roles, key, children };
 		return children;
@@ -2031,6 +2287,8 @@ export class ModelBrowser implements Component {
 			if (ctx > 0) facts.push({ k: "ctx", v: formatNumber(ctx).toLowerCase() });
 			if (out > 0) facts.push({ k: "out", v: formatNumber(out).toLowerCase() });
 			facts.push({ k: "price", v: isFreeModel(model) ? "free" : formatCostDetail(model) });
+			const nextCredits = nextCreditRateNote(model);
+			if (nextCredits) facts.push({ k: "then", v: nextCredits });
 			facts.push({ k: "reasoning", v: model.reasoning ? "yes" : "no" });
 			const children: NativeChild[] = [node("kv", { items: facts, layout: "inline" })];
 			const chips: NativeChild[] = [];
@@ -2069,6 +2327,17 @@ export class ModelBrowser implements Component {
 			if (v) facts.push({ k: [span(k, "muted")], v: [span(v, "mono")] });
 		};
 		fact("Context", ctx > 0 ? ctx.toLocaleString("en-US") : undefined);
+		const compaction = this.#settings.compactionPointFor?.(model);
+		if (compaction) {
+			const value =
+				compaction.tokens === undefined
+					? "off"
+					: `${compaction.tokens.toLocaleString("en-US")}${compaction.basis !== undefined ? ` · ${compaction.basis}` : ""}`;
+			facts.push({
+				k: [span("Compacts at", "muted")],
+				v: [span(value, "mono"), span(` · ${compaction.source}`, "dim")],
+			});
+		}
 		fact("Max output", out > 0 ? out.toLocaleString("en-US") : undefined);
 		fact("Price", isFreeModel(model) ? "free" : `${previewPrice(model)} per M`);
 		fact("Speed", speed.length > 0 ? speed.join(" · ") : undefined);
