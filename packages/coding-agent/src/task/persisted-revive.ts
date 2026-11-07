@@ -146,7 +146,6 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
 	};
 }
 
-
 /**
  * The session `subagent_stop` reports as a cold-revived child's spawner. A child
  * of the top-level session joins that live session. A nested child was spawned
