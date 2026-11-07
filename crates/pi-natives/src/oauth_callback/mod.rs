@@ -90,7 +90,12 @@ const JOURNAL_LIMIT: u64 = 1024 * 1024;
 const CALLBACK_LIMIT: u64 = 16 * 1024;
 // Fallback for a directory watch that failed to start or missed an event; the
 // watch itself wakes the claim as soon as the relay links the callback in.
+#[cfg(not(test))]
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+// Long enough in tests that a wake by the watch and a wake by the poll stay
+// far apart even on a loaded runner, so the tests can tell them apart.
+#[cfg(test)]
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT_MS: u32 = 15_000;
 const SETUP_TIMEOUT_MS: u32 = 30_000;
 const DEFAULT_WAIT_TIMEOUT_MS: u32 = 300_000;
@@ -651,9 +656,9 @@ async fn wait_for_callback_async(
 	let changed = Arc::new(tokio::sync::Notify::new());
 	let watcher = path.parent().and_then(|directory| {
 		let changed = Arc::clone(&changed);
-		// A failed watch (e.g. exhausted inotify instances) only costs latency, so
-		// the wait falls back to polling; logged because that fallback is otherwise
-		// invisible.
+		// A failed watch (e.g. exhausted inotify instances) only costs latency,
+		// so the wait falls back to polling; logged because that fallback
+		// is otherwise invisible.
 		let mut watcher =
 			match notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
 				changed.notify_one();
@@ -677,8 +682,9 @@ async fn wait_for_callback_async(
 		cancel
 			.heartbeat()
 			.map_err(|error| anyhow!(error.to_string()))?;
-		// A plain rename is one syscall that fails fast with ENOENT; routing it through
-		// tokio::fs would add a blocking-pool round trip to every attempt.
+		// A plain rename is one syscall that fails fast with ENOENT; routing it
+		// through tokio::fs would add a blocking-pool round trip to every
+		// attempt.
 		match fs::rename(path, &claim) {
 			Ok(()) => break,
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -728,7 +734,8 @@ pub(super) fn validate_scheme(scheme: &str) -> AnyResult<()> {
 			character.is_ascii_lowercase()
 				|| character.is_ascii_digit()
 				|| matches!(character, '+' | '-' | '.')
-		}) || scheme.len() > 128
+		})
+		|| scheme.len() > 128
 	{
 		bail!("invalid native OAuth URL scheme");
 	}

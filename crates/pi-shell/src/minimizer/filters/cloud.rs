@@ -525,11 +525,14 @@ fn generic_columns(rows: &[Map<String, Value>]) -> Vec<String> {
 			if (matches!(
 				lower.as_str(),
 				"id"
-					| "name" | "arn"
-					| "status" | "state"
+					| "name"
+					| "arn"
+					| "status"
+					| "state"
 					| "created"
 					| "modified"
-					| "type" | "engine"
+					| "type"
+					| "engine"
 					| "version"
 			) || lower.ends_with("id")
 				|| lower.ends_with("name")
@@ -1284,7 +1287,7 @@ fn is_important_line(line: &str) -> bool {
 			.is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 	}) || line
 		.as_bytes()
-		.windows(b"EXCEPTION".len())
+		.array_windows::<{ b"EXCEPTION".len() }>()
 		.any(|window| window.eq_ignore_ascii_case(b"EXCEPTION"))
 }
 
@@ -1393,7 +1396,7 @@ mod tests {
 		let ctx = ctx("psql", &cfg);
 		let mut input = String::from(" level | message\n-------+---------\n");
 		for idx in 0..5000 {
-			input.push_str(&format!(" ERROR | disk full on volume {idx}\n"));
+			let _ = writeln!(input, " ERROR | disk full on volume {idx}");
 		}
 		input.push_str("(5000 rows)\n");
 		let out = filter(&ctx, &input, 0);
@@ -1414,7 +1417,7 @@ mod tests {
 		let ctx = ctx("psql", &cfg);
 		let mut input = String::from(" id | name\n----+------\n");
 		for idx in 0..50 {
-			input.push_str(&format!(" {idx:>2} | n{idx}\n"));
+			let _ = writeln!(input, " {idx:>2} | n{idx}");
 		}
 		input.push_str(
 			"(50 rows)\n\nERROR:  operator does not exist: integer || integer\nLINE 1: select 1 || \

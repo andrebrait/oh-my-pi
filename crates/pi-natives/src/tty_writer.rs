@@ -20,6 +20,8 @@
 //! [`TtyWriter::dead`] and drops all queued output; the JS side maps that to
 //! its terminal-disconnected teardown.
 
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, IntoRawFd};
 use std::{
 	sync::{
 		Arc,
@@ -81,9 +83,9 @@ fn write_all_with(
 fn wait_writable(fd: i32) -> std::io::Result<()> {
 	let mut pollfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
 	loop {
-		// A child can change O_NONBLOCK on a shared open file description; backpressure
-		// is not a dead terminal. SAFETY: pollfd points to one valid element;
-		// TtyWriter owns fd until the pump stops.
+		// A child can change O_NONBLOCK on a shared open file description;
+		// backpressure is not a dead terminal. SAFETY: pollfd points to one
+		// valid element; TtyWriter owns fd until the pump stops.
 		let result = unsafe { libc::poll(&mut pollfd, 1, -1) };
 		if result > 0 {
 			if pollfd.revents & libc::POLLNVAL != 0 {
@@ -165,9 +167,13 @@ fn pump_loop(fd: i32, inner: &Inner) {
 
 /// Dedicated writer thread for one terminal fd.
 ///
-/// `dup(2)`'d at construction and closed on drop. The duplicate keeps the
-/// pump's fd alive if the original is closed or replaced; file-status flags
-/// such as `O_NONBLOCK` are shared and handled by polling for `POLLOUT`.
+/// Duplicated (close-on-exec) at construction and closed on drop. The
+/// duplicate keeps the pump's fd alive if the original is closed or replaced;
+/// file-status flags such as `O_NONBLOCK` are shared and handled by polling for
+/// `POLLOUT`. Close-on-exec keeps the terminal out of every child the process
+/// spawns without explicit fd handling (`std::process::Command`, gitoxide
+/// filter drivers), which could otherwise read the user's keystrokes and
+/// terminal replies through it.
 #[napi]
 pub struct TtyWriter {
 	inner:  Arc<Inner>,
@@ -184,14 +190,12 @@ impl TtyWriter {
 	pub fn new(fd: i32) -> Result<Self> {
 		#[cfg(unix)]
 		{
-			// SAFETY: dup on a caller-provided fd; a negative result is handled.
-			let owned = unsafe { libc::dup(fd) };
-			if owned < 0 {
-				return Err(Error::from_reason(format!(
-					"dup({fd}) failed: {}",
-					std::io::Error::last_os_error()
-				)));
-			}
+			// SAFETY: the caller's fd stays open for this call; the borrow only
+			// lives long enough to duplicate it.
+			let owned = unsafe { BorrowedFd::borrow_raw(fd) }
+				.try_clone_to_owned()
+				.map_err(|err| Error::from_reason(format!("duplicating fd {fd} failed: {err}")))?
+				.into_raw_fd();
 			let inner = Arc::new(Inner {
 				back:    Mutex::new(Vec::new()),
 				pending: AtomicUsize::new(0),
@@ -369,6 +373,29 @@ mod tests {
 	}
 
 	#[test]
+	fn spawned_children_do_not_inherit_the_writer_fd() {
+		let (read_fd, write_fd) = pipe_pair();
+		let mut writer = TtyWriter::new(write_fd).unwrap();
+		let open_in_child = |fd: i32| {
+			std::process::Command::new("/bin/sh")
+				.arg("-c")
+				.arg(format!("test -e /dev/fd/{fd}"))
+				.status()
+				.unwrap()
+				.success()
+		};
+		// The caller's pipe end lacks close-on-exec, so the probe sees it.
+		assert!(open_in_child(write_fd));
+		assert!(!open_in_child(writer.fd));
+		writer.stop(1_000);
+		// SAFETY: closing test-owned fds.
+		unsafe {
+			libc::close(read_fd);
+			libc::close(write_fd);
+		}
+	}
+
+	#[test]
 	fn writes_in_order_and_drains() {
 		let (read_fd, write_fd) = pipe_pair();
 		let mut writer = TtyWriter::new(write_fd).unwrap();
@@ -392,13 +419,13 @@ mod tests {
 	fn nonblocking_writer_waits_for_drain_instead_of_dying() {
 		let (read_fd, write_fd) = pipe_pair();
 		let mut writer = TtyWriter::new(write_fd).unwrap();
-		// Set the flag after construction to exercise the pump's dup of the same open
-		// file description. SAFETY: write_fd remains open until the writer stops;
-		// this only reads its flags.
+		// Set the flag after construction to exercise the pump's dup of the same
+		// open file description. SAFETY: write_fd remains open until the
+		// writer stops; this only reads its flags.
 		let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
 		assert!(flags >= 0);
-		// SAFETY: write_fd remains open; this simulates an inherited child changing the
-		// shared flags.
+		// SAFETY: write_fd remains open; this simulates an inherited child
+		// changing the shared flags.
 		assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
 		let total = 512 * 1024;
 		push(&writer, &vec![b'x'; total]);
@@ -418,7 +445,8 @@ mod tests {
 			let mut buf = [0u8; 64 * 1024];
 			let mut received = 0usize;
 			while received < total {
-				// SAFETY: this thread owns read_fd and buf is valid writable storage.
+				// SAFETY: this thread owns read_fd and buf is valid writable
+				// storage.
 				let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
 				if n <= 0 {
 					break;
@@ -528,7 +556,8 @@ mod tests {
 			let mut buf = [0u8; 4096];
 			let mut total = 0usize;
 			while total < WRITES {
-				// SAFETY: buf is a valid out-buffer and read_fd stays open for this loop.
+				// SAFETY: buf is a valid out-buffer and read_fd stays open for this
+				// loop.
 				let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
 				if n <= 0 {
 					break;
@@ -546,7 +575,8 @@ mod tests {
 		assert!(writer.flush_sync(5_000));
 		assert_eq!(writer.pending(), 0);
 		writer.stop(1_000);
-		// SAFETY: closing the test-owned original write fd lets the reader observe EOF.
+		// SAFETY: closing the test-owned original write fd lets the reader
+		// observe EOF.
 		unsafe { libc::close(write_fd) };
 		assert_eq!(reader.join().unwrap(), WRITES);
 	}

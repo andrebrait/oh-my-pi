@@ -2,7 +2,7 @@
 //! Neither route activates a window or substitutes keyboard input. Lazy menus
 //! absent from the provider's current tree are refused rather than guessed.
 
-use std::{mem::size_of, ptr::with_exposed_provenance_mut};
+use std::ptr::with_exposed_provenance_mut;
 
 use uiautomation::{
 	UIAutomation, UIElement, UITreeWalker,
@@ -368,7 +368,8 @@ struct ComApartment;
 
 impl ComApartment {
 	fn new() -> CoreResult<Self> {
-		// SAFETY: this initializes only the calling thread, with no reserved data.
+		// SAFETY: this initializes only the calling thread, with no reserved
+		// data.
 		let result = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) };
 		if result < 0 {
 			return Err(failed(format!(

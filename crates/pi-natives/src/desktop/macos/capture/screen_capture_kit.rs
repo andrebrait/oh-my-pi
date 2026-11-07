@@ -25,6 +25,7 @@ use crate::desktop::{
 	control,
 	error::{CoreResult, DesktopError},
 	frame::MAX_COMPOSITE_PIXELS,
+	macos::permission,
 	native_helper::HelperDirectory,
 };
 
@@ -321,9 +322,7 @@ fn frame_bytes(width: u32, height: u32) -> CoreResult<usize> {
 pub(super) fn capture(requests: Vec<CaptureRequest>) -> CoreResult<Vec<Captured>> {
 	control::check()?;
 	if !super::capture_permission() {
-		return Err(DesktopError::permission_denied(
-			"macOS Screen Recording permission is not granted for this process",
-		));
+		return Err(permission::denied(permission::screen_recording_pane()));
 	}
 	if !*MODERN_CAPTURE {
 		return requests
@@ -361,7 +360,8 @@ fn legacy_capture(request: CaptureRequest) -> CoreResult<RgbaImage> {
 	let image = match request.target {
 		CaptureTarget::Display(id) => CGDisplayCreateImage(id),
 		CaptureTarget::Window(id) => {
-			// SAFETY: CGRectNull is process-lived; capture the named window's full bounds.
+			// SAFETY: CGRectNull is process-lived; capture the named window's full
+			// bounds.
 			CGWindowListCreateImage(
 				unsafe { CGRectNull },
 				CGWindowListOption::OptionIncludingWindow,
@@ -374,7 +374,7 @@ fn legacy_capture(request: CaptureRequest) -> CoreResult<RgbaImage> {
 		if super::capture_permission() {
 			DesktopError::capture_failed("CoreGraphics returned no screenshot")
 		} else {
-			DesktopError::permission_denied("macOS Screen Recording permission was revoked")
+			permission::denied(permission::screen_recording_pane())
 		}
 	})?;
 	rgba_image(&image)
