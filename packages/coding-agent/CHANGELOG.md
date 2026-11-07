@@ -33,6 +33,7 @@
 - Added `btw.inject` (off by default; `/settings` → Interaction → "/btw Steering Inject"): when you ask `/btw` for a steering prompt, it drafts one in an `<inject>` block shown behind a pink rail, and `Alt+I` (`app.btw.inject`) sends it to the main session (as a steer while the agent runs, else as a new turn) from the inline answer or the BTW history sheet, once per answer from the current run. Once sent, the block turns green with `➤` on each line and "Injected into main session" below it; if the main session drops or refuses the send, the block turns back to pending and the same key retries ([#17618](https://github.com/can1357/oh-my-pi/pull/17618) by [@apullin](https://github.com/apullin))
 - Added queueable compaction: `/compact` sent with the follow-up key (Ctrl+Q) while the agent works now runs when it yields instead of interrupting it ([#17397](https://github.com/can1357/oh-my-pi/pull/17397) by [@H4vC](https://github.com/H4vC))
 - Added custom OpenAI-compatible provider management and comment-preserving `models.yml` editing ([#13874](https://github.com/can1357/oh-my-pi/pull/13874) by [@andrebrait](https://github.com/andrebrait)).
+- Extensions can pass `expandPromptTemplates: true` to `pi.sendUserMessage()` so a `/skill:<name>` command or prompt template they send expands like typed input, matching Pi; Pi extensions with skill-alias commands now load the skill instead of sending the literal command text ([#14608](https://github.com/can1357/oh-my-pi/pull/14608) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 
