@@ -119,6 +119,8 @@ describe("IRC wake turn subagent_stop (real session)", () => {
 		structured?: boolean;
 		/** Output schema; with it the session uses the real `YieldTool` instead of the stand-in. */
 		outputSchema?: Record<string, unknown>;
+		/** Conversation the session already held before the wake, e.g. an earlier user task. */
+		history?: AgentMessage[];
 	}) {
 		const stopEvents: SubagentStopEvent[] = [];
 		const lifecycle: LifecycleFrame[] = [];
@@ -153,7 +155,7 @@ describe("IRC wake turn subagent_stop (real session)", () => {
 			: yieldTool;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [sessionYieldTool], messages: [] },
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [sessionYieldTool], messages: args.history ?? [] },
 			convertToLlm,
 			streamFn: mock.stream,
 		});
@@ -484,7 +486,29 @@ describe("IRC wake turn subagent_stop (real session)", () => {
 
 	it("stops a refusal continuation still running when the user resumes, and cancels the pass", async () => {
 		const continuationStarted = Promise.withResolvers<void>();
+		// `resume` continues a real user conversation; a wake-only transcript has nothing to continue.
+		const timestamp = Date.now();
 		const run = await setup({
+			history: [
+				{ role: "user", content: "Investigate the build", timestamp },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "Investigated." }],
+					api: "openai-responses",
+					provider: "openai",
+					model: "gpt-test",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp,
+				},
+			],
 			responses: [
 				yieldCall("REFUSED-PAYLOAD"),
 				() => {

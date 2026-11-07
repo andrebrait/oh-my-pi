@@ -1195,7 +1195,7 @@ describe("persisted subagent revival", () => {
 			sessionFile: null,
 			session: {
 				model: parentModel,
-				sessionManager: { getCwd: () => parentCwd },
+				sessionManager: { getSessionId: () => "live-parent-session", getCwd: () => parentCwd },
 				effectiveExtensionRoots: parentRoots,
 				getSessionAgents: () => parentAgents,
 			} as unknown as AgentSession,
@@ -1305,7 +1305,7 @@ describe("persisted subagent revival", () => {
 					sessionFile: null,
 					session: {
 						model: parentModel,
-						sessionManager: { getCwd: () => cwd },
+						sessionManager: { getSessionId: () => "revived-parent-session", getCwd: () => cwd },
 						effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 						getSessionAgents: () => agents,
 					} as unknown as AgentSession,
@@ -1431,7 +1431,11 @@ describe("persisted subagent revival", () => {
 			const ref = { ...createRef(sessionFile), parentId: parent };
 			const factory = createPersistedSubagentReviverFactory({
 				session: {
-					sessionManager: { getCwd: () => cwd, getArtifactManager: () => undefined },
+					sessionManager: {
+						getSessionId: () => "root-session",
+						getCwd: () => cwd,
+						getArtifactManager: () => undefined,
+					},
 					effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 					getSessionAgents: () => [],
 					model: rootModel,
@@ -1456,7 +1460,7 @@ describe("persisted subagent revival", () => {
 			parentId: "Main",
 			session: {
 				model: parentModel,
-				sessionManager: { getCwd: () => "/tmp" },
+				sessionManager: { getSessionId: () => "live-parent-session", getCwd: () => "/tmp" },
 				effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 				getSessionAgents: () => [],
 			} as unknown as AgentSession,
