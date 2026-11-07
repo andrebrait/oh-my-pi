@@ -6,6 +6,7 @@ import * as natives from "@oh-my-pi/pi-natives";
 import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
 import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-filesystem";
+import { glob as ovnfsGlob } from "../ovnfs/search";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
@@ -23,13 +24,15 @@ import {
 	resolveExplicitFindPatterns,
 	resolveSearchBase,
 	resolveSearchResultPath,
+	searchPathTier,
 } from "./path-utils";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 
-import { cfgTaskDisabledAgents } from "../task/settings";
+import { cfgTaskDisabledAgents, ovnfsCommand } from "../task/settings";
 
 const findSchema = type({
 	"path?": "string",
@@ -69,6 +72,8 @@ export interface GlobOperationsOptions {
 	hidden: boolean;
 	/** Honour gitignore files. Resolved from the caller's `gitignore`, defaulting to true. */
 	gitignore: boolean;
+	/** Restrict matches to this entry type, including symlinks to that type. */
+	fileType?: natives.FileType;
 	/** Aborts when the caller cancels or when the tool's scan deadline expires.
 	 * Backends are expected to stop on it; the tool does not wait for one that
 	 * does not, but it still stops reporting at the deadline. */
@@ -95,8 +100,8 @@ export interface GlobToolOptions {
 	operations?: GlobOperations;
 	/** Remap slash-only paths to the session cwd before root-search validation. */
 	rootPathAlias?: boolean;
-	/** Native glob binding. Override only in tests. */
-	nativeGlob?: typeof natives.glob;
+	/** Glob backend (`natives.glob`, answered by the ovnfs daemon inside its mount). Override only in tests. */
+	nativeGlob?: typeof ovnfsGlob;
 	/** Filesystem stat used before native scans. Override only in tests. */
 	stat?: typeof fs.promises.stat;
 	/** Native and user-facing scan timeout. Override only in tests. */
@@ -107,6 +112,7 @@ interface GlobTarget {
 	searchPath: string;
 	globPattern: string;
 	hasGlob: boolean;
+	directoryOnly?: boolean;
 }
 
 interface NativePreparedTarget {
@@ -116,18 +122,44 @@ interface NativePreparedTarget {
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly name = "glob";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	/**
+	 * `always-ask-cached` keys: the folders and files this glob searches, so a
+	 * folder grant recorded by a `read` (or by a grep) covers a search inside it
+	 * and a search rooted at one file shares that file's read grant. Roots report
+	 * the walkable base `parseFindPattern` finds — no glob is expanded — and each
+	 * costs a single stat; see {@link searchApprovalCacheTargets}.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const a = args as { path?: string | string[] } | null | undefined;
+		return searchApprovalCacheTargets(
+			toPathList(a?.path),
+			this.session.cwd,
+			entry => parseFindPattern(entry).basePath,
+			entry => {
+				const { globPattern } = parseFindPattern(entry);
+				// A bare pattern recurses (`*.ts` matches at any depth); only a one-segment pattern
+				// under an explicit base (`dir/*.ts`) stays inside the folder's own entries.
+				return globPattern === "" || globPattern.includes("**");
+			},
+		);
+	};
 	readonly loadMode = "essential";
 	readonly label = "Glob";
 	get description(): string {
-		return prompt.render(globDescription, {
-			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
-			eagerDelegation: sessionDelegationBias(this.session) === "eager",
-			scoutAvailable: isScoutSpawnable(
-				cfgTaskDisabledAgents.get(this.session.settings),
-				this.session.getSessionSpawns?.() ?? "*",
-			),
-		});
+		const hasFind = this.session.isToolActive?.("find") ?? isFindEnabled(this.session);
+		const eagerDelegation = sessionDelegationBias(this.session) === "eager";
+		const scoutAvailable = isScoutSpawnable(
+			cfgTaskDisabledAgents.get(this.session.settings),
+			this.session.getSessionSpawns?.() ?? "*",
+		);
+		// Every render input is a boolean; pack them so repeat reads skip the template render.
+		const key = (hasFind ? 1 : 0) | (eagerDelegation ? 2 : 0) | (scoutAvailable ? 4 : 0);
+		if (key !== this.#descriptionKey) {
+			this.#description = prompt.render(globDescription, { hasFind, eagerDelegation, scoutAvailable });
+			this.#descriptionKey = key;
+		}
+		return this.#description;
 	}
 	readonly parameters = findSchema;
 
@@ -135,9 +167,11 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 
 	readonly #customOps?: GlobOperations;
 	readonly #rootPathAlias: boolean;
-	readonly #nativeGlob: typeof natives.glob;
+	readonly #nativeGlob: typeof ovnfsGlob;
 	readonly #stat: typeof fs.promises.stat;
 	readonly #timeoutMs: number;
+	#descriptionKey = -1;
+	#description = "";
 
 	constructor(
 		private readonly session: ToolSession,
@@ -145,7 +179,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	) {
 		this.#customOps = options?.operations;
 		this.#rootPathAlias = options?.rootPathAlias === true;
-		this.#nativeGlob = options?.nativeGlob ?? natives.glob;
+		this.#nativeGlob = options?.nativeGlob ?? ovnfsGlob;
 		this.#stat = options?.stat ?? fs.promises.stat;
 		this.#timeoutMs = options?.timeoutMs ?? DEFAULT_GLOB_TIMEOUT_MS;
 		if (!Number.isFinite(this.#timeoutMs) || this.#timeoutMs <= 0) {
@@ -191,7 +225,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			const internalRouter = InternalUrlRouter.instance();
 			// Internal URLs resolve inside the native walk, bounded by the tier this call was approved at.
 			const urlFilesystem = new InternalUrlFilesystem({
-				context: sessionResolveContext(this.session, { signal }),
+				context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
 				tier: resolveToolTier(this, params),
 			});
 			const normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
@@ -226,6 +260,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						searchPath: target.basePath,
 						globPattern: target.globPattern,
 						hasGlob: target.hasGlob,
+						directoryOnly: target.directoryOnly,
 					}))
 				: [
 						(() => {
@@ -234,6 +269,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 								searchPath: resolveSearchBase(parsed.basePath, this.session.cwd),
 								globPattern: parsed.globPattern,
 								hasGlob: parsed.hasGlob,
+								directoryOnly: parsed.directoryOnly,
 							};
 						})(),
 					];
@@ -400,6 +436,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 							if (stat.timedOut) return [] as string[];
 							if (stat.value.isFile()) return [formatScopePath(target.searchPath)];
 						}
+						const fileType = target.directoryOnly ? natives.FileType.Dir : undefined;
 						const results = await runCustom(
 							Promise.resolve(
 								customOps.glob(target.globPattern, target.searchPath, {
@@ -407,12 +444,13 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 									limit: effectiveLimit,
 									hidden: includeHidden,
 									gitignore: useGitignore,
+									fileType,
 									signal: combinedSignal,
 								}),
 							),
 						);
 						if (results.timedOut) return [] as string[];
-						return results.value.map(matchPath => formatMatchPath(matchPath, target.searchPath));
+						return results.value.map(matchPath => formatMatchPath(matchPath, target.searchPath, fileType));
 					}),
 				);
 				const seen = new Set<string>();
@@ -506,10 +544,10 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			};
 			const streamed = new Set<string>();
 			const makeOnMatch =
-				(base: string) =>
+				(formatTargetMatch: (match: natives.GlobMatch) => string) =>
 				(err: Error | null, match: natives.GlobMatch | null): void => {
 					if (err || combinedSignal.aborted || !match?.path) return;
-					const relativePath = formatMatchPath(match.path, base, match.fileType);
+					const relativePath = formatTargetMatch(match);
 					if (streamed.has(relativePath)) return;
 					streamed.add(relativePath);
 					onUpdateMatches.push(relativePath);
@@ -521,11 +559,24 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			const runTarget = async (prepared: NativePreparedTarget): Promise<Array<{ path: string; mtime: number }>> => {
 				if (prepared.result) return prepared.result;
 				const { target } = prepared;
+				// Native streams exactly the matches it returns; the streamed update and
+				// the final list share one formatting pass per raw path (a path's file
+				// type is fixed within one walk).
+				const formattedPaths = new Map<string, string>();
+				const formatTargetMatch = (match: natives.GlobMatch): string => {
+					let formatted = formattedPaths.get(match.path);
+					if (formatted === undefined) {
+						formatted = formatMatchPath(match.path, target.searchPath, match.fileType);
+						formattedPaths.set(match.path, formatted);
+					}
+					return formatted;
+				};
 				try {
 					const result = await this.#nativeGlob(
 						{
 							pattern: target.globPattern,
 							path: target.searchPath,
+							fileType: target.directoryOnly ? natives.FileType.Dir : undefined,
 							hidden: includeHidden,
 							maxResults: effectiveLimit,
 							sortByMtime: true,
@@ -537,20 +588,19 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 							// native auto-recursion so `dir/*` does not silently match
 							// `dir/sub/nested.ts`.
 							recursive: false,
+							followLinks: target.searchPath.startsWith("skill://"),
 							signal: combinedSignal,
 							timeoutMs,
 							filesystem: urlFilesystem.shellFilesystem(),
 						},
-						makeOnMatch(target.searchPath),
+						makeOnMatch(formatTargetMatch),
+						ovnfsCommand(this.session.settings),
 					);
 					throwIfAborted(signal);
 					const out: Array<{ path: string; mtime: number }> = [];
 					for (const match of result.matches) {
 						if (!match.path) continue;
-						out.push({
-							path: formatMatchPath(match.path, target.searchPath, match.fileType),
-							mtime: match.mtime ?? 0,
-						});
+						out.push({ path: formatTargetMatch(match), mtime: match.mtime ?? 0 });
 					}
 					return out;
 				} catch (error) {

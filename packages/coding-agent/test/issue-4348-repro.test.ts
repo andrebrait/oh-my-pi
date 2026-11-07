@@ -55,6 +55,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 	const chatContainer = new Container();
 	const ctx = {
 		chatContainer,
+		pendingShellContainer: new Container(),
 		pendingMessagesContainer: new Container(),
 		updatePendingMessagesDisplay: vi.fn(),
 		pendingBashComponents: [],
@@ -79,6 +80,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 			sessionManager: {
 				getEntries: vi.fn(() => []),
 				getCwd: vi.fn(() => "/tmp"),
+				getConversationTip: () => undefined,
 			},
 		},
 		sessionManager: {
@@ -101,6 +103,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 			renderChunk?: () => void,
 		) => helpers.renderSessionContextIncrementally(context, options, renderChunk),
 		showStatus: vi.fn(),
+		proseGithubRepo: () => () => undefined,
 	} as unknown as InteractiveModeContext;
 	const helpers = new UiHelpers(ctx);
 	return { ctx, chatContainer };
