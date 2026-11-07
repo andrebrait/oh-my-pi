@@ -33,6 +33,10 @@ export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
  */
 export const CODEX_CLIENT_VERSION = "0.159.0";
 
+/** Identity of the Codex Desktop client; Cloudflare 403s ChatGPT backend endpoints (live, transcribe) without it. */
+export const CODEX_DESKTOP_ORIGINATOR = "Codex Desktop";
+export const CODEX_DESKTOP_USER_AGENT = `${CODEX_DESKTOP_ORIGINATOR}/${CODEX_CLIENT_VERSION}`;
+
 export const OPENAI_HEADERS = {
 	BETA: "OpenAI-Beta",
 	/** Codex feature-negotiation header; values identify opt-in wire protocols. */
@@ -65,7 +69,6 @@ export const OPENAI_HEADERS = {
 } as const;
 
 export const OPENAI_HEADER_VALUES = {
-	BETA_RESPONSES: "responses=experimental",
 	BETA_RESPONSES_WEBSOCKETS_V2: "responses_websockets=2026-02-06",
 	REMOTE_COMPACTION_V2: "remote_compaction_v2",
 	ORIGINATOR_CODEX: "omp",
