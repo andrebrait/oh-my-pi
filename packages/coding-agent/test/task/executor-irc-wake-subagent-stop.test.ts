@@ -155,7 +155,12 @@ describe("IRC wake turn subagent_stop (real session)", () => {
 			: yieldTool;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [sessionYieldTool], messages: args.history ?? [] },
+			initialState: {
+				model: mock.model,
+				systemPrompt: ["Test"],
+				tools: [sessionYieldTool],
+				messages: args.history ?? [],
+			},
 			convertToLlm,
 			streamFn: mock.stream,
 		});
