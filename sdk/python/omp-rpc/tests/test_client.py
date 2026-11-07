@@ -149,13 +149,33 @@ FAKE_SERVER = textwrap.dedent(
         }
     ]
 
+    def skill_items():
+        group = skill_diagnostics[0]
+        review = {
+            "name": "review",
+            "issues": ["conflict", "redundancy"],
+            "skills": group["skills"],
+            "duplicates": group["duplicates"],
+            "reason": group["reason"],
+            "canAnalyze": True,
+        }
+        solo = {
+            "name": "solo",
+            "issues": [],
+            "skills": [group["skills"][0]],
+            "duplicates": [],
+            "canAnalyze": False,
+            "unavailableReason": "Only one copy is loaded.",
+        }
+        return [review, solo]
+
     def skill_snapshot():
         return {
             "cwd": "/workspace",
             "showStartupDiagnostics": show_skill_startup_diagnostics,
             "diagnostics": skill_diagnostics,
+            "items": skill_items(),
         }
-
 
     def emit_event(payload):
         if event_filter is None or payload["type"] in event_filter:
@@ -2339,8 +2359,11 @@ class TerminatesProcessGroupTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""
                     import os, time
-                    with open({pid_file!r}, "w") as f:
+                    with open({beat_file!r}, "w") as f:
+                        f.write(str(time.time()))
+                    with open({(pid_file + ".tmp")!r}, "w") as f:
                         f.write(str(os.getpid()))
+                    os.replace({(pid_file + ".tmp")!r}, {pid_file!r})
                     while True:
                         with open({beat_file!r}, "w") as f:
                             f.write(str(time.time()))
