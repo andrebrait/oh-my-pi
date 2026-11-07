@@ -40,18 +40,20 @@ import {
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
+import { createPersistedSubagentReviverFactory, resolveSpawner } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { PerCallModelError, PerCallModelUnavailableError } from "@oh-my-pi/pi-coding-agent/task/model-approval";
 import { cfgTaskMaxEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { buildWakeRelayBody, type IrcWakeTurnMonitorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { localSession } from "../helpers/local-session";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
@@ -66,7 +68,11 @@ function makeTempDir(prefix: string): string {
 
 /** Inert shared manager exposing the members a revived subagent reads: its tools and change feed. */
 function fakeMcpManager(getTools: () => Array<{ name: string; label: string }>): MCPManager {
-	return { getTools, addToolsChangedListener: () => () => {} } as unknown as MCPManager;
+	return {
+		getTools,
+		addToolsChangedListener: () => () => {},
+		openToolScope: () => {},
+	} as unknown as MCPManager;
 }
 
 function createRef(sessionFile: string): AgentRef {
@@ -78,6 +84,7 @@ function createRef(sessionFile: string): AgentRef {
 		status: "parked",
 		session: null,
 		sessionFile,
+		generation: 0,
 		createdAt: 0,
 		lastActivity: 0,
 	};
@@ -171,9 +178,17 @@ async function createPersistedSession(
 		resolvedModel?: string;
 		perCallModelIdentity?: string;
 		perCallThinkingLevel?: ConfiguredThinkingLevel | null;
+		/** Transcript of the session that spawned this one, as a nested child's header records it. */
+		parentSession?: string;
 	},
 ): Promise<string> {
-	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+	const manager = contract?.parentSession
+		? await SessionManager.open(path.join(cwd, "sessions", "nested-child.jsonl"), undefined, undefined, {
+				initialCwd: cwd,
+				parentSession: contract.parentSession,
+				suppressBreadcrumb: true,
+			})
+		: SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
 	manager.appendSessionInit({
@@ -228,6 +243,7 @@ interface ReviveOwnerOptions {
 function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptions = {}) {
 	const parentSession = {
 		sessionManager: {
+			getSessionId: () => "parent-session-1",
 			getCwd: () => cwd,
 			getArtifactManager: () => undefined,
 		},
@@ -336,7 +352,7 @@ describe("persisted subagent revival", () => {
 		};
 		let revived: AgentSession | undefined;
 		try {
-			revived = await reviver(ref);
+			revived = localSession(await reviver(ref));
 			const read = revived.getToolByName("read");
 			if (!read) throw new Error("Missing revived read tool");
 			await expect(read.execute("denied", { path: blockedPath })).rejects.toThrow("Owner policy denied the read");
@@ -391,7 +407,7 @@ describe("persisted subagent revival", () => {
 
 		let revived: AgentSession | undefined;
 		try {
-			revived = await reviver(ref);
+			revived = localSession(await reviver(ref));
 			const read = revived.getToolByName("read");
 			if (!read) throw new Error("Missing restricted read tool");
 			await expect(read.execute("denied", { path: blockedPath })).rejects.toThrow(
@@ -447,6 +463,184 @@ describe("persisted subagent revival", () => {
 		expect(capturedArtifactsDir).toBe(path.dirname(sessionFile));
 		expect(capturedArtifactsDir).not.toBe(path.join(cwd, "parent"));
 		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("reports the owning session as the wake monitor's parent for subagent_stop", async () => {
+		AgentRegistry.resetGlobalForTests();
+		const cwd = makeTempDir("@pi-revive-parent-identity-");
+		const sessionFile = await createPersistedSession(cwd);
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		let captured: IrcWakeTurnMonitorOptions | undefined;
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			captured = options;
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		AgentRegistry.global().register({
+			id: ref.id,
+			displayName: ref.displayName,
+			kind: "sub",
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(captured?.parentSessionId).toBe("parent-session-1");
+		expect(captured?.parentSessionFile).toBe(path.join(cwd, "parent.jsonl"));
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("reports a nested child's direct spawner, not the top-level session, as the wake monitor's parent", async () => {
+		AgentRegistry.resetGlobalForTests();
+		const cwd = makeTempDir("@pi-revive-nested-parent-");
+		// The spawning subagent's own transcript; the nested child's header records it.
+		const spawnerFile = await createPersistedSession(cwd);
+		const spawnerSessionId = await readSessionHeaderId(spawnerFile);
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, {
+			parentSession: spawnerFile,
+		});
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		let captured: IrcWakeTurnMonitorOptions | undefined;
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			captured = options;
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = { ...createRef(sessionFile), parentId: "Spawner" };
+		AgentRegistry.global().register({
+			id: "Spawner",
+			displayName: "Spawner",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: spawnerFile,
+			status: "parked",
+		});
+		AgentRegistry.global().register({
+			id: ref.id,
+			displayName: ref.displayName,
+			kind: "sub",
+			parentId: ref.parentId,
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(spawnerSessionId).toBeString();
+		expect(captured?.parentSessionId).toBe(spawnerSessionId);
+		expect(captured?.parentSessionFile).toBe(spawnerFile);
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("resolves a live peer-shaped nested parent's identity without a transcript fallback", async () => {
+		const registry = new AgentRegistry();
+		registry.register({
+			id: "Spawner",
+			displayName: "Spawner",
+			kind: "sub",
+			parentId: "Main",
+			session: {
+				sessionManager: { getSessionId: () => "peer-spawner-session" },
+			} as unknown as AgentSession,
+			sessionFile: null,
+			status: "running",
+		});
+		const spawner = await resolveSpawner(
+			registry,
+			{} as AgentSession,
+			{ ...createRef("child.jsonl"), parentId: "Spawner" },
+			undefined,
+		);
+
+		expect(spawner.sessionId).toBe("peer-spawner-session");
+		expect(spawner.sessionFile).toBeUndefined();
+	});
+
+	it("leaves a nested child's parent identity unset rather than guessing the top-level session", async () => {
+		AgentRegistry.resetGlobalForTests();
+		const cwd = makeTempDir("@pi-revive-nested-unknown-parent-");
+		// A header that never recorded its spawner, under a spawner with no transcript.
+		const sessionFile = await createPersistedSession(cwd);
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		let captured: IrcWakeTurnMonitorOptions | undefined;
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			captured = options;
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = { ...createRef(sessionFile), parentId: "Spawner" };
+		AgentRegistry.global().register({
+			id: "Spawner",
+			displayName: "Spawner",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: null,
+			status: "parked",
+		});
+		AgentRegistry.global().register({
+			id: ref.id,
+			displayName: ref.displayName,
+			kind: "sub",
+			parentId: ref.parentId,
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(captured).toBeDefined();
+		expect(captured?.parentSessionId).toBeUndefined();
+		expect(captured?.parentSessionFile).toBeUndefined();
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("hands the wake monitor the spawn's result contract", async () => {
+		AgentRegistry.resetGlobalForTests();
+		const cwd = makeTempDir("@pi-revive-structured-");
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		const captured: Array<IrcWakeTurnMonitorOptions | undefined> = [];
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			captured.push(options);
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		// A session persisted without `yield` returned its final message.
+		for (const tools of [["read", "yield"], ["read"]]) {
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { tools });
+			const ref = createRef(sessionFile);
+			AgentRegistry.global().register({
+				id: ref.id,
+				displayName: ref.displayName,
+				kind: "sub",
+				session: null,
+				sessionFile,
+				status: "parked",
+			});
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+			AgentRegistry.resetGlobalForTests();
+		}
+
+		expect(captured.map(options => options?.structured)).toEqual([true, false]);
 	});
 
 	it("cold-revives a restricted contract without loading hostile same-name capabilities", async () => {
@@ -585,6 +779,49 @@ describe("persisted subagent revival", () => {
 		// Restricted") for a cold-revived ref, not the durable agent definition
 		// name. `agents: [scout]` rule scoping must key on the latter.
 		expect(capturedOptions?.agentName).toBe("scout");
+	});
+
+	it("keys a revived subagent's soft request budget on its persisted agent name, not the ref display name", async () => {
+		const cwd = makeTempDir("@pi-revive-soft-budget-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: "scout" });
+		let capturedBudget: number | undefined;
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			capturedBudget = options.softRequestBudget;
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async () => ({ session: createRevivedSession([]).session }) as CreateAgentSessionResult,
+		);
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(capturedBudget).toBe(100);
+	});
+
+	it("hands the wake monitor the restored definition name as agent_type, not the ref label", async () => {
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		const captured: Array<IrcWakeTurnMonitorOptions | undefined> = [];
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((_session, options) => {
+			captured.push(options);
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		// A legacy transcript whose persisted name is a reserved sentinel is scoped
+		// under the ref label, so it must not be reported as the `main` agent either.
+		for (const persisted of ["scout", "main"]) {
+			const cwd = makeTempDir("@pi-revive-wake-agent-type-");
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: persisted });
+			const ref = createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+		}
+
+		expect(captured.map(options => options?.agentType)).toEqual(["scout", "Persisted Restricted"]);
 	});
 
 	it("restores the live account pool for the persisted agent name, so a revived agent stays restricted", async () => {
@@ -2028,7 +2265,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const ref = { ...createRef(path.join(cwd, "prompt-blocks.jsonl")), id: "prompt-blocks" };
 		const reviver = await createFactory(cwd)(ref);
 		if (!reviver) throw new Error("Expected a persisted reviver");
-		const session = await reviver(ref);
+		const session = localSession(await reviver(ref));
 		await session.prompt("follow-up");
 		await session.waitForIdle();
 		if (!revived) throw new Error("Expected the revive to create a session");
@@ -2079,7 +2316,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			warm = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["next"] }]);
 			return { session: warm.session } as CreateAgentSessionResult;
 		});
-		const live = await lifecycle.ensureLive("prompt-blocks");
+		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
 		if (!warm || live !== warm.session) throw new Error("Expected a warm revive through the lifecycle");
 		// The next work-pool batch installs its yield contract, which rebuilds the base prompt.
 		batch = 2;
@@ -2113,7 +2350,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			]);
 			return { session: warm.session } as CreateAgentSessionResult;
 		});
-		const live = await lifecycle.ensureLive("prompt-blocks");
+		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
 		if (!warm || live !== warm.session) throw new Error("Expected a warm revive through the lifecycle");
 		expect(live.getEnabledToolNames()).toEqual(spawnedTools);
 		await live.prompt("next");
@@ -2158,7 +2395,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			);
 			return { session: warm.session } as CreateAgentSessionResult;
 		});
-		const live = await lifecycle.ensureLive("prompt-blocks");
+		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
 		if (!warm || live !== warm.session) throw new Error("Expected a warm revive through the lifecycle");
 		await live.prompt("next");
 		await live.waitForIdle();
