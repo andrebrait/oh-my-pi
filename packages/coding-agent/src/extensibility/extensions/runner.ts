@@ -394,16 +394,20 @@ async function raceHandlerWithTimeout<T>(
 
 /**
  * Wait for an extension's earlier deliveries until `deadline` (a
- * `performance.now()` instant). Resolves `false` when the deadline passes
- * first; an already-settled `ready` wins even at a past deadline.
+ * `performance.now()` instant). Resolves `false` on cancellation or when the
+ * deadline passes first; an already-settled `ready` wins at a past deadline.
  */
-async function awaitDeliveryTurn(ready: Promise<void>, deadline: number): Promise<boolean> {
+async function awaitDeliveryTurn(ready: Promise<void>, deadline: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return false;
 	const { promise: expired, resolve } = Promise.withResolvers<boolean>();
+	const onAbort = () => resolve(false);
+	signal?.addEventListener("abort", onAbort, { once: true });
 	const timer = setTimeout(resolve, Math.max(0, deadline - performance.now()), false);
 	try {
 		return await Promise.race([ready.then(() => true), expired]);
 	} finally {
 		clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -2025,12 +2029,15 @@ export class ExtensionRunner {
 
 		const timeoutMs = handlerTimeoutForEvent(event.type);
 		const turns = this.#reserveDeliveryTurns(extensions, event.type, timeoutMs);
+		const signal = event.type === "session_stop" || event.type === "subagent_stop" ? event.signal : undefined;
 		try {
 			for (const ext of extensions) {
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
 				const turn = turns?.get(ext);
-				if (turn?.ready && !(await awaitDeliveryTurn(turn.ready, turn.deadline))) {
+				const ready = turn?.ready ? await awaitDeliveryTurn(turn.ready, turn.deadline, signal) : true;
+				if (signal?.aborted) return undefined as RunnerEmitResult<TEvent>;
+				if (!ready) {
 					logger.warn("Extension still handling an earlier event; delivering out of order", {
 						extensionPath: ext.path,
 						event: event.type,
@@ -2075,7 +2082,13 @@ export class ExtensionRunner {
 				turn?.release();
 			}
 		} finally {
-			if (turns) for (const turn of turns.values()) turn.release();
+			if (turns) {
+				for (const turn of turns.values()) {
+					// A cancelled delivery must not let later events bypass its predecessor.
+					if (signal?.aborted && turn.ready) void turn.ready.then(turn.release);
+					else turn.release();
+				}
+			}
 		}
 
 		// Handlers for these events export session-scoped environment (a session

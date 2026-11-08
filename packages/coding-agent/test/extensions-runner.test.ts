@@ -4510,6 +4510,87 @@ describe("ExtensionRunner", () => {
 			expect(seen).toEqual(["slow:start", "observer:start", "observer:end"]);
 		});
 
+		it("cancels a queued subagent stop promptly without letting later events overtake the earlier handler", async () => {
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const seen: string[] = [];
+			const errors: ExtensionError[] = [];
+			const extension = inlineExtension("cancel-queued-stop", {
+				tool_execution_start: async () => {
+					seen.push("start");
+					started.resolve();
+					await release.promise;
+					seen.push("released");
+				},
+				subagent_stop: () => seen.push("stop"),
+				tool_execution_end: () => seen.push("end"),
+			});
+			const runner = new ExtensionRunner(
+				[extension],
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.onError(error => errors.push(error));
+			const start = runner.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+			const deliveries: Promise<unknown>[] = [start];
+			try {
+				await started.promise;
+				const controller = new AbortController();
+				let stopSettled = false;
+				const stop = runner
+					.emitSubagentStop({
+						agent_id: "Scout",
+						agent_type: "task",
+						session_id: "child-session",
+						messages: [],
+						stop_hook_active: false,
+						signal: controller.signal,
+					})
+					.then(result => {
+						stopSettled = true;
+						return result;
+					});
+				deliveries.push(stop);
+				const waitingTurn = Promise.withResolvers<void>();
+				setImmediate(waitingTurn.resolve);
+				await waitingTurn.promise;
+				expect(stopSettled).toBe(false);
+				expect(seen).toEqual(["start"]);
+
+				controller.abort();
+				const cancelledTurn = Promise.withResolvers<void>();
+				setImmediate(cancelledTurn.resolve);
+				await cancelledTurn.promise;
+				expect(stopSettled).toBe(true);
+				await expect(stop).resolves.toBeUndefined();
+				expect(seen).toEqual(["start"]);
+				expect(errors).toEqual([]);
+
+				const end = runner.emit({
+					type: "tool_execution_end",
+					toolCallId: "call-1",
+					toolName: "read",
+					result: {},
+					isError: false,
+				});
+				deliveries.push(end);
+				const queuedTurn = Promise.withResolvers<void>();
+				setImmediate(queuedTurn.resolve);
+				await queuedTurn.promise;
+				expect(seen).toEqual(["start"]);
+
+				release.resolve();
+				await Promise.all(deliveries);
+				expect(seen).toEqual(["start", "released", "end"]);
+				expect(errors).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.all(deliveries);
+			}
+		});
+
 		it("delivers an event emitted inside a handler at once instead of queueing it behind that handler", async () => {
 			// Queued behind its own emitter the inner emit would wait out this budget.
 			testSetExtensionHandlerTimeoutMs(1_000);

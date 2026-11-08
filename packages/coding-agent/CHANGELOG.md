@@ -32,6 +32,7 @@
 - Reading Reddit URLs now works when Reddit blocks its API: posts, comment threads, subreddits, and user pages fall back to a Redlib mirror and then the Arctic Shift archive, and render full nested comment trees.
 - Limited xAI `web_search` to two hosted-search turns per request to help prevent unexpected X search costs.
 - Fixed extension event delivery so each extension receives events in emission order, even when another extension is slow to process an earlier event.
+- Cancelling a queued stop hook now settles promptly without running the cancelled handler or letting later extension events overtake earlier deliveries.
 - `pi.sendUserMessage()` now rejects when a message is dropped before a turn begins, including the cost-cap reason when available.
 - Prevented OpenTelemetry settings from omp-managed `.env` files from leaking into child processes or in-process extensions.
 - Supervised-service waits now complete only after logs, metadata, and session-owner state have been published.
