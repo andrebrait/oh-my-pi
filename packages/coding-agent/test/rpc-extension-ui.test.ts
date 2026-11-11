@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import type { ExtensionAskDialogQuestion } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { MAX_RPC_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import {
 	type PendingExtensionRequest,
 	type RpcExtensionUIResponse,
 	requestRpcAskDialog,
 	requestRpcDialog,
+	requestRpcFormDialog,
 	requestRpcInput,
 	requestRpcSelect,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
@@ -580,6 +582,178 @@ export default function(pi) {
 	}, 30_000);
 });
 
+const DEPLOY_FORM = `<form>
+  <p>Which target?</p>
+  <label><input type="radio" name="target" value="prod" checked> Production</label>
+  <label><input type="radio" name="target" value="canary"> Canary</label>
+  <label><input type="radio" name="target" value="legacy" disabled> Legacy</label>
+  <p>Which checks?</p>
+  <label><input type="checkbox" name="checks" value="lint"> Lint</label>
+  <label><input type="checkbox" name="checks" value="smoke"> Smoke</label>
+  <label><input type="checkbox" name="checks" value="e2e" disabled> End-to-end</label>
+  <label>Replicas <input type="number" name="replicas" value="2" min="1"></label>
+  <label>Owner <input type="text" name="owner"></label>
+  <input type="hidden" name="release" value="r7">
+</form>`;
+
+/** The protocol v1 limit `RpcFrameEncoder.maxResponseBytes` reports. */
+const FRAME_LIMIT = MAX_RPC_FRAME_BYTES - 1;
+
+describe("RPC form dialog", () => {
+	it("sends the form in one frame and returns the submitted data checked against it", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, DEPLOY_FORM, { timeout: 60_000 });
+		const request = requireRequest(output.mock.calls[0]?.[0]);
+
+		expect(output).toHaveBeenCalledWith({
+			type: "extension_ui_request",
+			id: request.id,
+			method: "form",
+			html: DEPLOY_FORM,
+			timeout: 60_000,
+		});
+
+		// Free text stands in as "Other", numbers arrive as text, and hidden inputs keep the form's value.
+		respond(pendingRequests, request.id, {
+			data: { target: "staging", checks: ["smoke", "Rollback"], replicas: "3", owner: "ops", release: "tampered" },
+		});
+		expect(await result).toEqual({
+			data: { release: "r7", target: "staging", checks: ["smoke", "Rollback"], replicas: 3, owner: "ops" },
+		});
+	});
+
+	it.each([
+		["no data object", { data: ["prod"] }],
+		["a field the form lacks", { data: { target: "prod", region: "eu" } }],
+		["a string for a checkbox group", { data: { checks: "lint" } }],
+		["an array for a radio group", { data: { target: ["prod"] } }],
+		["an option checked twice", { data: { checks: ["lint", "lint"] } }],
+		["two free-text answers in one group", { data: { checks: ["Rollback", "Canary bake"] } }],
+		["a number below the input's min", { data: { replicas: 0 } }],
+		["a disabled radio option", { data: { target: "legacy" } }],
+		["a disabled checkbox option", { data: { checks: ["lint", "e2e"] } }],
+		["a number for a text input", { data: { owner: 7 } }],
+	])("rejects %s", async (_case, response) => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, DEPLOY_FORM);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, response);
+
+		await expect(result).rejects.toThrow(Error);
+		expect(pendingRequests.size).toBe(0);
+	});
+
+	it("gives an omitted checkbox group an empty array", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, DEPLOY_FORM);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, { data: { target: "prod", replicas: 2 } });
+
+		expect(await result).toEqual({ data: { release: "r7", target: "prod", checks: [], replicas: 2, owner: "" } });
+	});
+
+	it("fails a form too large for one frame without sending a truncated copy", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const html = `<form><img src="data:image/png;base64,${"A".repeat(FRAME_LIMIT)}"><input type="text" name="owner" required></form>`;
+
+		await expect(requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, html)).rejects.toThrow("too large");
+		expect(output).not.toHaveBeenCalled();
+		expect(pendingRequests.size).toBe(0);
+	});
+
+	it("checks a shared name against every field that carries it", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const html = `<form>
+  <label>Name <input type="text" name="name" required></label>
+  <label>Nickname <input type="text" name="name"></label>
+</form>`;
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, html);
+
+		// The optional second field must not hide the required first one.
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, { data: {} });
+
+		await expect(result).rejects.toThrow("Required");
+	});
+
+	it("treats an omitted field named like an Object.prototype member as absent", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const html = `<form>
+  <label>Constructor <input type="text" name="constructor"></label>
+  <label>Target <input type="text" name="target"></label>
+</form>`;
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, html);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, { data: { target: "prod" } });
+
+		expect(await result).toEqual({ data: { constructor: "", target: "prod" } });
+	});
+
+	it("accepts a value whose enabled option follows a disabled duplicate", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const html = `<form>
+  <label><input type="radio" name="tier" value="basic" disabled> Basic (sold out)</label>
+  <label><input type="radio" name="tier" value="basic"> Basic</label>
+  <label><input type="radio" name="tier" value="pro"> Pro</label>
+</form>`;
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, html);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, { data: { tier: "basic" } });
+
+		expect(await result).toEqual({ data: { tier: "basic" } });
+	});
+
+	it("keeps a control named __proto__ as an ordinary key of the data", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const html = `<form>
+  <label>Proto <input type="text" name="__proto__"></label>
+  <label>Target <input type="text" name="target"></label>
+</form>`;
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, html);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, {
+			data: JSON.parse('{"__proto__":"x","target":"prod"}'),
+		});
+
+		// The model reads the data as JSON, so the key must survive serialization.
+		expect(JSON.stringify((await result)?.data)).toBe('{"__proto__":"x","target":"prod"}');
+	});
+
+	it.each([
+		["omp's timer fires", 5, undefined],
+		["the host reports its own timeout", undefined, { cancelled: true, timedOut: true }],
+	])("submits the form's defaults when %s", async (_case, timeout, response) => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const onTimeout = vi.fn();
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, DEPLOY_FORM, { timeout, onTimeout });
+		if (response) respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, response);
+
+		expect(await result).toEqual({
+			data: { release: "r7", target: "prod", checks: [], replicas: 2, owner: "" },
+			timedOut: true,
+		});
+		expect(onTimeout).toHaveBeenCalledTimes(1);
+	});
+
+	it("resolves a plain host cancel as a cancelled form", async () => {
+		const pendingRequests = new Map<string, PendingExtensionRequest>();
+		const output = vi.fn<(frame: object) => void>();
+		const result = requestRpcFormDialog(pendingRequests, output, FRAME_LIMIT, DEPLOY_FORM);
+
+		respond(pendingRequests, requireRequest(output.mock.calls[0]?.[0]).id, { cancelled: true });
+
+		expect(await result).toBeUndefined();
+	});
+});
+
 describe("RPC ask dialog", () => {
 	it("sends every question in one ask frame and returns the validated answers", async () => {
 		const pendingRequests = new Map<string, PendingExtensionRequest>();
@@ -707,7 +881,7 @@ describe("RPC ask dialog", () => {
 		expect(onTimeout).not.toHaveBeenCalled();
 	});
 
-	it("walks the ask tool's form through select prompts, also after the host opts into ask dialogs", async () => {
+	it("walks the ask tool's form through select prompts until the host opts into form dialogs", async () => {
 		await using temp = await TempDir.create("@rpc-ask-dialog-");
 		const extensionPath = temp.join("scripted-ask.ts");
 		await Bun.write(extensionPath, scriptedAskProvider);
@@ -748,12 +922,14 @@ describe("RPC ask dialog", () => {
 		};
 		const selectRequests: Record<string, unknown>[] = [];
 		const askRequests: Record<string, unknown>[] = [];
+		const formRequests: Record<string, unknown>[] = [];
 		const toolResults: unknown[] = [];
 		let optInResponse: unknown;
+		let formOptInResponse: unknown;
 		let finished = false;
-		const form = JSON.stringify({
-			html: '<form><p>Which database?</p><label><input type="radio" name="db" value="pg"> Postgres</label><label><input type="radio" name="db" value="sqlite" checked> SQLite</label></form>',
-		});
+		const html =
+			'<form><p>Which database?</p><label><input type="radio" name="db" value="pg"> Postgres</label><label><input type="radio" name="db" value="sqlite" checked> SQLite</label></form>';
+		const form = JSON.stringify({ html });
 
 		try {
 			// The provider exists only once the extension loads, so select it over RPC.
@@ -769,6 +945,9 @@ describe("RPC ask dialog", () => {
 				} else if (frame.type === "extension_ui_request" && frame.method === "ask") {
 					askRequests.push(frame);
 					await send({ type: "extension_ui_response", id: frame.id, cancelled: true });
+				} else if (frame.type === "extension_ui_request" && frame.method === "form") {
+					formRequests.push(frame);
+					await send({ type: "extension_ui_response", id: frame.id, data: { db: "pg" } });
 				} else if (frame.type === "tool_execution_end" && frame.toolName === "ask") {
 					toolResults.push(frame.result);
 				} else if (frame.type === "prompt_result" && frame.id === "fallback") {
@@ -777,6 +956,11 @@ describe("RPC ask dialog", () => {
 					optInResponse = frame;
 					await send({ type: "prompt", id: "dialog", message: form });
 				} else if (frame.type === "prompt_result" && frame.id === "dialog") {
+					await send({ type: "set_form_dialog", id: "form-opt-in", enabled: true });
+				} else if (frame.type === "response" && frame.id === "form-opt-in") {
+					formOptInResponse = frame;
+					await send({ type: "prompt", id: "form", message: form });
+				} else if (frame.type === "prompt_result" && frame.id === "form") {
 					finished = true;
 					break;
 				}
@@ -799,9 +983,11 @@ describe("RPC ask dialog", () => {
 			data: { enabled: true },
 		});
 		expect(askRequests).toEqual([]);
+		expect(formOptInResponse).toMatchObject({ command: "set_form_dialog", success: true, data: { enabled: true } });
+		expect(formRequests).toEqual([expect.objectContaining({ method: "form", html })]);
 		const answered = expect.objectContaining({
 			details: { answers: [{ name: "db", question: "Which database?", answer: "Postgres" }] },
 		});
-		expect(toolResults).toEqual([answered, answered]);
+		expect(toolResults).toEqual([answered, answered, answered]);
 	}, 60_000);
 });

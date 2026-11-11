@@ -26,6 +26,7 @@
 - RPC hosts can correlate submitted intents across native messages, queues, skill expansion and session reloads with optional `clientMessageId` metadata and read-only `get_client_message_status` reconciliation, without sending client IDs to providers ([#18668](https://github.com/can1357/oh-my-pi/pull/18668) by [@andrebrait](https://github.com/andrebrait))
 - The task tool can take an exact per-spawn thinking level with `actualEffort` (`minimal`…`max`), enabled by `task.enableActualEffort` and capped by the new `task.maxActualEffort`; it takes `effort`'s precedence one step above it, replacing `effort` entirely ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
 - Added a navigable `/skills diagnostics` panel and shared RPC workflow for consent-gated AI relationship analysis, with retained per-skill results, cancellation, cited evidence, and separately confirmed content-bound choices that affect OMP only. `omp plugin doctor --analyze` offers the same analyzer for plugins and extensions ([#14458](https://github.com/can1357/oh-my-pi/pull/14458) by [@andrebrait](https://github.com/andrebrait)).
+- RPC hosts can render the `ask` tool's HTML form whole: after `set_form_dialog`, the tool sends one `form` UI request carrying the HTML, answered with the submitted `data` (checked against the form) or a cancel, instead of walking the fields through `select`/`input`/`editor` ([#18646](https://github.com/can1357/oh-my-pi/pull/18646) by [@pasquale95](https://github.com/pasquale95))
 
 ### Fixed
 
