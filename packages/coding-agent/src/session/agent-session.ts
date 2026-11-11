@@ -193,6 +193,11 @@ import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
+import {
+	getMnemosyneOssSessionState,
+	type MnemosyneOssSessionState,
+	setMnemosyneOssSessionState,
+} from "../mnemosyne-oss/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { theme } from "@oh-my-pi/pi-tui/theme";
@@ -2562,6 +2567,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			setHindsightSessionState: state => this.setHindsightSessionState(state),
 			getMnemopiSessionState: () => this.getMnemopiSessionState(),
 			takeMnemopiSessionState: () => setMnemopiSessionState(this, undefined),
+			getMnemosyneOssSessionState: () => this.getMnemosyneOssSessionState(),
+			takeMnemosyneOssSessionState: () => setMnemosyneOssSessionState(this, undefined),
 			setBaseSystemPrompt: prompt => {
 				this.#tools.setBaseSystemPrompt(prompt);
 				this.agent.setSystemPrompt(prompt);
@@ -3624,6 +3631,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	getMnemopiSessionState(): MnemopiSessionState | undefined {
 		return getMnemopiSessionState(this);
+	}
+
+	getMnemosyneOssSessionState(): MnemosyneOssSessionState | undefined {
+		return getMnemosyneOssSessionState(this);
 	}
 
 	/** TTSR manager for time-traveling stream rules */
@@ -7059,6 +7070,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		const hindsightState = this.getHindsightSessionState();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
+		const mnemosyneOssState = setMnemosyneOssSessionState(this, undefined);
 		// Bound the wait for a just-fired sharpshooter extraction before dropping
 		// its subscriptions, so print-mode exits don't cut queued-delta writes.
 		const sharpshooterFlushed = flushSharpshooterExtraction(this, options.mnemopiConsolidateTimeoutMs);
@@ -7078,6 +7090,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
 			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+			mnemosyneOssState?.dispose() ?? Promise.resolve(),
 			sharpshooterFlushed,
 		]);
 		for (const result of results) {
@@ -12797,6 +12810,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let sessionTransitioned = false;
 		try {
 			advisorRecordersDetached = true;
+			// A deleted session must not leak into long-term memory.
+			if (options?.drop !== true) await this.#memory.retainOutgoingTranscript();
 			await this.#advisors.drainAndDetachRecorders();
 			try {
 				this.#releaseQueuedTtsrReservations();
@@ -12965,6 +12980,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let advisorRecordersDetached = false;
 		try {
 			advisorRecordersDetached = true;
+			await this.#memory.retainOutgoingTranscript();
 			// Fork keeps the conversation, but still needs a quiet artifact boundary:
 			// stop and settle in-flight advisors before muting their feeds.
 			await this.#advisors.drainAndDetachRecorders();
@@ -14717,6 +14733,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let cwdChangeTarget: string | undefined;
 		try {
 			if (switchingToDifferentSession) {
+				await this.#memory.retainOutgoingTranscript();
 				// Stop and settle in-flight advisors while the old-session feeds can
 				// still observe message_end, then mute before swapping files.
 				await this.#advisors.drainAndDetachRecorders();
@@ -15145,6 +15162,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let advisorRecordersDetached = false;
 		try {
 			advisorRecordersDetached = true;
+			await this.#memory.retainOutgoingTranscript();
 			await this.#advisors.drainAndDetachRecorders();
 			try {
 				// A prompt admitted during the drain awaits above belongs to the history
@@ -15274,6 +15292,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let advisorRecordersDetached = false;
 		try {
 			advisorRecordersDetached = true;
+			await this.#memory.retainOutgoingTranscript();
 			await this.#advisors.drainAndDetachRecorders();
 			try {
 				if (this.sessionManager.getSessionId() !== sessionId || this.sessionManager.getLeafId() !== leafId) {
