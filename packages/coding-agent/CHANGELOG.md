@@ -10,6 +10,11 @@
 ### Added
 
 - GitHub issue/PR references in assistant replies (`#123`, `owner/repo#123`) are now clickable terminal hyperlinks; bare `#123` links to the current directory's GitHub repository and the visible text is unchanged ([#13078](https://github.com/can1357/oh-my-pi/pull/13078) by [@andrebrait](https://github.com/andrebrait))
+- Added `skills.optInSkills` to keep matching skills available through `/skill:<name>` and `skill://<name>` while hiding them from the model prompt, without editing their files; `omp skill list --json` reports the result as `hide` ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@karls-science](https://github.com/karls-science) and [@andrebrait](https://github.com/andrebrait)).
+
+### Fixed
+
+- Fixed an unknown `skill://` name listing hidden skills as available to the model ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.18.8] - 2026-11-11
 
