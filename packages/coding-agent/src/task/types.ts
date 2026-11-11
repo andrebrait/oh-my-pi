@@ -46,6 +46,8 @@ export interface SubagentEventPayload {
 const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
+// Exact per-spawn thinking level; must stay in sync with THINKING_EFFORTS.
+const actualEffortRule = '"minimal" | "low" | "medium" | "high" | "xhigh" | "max"' as const;
 
 // Per-spawn fields the schema declares only conditionally: `sourceSession`
 // while seance is advertised, `model` while seance is advertised or per-call
@@ -176,6 +178,7 @@ function createTaskSchema(options: {
 	batchEnabled: boolean;
 	defaultAgent: string;
 	effortEnabled: boolean;
+	actualEffortEnabled: boolean;
 	evalToolsEnabled: boolean;
 	structured: boolean;
 	file: boolean;
@@ -184,7 +187,10 @@ function createTaskSchema(options: {
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const taskFields = options.file ? { "task?": "string", "taskFile?": "string" } : { task: "string" };
-	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
+	const effortField = {
+		...(options.effortEnabled ? { "effort?": effortRule } : {}),
+		...(options.actualEffortEnabled ? { "actualEffort?": actualEffortRule } : {}),
+	};
 	const schemaFields = options.structured
 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
 		: {};
@@ -267,6 +273,7 @@ export function getTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
 	effortEnabled?: boolean;
+	actualEffortEnabled?: boolean;
 	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
 	evalToolsEnabled?: boolean;
 	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
@@ -281,6 +288,7 @@ export function getTaskSchema(options: {
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
+	const actualEffortEnabled = options.actualEffortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
 	const structured = options.structured ?? true;
 	const file = options.file ?? false;
@@ -289,6 +297,7 @@ export function getTaskSchema(options: {
 	if (
 		defaultAgent === "task" &&
 		!effortEnabled &&
+		!actualEffortEnabled &&
 		evalToolsEnabled &&
 		structured &&
 		!file &&
@@ -298,12 +307,13 @@ export function getTaskSchema(options: {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${file ? "file" : "inline"}:${perCallModel ? "model" : "nomodel"}:${options.seanceFields ? "seance" : "plain"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${actualEffortEnabled ? "actual" : "inexact"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${file ? "file" : "inline"}:${perCallModel ? "model" : "nomodel"}:${options.seanceFields ? "seance" : "plain"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = createTaskSchema({
 		...options,
 		effortEnabled,
+		actualEffortEnabled,
 		evalToolsEnabled,
 		structured,
 		file,
