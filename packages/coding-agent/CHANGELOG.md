@@ -20,6 +20,7 @@
 - Added the Codex Dictation speech-to-text model: select `openai-codex/codex-transcribe` as the dictation model to transcribe voice input with your ChatGPT/Codex subscription login ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait](https://github.com/andrebrait))
 - Added the `subagent_stop` extension event, the subagent counterpart of `session_stop` and of Claude Code's `SubagentStop` hook: handlers can refuse a task or subagent result and send the subagent back to work before the result is published ([#15500](https://github.com/can1357/oh-my-pi/pull/15500) by [@obabac](https://github.com/obabac) and [@andrebrait](https://github.com/andrebrait))
 - Added `memory.backend: mnemosyne-oss`, which runs your own Mnemosyne 4.x Python SDK so recall, retain, and `memory://<id>` reads use the same local SQLite banks as other Mnemosyne clients ([#15687](https://github.com/can1357/oh-my-pi/pull/15687) by [@andrebrait](https://github.com/andrebrait), based on [#9211](https://github.com/can1357/oh-my-pi/pull/9211) by [@wannfq](https://github.com/wannfq))
+- RPC hosts can correlate submitted intents across native messages, queues, skill expansion and session reloads with optional `clientMessageId` metadata and read-only `get_client_message_status` reconciliation, without sending client IDs to providers ([#18668](https://github.com/can1357/oh-my-pi/pull/18668) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 

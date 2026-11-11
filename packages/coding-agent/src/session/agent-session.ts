@@ -316,6 +316,9 @@ import {
 } from "./async-job-views";
 import type {
 	AgentSessionConfig,
+	ClientMessageQueueSnapshot,
+	ClientMessageStatus,
+	LocalClientMessageRegistration,
 	AgentSessionDisposeOptions,
 	AsyncJobInspection,
 	AsyncJobSnapshot,
@@ -344,6 +347,11 @@ import type {
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
 import { writeArtifact } from "./artifacts";
+import {
+	assertClientMessageId,
+	assertClientMessageIds,
+	CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE,
+} from "./client-message-id";
 import { type PowerAssertionHandle, startPowerAssertion } from "./power-assertion-backend";
 import { renderAttachmentSourceNotice } from "./attachment-source-notice";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -1349,6 +1357,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
+	#clientMessageIds = new WeakMap<AgentMessage, string>();
+	#clientMessageAdmissions?: { sessionId: string; ids: Set<string> };
+	/** Correlated inputs a local command is handling; each registration is its own token, see {@link beginLocalClientMessage}. */
+	#localClientMessages = new Set<LocalClientMessageRegistration>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
 
 	// Custom commands (TypeScript slash commands)
@@ -4016,6 +4028,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
+		if (event.type === "message_start" || event.type === "message_end") {
+			const clientMessageId = this.#clientMessageIds.get(event.message);
+			if (clientMessageId !== undefined) event = { ...event, clientMessageId };
+		}
 		// Listener array is copy-on-write (see `subscribe`), so iterating the
 		// current array is safe against (un)subscribes made by a listener.
 		for (const l of this.#eventListeners) {
@@ -4442,6 +4458,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (entry.type !== "message") continue;
 			if (sessionMessagePersistenceKey(entry.message) !== key) continue;
 			if (!sameMessageContent(entry.message, message)) continue;
+			// Identical submissions in one millisecond are distinct intents when their client IDs differ.
+			const clientMessageId = this.#clientMessageIds.get(message);
+			if (clientMessageId !== undefined && entry.clientMessageId !== clientMessageId) continue;
 			if (
 				entry.message.role === "assistant" &&
 				message.role === "assistant" &&
@@ -4467,7 +4486,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
 		// A digest entry carries no persistence key, so the memo stays valid across it.
 		if (message.role === "assistant") this.#tools.recordReplyPrompt(message);
-		const entryId = this.sessionManager.appendMessage(message);
+		const entryId = this.sessionManager.appendMessage(message, this.#clientMessageMetadata(message));
 		if (message.role === "assistant") {
 			(message as PersistedAssistantMessage)[kPersistedSessionEntryId] = entryId;
 		}
@@ -4596,6 +4615,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					// otherwise records emission time, which on rebuild excludes
 					// provider preparation / hook time from the prompt→yield anchor.
 					message.timestamp,
+					this.#clientMessageMetadata(message),
 				);
 			}
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
@@ -6573,6 +6593,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Before anything awaits: a reload keeps the session id, so only the transition itself can supersede
 		// a pending idle check or an in-flight recap that belong to the transcript being replaced.
 		this.#idleMaintenance?.invalidate();
+		// A local command switching sessions has consumed its input in the session it is leaving.
+		this.#resolveLocalClientMessagesBeforeTransition();
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
@@ -8879,6 +8901,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * {@link PromptDroppedError} instead.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		this.#reserveClientMessageId(options?.clientMessageId);
 		return this.#admitSubmission(() => this.#prompt(text, options));
 	}
 
@@ -9038,23 +9061,33 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
-				const command = await this.#tryExecuteExtensionCommand(text, options?.onPromptAdmitted);
-				if (command) {
-					// Queued only now, so whatever the command sent runs before them. A failed
-					// command hands them back with itself instead of letting them run without it.
-					if (command === "ran") followUps?.release();
-					else if (followUps) this.#reportDroppedPrompt(typedText, options, followUps);
-					return false;
-				}
-
-				// Try custom commands (TypeScript slash commands)
-				const customResult = await this.#tryExecuteCustomCommand(text);
-				if (customResult !== null) {
-					if (customResult === "") {
-						followUps?.release();
+				const clientMessageId = options?.clientMessageId;
+				const registration =
+					clientMessageId === undefined ? undefined : this.beginLocalClientMessage(clientMessageId);
+				let consumed = false;
+				try {
+					const command = await this.#tryExecuteExtensionCommand(text, options?.onPromptAdmitted);
+					if (command) {
+						// Queued only now, so whatever the command sent runs before them. A failed
+						// command hands them back with itself instead of letting them run without it.
+						if (command === "ran") followUps?.release();
+						else if (followUps) this.#reportDroppedPrompt(typedText, options, followUps);
+						consumed = true;
 						return false;
 					}
-					text = customResult;
+
+					// Try custom commands (TypeScript slash commands)
+					const customResult = await this.#tryExecuteCustomCommand(text);
+					if (customResult !== null) {
+						if (customResult === "") {
+							followUps?.release();
+							consumed = true;
+							return false;
+						}
+						text = customResult;
+					}
+				} finally {
+					if (registration) this.finishLocalClientMessage(registration, consumed);
 				}
 			}
 
@@ -9103,6 +9136,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const queueGeneration = this.#promptGeneration;
 			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
+				clientMessageId: options?.clientMessageId,
 				attribution: promptAttribution,
 				prependMessages: prependNotices,
 				rawText: typedText,
@@ -9219,6 +9253,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
+				clientMessageId: options?.clientMessageId,
 				attribution: promptAttribution,
 				prependMessages: prependNotices,
 				rawText: typedText,
@@ -9251,6 +9286,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					userInitiated: options?.userInitiated === true ? true : undefined,
 				}
 			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: submittedAt };
+		this.#trackClientMessage(message, options?.clientMessageId);
 
 		const preludeMessages: AgentMessage[] = [];
 		if (eagerTodoPrelude) {
@@ -9341,18 +9377,25 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps"> & {
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps" | "clientMessageId"
+		> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
 		},
 	): Promise<boolean> {
+		this.#reserveClientMessageId(options?.clientMessageId);
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
 	}
 
 	async #promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps"> & {
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps" | "clientMessageId"
+		> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
@@ -9414,7 +9457,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async #dispatchCustomPrompt<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options:
-			| (Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps"> & {
+			| (Pick<
+					PromptOptions,
+					"streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps" | "clientMessageId"
+			  > & {
 					queueChipText?: string;
 					queueOnly?: boolean;
 					onPromptQueued?: PromptOptions["onPromptQueued"];
@@ -9466,6 +9512,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			const queued = await this.#queueCustomMessage(message, streamingBehavior, {
 				queueChipText: options?.queueChipText,
+				clientMessageId: options?.clientMessageId,
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
 				onPromptQueued: options?.onPromptQueued,
@@ -9491,6 +9538,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			customMessage.content.some(part => part.type === "image");
 		const preparationGeneration = this.#promptGeneration;
 		const preparedMessage = hasSkillImages ? await this.#normalizeAgentMessageImages(customMessage) : customMessage;
+		this.#trackClientMessage(preparedMessage, options?.clientMessageId);
 		const descriptionNotice = hasSkillImages
 			? await this.#buildSkillImageDescriptionNotice(preparedMessage)
 			: undefined;
@@ -9531,6 +9579,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			const queued = await this.#queueCustomMessage(message, streamingBehavior, {
 				queueChipText: options?.queueChipText,
+				clientMessageId: options?.clientMessageId,
 				preprocessed: { content: preparedMessage.content, descriptionNotice },
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
@@ -10325,6 +10374,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+		this.#reserveClientMessageId(options?.clientMessageId);
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -10335,6 +10385,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const submittedAt = Date.now();
 		await this.#queueUserMessage(expandedText, images, "steer", {
 			timestamp: submittedAt,
+			clientMessageId: options?.clientMessageId,
 			attribution: options?.attribution,
 			rawText: text,
 			onPromptQueued: options?.onPromptQueued,
@@ -10349,6 +10400,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		this.#reserveClientMessageId(options?.clientMessageId);
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -10361,6 +10413,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp", {
 				timestamp: submittedAt,
+				clientMessageId: options?.clientMessageId,
 				attribution: options?.attribution,
 				rawText: text,
 				onPromptQueued: options?.onPromptQueued,
@@ -10391,6 +10444,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// user's prompt anchor, matching the live agent_start clear.
 			synthetic: true,
 		};
+		this.#trackClientMessage(directive, options.clientMessageId);
 		this.agent.followUp(directive);
 		options.onPromptQueued?.(imageDescriptionNotice ? [imageDescriptionNotice, directive] : [directive]);
 		this.#scheduleIdleQueueDrain();
@@ -10517,6 +10571,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp" | "aside",
 		options?: {
+			clientMessageId?: string;
 			timestamp?: number;
 			attribution?: MessageAttribution;
 			prependMessages?: readonly CustomMessage[];
@@ -10622,6 +10677,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const records: AgentMessage[] = [...prependMessages, ...attachmentSourceNotices];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
 			const userMessage: AgentMessage = { role: "user", content, attribution, timestamp: timestamp ?? Date.now() };
+			this.#trackClientMessage(userMessage, options?.clientMessageId);
 			this.#queuedMessageRawText.set(userMessage, rawText);
 			records.push(userMessage);
 			this.#irc.queueAside(records);
@@ -10642,6 +10698,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution,
 			timestamp ?? Date.now(),
 			rawText,
+			options?.clientMessageId,
 		);
 		options?.onPromptQueued?.(queued);
 		options?.onPromptAdmitted?.();
@@ -10665,6 +10722,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		attribution: MessageAttribution,
 		timestamp: number,
 		rawText: string,
+		clientMessageId?: string,
 	): AgentMessage[] {
 		this.#allowQueuedMessageDrainRetry();
 		const userMessage: AgentMessage =
@@ -10672,6 +10730,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				? { role: "user", content, attribution, timestamp }
 				: { role: "user", content, steering: true, attribution, timestamp };
 		this.#queuedMessageRawText.set(userMessage, rawText);
+		this.#trackClientMessage(userMessage, clientMessageId);
 		const group = [...companions, userMessage];
 		if (mode === "followUp") {
 			for (const message of group) this.agent.followUp(message);
@@ -11163,6 +11222,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp" | "aside",
 		options?: {
+			clientMessageId?: string;
 			queueChipText?: string;
 			/** Content and vision companion already prepared by the caller; skips re-normalizing and re-describing. */
 			preprocessed?: { content: CustomMessage<T>["content"]; descriptionNotice?: CustomMessage };
@@ -11203,6 +11263,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const normalizedAppMessage = preprocessed
 			? { ...appMessage, content: preprocessed.content }
 			: await this.#normalizeAgentMessageImages(appMessage);
+		this.#trackClientMessage(normalizedAppMessage, options?.clientMessageId);
 		const descriptionNotice = preprocessed
 			? preprocessed.descriptionNotice
 			: await this.#buildSkillImageDescriptionNotice(normalizedAppMessage);
@@ -11645,6 +11706,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const followUpAll = [...(withdrawn?.followUp ?? []), ...this.agent.peekFollowUpQueue()];
 		const steering = steeringAll.filter(isUserAuthoredQueuedMessage).map(toRestoredQueuedMessage);
 		const followUp = followUpAll.filter(isUserAuthoredQueuedMessage).map(toRestoredQueuedMessage);
+		const withdrawnUserMessages = [...steeringAll, ...followUpAll].filter(isUserAuthoredQueuedMessage);
 		const recordable = (m: AgentMessage): boolean =>
 			m.role !== "developer" && isDisplayableQueuedMessage(m) && !isUserAuthoredQueuedMessage(m);
 		const recordedOnInterrupt = new Set<AgentMessage>();
@@ -11678,6 +11740,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
 		this.#reconcileQueuedMessageDrain();
+		this.#resolveWithdrawnClientMessages(withdrawnUserMessages);
 		return { steering, followUp };
 	}
 
@@ -11705,17 +11768,208 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.queuedMessageCount > 0 || this.agent.peekUndeliveredQueuedMessages().some(isDisplayableQueuedMessage);
 	}
 
+	/** Reject identity reuse, without inventing idempotent replay or matching payloads. */
+	assertClientMessageAvailable(id: string): void {
+		assertClientMessageId(id);
+		// Keyed on the journal's identity: `/fresh` rotates the provider-facing sessionId but keeps the journal.
+		const journalId = this.sessionManager.getSessionId();
+		if (this.#clientMessageAdmissions?.sessionId === journalId && this.#clientMessageAdmissions.ids.has(id)) {
+			throw new Error(`clientMessageId already submitted: ${id}`);
+		}
+		if (this.sessionManager.hasClientMessageEntry(id)) throw new Error(`clientMessageId already submitted: ${id}`);
+		if (this.sessionManager.isClientMessageResolved(id)) throw new Error(`clientMessageId already resolved: ${id}`);
+	}
+
+	#reserveClientMessageId(id: string | undefined): void {
+		if (id === undefined) return;
+		this.assertClientMessageAvailable(id);
+		const journalId = this.sessionManager.getSessionId();
+		if (this.#clientMessageAdmissions?.sessionId !== journalId) {
+			this.#clientMessageAdmissions = { sessionId: journalId, ids: new Set() };
+		}
+		this.#clientMessageAdmissions.ids.add(id);
+	}
+
+	#trackClientMessage(message: AgentMessage, clientMessageId: string | undefined): void {
+		if (clientMessageId !== undefined) this.#clientMessageIds.set(message, clientMessageId);
+	}
+
+	#clientMessageMetadata(message: AgentMessage): { clientMessageId: string } | undefined {
+		const clientMessageId = this.#clientMessageIds.get(message);
+		return clientMessageId === undefined ? undefined : { clientMessageId };
+	}
+
+	/**
+	 * Journal explicit consumption separately from model-facing messages. Callers have already
+	 * withdrawn or consumed the input, so a journal failure is logged, never thrown: the status
+	 * query then reports the ID unresolved instead of the caller losing the withdrawn input.
+	 * `forceFileCreation` lets the ordinary writer materialize an otherwise lazy session for it.
+	 */
+	resolveClientMessages(ids: readonly string[]): void {
+		if (ids.length === 0) return;
+		for (const id of ids) assertClientMessageId(id);
+		try {
+			this.sessionManager.appendCustomEntry(
+				CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE,
+				{ clientMessageIds: [...new Set(ids)] },
+				{ forceFileCreation: true },
+			);
+		} catch (error) {
+			logger.warn("Failed to journal client message resolution", { ids, error: toError(error).message });
+		}
+	}
+
+	/**
+	 * Mark a correlated input as handled by a local command (extension, custom or builtin command).
+	 * A session transition the command starts journals the ID as resolved in the admitting journal
+	 * before leaving it; otherwise {@link finishLocalClientMessage} journals it once the command ends.
+	 * The returned registration is the token for that finish: the same ID may be registered again in
+	 * another journal while this command still runs, and only this exact registration may be finished.
+	 */
+	beginLocalClientMessage(id: string): LocalClientMessageRegistration {
+		const registration: LocalClientMessageRegistration = { id, journalId: this.sessionManager.getSessionId() };
+		this.#localClientMessages.add(registration);
+		return registration;
+	}
+
+	/**
+	 * End {@link beginLocalClientMessage}; `consumed` journals the resolution. A registration a
+	 * transition already resolved is gone, so its finish is a no-op and never touches a newer one.
+	 */
+	finishLocalClientMessage(registration: LocalClientMessageRegistration, consumed: boolean): void {
+		if (!this.#localClientMessages.delete(registration)) return;
+		if (consumed && registration.journalId === this.sessionManager.getSessionId()) {
+			this.resolveClientMessages([registration.id]);
+		}
+	}
+
+	#resolveLocalClientMessagesBeforeTransition(): void {
+		if (this.#localClientMessages.size === 0) return;
+		const journalId = this.sessionManager.getSessionId();
+		const ids: string[] = [];
+		for (const registration of this.#localClientMessages) {
+			if (registration.journalId !== journalId) continue;
+			ids.push(registration.id);
+			this.#localClientMessages.delete(registration);
+		}
+		this.resolveClientMessages(ids);
+	}
+
+	#resolveWithdrawnClientMessages(messages: readonly AgentMessage[]): void {
+		const ids: string[] = [];
+		for (const message of messages) {
+			const id = this.#clientMessageIds.get(message);
+			if (id !== undefined) ids.push(id);
+		}
+		this.resolveClientMessages(ids);
+	}
+
+	/**
+	 * Read-only during streaming; persistence settlement never waits for the active turn.
+	 * `maxBytes` bounds the UTF-8 JSON of the whole result: native messages that do not fit are
+	 * omitted whole, never truncated.
+	 */
+	async getClientMessageStatus(ids: readonly string[], maxBytes: number): Promise<ClientMessageStatus> {
+		assertClientMessageIds(ids);
+		const journalId = this.sessionManager.getSessionId();
+		await this.settleInFlightMessagePersistence();
+		await this.#messageEndPersistenceTail;
+		// Only entries journaled before this flush are confirmed by it: one appended while it awaits
+		// storage (or an artifact copy) may still be unpublished, so it is not reported as persisted.
+		const persisted = ids.filter(id => this.sessionManager.hasClientMessageEntry(id));
+		const resolved = ids.filter(id => this.sessionManager.isClientMessageResolved(id));
+		await this.sessionManager.flush();
+		if (this.sessionManager.getSessionId() !== journalId) {
+			throw new Error("Session changed during client message reconciliation");
+		}
+		const requested = new Set(ids);
+		const candidates: ClientMessageStatus["messages"] = [];
+		for (const message of this.messages) {
+			const id = this.#clientMessageIds.get(message);
+			if (id !== undefined && requested.has(id)) candidates.push({ clientMessageId: id, message });
+		}
+		const queuedMessages = this.getQueuedMessages();
+		const queued = new Set<string>();
+		if (queuedMessages.clientMessageIds) {
+			for (const id of [...queuedMessages.clientMessageIds.steering, ...queuedMessages.clientMessageIds.followUp]) {
+				if (id !== null) queued.add(id);
+			}
+		}
+		const build = (
+			messages: ClientMessageStatus["messages"],
+			queue: ClientMessageQueueSnapshot = queuedMessages,
+		): ClientMessageStatus => {
+			const represented = new Set(queued);
+			for (const { clientMessageId } of messages) represented.add(clientMessageId);
+			return {
+				messages,
+				queuedMessages: queue,
+				resolvedClientMessageIds: resolved,
+				persistedClientMessageIds: persisted,
+				unresolvedClientMessageIds: ids.filter(
+					id => !represented.has(id) && !persisted.includes(id) && !resolved.includes(id),
+				),
+				...(queue === queuedMessages ? {} : { queueTextsOmitted: true as const }),
+			};
+		};
+		const bytesOf = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8");
+		const fill = (remaining: number): ClientMessageStatus["messages"] => {
+			const messages: ClientMessageStatus["messages"] = [];
+			for (const envelope of candidates) {
+				const bytes = bytesOf(envelope) + (messages.length === 0 ? 0 : 1);
+				if (bytes > remaining) continue;
+				remaining -= bytes;
+				messages.push(envelope);
+			}
+			return messages;
+		};
+		// Measured with no messages, the unresolved list is at its longest; each message added only shortens it.
+		const full = maxBytes - bytesOf(build([]));
+		if (full >= 0) return build(fill(full));
+		// The queue texts alone overflow: blank them (keeping every slot and ID aligned), fit native
+		// messages first, then restore whichever texts still fit, oldest first.
+		const queue: ClientMessageQueueSnapshot = {
+			...queuedMessages,
+			steering: queuedMessages.steering.map(() => ""),
+			followUp: queuedMessages.followUp.map(() => ""),
+		};
+		const messages = fill(maxBytes - bytesOf(build([], queue)));
+		let remaining = maxBytes - bytesOf(build(messages, queue));
+		for (const lane of ["steering", "followUp"] as const) {
+			const texts = queuedMessages[lane];
+			const restored = [...queue[lane]];
+			for (let index = 0; index < texts.length; index++) {
+				const bytes = bytesOf(texts[index]) - bytesOf("");
+				if (bytes > remaining) continue;
+				remaining -= bytes;
+				restored[index] = texts[index];
+			}
+			queue[lane] = restored;
+		}
+		return build(messages, queue);
+	}
+
 	/** Chip texts for the queue display. Steering live steering took for the streaming response
 	 *  stays listed until the transcript records it, when the model actually switches to it. */
-	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[]; liveSteered: number } {
-		const liveSteered = this.agent.peekLiveSteeredMessages().filter(isUserAuthoredQueuedMessage).length;
-		return {
-			steering: [...this.agent.peekLiveSteeredMessages(), ...this.agent.peekSteeringQueue()]
-				.filter(isUserAuthoredQueuedMessage)
-				.map(queueChipText),
-			followUp: this.agent.peekFollowUpQueue().filter(isUserAuthoredQueuedMessage).map(queueChipText),
-			liveSteered,
+	getQueuedMessages(): ClientMessageQueueSnapshot {
+		const live = this.agent.peekLiveSteeredMessages().filter(isUserAuthoredQueuedMessage);
+		const steering = [...live, ...this.agent.peekSteeringQueue().filter(isUserAuthoredQueuedMessage)];
+		const followUp = this.agent.peekFollowUpQueue().filter(isUserAuthoredQueuedMessage);
+		const snapshot: ClientMessageQueueSnapshot = {
+			steering: steering.map(queueChipText),
+			followUp: followUp.map(queueChipText),
+			liveSteered: live.length,
 		};
+		if (
+			steering.some(message => this.#clientMessageIds.has(message)) ||
+			followUp.some(message => this.#clientMessageIds.has(message))
+		) {
+			snapshot.clientMessageIds = {
+				steering: steering.map(message => this.#clientMessageIds.get(message) ?? null),
+				followUp: followUp.map(message => this.#clientMessageIds.get(message) ?? null),
+			};
+		}
+		return snapshot;
 	}
 
 	/** Last {@link getQueuedMessages} snapshot emitted as a `queue_update` event.
@@ -11723,9 +11977,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *  externally observable transitions RPC/ACP/TUI subscribers actually care
 	 *  about, so a mutation that leaves the displayable queue unchanged (e.g. an
 	 *  agent-authored aside, or a claim/restore round-trip) never re-emits. */
-	#lastEmittedQueueSnapshot:
-		| { steering: readonly string[]; followUp: readonly string[]; liveSteered: number }
-		| undefined;
+	#lastEmittedQueueSnapshot: ClientMessageQueueSnapshot | undefined;
 
 	#emitQueueUpdateIfChanged(): void {
 		const snapshot = this.getQueuedMessages();
@@ -11736,7 +11988,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			last.followUp.length === snapshot.followUp.length &&
 			last.liveSteered === snapshot.liveSteered &&
 			last.steering.every((text, i) => text === snapshot.steering[i]) &&
-			last.followUp.every((text, i) => text === snapshot.followUp[i]);
+			last.followUp.every((text, i) => text === snapshot.followUp[i]) &&
+			last.clientMessageIds?.steering.every((id, i) => id === snapshot.clientMessageIds?.steering[i]) !== false &&
+			last.clientMessageIds?.followUp.every((id, i) => id === snapshot.clientMessageIds?.followUp[i]) !== false &&
+			(last.clientMessageIds === undefined) === (snapshot.clientMessageIds === undefined);
 		if (unchanged) return;
 		this.#lastEmittedQueueSnapshot = snapshot;
 		this.#emit({
@@ -11744,6 +11999,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			steering: [...snapshot.steering],
 			followUp: [...snapshot.followUp],
 			liveSteered: snapshot.liveSteered,
+			...(snapshot.clientMessageIds ? { clientMessageIds: snapshot.clientMessageIds } : {}),
 		});
 	}
 
@@ -11774,8 +12030,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const dropped = new Set(messages);
 		if (dropped.size === 0) return;
 		const kept = (queue: readonly AgentMessage[]): AgentMessage[] => queue.filter(message => !dropped.has(message));
+		const withdrawn = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].filter(message =>
+			dropped.has(message),
+		);
 		this.agent.replaceQueues(kept(this.agent.peekSteeringQueue()), kept(this.agent.peekFollowUpQueue()));
 		this.#reconcileQueuedMessageDrain();
+		this.#resolveWithdrawnClientMessages(withdrawn);
 	}
 
 	/**
@@ -11790,6 +12050,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const removed = selected[index];
 		this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(selected, index));
 		this.#reconcileQueuedMessageDrain();
+		this.#resolveWithdrawnClientMessages([removed]);
 		return toRestoredQueuedMessage(removed);
 	}
 
@@ -11869,6 +12130,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const removed = steering[fromSteer];
 			this.agent.replaceQueues(this.#withoutQueuedUserMessage(steering, fromSteer), followUp.slice());
 			this.#reconcileQueuedMessageDrain();
+			this.#resolveWithdrawnClientMessages([removed]);
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
@@ -11876,6 +12138,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), this.#withoutQueuedUserMessage(followUp, fromFollowUp));
 			this.#reconcileQueuedMessageDrain();
+			this.#resolveWithdrawnClientMessages([removed]);
 			return toRestoredQueuedMessage(removed);
 		}
 		return undefined;
@@ -11903,6 +12166,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (index >= 0) {
 			this.agent.replaceQueue(queue, this.#withoutQueuedUserMessage(pending, index));
 			this.#reconcileQueuedMessageDrain();
+			this.#resolveWithdrawnClientMessages([message]);
 			return true;
 		}
 		if (!this.#heldQueuedMessages.has(message)) return false;
@@ -11912,6 +12176,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#heldQueuedMessages.delete(held[i]);
 			this.#withdrawnHeldMessages.add(held[i]);
 		}
+		this.#resolveWithdrawnClientMessages([message]);
 		return true;
 	}
 

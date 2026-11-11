@@ -2959,12 +2959,45 @@ pub struct ContextUsage {
 	pub percent: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedClientMessageIds {
+	pub steering: Vec<Option<String>>,
+	#[serde(rename = "followUp")]
+	pub follow_up: Vec<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrelatedClientMessage {
+	#[serde(rename = "clientMessageId")]
+	pub client_message_id: String,
+	pub message: AgentMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientMessageStatus {
+	pub messages: Vec<CorrelatedClientMessage>,
+	#[serde(rename = "queuedMessages")]
+	pub queued_messages: QueuedMessagesState,
+	#[serde(rename = "resolvedClientMessageIds")]
+	pub resolved_client_message_ids: Vec<String>,
+	#[serde(rename = "persistedClientMessageIds")]
+	pub persisted_client_message_ids: Vec<String>,
+	#[serde(rename = "unresolvedClientMessageIds")]
+	pub unresolved_client_message_ids: Vec<String>,
+	/// Only ever `true`: the queue texts exceeded the response limit, so some chip texts are `""`; every slot and its ID stay aligned.
+	#[serde(rename = "queueTextsOmitted", default, skip_serializing_if = "Option::is_none")]
+	pub queue_texts_omitted: Option<bool>,
+}
+
 /// Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedMessagesState {
 	pub steering: Vec<String>,
 	#[serde(rename = "followUp")]
 	pub follow_up: Vec<String>,
+	/// IDs align with chip arrays; legacy slots are null.
+	#[serde(rename = "clientMessageIds", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_ids: Option<QueuedClientMessageIds>,
 	/// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
 	#[serde(rename = "liveSteered", default = "default_queued_messages_state_live_steered")]
 	pub live_steered: i64,
@@ -3183,6 +3216,8 @@ pub struct SkillDiagnosticsSnapshot {
 pub struct SessionState {
 	#[serde(rename = "sessionId")]
 	pub session_id: String,
+	#[serde(rename = "supportsClientMessageIds", default = "default_session_state_supports_client_message_ids")]
+	pub supports_client_message_ids: bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub model: Option<ModelInfo>,
 	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
@@ -3831,6 +3866,8 @@ pub struct MessageStartEvent {
 	/// Shared by the start, updates, and end of one message; unique per process.
 	#[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
 	pub message_id: Option<String>,
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3849,6 +3886,8 @@ pub struct MessageEndEvent {
 	/// Shared by the start, updates, and end of one message; unique per process.
 	#[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
 	pub message_id: Option<String>,
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4073,6 +4112,8 @@ pub struct QueueUpdateEvent {
 	pub steering: Vec<String>,
 	#[serde(rename = "followUp")]
 	pub follow_up: Vec<String>,
+	#[serde(rename = "clientMessageIds", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_ids: Option<QueuedClientMessageIds>,
 	/// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
 	#[serde(rename = "liveSteered", default = "default_queue_update_event_live_steered")]
 	pub live_steered: i64,
@@ -5330,6 +5371,9 @@ pub struct PromptParams {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5338,6 +5382,9 @@ pub struct SteerParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5346,6 +5393,9 @@ pub struct FollowUpParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5365,6 +5415,9 @@ pub struct AbortAndPromptParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5386,6 +5439,13 @@ pub struct OpenSessionParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetSkillStartupDiagnosticsParams {
 	pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetClientMessageStatusParams {
+	/// Between 1 and 32 unique nonempty IDs, each at most 128 characters.
+	#[serde(rename = "clientMessageIds")]
+	pub client_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6171,6 +6231,10 @@ fn default_skill_diagnostic_duplicate_match() -> SkillDuplicateMatch {
 	serde_json::from_str("\"content\"").expect("valid wire default")
 }
 
+fn default_session_state_supports_client_message_ids() -> bool {
+	serde_json::from_str("false").expect("valid wire default")
+}
+
 fn default_session_state_is_streaming() -> bool {
 	serde_json::from_str("false").expect("valid wire default")
 }
@@ -6296,6 +6360,9 @@ pub struct PromptCommand {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 impl Command for PromptCommand {
@@ -6315,6 +6382,9 @@ pub struct SteerCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 impl Command for SteerCommand {
@@ -6335,6 +6405,9 @@ pub struct FollowUpCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 impl Command for FollowUpCommand {
@@ -6406,6 +6479,9 @@ pub struct AbortAndPromptCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected.
+	#[serde(rename = "clientMessageId", default, skip_serializing_if = "Option::is_none")]
+	pub client_message_id: Option<String>,
 }
 
 impl Command for AbortAndPromptCommand {
@@ -6512,6 +6588,24 @@ impl Command for SetSkillStartupDiagnosticsCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<SkillDiagnosticsSnapshot>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetClientMessageStatusCommand {
+	/// Between 1 and 32 unique nonempty IDs, each at most 128 characters.
+	#[serde(rename = "clientMessageIds")]
+	pub client_message_ids: Vec<String>,
+}
+
+impl Command for GetClientMessageStatusCommand {
+	const NAME: &'static str = "get_client_message_status";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ClientMessageStatus;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<ClientMessageStatus>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

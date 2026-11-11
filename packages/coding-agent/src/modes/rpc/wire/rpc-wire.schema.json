@@ -164,6 +164,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "get_client_message_status",
+				"doc": "Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn.",
+				"params": "GetClientMessageStatusParams",
+				"result": "ClientMessageStatus",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "set_fast_mode",
 				"doc": "Enable or disable fast mode for the session.",
 				"params": "SetFastModeParams",
@@ -2446,6 +2457,99 @@
 				"percent"
 			]
 		},
+		"QueuedClientMessageIds": {
+			"type": "object",
+			"properties": {
+				"steering": {
+					"type": "array",
+					"items": {
+						"anyOf": [
+							{
+								"type": "string"
+							},
+							{
+								"type": "null"
+							}
+						]
+					}
+				},
+				"followUp": {
+					"type": "array",
+					"items": {
+						"anyOf": [
+							{
+								"type": "string"
+							},
+							{
+								"type": "null"
+							}
+						]
+					}
+				}
+			},
+			"required": [
+				"steering",
+				"followUp"
+			]
+		},
+		"CorrelatedClientMessage": {
+			"type": "object",
+			"properties": {
+				"clientMessageId": {
+					"type": "string"
+				},
+				"message": {
+					"$ref": "#/$defs/AgentMessage"
+				}
+			},
+			"required": [
+				"clientMessageId",
+				"message"
+			]
+		},
+		"ClientMessageStatus": {
+			"type": "object",
+			"properties": {
+				"messages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/CorrelatedClientMessage"
+					}
+				},
+				"queuedMessages": {
+					"$ref": "#/$defs/QueuedMessagesState"
+				},
+				"resolvedClientMessageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"persistedClientMessageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"unresolvedClientMessageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"queueTextsOmitted": {
+					"type": "boolean",
+					"description": "Only ever `true`: the queue texts exceeded the response limit, so some chip texts are `\"\"`; every slot and its ID stay aligned."
+				}
+			},
+			"required": [
+				"messages",
+				"queuedMessages",
+				"resolvedClientMessageIds",
+				"persistedClientMessageIds",
+				"unresolvedClientMessageIds"
+			]
+		},
 		"QueuedMessagesState": {
 			"type": "object",
 			"properties": {
@@ -2460,6 +2564,10 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"clientMessageIds": {
+					"$ref": "#/$defs/QueuedClientMessageIds",
+					"description": "IDs align with chip arrays; legacy slots are null."
 				},
 				"liveSteered": {
 					"type": "integer",
@@ -2774,6 +2882,10 @@
 			"properties": {
 				"sessionId": {
 					"type": "string"
+				},
+				"supportsClientMessageIds": {
+					"type": "boolean",
+					"default": false
 				},
 				"model": {
 					"$ref": "#/$defs/ModelInfo"
@@ -3953,6 +4065,9 @@
 				"messageId": {
 					"type": "string",
 					"description": "Shared by the start, updates, and end of one message; unique per process."
+				},
+				"clientMessageId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -3995,6 +4110,9 @@
 				"messageId": {
 					"type": "string",
 					"description": "Shared by the start, updates, and end of one message; unique per process."
+				},
+				"clientMessageId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -4557,6 +4675,9 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"clientMessageIds": {
+					"$ref": "#/$defs/QueuedClientMessageIds"
 				},
 				"liveSteered": {
 					"type": "integer",
@@ -6321,6 +6442,10 @@
 				},
 				"streamingBehavior": {
 					"$ref": "#/$defs/StreamingBehavior"
+				},
+				"clientMessageId": {
+					"type": "string",
+					"description": "Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected."
 				}
 			},
 			"required": [
@@ -6339,6 +6464,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"clientMessageId": {
+					"type": "string",
+					"description": "Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected."
 				}
 			},
 			"required": [
@@ -6357,6 +6486,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"clientMessageId": {
+					"type": "string",
+					"description": "Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected."
 				}
 			},
 			"required": [
@@ -6401,6 +6534,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"clientMessageId": {
+					"type": "string",
+					"description": "Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected."
 				}
 			},
 			"required": [
@@ -6441,6 +6578,21 @@
 			},
 			"required": [
 				"enabled"
+			]
+		},
+		"GetClientMessageStatusParams": {
+			"type": "object",
+			"properties": {
+				"clientMessageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Between 1 and 32 unique nonempty IDs, each at most 128 characters."
+				}
+			},
+			"required": [
+				"clientMessageIds"
 			]
 		},
 		"SetFastModeParams": {

@@ -39,10 +39,24 @@ export const stateDefs = {
 	},
 	TodoPhase: { name: "string", tasks: "TodoItem[]" },
 	ContextUsage: { tokens: "number.integer", contextWindow: "number.integer", percent: "number" },
+	QueuedClientMessageIds: { steering: "(string | null)[]", followUp: "(string | null)[]" },
+	CorrelatedClientMessage: { clientMessageId: "string", message: "AgentMessage" },
+	ClientMessageStatus: {
+		messages: "CorrelatedClientMessage[]",
+		queuedMessages: "QueuedMessagesState",
+		resolvedClientMessageIds: "string[]",
+		persistedClientMessageIds: "string[]",
+		unresolvedClientMessageIds: "string[]",
+		"queueTextsOmitted?": doc(
+			"boolean",
+			'Only ever `true`: the queue texts exceeded the response limit, so some chip texts are `""`; every slot and its ID stay aligned.',
+		),
+	},
 	QueuedMessagesState: doc(
 		{
 			steering: "string[]",
 			followUp: "string[]",
+			"clientMessageIds?": doc("QueuedClientMessageIds", "IDs align with chip arrays; legacy slots are null."),
 			liveSteered: absentAs(
 				doc(
 					"number.integer",
@@ -143,6 +157,7 @@ export const stateDefs = {
 		"Current skill resolution; an empty `diagnostics` means no conflicts or redundant installations.",
 	),
 	SessionState: {
+		supportsClientMessageIds: absentAs("boolean", false),
 		"model?": "ModelInfo",
 		"thinkingLevel?": "ThinkingLevel",
 		isStreaming: absentAs("boolean", false),

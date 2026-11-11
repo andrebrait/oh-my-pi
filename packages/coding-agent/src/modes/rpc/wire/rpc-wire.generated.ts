@@ -425,10 +425,32 @@ export interface ContextUsage {
 	percent: number;
 }
 
+export interface QueuedClientMessageIds {
+	steering: (string | null)[];
+	followUp: (string | null)[];
+}
+
+export interface CorrelatedClientMessage {
+	clientMessageId: string;
+	message: AgentMessage;
+}
+
+export interface ClientMessageStatus {
+	messages: CorrelatedClientMessage[];
+	queuedMessages: QueuedMessagesState;
+	resolvedClientMessageIds: string[];
+	persistedClientMessageIds: string[];
+	unresolvedClientMessageIds: string[];
+	/** Only ever `true`: the queue texts exceeded the response limit, so some chip texts are `""`; every slot and its ID stay aligned. */
+	queueTextsOmitted?: boolean;
+}
+
 /** Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`. */
 export interface QueuedMessagesState {
 	steering: string[];
 	followUp: string[];
+	/** IDs align with chip arrays; legacy slots are null. */
+	clientMessageIds?: QueuedClientMessageIds;
 	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
 	liveSteered?: number;
 }
@@ -530,6 +552,7 @@ export interface SkillDiagnosticsSnapshot {
 
 export interface SessionState {
 	sessionId: string;
+	supportsClientMessageIds?: boolean;
 	model?: ModelInfo;
 	thinkingLevel?: ThinkingLevel;
 	isStreaming?: boolean;
@@ -891,6 +914,7 @@ export interface MessageStartEvent {
 	message: AgentMessage;
 	/** Shared by the start, updates, and end of one message; unique per process. */
 	messageId?: string;
+	clientMessageId?: string;
 }
 
 export interface MessageUpdateEvent {
@@ -906,6 +930,7 @@ export interface MessageEndEvent {
 	message: AgentMessage;
 	/** Shared by the start, updates, and end of one message; unique per process. */
 	messageId?: string;
+	clientMessageId?: string;
 }
 
 export interface ToolExecutionStartEvent {
@@ -1095,6 +1120,7 @@ export interface QueueUpdateEvent {
 	type: "queue_update";
 	steering: string[];
 	followUp: string[];
+	clientMessageIds?: QueuedClientMessageIds;
 	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
 	liveSteered?: number;
 }
@@ -1603,18 +1629,24 @@ export interface PromptParams {
 	/** Images attached to the message. */
 	images?: ImageContent[];
 	streamingBehavior?: StreamingBehavior;
+	/** Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected. */
+	clientMessageId?: string;
 }
 
 export interface SteerParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected. */
+	clientMessageId?: string;
 }
 
 export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected. */
+	clientMessageId?: string;
 }
 
 export interface RemoveQueuedMessageParams {
@@ -1630,6 +1662,8 @@ export interface AbortAndPromptParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** Local intent identity: nonempty, at most 128 characters; reuse in one session is rejected. */
+	clientMessageId?: string;
 }
 
 export interface NewSessionParams {
@@ -1644,6 +1678,11 @@ export interface OpenSessionParams {
 
 export interface SetSkillStartupDiagnosticsParams {
 	enabled: boolean;
+}
+
+export interface GetClientMessageStatusParams {
+	/** Between 1 and 32 unique nonempty IDs, each at most 128 characters. */
+	clientMessageIds: string[];
 }
 
 export interface SetFastModeParams {
@@ -1986,6 +2025,7 @@ export interface RpcWireCommands {
 	get_state: { params: undefined; result: SessionState };
 	get_skill_diagnostics: { params: undefined; result: SkillDiagnosticsSnapshot };
 	set_skill_startup_diagnostics: { params: SetSkillStartupDiagnosticsParams; result: SkillDiagnosticsSnapshot };
+	get_client_message_status: { params: GetClientMessageStatusParams; result: ClientMessageStatus };
 	set_fast_mode: { params: SetFastModeParams; result: FastModeResult };
 	set_slow_mode: { params: SetSlowModeParams; result: SetSlowModeResult };
 	goal: { params: GoalParams; result: GoalResult };

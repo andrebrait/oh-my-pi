@@ -19,6 +19,7 @@ import {
 	isEnotdir,
 	isEnotempty,
 	isFsError,
+	isRecord,
 	logger,
 	pathIsWithin,
 	stringifyJson,
@@ -31,6 +32,7 @@ import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
+import { CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE } from "./client-message-id";
 import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
@@ -1036,6 +1038,10 @@ export class SessionManager {
 	#sessionFileRelocating: { source: string; dest: string; copying?: boolean } | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
+	/** Client message IDs carried by journal entries; see {@link #indexedClientMessageIds}. */
+	#clientMessageIdIndex:
+		| { entries: SessionEntry[]; indexed: number; submitted: Set<string>; resolved: Set<string> }
+		| undefined;
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
@@ -3084,6 +3090,8 @@ export class SessionManager {
 		this.seal();
 		this.#entries = [];
 		this.#index.clear();
+		// The cache holds the journal array itself; dropping it lets the released transcript be collected.
+		this.#clientMessageIdIndex = undefined;
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
@@ -3582,9 +3590,12 @@ export class SessionManager {
 			| BashExecutionMessage
 			| PythonExecutionMessage
 			| FileMentionMessage,
+		metadata?: { clientMessageId?: string },
 	): string {
-		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message, ...metadata };
 		if (message.role === "assistant") entry.cwd = this.#cwd;
+		// Correlated acceptance must survive reconnect even before the first assistant reply.
+		if (metadata?.clientMessageId !== undefined) this.#forceFileCreation = true;
 		this.#recordEntry(entry);
 		return entry.id;
 	}
@@ -3769,8 +3780,45 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	appendCustomEntry(customType: string, data?: unknown): string {
+	/** Whether a journal entry carries `id` as the client message ID of a correlated message. */
+	hasClientMessageEntry(id: string): boolean {
+		return this.#indexedClientMessageIds().submitted.has(id);
+	}
+
+	/** Whether a journal entry records `id` as withdrawn or consumed without a native message. */
+	isClientMessageResolved(id: string): boolean {
+		return this.#indexedClientMessageIds().resolved.has(id);
+	}
+
+	/**
+	 * Appends extend the entry array in place; switch, reload, branch rewrites and rollback replace it.
+	 * The index therefore catches up on new entries and rebuilds only when the array changes.
+	 */
+	#indexedClientMessageIds(): { submitted: Set<string>; resolved: Set<string> } {
+		let index = this.#clientMessageIdIndex;
+		if (index?.entries !== this.#entries) {
+			index = { entries: this.#entries, indexed: 0, submitted: new Set(), resolved: new Set() };
+			this.#clientMessageIdIndex = index;
+		}
+		for (; index.indexed < index.entries.length; index.indexed++) {
+			const entry = index.entries[index.indexed]!;
+			if ((entry.type === "message" || entry.type === "custom_message") && entry.clientMessageId !== undefined) {
+				index.submitted.add(entry.clientMessageId);
+			} else if (
+				entry.type === "custom" &&
+				entry.customType === CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE &&
+				isRecord(entry.data) &&
+				Array.isArray(entry.data.clientMessageIds)
+			) {
+				for (const id of entry.data.clientMessageIds) if (typeof id === "string") index.resolved.add(id);
+			}
+		}
+		return index;
+	}
+
+	appendCustomEntry(customType: string, data?: unknown, options?: { forceFileCreation?: boolean }): string {
 		const entry: CustomEntry = { type: "custom", customType, data, ...this.#freshEntryFields() };
+		if (options?.forceFileCreation) this.#forceFileCreation = true;
 		this.#recordEntry(entry);
 		return entry.id;
 	}
@@ -3800,6 +3848,7 @@ export class SessionManager {
 		details?: T,
 		attribution: MessageAttribution | undefined = "agent",
 		timestamp?: number,
+		metadata?: { clientMessageId?: string },
 	): string {
 		const normalized = normalizeCustomMessagePayload<T>({ customType, content, display, details, attribution });
 		const fresh = this.#freshEntryFields();
@@ -3816,7 +3865,9 @@ export class SessionManager {
 			// records the emission time, which on rebuild excludes provider
 			// preparation / hook time from the prompt→yield anchor.
 			timestamp: timestamp !== undefined ? new Date(timestamp).toISOString() : fresh.timestamp,
+			...metadata,
 		};
+		if (metadata?.clientMessageId !== undefined) this.#forceFileCreation = true;
 		this.#recordEntry(entry);
 		return entry.id;
 	}
