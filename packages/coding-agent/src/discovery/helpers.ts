@@ -36,6 +36,7 @@ import { normalizeToolNames } from "../tools/builtin-names";
 
 import { realpathIfExists, resolveContainedPath } from "./contained-path";
 import { buildPluginDirRoot } from "./plugin-dir-roots";
+import { dropExcludedPaths, globalResourceExclusions, type ResourceExclusions } from "./resource-exclusions";
 
 /**
  * Standard paths for each config source.
@@ -1428,7 +1429,61 @@ async function readClaudeEnabledPlugins(
 	return { enabled, sources };
 }
 
-type PluginRootsResult = { roots: ClaudePluginRoot[]; warnings: string[] };
+/** Plugin roots as each registry names them, before same-ID precedence chooses the copies that load. */
+interface PluginRootLayers {
+	claude: ClaudePluginRoot[];
+	omp: ClaudePluginRoot[];
+	/** IDs the OMP registry names: its entries replace Claude's for that ID even when none is enabled. */
+	ompIds: Set<string>;
+	project: ClaudePluginRoot[];
+	/** `--plugin-dir` roots. */
+	injected: ClaudePluginRoot[];
+}
+
+type PluginRootsResult = { roots: ClaudePluginRoot[]; warnings: string[]; layers: PluginRootLayers };
+
+const newPluginRootLayers = (injected: readonly ClaudePluginRoot[]): PluginRootLayers => ({
+	claude: [],
+	omp: [],
+	ompIds: new Set(),
+	project: [],
+	injected: [...injected],
+});
+
+/**
+ * Same-ID precedence, lowest first: Claude's registry, the OMP user registry, the project registry, then
+ * `--plugin-dir`. The highest layer naming an ID supplies every copy of it. `hidden` copies are removed
+ * before precedence, as if never installed, so hiding the winner hands its ID to the copy it had shadowed.
+ */
+function mergePluginRootLayers(
+	layers: PluginRootLayers,
+	hidden: ReadonlySet<ClaudePluginRoot> = new Set<ClaudePluginRoot>(),
+): ClaudePluginRoot[] {
+	const visible = (roots: readonly ClaudePluginRoot[]) => roots.filter(root => !hidden.has(root));
+	const omp = visible(layers.omp);
+	// An OMP-registry ID whose enabled copies are all hidden no longer replaces Claude's copies of it.
+	const replaced = new Set(
+		[...layers.ompIds].filter(id => omp.some(root => root.id === id) || !layers.omp.some(root => root.id === id)),
+	);
+	let roots = [...visible(layers.claude).filter(root => !replaced.has(root.id)), ...omp];
+	for (const layer of [layers.project, layers.injected]) {
+		const top = visible(layer);
+		const ids = new Set(top.map(root => root.id));
+		roots = [...top, ...roots.filter(root => !ids.has(root.id))];
+	}
+	return roots;
+}
+
+/** The roots that load once still-valid reviewed-resource exclusions are applied before precedence. */
+async function mergeExcludingPluginRoots(
+	layers: PluginRootLayers,
+	exclusions: ResourceExclusions,
+): Promise<ClaudePluginRoot[]> {
+	if (Object.keys(exclusions).length === 0) return mergePluginRootLayers(layers);
+	const every = [...layers.claude, ...layers.omp, ...layers.project, ...layers.injected];
+	const kept = new Set(await dropExcludedPaths(every, root => root.path, exclusions));
+	return mergePluginRootLayers(layers, new Set(every.filter(root => !kept.has(root))));
+}
 
 /** A cached {@link listClaudePluginRoots} result and the registry files it was read from. */
 interface PluginRootsCacheEntry {
@@ -1536,13 +1591,19 @@ export async function isSupersededPluginPath(filePath: string, home: string, cwd
  * List all installed Claude Code plugin roots from its active plugin cache and
  * ~/.omp/plugins/installed_plugins.json, plus the nearest project registry when present.
  *
- * Results are cached per Claude and OMP config directories, project registry, and canonical active project.
+ * Roots with a still-valid reviewed-resource exclusion are omitted, and their plugin ID passes to the
+ * copy they shadowed (`exclusions` defaults to the global settings; discovery passes its session's
+ * value). The unfiltered listing is cached per Claude and OMP config directories, project registry, and
+ * canonical active project; exclusions are re-verified against current content on every call.
  */
-export function listClaudePluginRoots(
+export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
+	exclusions: ResourceExclusions = globalResourceExclusions(),
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	return readPluginRoots(home, cwd, false);
+	const listed = await readPluginRoots(home, cwd, false);
+	if (Object.keys(exclusions).length === 0) return listed;
+	return { roots: await mergeExcludingPluginRoots(listed.layers, exclusions), warnings: listed.warnings };
 }
 
 /** {@link listClaudePluginRoots}; with `revalidate`, a cached result whose registry files changed is read again. */
@@ -1602,9 +1663,8 @@ async function loadClaudePluginRoots({
 	activeClaudeProjectPath: string | null;
 	enabledOverrides: { enabled: Map<string, boolean>; sources: string[] };
 }): Promise<PluginRootsResult> {
-	const roots: ClaudePluginRoot[] = [];
+	const layers = newPluginRootLayers(injectedPluginDirRoots);
 	const warnings: string[] = [];
-	const projectRoots: ClaudePluginRoot[] = [];
 	const canonicalClaudeProjectPaths = new Map<string, string | null>();
 
 	// ── Claude Code registry ──────────────────────────────────────────────────
@@ -1653,7 +1713,7 @@ async function loadClaudePluginRoots({
 						if (entryProjectPath !== activeClaudeProjectPath) continue;
 					}
 
-					roots.push({
+					layers.claude.push({
 						id: pluginId,
 						marketplace,
 						plugin: pluginName,
@@ -1688,10 +1748,8 @@ async function loadClaudePluginRoots({
 				const pluginName = pluginId.slice(0, atIndex);
 				const marketplace = pluginId.slice(atIndex + 1);
 
-				// OMP is authoritative: drop all Claude-sourced entries for this plugin ID
-				const filtered = roots.filter(r => r.id !== pluginId);
-				roots.length = 0;
-				roots.push(...filtered);
+				// OMP is authoritative: its entries replace all Claude-sourced entries for this plugin ID
+				layers.ompIds.add(pluginId);
 
 				for (const entry of entries) {
 					if (!entry.installPath || typeof entry.installPath !== "string") {
@@ -1700,9 +1758,9 @@ async function loadClaudePluginRoots({
 					}
 					if (entry.enabled === false) continue;
 					// Deduplicate by installPath within same ID
-					if (roots.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
+					if (layers.omp.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
 
-					roots.push({
+					layers.omp.push({
 						id: pluginId,
 						marketplace,
 						plugin: pluginName,
@@ -1741,7 +1799,7 @@ async function loadClaudePluginRoots({
 							continue;
 						}
 						if (entry.enabled === false) continue;
-						projectRoots.push({
+						layers.project.push({
 							id: pluginId,
 							marketplace,
 							plugin: pluginName,
@@ -1758,25 +1816,9 @@ async function loadClaudePluginRoots({
 		}
 	}
 
-	// Project entries shadow user entries for the same plugin ID.
-	if (projectRoots.length > 0) {
-		const projectIds = new Set(projectRoots.map(r => r.id));
-		const deduped = roots.filter(r => !projectIds.has(r.id));
-		roots.length = 0;
-		roots.push(...projectRoots, ...deduped);
-	}
-
-	// Merge --plugin-dir roots (highest precedence) on every fresh load
-	if (injectedPluginDirRoots.length > 0) {
-		const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
-		const filtered = roots.filter(r => !injectedIds.has(r.id));
-		roots.length = 0;
-		roots.push(...injectedPluginDirRoots, ...filtered);
-	}
-
 	// Runs once per cached promise, so each warning is logged once per computation.
 	for (const warning of warnings) logger.warn(warning);
-	return { roots, warnings };
+	return { roots: mergePluginRootLayers(layers), warnings, layers };
 }
 
 /**
@@ -1785,7 +1827,9 @@ async function loadClaudePluginRoots({
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
 	for (const invalidate of pluginCacheInvalidators) invalidate();
+	rawPreloadedLayers = newPluginRootLayers(injectedPluginDirRoots);
 	preloadedPluginRoots = [...injectedPluginDirRoots];
+	preloadViewVersion++;
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {
 		void preloadPluginRoots(lastPreloadHome, getProjectDir());
@@ -1807,10 +1851,22 @@ export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void 
 // ── Preloaded plugin roots (for sync consumers like LSP config) ─────────────
 // Populated at startup by preloadPluginRoots(). Read synchronously by
 // getPreloadedPluginRoots(). Safe degradation: empty array if not warmed.
+// The raw layers are kept apart from the exclusion-applied view consumers read, so a later session
+// (new fingerprints, changed or restored copies) re-derives its view from every installed root.
 
+let rawPreloadedLayers: PluginRootLayers = newPluginRootLayers([]);
 let preloadedPluginRoots: ClaudePluginRoot[] = [];
+/** Bumped whenever the raw layers or the view changes, so a slower verification never overwrites a newer view. */
+let preloadViewVersion = 0;
 let injectedPluginDirRoots: ClaudePluginRoot[] = [];
 let lastPreloadHome: string | undefined;
+
+async function publishPreloadedPluginRoots(layers: PluginRootLayers, exclusions: ResourceExclusions): Promise<void> {
+	rawPreloadedLayers = layers;
+	const version = ++preloadViewVersion;
+	const view = await mergeExcludingPluginRoots(layers, exclusions);
+	if (version === preloadViewVersion) preloadedPluginRoots = view;
+}
 
 /**
  * Populate the module-level plugin roots cache for sync consumers.
@@ -1819,8 +1875,8 @@ let lastPreloadHome: string | undefined;
  */
 export async function preloadPluginRoots(home: string, cwd?: string): Promise<void> {
 	lastPreloadHome = home;
-	const { roots } = await listClaudePluginRoots(home, cwd);
-	preloadedPluginRoots = roots;
+	const { layers } = await readPluginRoots(home, cwd, false);
+	await publishPreloadedPluginRoots(layers, globalResourceExclusions());
 }
 
 /**
@@ -1829,6 +1885,16 @@ export async function preloadPluginRoots(home: string, cwd?: string): Promise<vo
  */
 export function getPreloadedPluginRoots(): readonly ClaudePluginRoot[] {
 	return preloadedPluginRoots;
+}
+
+/**
+ * Re-derive the preloaded roots read synchronously by LSP/DAP config from the raw layers under the
+ * session's exclusions. The startup preload can run before the session's settings exist, so each
+ * session calls this once they do; a changed fingerprint or a different session's settings restore
+ * the copies an earlier call hid. A newer preload or call supersedes one still verifying.
+ */
+export async function applyExclusionsToPreloadedPluginRoots(exclusions: ResourceExclusions): Promise<void> {
+	await publishPreloadedPluginRoots(rawPreloadedLayers, exclusions);
 }
 
 // ── --plugin-dir injection ──────────────────────────────────────────────────
@@ -1878,6 +1944,6 @@ export async function injectPluginDirRoots(home: string, dirs: string[], cwd?: s
 	pluginRootsCache.clear();
 	// Rebuild — cache miss triggers fresh load that includes both user+project registries
 	// and prepends injectedPluginDirRoots at highest precedence.
-	const { roots } = await listClaudePluginRoots(home, cwd);
-	preloadedPluginRoots = roots;
+	const { layers } = await readPluginRoots(home, cwd, false);
+	await publishPreloadedPluginRoots(layers, globalResourceExclusions());
 }

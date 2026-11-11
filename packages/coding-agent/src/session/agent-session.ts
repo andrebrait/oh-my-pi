@@ -170,6 +170,7 @@ import { resolveStopContinuationText } from "../extensibility/extensions/stop-co
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
+import { SkillDiagnosticController } from "../extensibility/skill-diagnostic-controller";
 import {
 	type BuiltSkillPromptMessage,
 	loadSkillPrompt,
@@ -583,6 +584,7 @@ import { cfgSteeringMode } from "../modes/settings";
 import { cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
 import { cfgEvalJs, cfgEvalPy, cfgEvalToolsEnabled, cfgEvalWorkpoolFreshAgents } from "../eval/settings";
 import { cfgExtensions, type SkillsSettings } from "../extensibility/settings";
+import { cfgUserResourceExclusions } from "../extensibility/resource-settings";
 import {
 	cfgImagesAutoResize,
 	cfgMagicKeyword,
@@ -1346,6 +1348,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
 	#setMcpServerInstructionsSource: AgentSessionConfig["setMcpServerInstructionsSource"];
 	#skillDescriptions: SkillDescriptionCatalog;
+	#skillDiagnosticController: SkillDiagnosticController | undefined;
 	#promptSkillsSource: readonly Skill[] | undefined;
 	#promptSkills: readonly Skill[] = [];
 	/**
@@ -2318,6 +2321,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				mode: config.disableExtensionDiscovery ? "explicit-only" : "merge",
 				configured: cfgExtensions.get(this.settings),
 				configuredLevel: this.settings.extensionsSourceLevel(),
+				resourceExclusions: cfgUserResourceExclusions.get(this.settings),
 			}));
 		this.#preparedExtensions = config.preparedExtensions;
 		this.#extensionPaths = config.extensionPaths;
@@ -12261,6 +12265,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Skill resolution diagnostics captured by SDK */
 	get skillDiagnostics(): readonly SkillDiagnostic[] {
 		return this.#tools.skillDiagnostics;
+	}
+
+	/** Session-owned consent plans and retained results shared by TUI and RPC clients. */
+	get skillDiagnosticController(): SkillDiagnosticController {
+		return (this.#skillDiagnosticController ??= new SkillDiagnosticController(this));
 	}
 
 	/** Session-local general-purpose agents pinned to user-tagged models. */
