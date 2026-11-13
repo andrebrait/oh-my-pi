@@ -1,6 +1,6 @@
 # fork-ci: the omp integration round
 
-This orphan branch is the default branch of `andrebrait/oh-my-pi` and holds only
+This orphan branch is the default branch of `ompweb-dev/oh-my-pi` and holds only
 CI: the hourly round that rebuilds each upstream omp release plus our carried
 pull requests and releases it here as `v<upstream>-int.<YYYYMMDDHHMM>.g<sha7>`
 (binaries that update from this fork's releases, and `omp-packages-<version>.zip`
@@ -19,7 +19,7 @@ Design: kahme247/ompweb `docs/specs/2026-11-12-omp-build-in-ompweb-design.md`.
 
 ## Because this is the default branch
 
-- Sync `main` only with `integration` or `gh repo sync andrebrait/oh-my-pi -b main`.
+- Sync `main` only with `integration` or `gh repo sync ompweb-dev/oh-my-pi -b main`.
   The bare `gh repo sync` and GitHub's "Sync fork" button act on this branch.
 - A pull request opened inside the fork defaults to base `fork-ci`: pass `--base main`.
 - Clones check out `fork-ci`; check out `main` (or a PR branch) explicitly.

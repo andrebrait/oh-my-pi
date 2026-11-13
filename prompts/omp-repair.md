@@ -22,7 +22,7 @@ carried pull requests. A round has three stages, and one of them stopped
 
 ## Layout
 
-- `$GITHUB_WORKSPACE`: clone of `andrebrait/oh-my-pi`, remotes `origin` (the
+- `$GITHUB_WORKSPACE`: clone of `ompweb-dev/oh-my-pi`, remotes `origin` (the
   fork) and `upstream` (`can1357/oh-my-pi`).
 - `$GITHUB_WORKSPACE/ci`: checkout of the fork's `fork-ci` branch (CI only). The
   config is `ci/config/root--git--oh-my-pi.sh` (`BUILD_CMD`, `TEST_CMD`,

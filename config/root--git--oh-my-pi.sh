@@ -12,7 +12,7 @@ EXTRA_PRS='7851=carry/pr-7851'
 SKIP_PRS='18668'
 BRANCH=integration
 # build runs BUILD_CMD/TEST_CMD on GitHub Actions (.github/workflows/omp.yml sources this file).
-CI_REPO=andrebrait/oh-my-pi
+CI_REPO=ompweb-dev/oh-my-pi
 CI_WORKFLOW=omp.yml
 # CI reads this config and its workflows from the fork's fork-ci branch.
 CI_CONFIG_REF=origin/fork-ci

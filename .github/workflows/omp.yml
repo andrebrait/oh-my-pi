@@ -295,7 +295,7 @@ jobs:
            shell: bash
            env:
               RELEASE_TARGETS: ${{ matrix.target }}
-              PI_UPDATE_REPO: andrebrait/oh-my-pi
+              PI_UPDATE_REPO: ompweb-dev/oh-my-pi
               SHA: ${{ inputs.sha }}
            run: |
               set -euo pipefail
@@ -355,8 +355,8 @@ jobs:
               [ "$got" = "omp/$VERSION" ] || { echo "bin/omp --version printed '$got', want 'omp/$VERSION'" >&2; exit 1; }
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" bin/omp --smoke-test
               # Fails when the carried update-source PR (PI_UPDATE_REPO) dropped out of the build.
-              if [ "$TARGET" = linux-x64 ] && ! grep -qaF andrebrait/oh-my-pi bin/omp; then
-                echo "bin/omp does not name andrebrait/oh-my-pi: it would update from upstream" >&2
+              if [ "$TARGET" = linux-x64 ] && ! grep -qaF ompweb-dev/oh-my-pi bin/omp; then
+                echo "bin/omp does not name ompweb-dev/oh-my-pi: it would update from upstream" >&2
                 exit 1
               fi
          - name: Smoke release binary (Windows)
