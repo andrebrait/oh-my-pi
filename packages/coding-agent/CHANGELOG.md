@@ -10,6 +10,7 @@
 - Added an Auto Thinking Source setting (`providers.autoThinkingSource`): `vendor` makes the `auto` thinking level use the model vendor's default effort (for example `medium` on Claude Opus 5.5 and GPT-5.6, `high` on other Claude models) instead of classifying each prompt ([#14114](https://github.com/can1357/oh-my-pi/pull/14114) by [@andrebrait](https://github.com/andrebrait))
 - Added startup notices for conflicting skill variants and redundant installations, with `/skills diagnostics` for resolution details and `skills.showStartupDiagnostics` to disable the notices ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
 - Added declared repository and version provenance to skill diagnostics, with opt-in `skills.dedupeSameOrigin` resolution for differing same-name plugin variants from the same source repository ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
+- Added the `retry.preferSlowMode` setting ("Prefer Slow Mode Over Fallback"): with `/slow` on a Claude subscription model, usage-aware fallback keeps Claude past its usage limits on low priority and switches models only when Claude refuses a request, such as at the weekly limit ([#14365](https://github.com/can1357/oh-my-pi/pull/14365) by [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 
