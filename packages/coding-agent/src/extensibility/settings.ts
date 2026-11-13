@@ -40,6 +40,30 @@ export const cfgSkillsEnableSkillCommands = register({
 	},
 });
 
+export const cfgSkillsShowStartupDiagnostics = register({
+	id: "skills.showStartupDiagnostics",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Skill Startup Notices",
+		description: "Show skill conflicts and deduplicated installations at startup",
+	},
+});
+
+export const cfgSkillsDedupeSameOrigin = register({
+	id: "skills.dedupeSameOrigin",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Dedupe Same-Origin Skills",
+		description: "Keep one variant of same-name skills whose plugins declare the same source repository",
+	},
+});
+
 export const cfgSkillsEnableCodexUser = register({ id: "skills.enableCodexUser", type: "boolean", default: false });
 
 export const cfgSkillsEnableClaudeUser = register({ id: "skills.enableClaudeUser", type: "boolean", default: false });
@@ -92,7 +116,7 @@ export const cfgSkillsOptInSkills = register({
 	default: EMPTY_STRING_ARRAY,
 });
 
-/** Skill discovery options (`skills.*` except the `omp skill` registry URL). */
+/** Skill discovery options (`skills.*` except the `omp skill` registry URL and startup-only presentation settings). */
 export const cfgSkills = combine({
 	enabled: cfgSkillsEnabled,
 	enableSkillCommands: cfgSkillsEnableSkillCommands,
@@ -108,6 +132,7 @@ export const cfgSkills = combine({
 	manualSkills: cfgSkillsManualSkills,
 	includeSkills: cfgSkillsIncludeSkills,
 	optInSkills: cfgSkillsOptInSkills,
+	dedupeSameOrigin: cfgSkillsDedupeSameOrigin,
 });
 
 /** Skill discovery options ({@link cfgSkills}); omitted fields fall back to the setting defaults. */
