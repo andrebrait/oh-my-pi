@@ -6,11 +6,16 @@
 
 - Added per-role skill visibility control for subagents via agent frontmatter: `skills` (allowlist globs; `"none"`/`[]` lists none), `hideSkills` (denylist globs, highest precedence), and `unhideSkills` (re-exposes skills whose `SKILL.md` sets `hide: true`) — see [#4570](https://github.com/can1357/oh-my-pi/issues/4570). Controls the rendered `<skills>` block only; hidden skills remain loadable via `skill://<name>` (and `/skill:<name>` where the session has a slash dispatcher, i.e. the main session). Vibe workers (`vibe_spawn`) resolve the parent session's skill list through the same per-role filter (bundled vibe agents set no visibility frontmatter, so the listing passes through unchanged); `autoloadSkills` preloads any named skill, including one hidden from the listing.
 - GitHub issue/PR references in assistant replies (`#123`, `owner/repo#123`) are now clickable terminal hyperlinks; bare `#123` links to the current directory's GitHub repository and the visible text is unchanged ([#13078](https://github.com/can1357/oh-my-pi/pull/13078) by [@andrebrait](https://github.com/andrebrait))
+- Added `skills.optInSkills` to keep matching skills available through `/skill:<name>` and `skill://<name>` while hiding them from the model prompt, without editing their files; `omp skill list --json` reports the result as `hide` ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@karls-science](https://github.com/karls-science) and [@andrebrait](https://github.com/andrebrait)).
 
 ### Changed
 
 - Issue and PR references to other repositories are now written as `owner/repo#N` or full URLs, so bare `#N` only ever means the current repository ([#13078](https://github.com/can1357/oh-my-pi/pull/13078) by [@andrebrait](https://github.com/andrebrait))
 - Passive context emitted after a tool batch now appears as one dim line on the batch's final tool card instead of remaining invisible or creating a separate transcript row; expanding tools (`Ctrl+O` by default) shows its full text ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+
+### Fixed
+
+- Fixed an unknown `skill://` name listing hidden skills as available to the model ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.20.0] - 2026-11-12
 
