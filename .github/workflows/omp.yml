@@ -34,9 +34,6 @@ on:
          sha:
             required: true
             type: string
-      secrets:
-         OMP_FORK_TOKEN:
-            required: false
       outputs:
          version:
             description: Version every artifact of this build reports (<upstream>-int.<stamp>.g<sha7>)
@@ -460,5 +457,3 @@ jobs:
          targets: linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64
          executables: omp
          description: "omp binary for {target}. macOS builds are ad-hoc signed, not notarized: after a browser download, run `xattr -d com.apple.quarantine omp` once."
-      secrets:
-         OMP_FORK_TOKEN: ${{ secrets.OMP_FORK_TOKEN }}

@@ -23,5 +23,6 @@ Design: kahme247/ompweb `docs/specs/2026-11-12-omp-build-in-ompweb-design.md`.
   The bare `gh repo sync` and GitHub's "Sync fork" button act on this branch.
 - A pull request opened inside the fork defaults to base `fork-ci`: pass `--base main`.
 - Clones check out `fork-ci`; check out `main` (or a PR branch) explicitly.
-- Secrets `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `OMP_FORK_TOKEN` are repository
-  secrets; `fork-guard.yml` keeps every other workflow disabled.
+- Secrets `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `OMP_FORK_TOKEN` live in the
+  `fork-build` environment (branch `fork-ci` only); only jobs that read one declare
+  it, and `fork-guard.yml` keeps every other workflow disabled.

@@ -18,8 +18,8 @@ name: omp auto-integration
 #
 # Trust: jobs that run fork code or an agent hold no write token; they hand
 # their refs and patches to a publishing job that runs no fork code. `rebase` only
-# runs git, so it pushes itself. The round's secrets are repository secrets: fork-guard
-# keeps every workflow not on fork-ci disabled. Writes use GITHUB_TOKEN and retry
+# runs git, so it pushes itself. The round's secrets live in the `fork-build`
+# environment (fork-ci only); only jobs that read one declare it. Writes use GITHUB_TOKEN and retry
 # with OMP_FORK_TOKEN only when GitHub refuses them for the workflows permission
 # (scripts/fork-token.sh).
 on:
@@ -157,6 +157,7 @@ jobs:
       needs: detect
       if: needs.detect.outputs.tag != '' && inputs.candidate == ''
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 30
       permissions:
          contents: write
@@ -204,6 +205,7 @@ jobs:
       needs: [detect, rebase]
       if: ${{ !cancelled() && needs.rebase.result == 'failure' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 120
       permissions:
          contents: read
@@ -262,6 +264,7 @@ jobs:
       # Explicit: the implicit success() is false once any earlier job (here `rebase`) failed.
       if: ${{ !cancelled() && needs.rebase-repair.result == 'success' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 30
       permissions:
          contents: write
@@ -324,6 +327,7 @@ jobs:
       needs: [detect, integrate]
       if: ${{ !cancelled() && needs.integrate.result == 'failure' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 120
       permissions:
          contents: read
@@ -365,6 +369,7 @@ jobs:
       needs: [detect, integrate, integrate-repair]
       if: ${{ !cancelled() && (needs.integrate.result == 'success' || needs.integrate-repair.result == 'success') }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 30
       permissions:
          contents: write
@@ -395,13 +400,12 @@ jobs:
       with:
          repo: ${{ github.repository }}
          sha: ${{ inputs.candidate || needs.candidate.outputs.sha }}
-      secrets:
-         OMP_FORK_TOKEN: ${{ secrets.OMP_FORK_TOKEN }}
 
    build-repair:
       needs: [detect, candidate, build]
       if: ${{ !cancelled() && inputs.candidate == '' && needs.build.result == 'failure' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 330
       permissions:
          contents: read
@@ -463,6 +467,7 @@ jobs:
       needs: [detect, build-repair]
       if: ${{ !cancelled() && needs.build-repair.result == 'success' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 30
       permissions:
          contents: write
@@ -491,6 +496,7 @@ jobs:
       needs: [detect, candidate, build]
       if: ${{ !cancelled() && needs.build.result == 'success' }}
       runs-on: ubuntu-24.04
+      environment: fork-build
       timeout-minutes: 30
       permissions:
          contents: write
