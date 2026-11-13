@@ -1,0 +1,29 @@
+name: zz probe called
+on:
+   workflow_call:
+      outputs:
+         marker:
+            value: ${{ jobs.ok.outputs.marker }}
+permissions: {}
+jobs:
+   ok:
+      runs-on: ubuntu-24.04
+      timeout-minutes: 2
+      outputs:
+         marker: ${{ steps.m.outputs.marker }}
+      steps:
+         - id: m
+           run: echo marker=hello >> "$GITHUB_OUTPUT"
+   # Never acquires a runner: a label no hosted runner has, timed out after 1 minute.
+   norunner:
+      runs-on: macos-nonexistent-probe-label
+      timeout-minutes: 1
+      steps:
+         - run: echo never
+   after:
+      needs: [ok, norunner]
+      if: ${{ always() && needs.ok.result == 'success' }}
+      runs-on: ubuntu-24.04
+      timeout-minutes: 2
+      steps:
+         - run: echo "after ran; norunner=${{ needs.norunner.result }}"
