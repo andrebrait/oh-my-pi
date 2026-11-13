@@ -70,6 +70,8 @@
 
 - Markdown now renders GitHub issue/PR references (`owner/repo#123`, and bare `#123` when `MarkdownTheme.githubRepo` is set) as OSC 8 hyperlinks without changing their visible text ([#13078](https://github.com/can1357/oh-my-pi/pull/13078) by [@andrebrait](https://github.com/andrebrait))
 - Tool cards can now show passive model context as one sanitized, dim line, in both the terminal and native transcripts, without exposing it as a separate transcript message; expanding tools shows the full text, and the native line shows it on hover ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
+- Added a custom OpenAI-compatible endpoint option to the setup provider list ([#12997](https://github.com/can1357/oh-my-pi/pull/12997) by [@DrB0rk](https://github.com/DrB0rk)).
+- Added a provider editor to the `/models` hub for adding, editing, and deleting custom OpenAI-compatible providers (`+ Add provider…`, `Ctrl+N` / `Ctrl+E` / `Ctrl+D`); saves keep `models.yml` comments ([#13874](https://github.com/can1357/oh-my-pi/pull/13874) by [@andrebrait](https://github.com/andrebrait)).
 
 ## [18.18.7] - 2026-11-10
 
