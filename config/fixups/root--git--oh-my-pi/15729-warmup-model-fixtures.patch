@@ -1,0 +1,32 @@
+diff --git a/packages/coding-agent/test/memory-tools.test.ts b/packages/coding-agent/test/memory-tools.test.ts
+index 241aaf2b5f..94a12d7c71 100644
+--- a/packages/coding-agent/test/memory-tools.test.ts
++++ b/packages/coding-agent/test/memory-tools.test.ts
+@@ -1254,7 +1254,9 @@ describe("Mnemopi backend lifecycle", () => {
+ 		};
+ 
+ 		/** Seeds three rows with raw-SQL vectors (no provider), then starts the backend on that bank. */
+-		const startSeededBank = async (options: { autoRecall?: boolean; noEmbeddings?: boolean } = {}) => {
++		const startSeededBank = async (
++			options: { autoRecall?: boolean; noEmbeddings?: boolean; embeddingModel?: string } = {},
++		) => {
+ 			const settings = Settings.isolated({
+ 				"memory.backend": "mnemopi",
+ 				"mnemopi.noEmbeddings": options.noEmbeddings ?? false,
+@@ -1263,6 +1265,7 @@ describe("Mnemopi backend lifecycle", () => {
+ 				"mnemopi.scoping": "global",
+ 				"mnemopi.bank": "default",
+ 				"mnemopi.dbPath": makeMnemopiConfig().dbPath,
++				...(options.embeddingModel ? { "mnemopi.embeddingModel": options.embeddingModel } : {}),
+ 			});
+ 			// Same model the started backend reconciles against; a mismatch makes start wipe these vectors.
+ 			const backendModel = loadMnemopiConfig(settings, path.dirname(tempDbPath!)).providerOptions.embeddingModel;
+@@ -1324,7 +1327,7 @@ describe("Mnemopi backend lifecycle", () => {
+ 		};
+ 
+ 		it("warms the recall bank's vectors in the background so the next recall reads none", async () => {
+-			const { started, warm, vectorReads, ids } = await startSeededBank();
++			const { started, warm, vectorReads, ids } = await startSeededBank({ embeddingModel: "warmup-bank-model" });
+ 			expect(vectorReads()).toBe(0);
+ 
+ 			await Promise.all(warm.mock.results.map(result => result.value));

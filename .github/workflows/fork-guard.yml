@@ -1,0 +1,29 @@
+name: fork guard
+
+# The fork's main mirrors upstream, so every sync brings upstream's workflows
+# (CI, OMP Nix on each v* tag, ...). None of them should run here: this disables
+# every active workflow whose file is not on fork-ci. omp-auto.yml's detect job
+# runs the same step every round.
+on:
+   schedule:
+      - cron: "0 5 * * *"
+   workflow_dispatch:
+
+permissions: {}
+
+jobs:
+   guard:
+      runs-on: ubuntu-24.04
+      timeout-minutes: 5
+      permissions:
+         actions: write
+         contents: read
+      steps:
+         - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+           with:
+              ref: fork-ci
+              persist-credentials: false
+         - name: Disable workflows that are not on fork-ci
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: scripts/fork-guard.sh .

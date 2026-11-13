@@ -1,0 +1,255 @@
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-types.ts b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+index 7290e25475e0a03067ed151f766b52d6f235eab4..e6659c77415dce10f257579cd81f970abf58c135 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-types.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+@@ -89,14 +89,11 @@ export type RpcCommand =
+ 	| { id?: string; type: "get_state" }
+ 	| { id?: string; type: "get_skill_diagnostics" }
+ 	| { id?: string; type: "set_skill_startup_diagnostics"; enabled: boolean }
+-<<<<<<< HEAD
+ 	| { id?: string; type: "get_client_message_status"; clientMessageIds: string[] }
+-=======
+ 	| { id?: string; type: "prepare_skill_diagnostic_analysis"; name: string; model?: string }
+ 	| { id?: string; type: "analyze_skill_diagnostics"; analysisId: string; consent: boolean }
+ 	| { id?: string; type: "cancel_skill_diagnostic_analysis"; analysisId: string }
+ 	| { id?: string; type: "apply_skill_diagnostic_analysis"; analysisId: string; confirmed: boolean }
+->>>>>>> c595aba (PR #14458)
+ 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+ 	| { id?: string; type: "set_slow_mode"; enabled: boolean }
+ 	| {
+diff --git a/packages/coding-agent/src/modes/rpc/wire/commands.ts b/packages/coding-agent/src/modes/rpc/wire/commands.ts
+index 46875ccb3893871369b1f31ba23f8eb61a3d5c60..426fb589bc8ab285e99c8398f3222db8dd88cc93 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/commands.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/commands.ts
+@@ -114,14 +114,14 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
+ 		result: "SkillDiagnosticsSnapshot",
+ 	},
+ 	{
+-<<<<<<< HEAD
+ 		name: "get_client_message_status",
+ 		doc: "Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn.",
+ 		params: {
+ 			clientMessageIds: doc("string[]", "Between 1 and 32 unique nonempty IDs, each at most 128 characters."),
+ 		},
+ 		result: "ClientMessageStatus",
+-=======
++	},
++	{
+ 		name: "prepare_skill_diagnostic_analysis",
+ 		doc: "Snapshot the comparable variants of one skill name and return the server-held record with its consent disclosure; sends nothing to a model. `model` must name one authenticated model exactly; omitted uses the default analysis model.",
+ 		params: { name: "string", "model?": "string" },
+@@ -144,7 +144,6 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
+ 		doc: "Apply a complete `prefer` recommendation after a separate confirmation (`confirmed` must be true): saves a content-bound exclusion in the user's global settings and reloads skills; installed files are unchanged. A successfully applied id replays without another change. If its record has `applied: true` and `error`, saving succeeded but the session reload failed; another separately confirmed call retries the application.",
+ 		params: { analysisId: "string", confirmed: "boolean" },
+ 		result: "SkillDiagnosticAnalysisRecord",
+->>>>>>> c595aba (PR #14458)
+ 	},
+ 	{
+ 		name: "set_fast_mode",
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+index bd1e8f228044ac752ed7187698943a048394ecff..dc705ff137c4bada5c81e15b7f984b6b9d2d385b 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+@@ -1796,11 +1796,11 @@ export interface SetSkillStartupDiagnosticsParams {
+ 	enabled: boolean;
+ }
+ 
+-<<<<<<< HEAD
+ export interface GetClientMessageStatusParams {
+ 	/** Between 1 and 32 unique nonempty IDs, each at most 128 characters. */
+ 	clientMessageIds: string[];
+-=======
++}
++
+ export interface PrepareSkillDiagnosticAnalysisParams {
+ 	name: string;
+ 	model?: string;
+@@ -1818,7 +1818,6 @@ export interface CancelSkillDiagnosticAnalysisParams {
+ export interface ApplySkillDiagnosticAnalysisParams {
+ 	analysisId: string;
+ 	confirmed: boolean;
+->>>>>>> c595aba (PR #14458)
+ }
+ 
+ export interface SetFastModeParams {
+@@ -2169,14 +2168,11 @@ export interface RpcWireCommands {
+ 	get_state: { params: undefined; result: SessionState };
+ 	get_skill_diagnostics: { params: undefined; result: SkillDiagnosticsSnapshot };
+ 	set_skill_startup_diagnostics: { params: SetSkillStartupDiagnosticsParams; result: SkillDiagnosticsSnapshot };
+-<<<<<<< HEAD
+ 	get_client_message_status: { params: GetClientMessageStatusParams; result: ClientMessageStatus };
+-=======
+ 	prepare_skill_diagnostic_analysis: { params: PrepareSkillDiagnosticAnalysisParams; result: SkillDiagnosticAnalysisRecord };
+ 	analyze_skill_diagnostics: { params: AnalyzeSkillDiagnosticsParams; result: SkillDiagnosticAnalysisRecord };
+ 	cancel_skill_diagnostic_analysis: { params: CancelSkillDiagnosticAnalysisParams; result: SkillDiagnosticAnalysisRecord };
+ 	apply_skill_diagnostic_analysis: { params: ApplySkillDiagnosticAnalysisParams; result: SkillDiagnosticAnalysisRecord };
+->>>>>>> c595aba (PR #14458)
+ 	set_fast_mode: { params: SetFastModeParams; result: FastModeResult };
+ 	set_slow_mode: { params: SetSlowModeParams; result: SetSlowModeResult };
+ 	goal: { params: GoalParams; result: GoalResult };
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+index dc5b2f339390d1c797a54fc59d39564a0c4c4053..761a501be02409e051eabc12cc2cda9d658d2650 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+@@ -164,12 +164,12 @@
+ 				"clientOmit": []
+ 			},
+ 			{
+-<<<<<<< HEAD
+ 				"name": "get_client_message_status",
+ 				"doc": "Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn.",
+ 				"params": "GetClientMessageStatusParams",
+ 				"result": "ClientMessageStatus",
+-=======
++			},
++			{
+ 				"name": "prepare_skill_diagnostic_analysis",
+ 				"doc": "Snapshot the comparable variants of one skill name and return the server-held record with its consent disclosure; sends nothing to a model. `model` must name one authenticated model exactly; omitted uses the default analysis model.",
+ 				"params": "PrepareSkillDiagnosticAnalysisParams",
+@@ -207,7 +207,6 @@
+ 				"doc": "Apply a complete `prefer` recommendation after a separate confirmation (`confirmed` must be true): saves a content-bound exclusion in the user's global settings and reloads skills; installed files are unchanged. A successfully applied id replays without another change. If its record has `applied: true` and `error`, saving succeeded but the session reload failed; another separately confirmed call retries the application.",
+ 				"params": "ApplySkillDiagnosticAnalysisParams",
+ 				"result": "SkillDiagnosticAnalysisRecord",
+->>>>>>> c595aba (PR #14458)
+ 				"nullable": false,
+ 				"unwrap": null,
+ 				"timeoutMs": null,
+@@ -6997,7 +6996,6 @@
+ 				"enabled"
+ 			]
+ 		},
+-<<<<<<< HEAD
+ 		"GetClientMessageStatusParams": {
+ 			"type": "object",
+ 			"properties": {
+@@ -7011,7 +7009,8 @@
+ 			},
+ 			"required": [
+ 				"clientMessageIds"
+-=======
++			]
++		},
+ 		"PrepareSkillDiagnosticAnalysisParams": {
+ 			"type": "object",
+ 			"properties": {
+@@ -7065,7 +7064,6 @@
+ 			"required": [
+ 				"analysisId",
+ 				"confirmed"
+->>>>>>> c595aba (PR #14458)
+ 			]
+ 		},
+ 		"SetFastModeParams": {
+diff --git a/sdk/go/omp-rpc/wire.go b/sdk/go/omp-rpc/wire.go
+index 4ae59ac6a44470c3c9f3da41f7a8f8cb914d7ad8..2f9eb5d1a09c1e0a63d6d48e5e12e42ed38e1bd7 100644
+--- a/sdk/go/omp-rpc/wire.go
++++ b/sdk/go/omp-rpc/wire.go
+@@ -8592,7 +8592,6 @@ func (c Commands) SetSkillStartupDiagnostics(ctx context.Context, p SetSkillStar
+ 	return out, err
+ }
+ 
+-<<<<<<< HEAD
+ // GetClientMessageStatusCommand holds the parameters of "get_client_message_status".
+ type GetClientMessageStatusCommand struct {
+ 	// Between 1 and 32 unique nonempty IDs, each at most 128 characters.
+@@ -8603,7 +8602,9 @@ type GetClientMessageStatusCommand struct {
+ func (c Commands) GetClientMessageStatus(ctx context.Context, p GetClientMessageStatusCommand) (ClientMessageStatus, error) {
+ 	var out ClientMessageStatus
+ 	err := c.call(ctx, "get_client_message_status", p, 0, &out)
+-=======
++	return out, err
++}
++
+ // PrepareSkillDiagnosticAnalysisCommand holds the parameters of "prepare_skill_diagnostic_analysis".
+ type PrepareSkillDiagnosticAnalysisCommand struct {
+ 	Name  string  `json:"name"`
+@@ -8652,7 +8653,6 @@ type ApplySkillDiagnosticAnalysisCommand struct {
+ func (c Commands) ApplySkillDiagnosticAnalysis(ctx context.Context, p ApplySkillDiagnosticAnalysisCommand) (SkillDiagnosticAnalysisRecord, error) {
+ 	var out SkillDiagnosticAnalysisRecord
+ 	err := c.call(ctx, "apply_skill_diagnostic_analysis", p, 0, &out)
+->>>>>>> c595aba (PR #14458)
+ 	return out, err
+ }
+ 
+diff --git a/sdk/python/omp-rpc/src/omp_rpc/_wire.py b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+index 5dd06799dae83c3be765aaab7e9cc88ed73b846e..9770cc053667db880d12d59be904304d0c26a2cb 100644
+--- a/sdk/python/omp-rpc/src/omp_rpc/_wire.py
++++ b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+@@ -3813,13 +3813,12 @@ class WireClient:
+         params["enabled"] = enabled
+         return parse_skill_diagnostics_snapshot(self._command("set_skill_startup_diagnostics", params), "set_skill_startup_diagnostics")
+ 
+-<<<<<<< HEAD
+     def get_client_message_status(self, client_message_ids: Sequence[str]) -> ClientMessageStatus:
+         """Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn."""
+         params: dict[str, object] = {}
+         params["clientMessageIds"] = list(client_message_ids)
+         return parse_client_message_status(self._command("get_client_message_status", params), "get_client_message_status")
+-=======
++
+     def prepare_skill_diagnostic_analysis(self, name: str, *, model: str | None = None) -> SkillDiagnosticAnalysisRecord:
+         """Snapshot the comparable variants of one skill name and return the server-held record with its consent disclosure; sends nothing to a model. `model` must name one authenticated model exactly; omitted uses the default analysis model."""
+         params: dict[str, object] = {}
+@@ -3847,7 +3846,6 @@ class WireClient:
+         params["analysisId"] = analysis_id
+         params["confirmed"] = confirmed
+         return parse_skill_diagnostic_analysis_record(self._command("apply_skill_diagnostic_analysis", params), "apply_skill_diagnostic_analysis")
+->>>>>>> c595aba (PR #14458)
+ 
+     def set_fast_mode(self, enabled: bool) -> FastModeResult:
+         """Enable or disable fast mode for the session."""
+diff --git a/sdk/rust/omp-rpc/src/wire.rs b/sdk/rust/omp-rpc/src/wire.rs
+index 019a7c9a15e0bf0010d0269914bd13e0b33b9ca0..5ea7e255512da5ed4e5cf1f111acf0626c7243dd 100644
+--- a/sdk/rust/omp-rpc/src/wire.rs
++++ b/sdk/rust/omp-rpc/src/wire.rs
+@@ -5680,12 +5680,13 @@ pub struct SetSkillStartupDiagnosticsParams {
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-<<<<<<< HEAD
+ pub struct GetClientMessageStatusParams {
+ 	/// Between 1 and 32 unique nonempty IDs, each at most 128 characters.
+ 	#[serde(rename = "clientMessageIds")]
+ 	pub client_message_ids: Vec<String>,
+-=======
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct PrepareSkillDiagnosticAnalysisParams {
+ 	pub name: String,
+ 	#[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -5710,7 +5711,6 @@ pub struct ApplySkillDiagnosticAnalysisParams {
+ 	#[serde(rename = "analysisId")]
+ 	pub analysis_id: String,
+ 	pub confirmed: bool,
+->>>>>>> c595aba (PR #14458)
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -6884,7 +6884,6 @@ impl Command for SetSkillStartupDiagnosticsCommand {
+ 	}
+ }
+ 
+-<<<<<<< HEAD
+ /// Read current correlated messages, queues and explicit resolutions without starting or waiting for a turn.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct GetClientMessageStatusCommand {
+@@ -6900,7 +6899,9 @@ impl Command for GetClientMessageStatusCommand {
+ 
+ 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+ 		serde_json::from_value::<ClientMessageStatus>(data.unwrap_or_else(|| Value::Object(Map::new())))
+-=======
++	}
++}
++
+ /// Snapshot the comparable variants of one skill name and return the server-held record with its consent disclosure; sends nothing to a model. `model` must name one authenticated model exactly; omitted uses the default analysis model.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct PrepareSkillDiagnosticAnalysisCommand {
+@@ -6969,7 +6970,6 @@ impl Command for ApplySkillDiagnosticAnalysisCommand {
+ 
+ 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+ 		serde_json::from_value::<SkillDiagnosticAnalysisRecord>(data.unwrap_or_else(|| Value::Object(Map::new())))
+->>>>>>> c595aba (PR #14458)
+ 	}
+ }
+ 

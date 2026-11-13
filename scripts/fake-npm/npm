@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stand-in for `npm` under scripts/ci-release-publish.ts in omp.yml's `pack` job:
+# `npm publish <tarball> …` keeps the tarball in $OMP_PACK_OUT; anything else
+# (`npm view` included, which then reads as "not published") exits 0 without
+# touching the network.
+[ "$1" = publish ] || exit 0
+cp "$2" "${OMP_PACK_OUT:?}/" && echo "fake-npm: kept $(basename "$2")"
