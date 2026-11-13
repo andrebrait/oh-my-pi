@@ -14,12 +14,12 @@ jobs:
       steps:
          - id: m
            run: echo marker=hello >> "$GITHUB_OUTPUT"
-   # Never acquires a runner: a label no hosted runner has, timed out after 1 minute.
+   # Times out after 1 minute (cancelled, like the runner-less macOS smoke).
    norunner:
-      runs-on: macos-nonexistent-probe-label
+      runs-on: ubuntu-24.04
       timeout-minutes: 1
       steps:
-         - run: echo never
+         - run: sleep 150
    after:
       needs: [ok, norunner]
       if: ${{ always() && needs.ok.result == 'success' }}
