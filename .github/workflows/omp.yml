@@ -377,6 +377,37 @@ jobs:
               & "bin/omp.exe" --smoke-test
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+   # GitHub sometimes never acquires a macOS arm64 runner for the darwin-arm64 smoke.
+   # The build then publishes without it and its notes say so; any other smoke that
+   # did not succeed, or a darwin-arm64 smoke that ran and failed, still blocks.
+   smoke-gate:
+      needs: smoke
+      if: ${{ !cancelled() && needs.smoke.result != 'skipped' }}
+      runs-on: ubuntu-24.04
+      timeout-minutes: 5
+      permissions:
+         contents: read
+         actions: read
+      outputs:
+         unsmoked: ${{ steps.gate.outputs.unsmoked }}
+      steps:
+         - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+           with:
+              ref: fork-ci
+              persist-credentials: false
+              sparse-checkout: scripts/smoke-gate.sh
+              sparse-checkout-cone-mode: false
+         - id: gate
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: |
+              set -euo pipefail
+              # Matrix jobs are named `smoke (...)`, or `build / smoke (...)` under omp-auto.yml.
+              out="$(scripts/smoke-gate.sh '(^|/ )smoke \(')"
+              echo "$out" >> "$GITHUB_OUTPUT"
+              grep -qx ok=true <<< "$out"
+
    # The npm packages of this build, as upstream's release publishes them, kept instead
    # of published: 12 JS packages and the 6 native leaves, zipped with an index.json
    # ({ "<npm name>": "<file>.tgz" }) for ompweb's runner.
@@ -445,7 +476,8 @@ jobs:
               if-no-files-found: error
 
    publish:
-      needs: [build, smoke, pack]
+      needs: [build, pack, smoke-gate]
+      if: ${{ !cancelled() && needs.build.result == 'success' && needs.pack.result == 'success' && needs.smoke-gate.result == 'success' }}
       permissions:
          contents: write
       uses: ./.github/workflows/publish.yml
@@ -457,3 +489,4 @@ jobs:
          targets: linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64
          executables: omp
          description: "omp binary for {target}. macOS builds are ad-hoc signed, not notarized: after a browser download, run `xattr -d com.apple.quarantine omp` once."
+         note: ${{ needs.smoke-gate.outputs.unsmoked == 'true' && 'darwin-arm64 smoke not run (no runner)' || '' }}

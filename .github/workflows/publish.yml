@@ -41,6 +41,11 @@ on:
             required: false
             type: string
             default: ""
+         note:
+            description: Caveat for this build's RELEASE.md (e.g. a smoke that could not run); empty adds none
+            required: false
+            type: string
+            default: ""
 
 jobs:
    publish:
@@ -80,6 +85,7 @@ jobs:
               TARGETS: ${{ inputs.targets }}
               DESCRIPTION: ${{ inputs.description }}
               EXECUTABLES: ${{ inputs.executables }}
+              NOTE: ${{ inputs.note }}
            run: |
               set -euo pipefail
               . "$FORK_CI/scripts/fork-token.sh"
@@ -111,6 +117,7 @@ jobs:
                 {
                   echo "$PROJECT integration build of $FORK@$SHA (https://github.com/$FORK/commit/$SHA)."
                   echo "${DESCRIPTION//\{target\}/$target}"
+                  [ -z "$NOTE" ] || { echo; echo "Note: $NOTE"; }
                   echo
                   echo "Upstream base: $(awk -F'\t' '$2 !~ /^PR #[0-9]+: / { print substr($1, 1, 10) " " $2; exit }' "$out/log.tsv")"
                   echo

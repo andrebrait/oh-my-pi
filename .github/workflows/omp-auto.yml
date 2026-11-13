@@ -398,14 +398,35 @@ jobs:
       if: ${{ !cancelled() && needs.detect.outputs.tag != '' && (needs.candidate.result == 'success' || inputs.candidate != '') }}
       permissions:
          contents: write
+         actions: read
       uses: ./.github/workflows/omp.yml
       with:
          repo: ${{ github.repository }}
          sha: ${{ inputs.candidate || needs.candidate.outputs.sha }}
 
+   # Runs no fork code. A runner-less darwin-arm64 smoke fails the build although omp.yml
+   # published it (its smoke-gate job); ok=true when that is the build's only failure.
+   build-gate:
+      needs: build
+      if: ${{ !cancelled() && (needs.build.result == 'failure' || needs.build.result == 'cancelled') }}
+      runs-on: ubuntu-24.04
+      timeout-minutes: 5
+      permissions:
+         contents: read
+         actions: read
+      outputs:
+         ok: ${{ steps.gate.outputs.ok }}
+         unsmoked: ${{ steps.gate.outputs.unsmoked }}
+      steps:
+         - *checkout-self
+         - id: gate
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: scripts/smoke-gate.sh '^build / ' >> "$GITHUB_OUTPUT"
+
    build-repair:
-      needs: [detect, candidate, build]
-      if: ${{ !cancelled() && inputs.candidate == '' && needs.build.result == 'failure' }}
+      needs: [detect, candidate, build, build-gate]
+      if: ${{ !cancelled() && inputs.candidate == '' && needs.build.result == 'failure' && needs.build-gate.outputs.ok != 'true' }}
       runs-on: ubuntu-24.04
       environment: fork-build
       timeout-minutes: 330
@@ -495,8 +516,8 @@ jobs:
    # Runs no fork code: attaches the built binaries and npm packages to a release on the
    # fork, then moves integration-release to it.
    release:
-      needs: [detect, candidate, build]
-      if: ${{ !cancelled() && needs.build.result == 'success' }}
+      needs: [detect, candidate, build, build-gate]
+      if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build-gate.outputs.ok == 'true') }}
       runs-on: ubuntu-24.04
       environment: fork-build
       timeout-minutes: 30
@@ -516,6 +537,7 @@ jobs:
               SHA: ${{ inputs.candidate || needs.candidate.outputs.sha }}
               REL: ${{ needs.build.outputs.tag }}
               VERSION: ${{ needs.build.outputs.version }}
+              UNSMOKED: ${{ needs.build-gate.outputs.unsmoked }}
            run: |
               set -euo pipefail
               . scripts/fork-token.sh
@@ -544,6 +566,7 @@ jobs:
                   gh api "repos/$FORK/commits?sha=$SHA&per_page=100" --jq '.[].commit.message | split("\n")[0]' |
                     awk 'done { next } !/^PR / { done = 1; next } { print }' | tac |
                     sed -E 's~^PR #([0-9]+): (.*)~- [#\1](https://github.com/can1357/oh-my-pi/pull/\1): \2~; s~^PR ([^ #]+)#([0-9]+): (.*)~- [\1#\2](https://github.com/\1/pull/\2): \3~'
+                  [ "$UNSMOKED" != true ] || printf '\n## Note\n\ndarwin-arm64 smoke not run (no runner)\n'
                 } > notes.md
                 # A full release marked Latest: `omp update` reads releases/latest.
                 fork_write gh release create "$REL" -R "$FORK" --target "$SHA" --title "$REL" --notes-file notes.md --latest out/*
@@ -569,13 +592,14 @@ jobs:
                 done
 
    escalate:
-      needs: [detect, rebase-repair, rebase-repair-push, integrate-repair, candidate, build, build-repair, build-repair-push, release]
+      needs: [detect, rebase-repair, rebase-repair-push, integrate-repair, candidate, build, build-gate, build-repair, build-repair-push, release]
       if: >-
          ${{ !cancelled() && needs.detect.outputs.tag != '' && (
             needs.rebase-repair.result == 'failure' || needs.rebase-repair-push.result == 'failure' ||
             needs.integrate-repair.result == 'failure' || needs.candidate.result == 'failure' ||
             needs.build-repair.result == 'failure' || needs.build-repair-push.result == 'failure' ||
-            needs.release.result == 'failure' || (inputs.candidate != '' && needs.build.result == 'failure')) }}
+            needs.release.result == 'failure' ||
+            (inputs.candidate != '' && needs.build.result == 'failure' && needs.build-gate.outputs.ok != 'true')) }}
       runs-on: ubuntu-24.04
       timeout-minutes: 10
       permissions:
