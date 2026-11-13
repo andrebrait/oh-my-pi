@@ -23,6 +23,8 @@ name: omp auto-integration
 # with OMP_FORK_TOKEN only when GitHub refuses them for the workflows permission
 # (scripts/fork-token.sh).
 on:
+   schedule:
+      - cron: "17 * * * *"
    workflow_dispatch:
       inputs:
          tag:
