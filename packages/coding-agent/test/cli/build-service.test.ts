@@ -2,12 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import {
 	type BuildHost,
+	type BuildProduct,
 	downloadBuildFile,
 	fetchBuild,
 	isMuslLinuxForTest,
 	OMP_BUILD,
 	parseBuildAnswer,
 	resolveBuildHost,
+	updateRepo,
 } from "@oh-my-pi/pi-coding-agent/cli/build-service";
 import { TempDir, VERSION } from "@oh-my-pi/pi-utils";
 
@@ -168,6 +170,146 @@ describe("fetchBuild", () => {
 				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
 			),
 		).rejects.toThrow("No omp stable build for macos-arm64 is published");
+	});
+
+	describe("from a fork's GitHub releases", () => {
+		const saved = Object.fromEntries(
+			["PI_UPDATE_REPO", "PI_DEFAULT_UPDATE_REPO", "PI_BUILD_URL", "GITHUB_TOKEN", "GH_TOKEN"].map(key => [
+				key,
+				process.env[key],
+			]),
+		);
+		afterEach(() => {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		});
+		const clearTokens = () => {
+			delete process.env.GITHUB_TOKEN;
+			delete process.env.GH_TOKEN;
+		};
+
+		const release = (assetFields: Record<string, unknown> = {}) => ({
+			tag_name: "v18.20.0-int.202611130355.gd2c2eff",
+			assets: [
+				{
+					name: "omp-linux-x64",
+					size: 1,
+					digest: `sha256:${sha("other")}`,
+					browser_download_url: "https://x.test/a",
+				},
+				{
+					name: fileName,
+					size: 205_765_664,
+					digest: `sha256:${sha("new")}`,
+					browser_download_url: `https://github.com/fork/omp/releases/download/v18.20.0-int.202611130355.gd2c2eff/${fileName}`,
+					...assetFields,
+				},
+			],
+		});
+
+		/** Requests `fetchBuild` sent, answered with `body`. */
+		const recording = (body: unknown) => {
+			const requests: Array<{ url: string; authorization: string | null }> = [];
+			const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+				requests.push({ url: String(input), authorization: new Headers(init?.headers).get("Authorization") });
+				return Response.json(body);
+			};
+			return { requests, fetchImpl };
+		};
+
+		it("answers the latest release's asset for the host, versioned by its tag, without a token", async () => {
+			clearTokens();
+			const { requests, fetchImpl } = recording(release());
+			const build = await fetchBuild(
+				{ channel: "stable" },
+				{ host, fromVersion: "18.19.0", repo: "fork/omp", fetchImpl },
+			);
+
+			expect(requests).toEqual([
+				{ url: "https://api.github.com/repos/fork/omp/releases/latest", authorization: null },
+			]);
+			expect(build).toEqual({
+				version: "18.20.0-int.202611130355.gd2c2eff",
+				file: { name: fileName, size: 205_765_664, sha256: sha("new") },
+				download: `https://github.com/fork/omp/releases/download/v18.20.0-int.202611130355.gd2c2eff/${fileName}`,
+				patch: undefined,
+			});
+		});
+
+		it("asks for an exact version by its tag", async () => {
+			const { requests, fetchImpl } = recording(release());
+			await fetchBuild({ version: "18.20.0-int.202611130355.gd2c2eff" }, { host, repo: "fork/omp", fetchImpl });
+			expect(requests[0].url).toBe(
+				"https://api.github.com/repos/fork/omp/releases/tags/v18.20.0-int.202611130355.gd2c2eff",
+			);
+		});
+
+		it("sends GITHUB_TOKEN, else GH_TOKEN, to GitHub only", async () => {
+			clearTokens();
+			process.env.GH_TOKEN = "gh-token";
+			const github = recording(release());
+			await fetchBuild({ channel: "stable" }, { host, repo: "fork/omp", fetchImpl: github.fetchImpl });
+			process.env.GITHUB_TOKEN = "github-token";
+			await fetchBuild({ channel: "stable" }, { host, repo: "fork/omp", fetchImpl: github.fetchImpl });
+			expect(github.requests.map(r => r.authorization)).toEqual(["Bearer gh-token", "Bearer github-token"]);
+
+			const service = recording(answer());
+			await fetchBuild({ channel: "stable" }, { host, fetchImpl: service.fetchImpl });
+			expect(service.requests[0].authorization).toBeNull();
+		});
+
+		it("refuses the canary channel instead of serving the latest release under it", async () => {
+			const { requests, fetchImpl } = recording(release());
+			await expect(fetchBuild({ channel: "canary" }, { host, repo: "fork/omp", fetchImpl })).rejects.toThrow(
+				"PI_UPDATE_REPO (fork/omp) has no canary channel",
+			);
+			expect(requests).toHaveLength(0);
+		});
+
+		it("refuses a release whose asset is missing or has no digest", async () => {
+			const ask = (body: unknown) =>
+				fetchBuild({ channel: "stable" }, { host, repo: "fork/omp", fetchImpl: async () => Response.json(body) });
+			await expect(ask(release({ digest: null }))).rejects.toThrow("invalid sha256");
+			await expect(ask({ tag_name: "v18.20.0", assets: [] })).rejects.toThrow("has no omp-darwin-arm64");
+		});
+
+		it("uses the baked default unless a runtime PI_UPDATE_REPO overrides or clears it", () => {
+			// Compiled binaries replace `process.env.PI_DEFAULT_UPDATE_REPO` with the baked value.
+			process.env.PI_DEFAULT_UPDATE_REPO = "fork/omp";
+			delete process.env.PI_UPDATE_REPO;
+			expect(updateRepo()).toBe("fork/omp");
+			process.env.PI_UPDATE_REPO = " other/omp ";
+			expect(updateRepo()).toBe("other/omp");
+			process.env.PI_UPDATE_REPO = "";
+			expect(updateRepo()).toBeUndefined();
+			process.env.PI_UPDATE_REPO = "fork/omp/../x";
+			expect(() => updateRepo()).toThrow("PI_UPDATE_REPO must be owner/repo");
+			delete process.env.PI_DEFAULT_UPDATE_REPO;
+			delete process.env.PI_UPDATE_REPO;
+			expect(updateRepo()).toBeUndefined();
+		});
+
+		it("keeps every request without `repo` on the build service while PI_UPDATE_REPO is set", async () => {
+			process.env.PI_UPDATE_REPO = "fork/omp";
+			process.env.PI_BUILD_URL = "https://build.test";
+			const omp = recording(answer());
+			// Package-manager repair asks for npm's exact version; the binary takeover asks for the channel.
+			await fetchBuild({ version: "18.8.9" }, { host, fetchImpl: omp.fetchImpl });
+			await fetchBuild({ channel: "stable" }, { host, fetchImpl: omp.fetchImpl });
+			expect(omp.requests.map(r => r.url)).toEqual([
+				"https://build.test/api/products/omp/versions/18.8.9/macos-arm64",
+				"https://build.test/api/products/omp/latest/macos-arm64?channel=stable",
+			]);
+
+			const other: BuildProduct = { id: "abkit", fileName: () => "abkit-macos-arm64.tar.zst" };
+			const engine = recording(
+				answer({ file: { ...(answer().file as object), name: "abkit-macos-arm64.tar.zst" } }),
+			);
+			await fetchBuild({ channel: "stable" }, { product: other, host, fetchImpl: engine.fetchImpl });
+			expect(engine.requests[0].url).toBe("https://build.test/api/products/abkit/latest/macos-arm64?channel=stable");
+		});
 	});
 });
 
