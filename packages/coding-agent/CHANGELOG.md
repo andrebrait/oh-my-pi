@@ -22,6 +22,7 @@
 ### Fixed
 
 - Fixed an unknown `skill://` name listing hidden skills as available to the model ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@andrebrait](https://github.com/andrebrait)).
+- `omp auth-gateway` no longer advertises or falls back to models its routes refuse (on-device `local-inference` runners, the Codex `gpt-image-2` Responses model), so `/v1/models` lists only servable models and a stdio fallback chain never ends on a guaranteed `400` ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait])
 
 ## [18.20.0] - 2026-11-12
 
@@ -249,6 +250,8 @@
 ### Added
 
 - Added custom OpenAI-compatible provider management and comment-preserving `models.yml` editing ([#13874](https://github.com/can1357/oh-my-pi/pull/13874) by [@andrebrait](https://github.com/andrebrait)).
+- Added the Codex Dictation speech-to-text model: select `openai-codex/codex-transcribe` as the dictation model to transcribe voice input with your ChatGPT/Codex subscription login ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait](https://github.com/andrebrait))
+- Added speech-to-text, text-to-speech and image model selectors (e.g. `openai-codex/codex-transcribe`) to `omp auth-gateway stdio`, which previously answered 404 for anything but chat models ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.18.7] - 2026-11-10
 
