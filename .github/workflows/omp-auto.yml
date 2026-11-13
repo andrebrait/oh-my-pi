@@ -408,7 +408,7 @@ jobs:
    # published it (its smoke-gate job); ok=true when that is the build's only failure.
    build-gate:
       needs: build
-      if: ${{ !cancelled() && (needs.build.result == 'failure' || needs.build.result == 'cancelled') }}
+      if: ${{ always() && (needs.build.result == 'failure' || needs.build.result == 'cancelled') }}
       runs-on: ubuntu-24.04
       timeout-minutes: 5
       permissions:
@@ -426,7 +426,7 @@ jobs:
 
    build-repair:
       needs: [detect, candidate, build, build-gate]
-      if: ${{ !cancelled() && inputs.candidate == '' && needs.build.result == 'failure' && needs.build-gate.outputs.ok != 'true' }}
+      if: ${{ always() && inputs.candidate == '' && needs.build.result == 'failure' && needs.build-gate.outputs.ok != 'true' }}
       runs-on: ubuntu-24.04
       environment: fork-build
       timeout-minutes: 330
@@ -517,7 +517,7 @@ jobs:
    # fork, then moves integration-release to it.
    release:
       needs: [detect, candidate, build, build-gate]
-      if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build-gate.outputs.ok == 'true') }}
+      if: ${{ always() && (needs.build.result == 'success' || needs.build-gate.outputs.ok == 'true') }}
       runs-on: ubuntu-24.04
       environment: fork-build
       timeout-minutes: 30
@@ -594,7 +594,7 @@ jobs:
    escalate:
       needs: [detect, rebase-repair, rebase-repair-push, integrate-repair, candidate, build, build-gate, build-repair, build-repair-push, release]
       if: >-
-         ${{ !cancelled() && needs.detect.outputs.tag != '' && (
+         ${{ always() && needs.detect.outputs.tag != '' && (
             needs.rebase-repair.result == 'failure' || needs.rebase-repair-push.result == 'failure' ||
             needs.integrate-repair.result == 'failure' || needs.candidate.result == 'failure' ||
             needs.build-repair.result == 'failure' || needs.build-repair-push.result == 'failure' ||
