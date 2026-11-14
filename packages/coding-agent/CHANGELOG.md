@@ -12,6 +12,7 @@
 - Added declared repository and version provenance to skill diagnostics, with opt-in `skills.dedupeSameOrigin` resolution for differing same-name plugin variants from the same source repository ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
 - Added the `retry.preferSlowMode` setting ("Prefer Slow Mode Over Fallback"): with `/slow` on a Claude subscription model, usage-aware fallback keeps Claude past its usage limits on low priority and switches models only when Claude refuses a request, such as at the weekly limit ([#14365](https://github.com/can1357/oh-my-pi/pull/14365) by [@andrebrait](https://github.com/andrebrait)).
 - Added the `subagent_stop` extension event, the subagent counterpart of `session_stop` and of Claude Code's `SubagentStop` hook: handlers can refuse a task or subagent result and send the subagent back to work before the result is published ([#15500](https://github.com/can1357/oh-my-pi/pull/15500) by [@obabac](https://github.com/obabac) and [@andrebrait](https://github.com/andrebrait))
+- Added `memory.backend: mnemosyne-oss`, which runs your own Mnemosyne 4.x Python SDK so recall, retain, and `memory://<id>` reads use the same local SQLite banks as other Mnemosyne clients ([#15687](https://github.com/can1357/oh-my-pi/pull/15687) by [@andrebrait](https://github.com/andrebrait), based on [#9211](https://github.com/can1357/oh-my-pi/pull/9211) by [@wannfq](https://github.com/wannfq))
 
 ### Changed
 
