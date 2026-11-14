@@ -25,12 +25,15 @@
 - Extensions can pass `expandPromptTemplates: true` to `pi.sendUserMessage()` so a `/skill:<name>` command or prompt template they send expands like typed input, matching Pi; Pi extensions with skill-alias commands now load the skill instead of sending the literal command text ([#14608](https://github.com/can1357/oh-my-pi/pull/14608) by [@andrebrait](https://github.com/andrebrait))
 - An invalid `task.maxEffort` or `task.maxActualEffort` value (e.g. `turbo`, a list, or a malformed model key) now stops startup with an error naming the setting, instead of logging a warning and using the default ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
 - `task.maxEffort` is now a per-model map (exact `provider/modelId`, a prefix ending in `*`, or `"*"` keys) so each model, including retry-fallback models, gets its own cap, and a model whose lowest effort is above its cap fails a spawn whose model resolves late, is skipped by retry fallback, context promotion and prewalk hand-offs, and is refused by a model switch; an existing `task.maxEffort: medium` still works as the `"*"` entry, a map in a higher config layer merges over it, and a string in a higher layer replaces a lower map (also across several `--config` files or project sources), and the setting leaves the settings panel ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
+- Mnemopi recall now fuses its vector, graph, fact and temporal voices by default (`mnemopi.polyphonicRecall`); set it to `false` or `MNEMOPI_POLYPHONIC_RECALL=0` to restore linear ranking. Retained memories' extracted facts are consolidated for the fact voice, including backfill of existing banks ([#15896](https://github.com/can1357/oh-my-pi/pull/15896) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 
 - Fixed an unknown `skill://` name listing hidden skills as available to the model ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@andrebrait](https://github.com/andrebrait)).
 - `omp auth-gateway` no longer advertises or falls back to models its routes refuse (on-device `local-inference` runners, the Codex `gpt-image-2` Responses model), so `/v1/models` lists only servable models and a stdio fallback chain never ends on a guaranteed `400` ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait])
 - Cancelling a queued stop hook now settles promptly without running the cancelled handler or letting later extension events overtake earlier deliveries.
+- Mnemopi no longer labels fused rank scores as confidence, and polyphonic recall interleaves scoped-bank rankings instead of comparing their fused score magnitudes ([#15896](https://github.com/can1357/oh-my-pi/pull/15896) by [@andrebrait](https://github.com/andrebrait))
+- Fixed cross-bank recall dropping distinct memories when their clipped previews were identical ([#15896](https://github.com/can1357/oh-my-pi/pull/15896) by [@andrebrait](https://github.com/andrebrait))
 
 ### Breaking Changes
 
