@@ -105,6 +105,8 @@ import type {
 	SessionStopEvent,
 	SessionStopEventResult,
 	ShortcutConflict,
+	SubagentStopEvent,
+	SubagentStopEventResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -215,6 +217,7 @@ const SESSION_BEFORE_EVENTS: Record<string, true> = {
  */
 const RELEASING_SIGNAL_EVENTS: Record<string, true> = {
 	session_stop: true,
+	subagent_stop: true,
 	session_before_shutdown: true,
 };
 
@@ -432,9 +435,9 @@ async function raceHandlerWithTimeout<T>(
 async function awaitDeliveryTurn(ready: Promise<void>, deadline: number, signal?: AbortSignal): Promise<boolean> {
 	if (signal?.aborted) return false;
 	const { promise: expired, resolve } = Promise.withResolvers<boolean>();
-	const timer = setTimeout(resolve, Math.max(0, deadline - performance.now()), false);
 	const onAbort = () => resolve(false);
 	signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(resolve, Math.max(0, deadline - performance.now()), false);
 	try {
 		return await Promise.race([ready.then(() => true), expired]);
 	} finally {
@@ -504,7 +507,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 						? SessionCompactingResult | undefined
 						: TEvent extends { type: "session_stop" }
 							? SessionStopEventResult | undefined
-							: undefined;
+							: TEvent extends { type: "subagent_stop" }
+								? SubagentStopEventResult | undefined
+								: undefined;
 
 // Session-lifecycle handler types live once in session-handler-types (imported
 // above for local use); re-exported here to keep this module's public API stable.
@@ -1079,6 +1084,12 @@ export class ExtensionRunner {
 	async emitSessionStop(event: Omit<SessionStopEvent, "type">): Promise<SessionStopEventResult | undefined> {
 		if (event.signal.aborted) return undefined;
 		return await this.emit({ type: "session_stop", ...event });
+	}
+
+	/** Emits a subagent stop pass that can be cancelled with the run's abort signal. */
+	async emitSubagentStop(event: Omit<SubagentStopEvent, "type">): Promise<SubagentStopEventResult | undefined> {
+		if (event.signal.aborted) return undefined;
+		return await this.emit({ type: "subagent_stop", ...event });
 	}
 
 	/**
@@ -2065,7 +2076,9 @@ export class ExtensionRunner {
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
 				const turn = turns?.get(ext);
-				if (turn?.ready && !(await awaitDeliveryTurn(turn.ready, turn.deadline, signal)) && !signal?.aborted) {
+				const ready = turn?.ready ? await awaitDeliveryTurn(turn.ready, turn.deadline, signal) : true;
+				if (signal?.aborted) return undefined as RunnerEmitResult<TEvent>;
+				if (!ready) {
 					logger.warn("Extension still handling an earlier event; delivering out of order", {
 						extensionPath: ext.path,
 						event: event.type,
@@ -2088,7 +2101,7 @@ export class ExtensionRunner {
 						result = handlerResult as SessionCompactingResult;
 					}
 
-					if (event.type === "session_stop" && handlerResult) {
+					if ((event.type === "session_stop" || event.type === "subagent_stop") && handlerResult) {
 						const stopResult = handlerResult as SessionStopEventResult;
 						if (stopResult.decision === "block") {
 							return stopResult as RunnerEmitResult<TEvent>;
@@ -2110,7 +2123,13 @@ export class ExtensionRunner {
 				turn?.release();
 			}
 		} finally {
-			if (turns) for (const turn of turns.values()) turn.release();
+			if (turns) {
+				for (const turn of turns.values()) {
+					// A cancelled delivery must not let later events bypass its predecessor.
+					if (signal?.aborted && turn.ready) void turn.ready.then(turn.release);
+					else turn.release();
+				}
+			}
 		}
 
 		// Handlers for these events export session-scoped environment (a session
