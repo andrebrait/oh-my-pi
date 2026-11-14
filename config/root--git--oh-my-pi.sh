@@ -16,7 +16,7 @@ CI_REPO=ompweb-dev/oh-my-pi
 CI_WORKFLOW=omp.yml
 # CI reads this config and its workflows from the fork's fork-ci branch.
 CI_CONFIG_REF=origin/fork-ci
-# omp.yml builds every platform; this host deploys the linux-x64 binary.
+# omp.yml builds every platform; `integration build` downloads the linux-x64 binary.
 CI_TARGET=linux-x64
 BASE=upstream/main
 # upstream merges changelogs with merge=union, which drags rebased entries into released sections.
@@ -41,21 +41,3 @@ TEST_CMD+=' packages/coding-agent/test/agent-session-send-user-message-expand.te
 # Own process: upstream's issue-985 test calls Settings.init() without resetting a global
 # instance left by agent-session-message-pipeline.test.ts, so it fails when co-run (upstream too).
 TEST_CMD+=' && PI_CODING_AGENT_DIR="$(mktemp -d /tmp/omp-integration-agent-XXXXXX)" bun test packages/coding-agent/test/issue-985-subagent-auth-fallback.test.ts'
-DEPLOY_CMD='set -e
-rel="/opt/omp-patched/releases/${DEPLOY_SHA:0:10}"
-mkdir -p "$rel"
-# Copy beside, then rename over: redeploying the running sha would hit "Text file busy",
-# and a rename leaves running processes on the old inode.
-cp "$BUILD_DIR/omp" "$rel/omp.new"
-mv -f "$rel/omp.new" "$rel/omp"
-sha256sum "$rel/omp" | cut -d" " -f1 > "$rel/omp.sha256"
-{
-	echo "branch: integration"
-	echo "sha: $DEPLOY_SHA"
-	echo "upstream base: $DEPLOY_BASE"
-	echo "built: $(date -u +%FT%TZ)"
-	echo "sha256(omp): $(cat "$rel/omp.sha256")"
-	echo "verify: bun check, downstream-patch tests, omp --smoke-test"
-} > "$rel/RELEASE.md"
-ln -sfn "$rel" /opt/omp-patched/current
-echo "current -> $rel"'

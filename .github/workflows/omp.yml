@@ -8,7 +8,6 @@ name: omp integration build
 # Every binary, native addon and npm package of a build carries the version
 # <upstream>-int.<YYYYMMDDHHMM>.g<sha7>, the stamp being the commit's committer
 # time in UTC, so each job computes the same value (the `version` job outputs it).
-# Binaries take updates from this fork's releases (PI_UPDATE_REPO).
 #
 # `build` runs the config's BUILD_CMD/TEST_CMD (the test gate). The release
 # binaries follow upstream's release jobs: every native addon (macOS included)
@@ -308,7 +307,6 @@ jobs:
            shell: bash
            env:
               RELEASE_TARGETS: ${{ matrix.target }}
-              PI_UPDATE_REPO: ompweb-dev/oh-my-pi
               SHA: ${{ inputs.sha }}
            run: |
               set -euo pipefail
@@ -357,21 +355,15 @@ jobs:
            shell: bash
            env:
               VERSION: ${{ needs.version.outputs.version }}
-              TARGET: ${{ matrix.target }}
            run: |
               set -euo pipefail
               chmod +x bin/omp
               if [ "$RUNNER_OS" = macOS ]; then codesign --verify --strict --verbose=2 bin/omp; fi
               runtime_dir="$(mktemp -d)"
-              # `omp update` installs a release only when the binary reports its tag's version.
+              # Each binary must report its release tag's version.
               got="$(HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" bin/omp --version)"
               [ "$got" = "omp/$VERSION" ] || { echo "bin/omp --version printed '$got', want 'omp/$VERSION'" >&2; exit 1; }
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" bin/omp --smoke-test
-              # Fails when the carried update-source PR (PI_UPDATE_REPO) dropped out of the build.
-              if [ "$TARGET" = linux-x64 ] && ! grep -qaF ompweb-dev/oh-my-pi bin/omp; then
-                echo "bin/omp does not name ompweb-dev/oh-my-pi: it would update from upstream" >&2
-                exit 1
-              fi
          - name: Smoke release binary (Windows)
            if: runner.os == 'Windows'
            shell: pwsh
