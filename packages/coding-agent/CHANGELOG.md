@@ -13,6 +13,7 @@
 - Added the `retry.preferSlowMode` setting ("Prefer Slow Mode Over Fallback"): with `/slow` on a Claude subscription model, usage-aware fallback keeps Claude past its usage limits on low priority and switches models only when Claude refuses a request, such as at the weekly limit ([#14365](https://github.com/can1357/oh-my-pi/pull/14365) by [@andrebrait](https://github.com/andrebrait)).
 - Added the `subagent_stop` extension event, the subagent counterpart of `session_stop` and of Claude Code's `SubagentStop` hook: handlers can refuse a task or subagent result and send the subagent back to work before the result is published ([#15500](https://github.com/can1357/oh-my-pi/pull/15500) by [@obabac](https://github.com/obabac) and [@andrebrait](https://github.com/andrebrait))
 - Added `memory.backend: mnemosyne-oss`, which runs your own Mnemosyne 4.x Python SDK so recall, retain, and `memory://<id>` reads use the same local SQLite banks as other Mnemosyne clients ([#15687](https://github.com/can1357/oh-my-pi/pull/15687) by [@andrebrait](https://github.com/andrebrait), based on [#9211](https://github.com/can1357/oh-my-pi/pull/9211) by [@wannfq](https://github.com/wannfq))
+- The task tool can take an exact per-spawn thinking level with `actualEffort` (`minimal`…`max`), enabled by `task.enableActualEffort` and capped by the new `task.maxActualEffort`; it takes `effort`'s precedence one step above it, replacing `effort` entirely ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
 
 ### Changed
 
@@ -20,12 +21,18 @@
 - Passive context emitted after a tool batch now appears as one dim line on the batch's final tool card instead of remaining invisible or creating a separate transcript row; expanding tools (`Ctrl+O` by default) shows its full text ([#13269](https://github.com/can1357/oh-my-pi/pull/13269) by [@andrebrait](https://github.com/andrebrait)).
 - RPC hosts can inspect skill conflicts and redundant installations through typed diagnostics snapshots, receive startup and live updates, and persist the startup-notice preference ([#14148](https://github.com/can1357/oh-my-pi/pull/14148) by [@andrebrait](https://github.com/andrebrait)).
 - Extensions can pass `expandPromptTemplates: true` to `pi.sendUserMessage()` so a `/skill:<name>` command or prompt template they send expands like typed input, matching Pi; Pi extensions with skill-alias commands now load the skill instead of sending the literal command text ([#14608](https://github.com/can1357/oh-my-pi/pull/14608) by [@andrebrait](https://github.com/andrebrait))
+- An invalid `task.maxEffort` or `task.maxActualEffort` value (e.g. `turbo`, a list, or a malformed model key) now stops startup with an error naming the setting, instead of logging a warning and using the default ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
+- `task.maxEffort` is now a per-model map (exact `provider/modelId`, a prefix ending in `*`, or `"*"` keys) so each model, including retry-fallback models, gets its own cap, and a model whose lowest effort is above its cap fails a spawn whose model resolves late, is skipped by retry fallback, context promotion and prewalk hand-offs, and is refused by a model switch; an existing `task.maxEffort: medium` still works as the `"*"` entry, a map in a higher config layer merges over it, and a string in a higher layer replaces a lower map (also across several `--config` files or project sources), and the setting leaves the settings panel ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
 
 ### Fixed
 
 - Fixed an unknown `skill://` name listing hidden skills as available to the model ([#14049](https://github.com/can1357/oh-my-pi/pull/14049) by [@andrebrait](https://github.com/andrebrait)).
 - `omp auth-gateway` no longer advertises or falls back to models its routes refuse (on-device `local-inference` runners, the Codex `gpt-image-2` Responses model), so `/v1/models` lists only servable models and a stdio fallback chain never ends on a guaranteed `400` ([#15391](https://github.com/can1357/oh-my-pi/pull/15391) by [@andrebrait])
 - Cancelling a queued stop hook now settles promptly without running the cancelled handler or letting later extension events overtake earlier deliveries.
+
+### Breaking Changes
+
+- SDK: `createAgentSession`'s `thinkingLevelCeiling` is now a per-model function `(model) => Effort | undefined` instead of a single `Effort`; pass `() => effort` for a fixed cap ([#18780](https://github.com/can1357/oh-my-pi/pull/18780) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.20.0] - 2026-11-12
 
